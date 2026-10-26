@@ -30,4 +30,6 @@ Every ruling that shapes this repository, with its date and source. AUTHOR-STATE
 | 2026-10-26 17:20 | Proceed in the proposed order: O15 fence variant, P-M4 probe fixes, then the P-M5 route | AUTHOR-STATED | Masterwork O15 |
 | 2026-10-26 17:26 | P-M5 deferred to step 10 (engine byte counters, no third-party counter tool) | AUTHOR-STATED | Masterwork O16 |
 | 2026-10-26 17:29 to 17:30 | ReBAR on/off pair optional: build ReBAR support in, let the startup probe choose; account for the ReBAR-off path on another build day (an adjustment, not a rewrite). Step 1 closes | AUTHOR-STATED | Masterwork 15.2, O17 |
+| 2026-10-26 17:34 | Push | AUTHOR-STATED | All three repositories, main branches |
+| 2026-10-26 17:41 to 17:43 | From all the probe data update Section 21 and 21.5 (everything mapped beyond the hot bank), push it and anything left unfinished | AUTHOR-STATED | Masterwork 21 |
 | 2026-10-26 | Vulkan compute as the second GPU backend; pelias-master as the code repository; own installer; tighter kernel tolerance until measured; reference profile 7.5 GiB bank at `-ub 2048`; poll level 100 | DECISION (proposed) | Masterwork 3.1, 14.1, 13.3, 16.2, 18.1 |
