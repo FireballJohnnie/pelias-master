@@ -62,9 +62,9 @@ JW stats_json(const Stats& s) {
 }
 
 // One placement: returns the timed rounds (first ring of each batch left out: it also waits for the kernel to start).
-JW run_bell(const Loc& req, const Loc& rep, int rounds, int batch, uint32_t* status_dev, cudaStream_t s, Stats& out) {
+JW run_bell(const Loc& req, const Loc& rep, int mode, int rounds, int batch, uint32_t* status_dev, cudaStream_t s, Stats& out) {
   JW j;
-  j.kv("request_word", req.name).kv("reply_word", rep.name);
+  j.kv("request_word", req.name).kv("reply_word", rep.name).kv("gpu_reply_mode", e16::bell_mode_name(mode));
   store(req.host, 0);
   store(rep.host, 0);
   std::vector<double> us;
@@ -76,7 +76,7 @@ JW run_bell(const Loc& req, const Loc& rep, int rounds, int batch, uint32_t* sta
   while (done < rounds && failure.empty()) {
     const int count = std::min(batch, rounds - done);
     PP_CK(cudaMemsetAsync(status_dev, 0, 4, s));
-    PP_CK(e16::launch_bell(req.dev, rep.dev, n, static_cast<uint32_t>(count), 200000000ull, status_dev, s));
+    PP_CK(e16::launch_bell(req.dev, rep.dev, n, static_cast<uint32_t>(count), 200000000ull, status_dev, mode, s));
     // Windows (WDDM) batches launches and may hold this one until something flushes the queue; a query flushes it
     // without waiting (revision 3: without it no ring was ever answered on Windows, in any placement).
     (void)cudaStreamQuery(s);
@@ -157,11 +157,14 @@ int main(int argc, char** argv) {
 
     std::vector<JW> rows;
     Stats st;
-    JW base = run_bell(sys_req, sys_rep, rounds, batch, status_dev, s, st);
-    const double base_median = st.median;
-    rows.push_back(base);
-    std::printf("  request sys  / reply sys    median %8.2f us  p99 %8.2f us\n", st.median, st.p99);
-    std::fflush(stdout);
+    double base_median[e16::kBellModes] = {};
+    for (int m = 0; m < e16::kBellModes; ++m) {
+      JW base = run_bell(sys_req, sys_rep, m, rounds, batch, status_dev, s, st);
+      base_median[m] = st.median;
+      rows.push_back(base);
+      std::printf("  [%-27s] request sys  / reply sys    median %8.2f us  p99 %8.2f us%s\n", e16::bell_mode_name(m), st.median, st.p99, st.n ? "" : "  (did not complete)");
+      std::fflush(stdout);
+    }
 
     e16::VkVram vk;
     std::string why;
@@ -176,21 +179,24 @@ int main(int argc, char** argv) {
       vkj.kv("host_coherent", vk.coherent).kv("resizable_bar_inferred_on", vk.host_visible_vram_heap_bytes > (uint64_t{512} << 20));
       const Loc* pairs[3][2] = {{&v_req, &sys_rep}, {&sys_req, &v_rep}, {&v_req, &v_rep}};
       const char* labels[3] = {"request VRAM / reply sys  ", "request sys  / reply VRAM ", "request VRAM / reply VRAM "};
-      for (int k = 0; k < 3; ++k) {
-        JW row = run_bell(*pairs[k][0], *pairs[k][1], rounds, batch, status_dev, s, st);
-        if (st.n) row.kv("median_over_system_ram_both", st.median / base_median).kv("speedup_vs_system_ram_both", base_median / st.median);
-        rows.push_back(row);
-        std::printf("  %s median %8.2f us  p99 %8.2f us%s\n", labels[k], st.median, st.p99, st.n ? "" : "  (did not complete)");
-        std::fflush(stdout);
+      for (int m = 0; m < e16::kBellModes; ++m) {
+        for (int k = 0; k < 3; ++k) {
+          JW row = run_bell(*pairs[k][0], *pairs[k][1], m, rounds, batch, status_dev, s, st);
+          if (st.n && base_median[m] > 0) row.kv("speedup_vs_system_ram_both_same_mode", base_median[m] / st.median);
+          if (st.n && base_median[0] > 0) row.kv("speedup_vs_revision3_system_ram_both", base_median[0] / st.median);
+          rows.push_back(row);
+          std::printf("  [%-27s] %s median %8.2f us  p99 %8.2f us%s\n", e16::bell_mode_name(m), labels[k], st.median, st.p99, st.n ? "" : "  (did not complete)");
+          std::fflush(stdout);
+        }
       }
     } else {
       vkj.kv("available", false).kv("reason", a.has("no-vulkan") ? std::string("--no-vulkan") : why);
       std::printf("  CPU-visible VRAM: unavailable (%s)\n", a.has("no-vulkan") ? "--no-vulkan" : why.c_str());
     }
     r.inputs.kv("rounds_per_placement", rounds).kv("rounds_per_kernel_launch", batch).kv("patience_ms", 250).kv("gpu", prop.name);
-    r.inputs.kv("cpu_timer", "std::chrono::steady_clock").kv("gpu_side", "one thread; volatile loads; reply = volatile store between __threadfence_system()");
+    r.inputs.kv("cpu_timer", "std::chrono::steady_clock").kv("gpu_side", "one thread; four reply-ordering modes (gpu_reply_mode per row)");
     r.values.kv_obj("launch_and_synchronize", stats_json(sl)).arr_obj("doorbell", rows).kv_obj("cpu_visible_vram", vkj);
-    r.headline = "system RAM both " + std::to_string(base_median) + " us median" + (have_vram ? "; VRAM placements recorded" : "; VRAM unavailable");
+    r.headline = "system RAM both " + std::to_string(base_median[0]) + " us median (revision 3 mode)" + (have_vram ? "; VRAM placements recorded" : "; VRAM unavailable");
     r.inputs.kv("launch_flush", "cudaStreamQuery right after each launch (WDDM batching)");
     r.notes = "Masterwork 21.2 H-G1. The first ring of each kernel launch is left out (it also waits for the launch). ReBAR state is inferred from the size of the CPU-visible VRAM heap.";
     write_result(c, r, "e16_doorbell");

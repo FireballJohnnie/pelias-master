@@ -10,7 +10,7 @@ Platforms: Windows native runs all placements. Under WSL2 the Vulkan loader find
 
 Files: `e16_kernels.cu` / `.h` (GPU side), `vk_extmem.h` (Vulkan block exported to CUDA), `main_e16.cpp`; it builds on the Wave 0 framework (`cudautil.h`, `hostlib.h`, `nvml_dyn.h`, `kernels.h`, linked with `kernels.obj` / `kernels.o`) and the Vulkan-Headers vendored with gfx_probe (`../gfx_probe/third/Vulkan-Headers/include` in this repository). The framework files are in `../batch_c/`; copy them next to these files, or add `-I../batch_c`, and build `kernels.cu` from there first.
 
-Revisions: r1's GPU side used inline-PTX acquire/release; it and every other file failed to build in a 32-bit (x86) Developer PowerShell window (`cudafe++` 0xC0000005), which was the real cause; r2 uses volatile loads and system-scope fences; r3 flushes the launch with `cudaStreamQuery` (without it Windows held the launch and no ring was answered: `data/probe_results/P-E16/windows_r2_no_flush`).
+Revisions: r1's GPU side used inline-PTX acquire/release; it and every other file failed to build in a 32-bit (x86) Developer PowerShell window (`cudafe++` 0xC0000005), which was the real cause; r2 uses volatile loads and system-scope fences; r3 flushes the launch with `cudaStreamQuery`; r4 adds four ways for the GPU to post its reply (open item O15): fence-store-fence, store-fence, store only, acquire load with release store (without it Windows held the launch and no ring was answered: `data/probe_results/P-E16/windows_r2_no_flush`).
 
 Windows (a 64-bit Developer Command Prompt: `where cl` must show `Hostx64\x64`; run `vcvars64.bat` otherwise; in the probe folder):
 

@@ -27,4 +27,6 @@ Every ruling that shapes this repository, with its date and source. AUTHOR-STATE
 | 2026-10-26 16:00 | Split-K is wrong for expert down (enough tiles already) and M=64 experts need their own test | AUTHOR-STATED (challenge, accepted) | Masterwork 17.5, O13 |
 | 2026-10-26 16:1x | Dense layers: int8 v10 (3 stages, fp32 output); MoE experts at small M: grouped 64x128 launch; activation quantization fused into the RMSNorm; no split-K | DECISION (from the measurements, author's "excellent") | Masterwork 17.5 |
 | 2026-10-26 16:14 | Update everything on git with these results | AUTHOR-STATED | This commit (not pushed) |
+| 2026-10-26 17:20 | Proceed in the proposed order: O15 fence variant, P-M4 probe fixes, then the P-M5 route | AUTHOR-STATED | Masterwork O15 |
+| 2026-10-26 17:26 | P-M5 deferred to step 10 (engine byte counters, no third-party counter tool) | AUTHOR-STATED | Masterwork O16 |
 | 2026-10-26 | Vulkan compute as the second GPU backend; pelias-master as the code repository; own installer; tighter kernel tolerance until measured; reference profile 7.5 GiB bank at `-ub 2048`; poll level 100 | DECISION (proposed) | Masterwork 3.1, 14.1, 13.3, 16.2, 18.1 |
