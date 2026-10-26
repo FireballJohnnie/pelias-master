@@ -18,6 +18,10 @@
 
 namespace pelias::io {
 
+namespace detail {
+class JsonParser;
+}
+
 class Json {
  public:
   enum class Kind { null, boolean, number, string, array, object };
@@ -58,12 +62,14 @@ class Json {
   Json& push(Json v);                        // array append; returns *this so calls chain
   Json& set(std::string key, Json v);        // object insert or replace (keeps first-insert order); returns *this
 
-  // Parses a whole document (any value at the top level, as RFC 8259 allows). Depth is limited to 512.
+  // Parses a whole document (any value at the top level, as RFC 8259 allows). Depth is limited to 512. A key that
+  // appears twice in one object is refused (RFC 8259 leaves it open; a header is input to check, not to guess about).
   static Result<Json> parse(std::string_view text);
   // Writes compactly (indent 0) or pretty-printed with `indent` spaces per level; keys in stored order.
   [[nodiscard]] std::string dump(int indent = 0) const;
 
  private:
+  friend class detail::JsonParser;
   void dump_to(std::string& out, int indent, int depth) const;
   Kind kind_ = Kind::null;
   bool b_ = false;

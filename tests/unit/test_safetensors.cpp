@@ -74,3 +74,22 @@ TEST(safetensors_refuses_damage) {
   CHECK(s.code == Code::corrupt);
   CHECK(s.offset >= 8);
 }
+
+TEST(safetensors_zero_length_tensor_and_duplicate_name) {
+  SafetensorsReader r;
+  os::FileMap m;
+  // a zero-length tensor sharing its begin with a real one; listed after it so the old begin-only sort could misorder
+  std::string h = R"({"a":{"dtype":"F32","shape":[2],"data_offsets":[0,8]},"z":{"dtype":"F32","shape":[0],"data_offsets":[0,0]}})";
+  CHECK(ptest::write_and_map(ptest::data_dir() + "/z.safetensors", st_file(h, 8), m));
+  Status s = r.parse(m);
+  CHECK(s.ok());
+  if (!s) std::printf("      %s\n", s.text().c_str());
+  CHECK_EQ(r.tensors().size(), 2u);
+  // the same tensor name twice: refused as a duplicate key, named
+  h = R"({"a":{"dtype":"F32","shape":[2],"data_offsets":[0,8]},"a":{"dtype":"F32","shape":[2],"data_offsets":[8,16]}})";
+  CHECK(ptest::write_and_map(ptest::data_dir() + "/z.safetensors", st_file(h, 16), m));
+  s = r.parse(m);
+  CHECK(s.code == Code::corrupt);
+  CHECK_EQ(s.name, std::string("a"));
+  CHECK(s.offset >= 8);
+}

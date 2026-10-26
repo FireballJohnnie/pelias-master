@@ -6,15 +6,18 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <unordered_set>
 
 namespace pelias::io {
 namespace {
-
 constexpr int kMaxDepth = 512;
+}  // namespace
 
-class Parser {
+namespace detail {
+
+class JsonParser {
  public:
-  explicit Parser(std::string_view t) : t_(t) {}
+  explicit JsonParser(std::string_view t) : t_(t) {}
   Status run(Json& out) {
     skip_ws();
     Status s = value(out, 0);
@@ -190,12 +193,15 @@ class Parser {
     out = Json::object();
     skip_ws();
     if (peek() == '}') { ++pos_; return Status::good(); }
+    std::unordered_set<std::string> keys;
     while (true) {
       skip_ws();
       if (peek() != '"') return fail("object key expected");
+      const std::size_t key_at = pos_;
       std::string key;
       Status s = string(key);
       if (!s) return s;
+      if (!keys.insert(key).second) return Status::fail(Code::corrupt, "JSON: duplicate key", key_at, key);
       skip_ws();
       if (peek() != ':') return fail("':' expected");
       ++pos_;
@@ -203,7 +209,7 @@ class Parser {
       Json v;
       s = value(v, depth + 1);
       if (!s) return s;
-      out.set(std::move(key), std::move(v));
+      out.members_.emplace_back(std::move(key), std::move(v));  // unique: checked above, so no scan
       skip_ws();
       if (peek() == ',') { ++pos_; continue; }
       if (peek() == '}') { ++pos_; return Status::good(); }
@@ -214,6 +220,10 @@ class Parser {
   std::string_view t_;
   std::size_t pos_ = 0;
 };
+
+}  // namespace detail
+
+namespace {
 
 void escape_into(std::string& out, const std::string& s) {
   out += '"';
@@ -268,7 +278,7 @@ Json& Json::set(std::string key, Json v) {
 
 Result<Json> Json::parse(std::string_view text) {
   Json j;
-  Parser p(text);
+  detail::JsonParser p(text);
   const Status s = p.run(j);
   if (!s) return Result<Json>::fail(s);
   return Result<Json>::good(std::move(j));

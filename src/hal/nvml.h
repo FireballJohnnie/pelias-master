@@ -18,8 +18,13 @@ struct NvmlMemory {
   std::string note;
 };
 
-// Reads memory of the device whose PCI bus id matches `pci_bus_id` (as the CUDA runtime formats it), or device 0 when
-// the id is empty.
+// Which NVML device to read. CUDA and NVML may number cards differently (CUDA's default order is fastest first, NVML's
+// is by PCI bus), so only the PCI bus id identifies the same card in both. Without a PCI match, the one card is used
+// only when NVML sees exactly one; otherwise none (the ceiling then rests on CUDA alone, and the note says so).
+enum class NvmlPick { by_pci, only_device, none };
+NvmlPick nvml_pick(bool pci_matched, unsigned device_count);
+
+// Reads memory of the device whose PCI bus id matches `pci_bus_id` (as the CUDA runtime formats it); see nvml_pick.
 NvmlMemory nvml_memory(const std::string& pci_bus_id);
 
 }  // namespace pelias::hal

@@ -10,6 +10,7 @@
 // over the ceiling); 4 no device.
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <string>
 #include <vector>
@@ -17,6 +18,7 @@
 #include "hal/device.h"
 #include "hal/vram_governor.h"
 #include "io/gguf_reader.h"
+#include "io/number_text.h"
 #include "io/safetensors.h"
 #include "io/sha256.h"
 #include "os/clock.h"
@@ -45,8 +47,36 @@ struct Args {
       if (o.first == k) return o.second;
     return d;
   }
-  [[nodiscard]] double num(const std::string& k, double d) const { return has(k) ? std::strtod(get(k).c_str(), nullptr) : d; }
 };
+
+// Sizes typed in GiB become bytes; below 2^34 GiB the byte count fits 64 bits (2^34 x 2^30 = 2^64), so that is the
+// limit (DERIVED, not a policy).
+constexpr double kGiBTextLimit = 17179869184.0;
+
+// Reads --k as GiB greater than zero. Absent: true, `bytes` unchanged. Bad text: prints why, returns false (exit 1).
+bool gib_option(const Args& a, const char* k, std::uint64_t& bytes) {
+  if (!a.has(k)) return true;
+  const Result<double> r = io::parse_positive_decimal(a.get(k), kGiBTextLimit);
+  if (!r.ok()) {
+    std::fprintf(stderr, "pelias: --%s %s\n", k, r.status.message.c_str());
+    return false;
+  }
+  bytes = static_cast<std::uint64_t>(r.value * static_cast<double>(plan::kGiB));
+  return true;
+}
+
+// Reads --index as a whole number (default 0). Bad text: prints why, returns false (exit 1).
+bool index_option(const Args& a, int& index) {
+  index = 0;
+  if (!a.has("index")) return true;
+  const Result<std::uint64_t> r = io::parse_whole(a.get("index"), static_cast<std::uint64_t>(std::numeric_limits<int>::max()));
+  if (!r.ok()) {
+    std::fprintf(stderr, "pelias: --index %s\n", r.status.message.c_str());
+    return false;
+  }
+  index = static_cast<int>(r.value);
+  return true;
+}
 
 Args parse_args(int argc, char** argv) {
   Args a;
@@ -104,7 +134,9 @@ int cmd_version() {
 }
 
 int cmd_device(const Args& a) {
-  const hal::DeviceInfo d = hal::query_device(static_cast<int>(a.num("index", 0)));
+  int index = 0;
+  if (!index_option(a, index)) return 1;
+  const hal::DeviceInfo d = hal::query_device(index);
   std::printf("platform: %s\n", os::platform_name().c_str());
   if (!d.available) {
     std::printf("device: none (%s)\n", d.note.c_str());
@@ -246,12 +278,17 @@ int cmd_plan(const Args& a) {
   s = r.parse(m, !a.has("header-only"));  // a plan needs only the tensor table; --header-only plans from a header sample
   if (!s) return fail_input(s);
   plan::PlanRequest req;
-  if (a.has("ceiling-gib")) {
-    const hal::Ceiling c = hal::ceiling_stated(static_cast<std::uint64_t>(a.num("ceiling-gib", 0) * static_cast<double>(plan::kGiB)));
+  std::uint64_t stated_ceiling = 0;
+  int index = 0;
+  if (!gib_option(a, "ceiling-gib", stated_ceiling) || !gib_option(a, "bank-gib", req.bank_bytes) ||
+      !gib_option(a, "working-set-gib", req.working_set_bytes) || !index_option(a, index))
+    return 1;
+  if (stated_ceiling) {
+    const hal::Ceiling c = hal::ceiling_stated(stated_ceiling);
     req.ceiling_bytes = c.bytes;
     req.ceiling_basis = "stated";
   } else {
-    const hal::DeviceInfo d = hal::query_device(static_cast<int>(a.num("index", 0)));
+    const hal::DeviceInfo d = hal::query_device(index);
     const hal::Ceiling c = hal::ceiling_from_device(d);
     if (c.bytes) {
       req.ceiling_bytes = c.bytes;
@@ -261,8 +298,6 @@ int cmd_plan(const Args& a) {
       return 4;
     }
   }
-  if (a.has("bank-gib")) req.bank_bytes = static_cast<std::uint64_t>(a.num("bank-gib", 0) * static_cast<double>(plan::kGiB));
-  if (a.has("working-set-gib")) req.working_set_bytes = static_cast<std::uint64_t>(a.num("working-set-gib", 0) * static_cast<double>(plan::kGiB));
   const Result<plan::Plan> res = plan::make_plan(r, req);
   if (res.status.code == Code::invalid_argument) return fail_input(res.status);
   std::fputs(plan::plan_text(res.value).c_str(), stdout);

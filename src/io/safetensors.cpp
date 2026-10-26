@@ -81,7 +81,10 @@ Status SafetensorsReader::parse(const os::FileMap& map) {
   // the ranges must tile the data section without gaps or overlaps (the format's rule)
   std::vector<const SafetensorsTensor*> order;
   for (const auto& t : tensors_) order.push_back(&t);
-  std::sort(order.begin(), order.end(), [](const SafetensorsTensor* a, const SafetensorsTensor* b) { return a->begin < b->begin; });
+  std::sort(order.begin(), order.end(), [](const SafetensorsTensor* a, const SafetensorsTensor* b) {
+    // by begin, then end: a zero-length tensor sharing a begin with a real one sorts first, so the walk stays in order
+    return a->begin != b->begin ? a->begin < b->begin : a->end < b->end;
+  });
   std::uint64_t expect = 0;
   for (const SafetensorsTensor* t : order) {
     if (t->begin != expect) return Status::fail(Code::corrupt, "tensor data does not follow the previous tensor (gap or overlap at " + std::to_string(t->begin) + ")", data_start_ + t->begin, t->name);

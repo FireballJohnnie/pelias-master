@@ -55,3 +55,20 @@ TEST(json_dump_round_trip) {
   CHECK_EQ(pretty.value.dump(0), compact);
   CHECK_EQ(Json::parse("  42 ").value.as_uint(), 42u);  // a scalar document is valid
 }
+
+TEST(json_refuses_duplicate_keys) {
+  const auto r = Json::parse(R"({"a": 1, "b": 2, "a": 3})");
+  CHECK(!r.ok());
+  CHECK(r.status.code == pelias::Code::corrupt);
+  CHECK_EQ(r.status.name, std::string("a"));
+  CHECK_EQ(r.status.offset, 17u);  // the second "a"
+  CHECK(Json::parse(R"({"a": {"x": 1}, "b": {"x": 2}})").ok());  // same key in different objects is fine
+  // many keys: parses in linear time (the old insert scanned every earlier key)
+  std::string big = "{";
+  for (int i = 0; i < 50000; ++i) big += (i ? ",\"k" : "\"k") + std::to_string(i) + "\":" + std::to_string(i);
+  big += "}";
+  const auto b = Json::parse(big);
+  CHECK(b.ok());
+  CHECK_EQ(b.value.size(), 50000u);
+  CHECK_EQ(b.value.members()[49999].first, std::string("k49999"));
+}
