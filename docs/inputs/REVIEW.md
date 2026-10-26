@@ -1,0 +1,14 @@
+# Review of the input files (2026-10-26)
+
+These files were attached by the author on 2026-10-26 (the BAR1 guide on 2026-10-22). They are kept here **word for word** as inputs, except that two of them have the private model alias replaced for publication (noted at the top of each). Who wrote each one is not recorded in the files; they are treated as the author's attachments. Nothing in them is relied on until it is checked against the measured records; where they disagree with the records or with each other, `PELIAS_SYSTEM_MASTERWORK.md` Section 18.1 says how it was settled.
+
+| File | What it is | Checked against the records | Notes |
+|---|---|---|---|
+| `pelias_reference_profile.attached.md` (attached as `pelias_reference_profile.json`) | A reference-machine profile: hardware, model facts, parameter defaults, gate values | Hardware and model numbers spot-checked: found in the trainer and engine records | Wrapped in a Markdown heading and code fence, so it is **not valid JSON as given**; the importer must accept it as `.md` (a table or code block) or the wrapper must be removed. Uses port 8012 (now 8062). Superseded as the import file by `profiles/reference_pelias/` |
+| `pelias-parameter-dictionary.md` | Canonical keys, aliases, types, ranges, reference defaults, effects | Defaults compared with the launch records: see conflicts C2 to C12 | The first version of the dictionary (Masterwork 7.1) |
+| `pelias_server_master_parameters.csv` | 62 server parameters with handling and routing notes | Compared with the dictionary and launch records | Port 8080, threads 7, poll 100, prefetch on, thinking off, `max_tokens` 256 disagree with other sources (C1 to C7) |
+| `pelias-universal-build-master.md` | Universal multi-vendor master specification (v1.0, 2026-10-25) | Spot-check of 19 facts that are easy to get wrong (board, drives, Windows build, RAM speed and part number, clocks, voltages, driver profile settings, HAGS, allocation rate, context cost, free VRAM, snapshot size, bank experts, hit rate, prefill, CMake 4.4.3): every one found in the records | Engine marked HELD (lifted 2026-10-26); port 8012; Dear ImGui; cuBLASLt allowed; "Avoid CUDA 13.2" labelled PUBLISHED where the records say AUTHOR-STATED (C13, C15 to C17) |
+| `pelias_ground_up_master_specification.md` | Ground-up master specification (v1.0, 2026-10-25), WSL2 and Windows | Same spot-check | Native Linux held (lifted 2026-10-26, A2); port 8012 |
+| `PCIe_BAR1_Host-to-VRAM_Architecture_and_Verification_Guide.md` | Routes for CPU writes into VRAM through Resizable BAR | Not tested; every route is UNVERIFIED | Basis of Masterwork 10.6 and probe P-E15 |
+
+Copies of the trainer and engine documents that came with the same attachments are identical to the repository copies (SHA-256 compared on 2026-10-26) and are not duplicated here.

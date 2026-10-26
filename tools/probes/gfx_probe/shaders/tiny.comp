@@ -1,0 +1,7 @@
+#version 450
+// provenance: original
+// Copyright (c) 2026 John Lipka and the Pelias contributors
+// One tiny job: each workgroup writes one value. Used by the submit and the fence tests.
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0) buffer Out { uint d[]; } outb;
+void main() { outb.d[gl_WorkGroupID.x & 1023u] = gl_WorkGroupID.x + 1u; }

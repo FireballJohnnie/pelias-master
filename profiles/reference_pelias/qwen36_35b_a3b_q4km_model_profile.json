@@ -1,0 +1,572 @@
+{
+  "profile_schema": "pelias.profile/1",
+  "profile_name": "Qwen3.6-35B-A3B Q4_K_M (the author's served model) on the reference machine",
+  "written": "2026-10-26",
+  "copyright": "Copyright (c) 2026 John Lipka and the Pelias contributors",
+  "applies_to": {
+    "model_key": "SHA-256 of the GGUF, computed at import",
+    "architecture": "qwen35moe",
+    "gguf_bytes": 21713463296,
+    "gguf_tensors": 753
+  },
+  "model_facts": {
+    "label": "READ-SRC (served GGUF header; bf16 shard headers MEASURED)",
+    "trunk_layers": 40,
+    "mtp_block": "blk.40",
+    "full_attention_layers": [
+      3,
+      7,
+      11,
+      15,
+      19,
+      23,
+      27,
+      31,
+      35,
+      39
+    ],
+    "deltanet_layers": 30,
+    "experts": 256,
+    "experts_per_token": 8,
+    "expert_ffn": 512,
+    "shared_experts": 1,
+    "d_model": 2048,
+    "vocab": 248320,
+    "context_max": 262144,
+    "expert_layer_mib": {
+      "down_q4k": 432,
+      "down_q6k": 498
+    },
+    "q6k_down_layers": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      7,
+      10,
+      13,
+      16,
+      19,
+      22,
+      25,
+      28,
+      31,
+      34,
+      35,
+      36,
+      37,
+      38,
+      39,
+      40
+    ],
+    "routed_experts_mib": {
+      "trunk": 18600,
+      "with_blk40": 19098
+    },
+    "core_mib": {
+      "served": 820.3,
+      "all_q6k": 1102.3,
+      "all_q8_0": 1427.7,
+      "bf16": 2687.5
+    },
+    "core_params_m": 1409.0,
+    "lora_modules": 310,
+    "lora_r16_params": 21166080,
+    "bf16_source": {
+      "shards": 26,
+      "tensors": 1045,
+      "bytes": 71903645408
+    },
+    "tokenizer": {
+      "vocab_entries": 248044,
+      "merges": 247587,
+      "added_tokens": 33,
+      "special_tokens": 21
+    },
+    "chat_template": {
+      "lines": 158,
+      "bytes": 8057
+    }
+  },
+  "measured_on_reference": {
+    "label": "MEASURED (llama.cpp tier build) unless marked",
+    "hit_rate": {
+      "bank_7_5_simulated_heldout": 0.8273,
+      "bank_7_0_live_1token": "0.775-0.779",
+      "bank_7_0_simulated": 0.806
+    },
+    "simulated_hit_by_bank_gib": {
+      "2": 0.43,
+      "3": 0.54,
+      "4": 0.63,
+      "5": 0.7,
+      "5.6": 0.74,
+      "6": 0.76,
+      "8": 0.85,
+      "label": "DERIVED (trainer master 7.12)"
+    },
+    "peak_vram_whole_card_gib": {
+      "bank_7_0_ub4096": 10.7,
+      "bank_7_5_default_ub": "10.40-10.44",
+      "bank_7_5_ub2048": "10.67-10.69",
+      "bank_8_0": "11.0-11.19",
+      "bank_8_5": 11.4
+    },
+    "float_spread_kl": {
+      "batch16": 0.017353,
+      "batch1024": 0.018286
+    },
+    "decode_tok_s": {
+      "wsl2_best_cell_short_4k_12k": [
+        53.5,
+        53.0,
+        49.0
+      ],
+      "windows_cell_a_12k": [
+        53.7,
+        54.1
+      ],
+      "mtp_draft_2_3_12k": "51.5-52.9 vs 45.4"
+    },
+    "prefill_12k_tok_s": {
+      "tier": 1670,
+      "stock_load_mode_none": 2238
+    },
+    "ceiling_tok_s": {
+      "value": "88.2-92.0",
+      "label": "DERIVED"
+    }
+  },
+  "hot_set_files": {
+    "b7.0": "profiles/pelias_hot_set_b7.0.txt",
+    "b7.5": "profiles/pelias_hot_set_b7.5.txt",
+    "b8.0_b8.5": "pelias-engine benchmarks/raw/stage2-tier-cuda/hot-sets/",
+    "note": "measured on the served file; re-profiled on the clean base at step 10 (masterwork 5.2)"
+  },
+  "alternatives": [
+    {
+      "name": "Cell A (Windows launcher of 2026-10-24)",
+      "settings": {
+        "bank.size_gib": 7.0,
+        "prefill.micro_batch": 4096,
+        "bank.hot_set_file": "profiles/pelias_hot_set_b7.0.txt"
+      },
+      "peak_vram_whole_card_gib": 10.7
+    }
+  ],
+  "plan_basis": {
+    "basis": "whole_card",
+    "basis_note": "Peaks below are whole-card NVML readings (they include about 0.9-1.0 GiB held by Windows). The governor enforces the process-only ceiling (decision 7, ruled 2026-10-24), which on this machine leaves about 1.0-1.3 GiB more room; so the recommendation of PELIAS_SYSTEM_MASTERWORK.md 7.6 is expected to fire on the first run.",
+    "vram_ceiling_gib": 10.7,
+    "vram_ceiling_basis": "process_only",
+    "assumed_cuda_free_after_context_gib": 10.83,
+    "margin_gib": 0.13,
+    "source": "whole-card peaks of the llama.cpp tier build; the Pelias engine's own peaks are unmeasured (P-E4)",
+    "bank_7_5_peak_gib_ub2048": "10.67-10.69",
+    "bank_7_5_peak_gib_default_ub": "10.40-10.44",
+    "bank_8_0_peak_gib": "11.0-11.19 (over the ceiling)",
+    "label": "MEASURED peaks; AUTHOR-STATED ceiling (D26)"
+  },
+  "recommend_on_higher_ceiling": true,
+  "recommend_candidates": [
+    "bank.size_gib (larger hot bank; hit curve above)",
+    "train.expert_vram_slots 3 (+0.49 GiB)",
+    "kv.context_tokens",
+    "core class raise (only if the engine supports it, P-E5)"
+  ],
+  "settings": {
+    "model.arch_plugin": "qwen35moe",
+    "model.enable_mtp_blk40": false,
+    "bank.size_gib": 7.5,
+    "bank.hot_set_file": "profiles/pelias_hot_set_b7.5.txt",
+    "bank.objective": "byte_weighted_hit",
+    "bank.policy": "static_waterfill",
+    "bank.zero_slot_enabled": true,
+    "kv.context_tokens": 32768,
+    "kv.type_k": "q8_0",
+    "kv.type_v": "q8_0",
+    "kv.deltanet_snapshots": 4,
+    "prefill.micro_batch": 2048,
+    "prefill.batch_cap": 4096,
+    "prefill.bypass_tokens": 32,
+    "engine.slots": 1,
+    "engine.context_overflow": "stop_error",
+    "engine.mtp_draft_max": 0,
+    "generation.max_tokens": -1,
+    "api.reasoning_format": "deepseek",
+    "api.reasoning_field": "reasoning_content",
+    "api.enable_thinking_default": true,
+    "api.tool_call_parser": "qwen_xml",
+    "api.special_in_user_content": "pass_counted",
+    "sampling.temperature": 1.0,
+    "sampling.top_p": 0.95,
+    "sampling.top_k": 20,
+    "sampling.min_p": 0.0,
+    "sampling.repeat_penalty": 1.0,
+    "sampling.presence_penalty": 0.0,
+    "sampling.frequency_penalty": 0.0,
+    "sampling.seed": 20261019,
+    "tok.apply_nfc": "auto_probe",
+    "tok.bpe_cache_entries": 65536,
+    "ingest.keep_mtp_blk40": true,
+    "ingest.drop_vision_tower": true,
+    "data.max_seq_len": 8192,
+    "data.min_step_tokens": 3072,
+    "data.target_step_tokens": 16384,
+    "data.train_on_turns": "all_assistant",
+    "train.forward_mode": "auto_probe",
+    "train.deterministic": true,
+    "train.epochs": 2,
+    "train.seed": 3407,
+    "train.lr": 0.0001,
+    "train.warmup_frac": 0.05,
+    "train.adam_beta1": 0.9,
+    "train.adam_beta2": 0.999,
+    "train.adam_eps": 1e-08,
+    "train.weight_decay": 0.0,
+    "train.grad_clip_norm": 1.0,
+    "train.ce_chunk_positions": 256,
+    "train.boundary_dtype": "fp32",
+    "train.expert_vram_slots": 2,
+    "train.canary_every_steps": 50,
+    "lora.rank": 16,
+    "lora.alpha": 32.0,
+    "lora.rslora": false,
+    "lora.targets": "attn,deltanet,shexp",
+    "core.export_mode": "mode_q_served",
+    "core.delta_max_mib": 0.0,
+    "mode_l.enabled": false,
+    "mode_b.bimodal_forward": false,
+    "export.layout": "expert_last_2mib",
+    "export.write_adapter_gguf": true,
+    "export.write_hot_set": true
+  },
+  "provenance": [
+    {
+      "key": "model.arch_plugin",
+      "label": "READ-SRC",
+      "source": "GGUF general.architecture"
+    },
+    {
+      "key": "model.enable_mtp_blk40",
+      "label": "DECISION",
+      "source": "off for serving; MTP draft is a gated extra (E12)"
+    },
+    {
+      "key": "bank.size_gib",
+      "label": "DERIVED",
+      "source": "best recorded cell; peak 10.67-10.69 GiB at -ub 2048 (MEASURED, whole card); O1 open; PELIAS_SYSTEM_MASTERWORK.md 18.1 C9"
+    },
+    {
+      "key": "bank.hot_set_file",
+      "label": "READ-SRC",
+      "source": "export_hot_set.py output: 4,170 experts, used 7.499 GiB, held-out hit 0.8273"
+    },
+    {
+      "key": "bank.objective",
+      "label": "DECISION",
+      "source": "P-E2 decides vs zero_miss_share"
+    },
+    {
+      "key": "bank.policy",
+      "label": "DECISION",
+      "source": "live hit 0.775-0.779 vs 0.806 simulated (7.0 GiB): LRU trigger not met"
+    },
+    {
+      "key": "bank.zero_slot_enabled",
+      "label": "DECISION",
+      "source": "no negative expert id reaches a kernel"
+    },
+    {
+      "key": "kv.context_tokens",
+      "label": "READ-SRC",
+      "source": "READ-SRC launcher records (start_pelias_server.bat 2026-10-24; tier-n40-hotashotsetb7.5-by32/launch.json; the author's serving model file) (-c 32768)"
+    },
+    {
+      "key": "kv.type_k",
+      "label": "READ-SRC",
+      "source": "READ-SRC launcher records (start_pelias_server.bat 2026-10-24; tier-n40-hotashotsetb7.5-by32/launch.json; the author's serving model file)"
+    },
+    {
+      "key": "kv.type_v",
+      "label": "READ-SRC",
+      "source": "READ-SRC launcher records (start_pelias_server.bat 2026-10-24; tier-n40-hotashotsetb7.5-by32/launch.json; the author's serving model file)"
+    },
+    {
+      "key": "kv.deltanet_snapshots",
+      "label": "DECISION",
+      "source": "DECISION in the author's parameter dictionary (docs/inputs/pelias-parameter-dictionary.md)"
+    },
+    {
+      "key": "prefill.micro_batch",
+      "label": "READ-SRC",
+      "source": "best-cell launch record (-ub 2048); PELIAS_SYSTEM_MASTERWORK.md 18.1 C9"
+    },
+    {
+      "key": "prefill.batch_cap",
+      "label": "READ-SRC",
+      "source": "READ-SRC launcher records (start_pelias_server.bat 2026-10-24; tier-n40-hotashotsetb7.5-by32/launch.json; the author's serving model file) (-b 4096)"
+    },
+    {
+      "key": "prefill.bypass_tokens",
+      "label": "READ-SRC",
+      "source": "READ-SRC launcher records (start_pelias_server.bat 2026-10-24; tier-n40-hotashotsetb7.5-by32/launch.json; the author's serving model file) (PELIAS_TIER_BYPASS_N 32)"
+    },
+    {
+      "key": "engine.slots",
+      "label": "READ-SRC",
+      "source": "READ-SRC launcher records (start_pelias_server.bat 2026-10-24; tier-n40-hotashotsetb7.5-by32/launch.json; the author's serving model file) (-np 1)"
+    },
+    {
+      "key": "engine.context_overflow",
+      "label": "READ-SRC",
+      "source": "READ-SRC launcher records (start_pelias_server.bat 2026-10-24; tier-n40-hotashotsetb7.5-by32/launch.json; the author's serving model file) (--no-context-shift)"
+    },
+    {
+      "key": "engine.mtp_draft_max",
+      "label": "DECISION",
+      "source": "2 drafts MEASURED 51.5-52.9 vs 45.4 tok/s at 12k; enabled only via E12"
+    },
+    {
+      "key": "generation.max_tokens",
+      "label": "READ-SRC",
+      "source": "READ-SRC launcher records (start_pelias_server.bat 2026-10-24; tier-n40-hotashotsetb7.5-by32/launch.json; the author's serving model file) (-n -1; num_predict -1)"
+    },
+    {
+      "key": "api.reasoning_format",
+      "label": "READ-SRC",
+      "source": "READ-SRC launcher records (start_pelias_server.bat 2026-10-24; tier-n40-hotashotsetb7.5-by32/launch.json; the author's serving model file)"
+    },
+    {
+      "key": "api.reasoning_field",
+      "label": "READ-SRC",
+      "source": "READ-SRC launcher records (start_pelias_server.bat 2026-10-24; tier-n40-hotashotsetb7.5-by32/launch.json; the author's serving model file)"
+    },
+    {
+      "key": "api.enable_thinking_default",
+      "label": "READ-SRC",
+      "source": "READ-SRC launcher records (start_pelias_server.bat 2026-10-24; tier-n40-hotashotsetb7.5-by32/launch.json; the author's serving model file) ({\"enable_thinking\":true})"
+    },
+    {
+      "key": "api.tool_call_parser",
+      "label": "READ-SRC",
+      "source": "chat template tool-call format"
+    },
+    {
+      "key": "api.special_in_user_content",
+      "label": "DECISION",
+      "source": "O10 (proposed)"
+    },
+    {
+      "key": "sampling.temperature",
+      "label": "READ-SRC",
+      "source": "READ-SRC launcher records (start_pelias_server.bat 2026-10-24; tier-n40-hotashotsetb7.5-by32/launch.json; the author's serving model file)"
+    },
+    {
+      "key": "sampling.top_p",
+      "label": "READ-SRC",
+      "source": "READ-SRC launcher records (start_pelias_server.bat 2026-10-24; tier-n40-hotashotsetb7.5-by32/launch.json; the author's serving model file)"
+    },
+    {
+      "key": "sampling.top_k",
+      "label": "READ-SRC",
+      "source": "READ-SRC launcher records (start_pelias_server.bat 2026-10-24; tier-n40-hotashotsetb7.5-by32/launch.json; the author's serving model file)"
+    },
+    {
+      "key": "sampling.min_p",
+      "label": "READ-SRC",
+      "source": "READ-SRC launcher records (start_pelias_server.bat 2026-10-24; tier-n40-hotashotsetb7.5-by32/launch.json; the author's serving model file)"
+    },
+    {
+      "key": "sampling.repeat_penalty",
+      "label": "READ-SRC",
+      "source": "the author's serving model file (repeat_penalty 1.0)"
+    },
+    {
+      "key": "sampling.presence_penalty",
+      "label": "READ-SRC",
+      "source": "the author's serving model file (presence_penalty 0.0)"
+    },
+    {
+      "key": "sampling.frequency_penalty",
+      "label": "DECISION",
+      "source": "DECISION in the author's parameter dictionary (docs/inputs/pelias-parameter-dictionary.md)"
+    },
+    {
+      "key": "sampling.seed",
+      "label": "DECISION",
+      "source": "DECISION in the author's parameter dictionary (docs/inputs/pelias-parameter-dictionary.md)"
+    },
+    {
+      "key": "tok.apply_nfc",
+      "label": "DECISION",
+      "source": "P-D1 decides"
+    },
+    {
+      "key": "tok.bpe_cache_entries",
+      "label": "DECISION",
+      "source": "DECISION in the author's parameter dictionary (docs/inputs/pelias-parameter-dictionary.md)"
+    },
+    {
+      "key": "ingest.keep_mtp_blk40",
+      "label": "DECISION",
+      "source": "D33 / Stage A"
+    },
+    {
+      "key": "ingest.drop_vision_tower",
+      "label": "READ-SRC",
+      "source": "333 vision tensors, 0.832 GiB (shard headers)"
+    },
+    {
+      "key": "data.max_seq_len",
+      "label": "AUTHOR-STATED",
+      "source": "never-truncate window"
+    },
+    {
+      "key": "data.min_step_tokens",
+      "label": "DERIVED",
+      "source": "hides the 1.49 s expert stream at >= 2,000 tok/s compute (TM 5)"
+    },
+    {
+      "key": "data.target_step_tokens",
+      "label": "DECISION",
+      "source": "DECISION in the author's parameter dictionary (docs/inputs/pelias-parameter-dictionary.md)"
+    },
+    {
+      "key": "data.train_on_turns",
+      "label": "DECISION",
+      "source": "DECISION in the author's parameter dictionary (docs/inputs/pelias-parameter-dictionary.md)"
+    },
+    {
+      "key": "train.forward_mode",
+      "label": "DECISION",
+      "source": "D6: Batch C (P-K2, P-Q6) decides"
+    },
+    {
+      "key": "train.deterministic",
+      "label": "DECISION",
+      "source": "P-T4"
+    },
+    {
+      "key": "train.epochs",
+      "label": "READ-SRC",
+      "source": "v0.2 recipe (pelias-trainer master scaffold 2.6)"
+    },
+    {
+      "key": "train.seed",
+      "label": "READ-SRC",
+      "source": "v0.2 recipe"
+    },
+    {
+      "key": "train.lr",
+      "label": "READ-SRC",
+      "source": "v0.2 run 1 (5e-5 second phase)"
+    },
+    {
+      "key": "train.warmup_frac",
+      "label": "READ-SRC",
+      "source": "v0.2 recipe"
+    },
+    {
+      "key": "train.adam_beta1",
+      "label": "READ-SRC",
+      "source": "v0.2 recipe"
+    },
+    {
+      "key": "train.adam_beta2",
+      "label": "READ-SRC",
+      "source": "v0.2 recipe"
+    },
+    {
+      "key": "train.adam_eps",
+      "label": "READ-SRC",
+      "source": "v0.2 recipe"
+    },
+    {
+      "key": "train.weight_decay",
+      "label": "READ-SRC",
+      "source": "v0.2 recipe"
+    },
+    {
+      "key": "train.grad_clip_norm",
+      "label": "READ-SRC",
+      "source": "v0.2 recipe"
+    },
+    {
+      "key": "train.ce_chunk_positions",
+      "label": "READ-SRC",
+      "source": "v0.2 recipe"
+    },
+    {
+      "key": "train.boundary_dtype",
+      "label": "DECISION",
+      "source": "pelias-trainer master scaffold 5.3"
+    },
+    {
+      "key": "train.expert_vram_slots",
+      "label": "DECISION",
+      "source": "pelias-trainer master scaffold 5.3 (2 x 498 MiB)"
+    },
+    {
+      "key": "train.canary_every_steps",
+      "label": "DECISION",
+      "source": "pelias-trainer master scaffold 9.4"
+    },
+    {
+      "key": "lora.rank",
+      "label": "READ-SRC",
+      "source": "v0.2 recipe"
+    },
+    {
+      "key": "lora.alpha",
+      "label": "READ-SRC",
+      "source": "v0.2 recipe"
+    },
+    {
+      "key": "lora.rslora",
+      "label": "DECISION",
+      "source": "ablation T-A3"
+    },
+    {
+      "key": "lora.targets",
+      "label": "READ-SRC",
+      "source": "310 modules"
+    },
+    {
+      "key": "core.export_mode",
+      "label": "DECISION",
+      "source": "D31"
+    },
+    {
+      "key": "core.delta_max_mib",
+      "label": "DECISION",
+      "source": "D31, D32"
+    },
+    {
+      "key": "mode_l.enabled",
+      "label": "DECISION",
+      "source": "gated G-L1..G-L4"
+    },
+    {
+      "key": "mode_b.bimodal_forward",
+      "label": "DECISION",
+      "source": "gated P-E12"
+    },
+    {
+      "key": "export.layout",
+      "label": "DECISION",
+      "source": "F12 (zero byte cost)"
+    },
+    {
+      "key": "export.write_adapter_gguf",
+      "label": "DECISION",
+      "source": "DECISION in the author's parameter dictionary (docs/inputs/pelias-parameter-dictionary.md)"
+    },
+    {
+      "key": "export.write_hot_set",
+      "label": "DECISION",
+      "source": "D25"
+    }
+  ]
+}

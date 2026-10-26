@@ -1,0 +1,119 @@
+key,value,label,source,group,scope
+system.mode,standard,DECISION,PELIAS_SYSTEM_MASTERWORK.md 6.1,system,machine
+plan.goal_preset,balanced,DECISION,DECISION in the author's parameter dictionary (docs/inputs/pelias-parameter-dictionary.md),plan,machine
+plan.auto_select_default,false,DECISION,DECISION in the author's parameter dictionary (docs/inputs/pelias-parameter-dictionary.md); U3: the user picks the plan,plan,machine
+probe.startup_mode,quick_every_start,DECISION,D29 (U1),probe,machine
+probe.settle_wait,true,DECISION,U5,probe,machine
+probe.retry_on_fail,true,DECISION,U5,probe,machine
+hal.backend,cuda,MEASURED,"P-H1: RTX 4070, compute capability 8.9",hal,machine
+hal.device_id,0,MEASURED,single GPU,hal,machine
+hal.gpu_arch,sm_89,MEASURED,P-H1,hal,machine
+vram.ceiling_mode,probe_auto,DECISION,D28,vram,machine
+vram.ceiling_override_gib,10.7,AUTHOR-STATED,D26 (2026-10-23); 10.83 CUDA free minus 0.13 margin,vram,machine
+vram.margin_gib,0.13,DERIVED,"10.83 - 10.7 (P-H8 MEASURED, D26)",vram,machine
+vram.scan_propose_close,true,DECISION,U6,vram,machine
+host.alloc_backend,host_alloc,DECISION,PELIAS_SYSTEM_MASTERWORK.md 18.1 C8; P-H7 (cudaHostAlloc pointers identical host/device),host,machine
+host.pinned_pool_gib,0.0,DECISION,0 = auto; planner sizes it,host,machine
+host.pinned_max_gib,32.0,MEASURED,P-H7: 32 GiB held on WSL2 and Windows,host,machine
+host.fallback_chain_enabled,true,DECISION,pelias-trainer master scaffold 5.3,host,machine
+os.large_pages,off,DECISION,off until P-E11 shows >= 5 % end to end (DECISION in the author's parameter dictionary (docs/inputs/pelias-parameter-dictionary.md)),os,machine
+os.high_res_timer_win32,true,DECISION,P-M3 MEASURED: Windows sleep overshoot median 6.14 ms with the default tick,os,machine
+hal.stream_flush_policy,batch_query,DECISION,D27; P-H12 MEASURED 0.92 overlap flushed vs 0.47/0.52,hal,machine
+hal.cuda_graphs,on,DECISION,P-H9 MEASURED: replay 0.716/0.707 us per kernel vs eager 4.70/2.18,hal,machine
+hal.l2_persisting_mib,0.0,DECISION,E-A4 UNVERIFIED; off until A/B,hal,machine
+hal.rebar_path,auto_probe,DECISION,PELIAS_SYSTEM_MASTERWORK.md 10.6 (P-E15),hal,machine
+io.warn_slow_mount_gbps,0.8,DECISION,DECISION in the author's parameter dictionary (docs/inputs/pelias-parameter-dictionary.md); WSL2 /mnt reads MEASURED 0.17-0.52 GB/s,io,machine
+handoff.mode,doorbell,DECISION,MEASURED 13.34 us median vs 94.4 us stream sync,handoff,machine
+handoff.atomic_order,acquire_release,DECISION,G7 (benefit UNVERIFIED; A/B E-A2),handoff,machine
+handoff.timeout_us,50000,DECISION,DECISION in the author's parameter dictionary (docs/inputs/pelias-parameter-dictionary.md),handoff,machine
+handoff.depth_per_layer,1,DECISION,DECISION in the author's parameter dictionary (docs/inputs/pelias-parameter-dictionary.md),handoff,machine
+cpu.isa_level,avx2,MEASURED,"census: AVX2, no AVX-512",cpu,machine
+cpu.threads,6,READ-SRC,"measured on the llama.cpp build (READ-SRC launcher records (start_pelias_server.bat 2026-10-24; tier-n40-hotashotsetb7.5-by32/launch.json; the author's serving model file), -t 6); the Pelias engine re-measures with the E-A1 sweep; PELIAS_SYSTEM_MASTERWORK.md 18.1 C2",cpu,machine
+cpu.threads_batch,8,READ-SRC,READ-SRC launcher records (start_pelias_server.bat 2026-10-24; tier-n40-hotashotsetb7.5-by32/launch.json; the author's serving model file) (-tb 8),cpu,machine
+cpu.pin_mode,physical_1t,DECISION,proposed; E-A1 A/B,cpu,machine
+cpu.use_ecores,false,DECISION,not applicable on the 5800X3D,cpu,machine
+cpu.prefetch_nta,false,DECISION,PELIAS_SYSTEM_MASTERWORK.md 18.1 C4 (E-A3 UNVERIFIED),cpu,machine
+cpu.poll_level,100,DECISION,PELIAS_SYSTEM_MASTERWORK.md 18.1 C3 (proposed; A/B at step 10),cpu,machine
+gpu.cold_zerocopy_branch,auto_probe,DECISION,"on only after the restated E12 gate (PELIAS_SYSTEM_MASTERWORK.md 10.4, C21): GPU share >= 15 GB/s, combined >= 1.0x CPU alone, decode faster on vs off over 3 launches",gpu,machine
+gpu.cold_share_fraction,0.44,DERIVED,21.06 / 47.62 GB/s (microbench 04 MEASURED),gpu,machine
+gpu.q6k_wide_staging,shared_mem_uint4,DECISION,P-E10 not run,gpu,machine
+server.bind_address,127.0.0.1,READ-SRC,READ-SRC launcher records (start_pelias_server.bat 2026-10-24; tier-n40-hotashotsetb7.5-by32/launch.json; the author's serving model file),server,machine
+server.port,8062,AUTHOR-STATED,"2026-10-26 (A8): 80xx range, avoids 8012; P16+E5+L12+I9+A1+S19 = 62",server,machine
+server.ollama_port_alias,0,DECISION,DECISION in the author's parameter dictionary (docs/inputs/pelias-parameter-dictionary.md),server,machine
+server.max_connections,8,DECISION,DECISION in the author's parameter dictionary (docs/inputs/pelias-parameter-dictionary.md),server,machine
+server.queue_max,4,DECISION,DECISION in the author's parameter dictionary (docs/inputs/pelias-parameter-dictionary.md),server,machine
+server.max_header_bytes,16384,DECISION,DECISION in the author's parameter dictionary (docs/inputs/pelias-parameter-dictionary.md),server,machine
+server.max_body_bytes,33554432,DECISION,DECISION in the author's parameter dictionary (docs/inputs/pelias-parameter-dictionary.md),server,machine
+server.read_timeout_s,60,DECISION,DECISION in the author's parameter dictionary (docs/inputs/pelias-parameter-dictionary.md); PELIAS_SYSTEM_MASTERWORK.md 18.1 C7,server,machine
+server.idle_timeout_s,300,DECISION,DECISION in the author's parameter dictionary (docs/inputs/pelias-parameter-dictionary.md),server,machine
+server.sse_heartbeat_s,15,DECISION,DECISION in the author's parameter dictionary (docs/inputs/pelias-parameter-dictionary.md),server,machine
+api.log_structure_only,true,DECISION,privacy rule 7,api,machine
+web.solver_url,http://127.0.0.1:8191/v1,READ-SRC,the author's web-tools script and dataset builder (FLARESOLVERR_URL),web,machine
+web.solver_timeout_ms,60000,READ-SRC,create_parameters_v2.py (CHALLENGE_TIMEOUT_MS),web,machine
+web.page_chars,6000,READ-SRC,create_parameters_v2.py (page_slice max_chars),web,machine
+web.redact_before_send,true,READ-SRC,"create_parameters_v2.py (redact: cards, e-mail, API keys)",web,machine
+model.arch_plugin,qwen35moe,READ-SRC,GGUF general.architecture,model,model
+model.enable_mtp_blk40,false,DECISION,off for serving; MTP draft is a gated extra (E12),model,model
+bank.size_gib,7.5,DERIVED,"best recorded cell; peak 10.67-10.69 GiB at -ub 2048 (MEASURED, whole card); O1 open; PELIAS_SYSTEM_MASTERWORK.md 18.1 C9",bank,model
+bank.hot_set_file,profiles/pelias_hot_set_b7.5.txt,READ-SRC,"export_hot_set.py output: 4,170 experts, used 7.499 GiB, held-out hit 0.8273",bank,model
+bank.objective,byte_weighted_hit,DECISION,P-E2 decides vs zero_miss_share,bank,model
+bank.policy,static_waterfill,DECISION,live hit 0.775-0.779 vs 0.806 simulated (7.0 GiB): LRU trigger not met,bank,model
+bank.zero_slot_enabled,true,DECISION,no negative expert id reaches a kernel,bank,model
+kv.context_tokens,32768,READ-SRC,READ-SRC launcher records (start_pelias_server.bat 2026-10-24; tier-n40-hotashotsetb7.5-by32/launch.json; the author's serving model file) (-c 32768),kv,model
+kv.type_k,q8_0,READ-SRC,READ-SRC launcher records (start_pelias_server.bat 2026-10-24; tier-n40-hotashotsetb7.5-by32/launch.json; the author's serving model file),kv,model
+kv.type_v,q8_0,READ-SRC,READ-SRC launcher records (start_pelias_server.bat 2026-10-24; tier-n40-hotashotsetb7.5-by32/launch.json; the author's serving model file),kv,model
+kv.deltanet_snapshots,4,DECISION,DECISION in the author's parameter dictionary (docs/inputs/pelias-parameter-dictionary.md),kv,model
+prefill.micro_batch,2048,READ-SRC,best-cell launch record (-ub 2048); PELIAS_SYSTEM_MASTERWORK.md 18.1 C9,prefill,model
+prefill.batch_cap,4096,READ-SRC,READ-SRC launcher records (start_pelias_server.bat 2026-10-24; tier-n40-hotashotsetb7.5-by32/launch.json; the author's serving model file) (-b 4096),prefill,model
+prefill.bypass_tokens,32,READ-SRC,READ-SRC launcher records (start_pelias_server.bat 2026-10-24; tier-n40-hotashotsetb7.5-by32/launch.json; the author's serving model file) (PELIAS_TIER_BYPASS_N 32),prefill,model
+engine.slots,1,READ-SRC,READ-SRC launcher records (start_pelias_server.bat 2026-10-24; tier-n40-hotashotsetb7.5-by32/launch.json; the author's serving model file) (-np 1),engine,model
+engine.context_overflow,stop_error,READ-SRC,READ-SRC launcher records (start_pelias_server.bat 2026-10-24; tier-n40-hotashotsetb7.5-by32/launch.json; the author's serving model file) (--no-context-shift),engine,model
+engine.mtp_draft_max,0,DECISION,2 drafts MEASURED 51.5-52.9 vs 45.4 tok/s at 12k; enabled only via E12,engine,model
+generation.max_tokens,-1,READ-SRC,READ-SRC launcher records (start_pelias_server.bat 2026-10-24; tier-n40-hotashotsetb7.5-by32/launch.json; the author's serving model file) (-n -1; num_predict -1),generation,model
+api.reasoning_format,deepseek,READ-SRC,READ-SRC launcher records (start_pelias_server.bat 2026-10-24; tier-n40-hotashotsetb7.5-by32/launch.json; the author's serving model file),api,model
+api.reasoning_field,reasoning_content,READ-SRC,READ-SRC launcher records (start_pelias_server.bat 2026-10-24; tier-n40-hotashotsetb7.5-by32/launch.json; the author's serving model file),api,model
+api.enable_thinking_default,true,READ-SRC,"READ-SRC launcher records (start_pelias_server.bat 2026-10-24; tier-n40-hotashotsetb7.5-by32/launch.json; the author's serving model file) ({""enable_thinking"":true})",api,model
+api.tool_call_parser,qwen_xml,READ-SRC,chat template tool-call format,api,model
+api.special_in_user_content,pass_counted,DECISION,O10 (proposed),api,model
+sampling.temperature,1.0,READ-SRC,READ-SRC launcher records (start_pelias_server.bat 2026-10-24; tier-n40-hotashotsetb7.5-by32/launch.json; the author's serving model file),sampling,model
+sampling.top_p,0.95,READ-SRC,READ-SRC launcher records (start_pelias_server.bat 2026-10-24; tier-n40-hotashotsetb7.5-by32/launch.json; the author's serving model file),sampling,model
+sampling.top_k,20,READ-SRC,READ-SRC launcher records (start_pelias_server.bat 2026-10-24; tier-n40-hotashotsetb7.5-by32/launch.json; the author's serving model file),sampling,model
+sampling.min_p,0.0,READ-SRC,READ-SRC launcher records (start_pelias_server.bat 2026-10-24; tier-n40-hotashotsetb7.5-by32/launch.json; the author's serving model file),sampling,model
+sampling.repeat_penalty,1.0,READ-SRC,the author's serving model file (repeat_penalty 1.0),sampling,model
+sampling.presence_penalty,0.0,READ-SRC,the author's serving model file (presence_penalty 0.0),sampling,model
+sampling.frequency_penalty,0.0,DECISION,DECISION in the author's parameter dictionary (docs/inputs/pelias-parameter-dictionary.md),sampling,model
+sampling.seed,20261019,DECISION,DECISION in the author's parameter dictionary (docs/inputs/pelias-parameter-dictionary.md),sampling,model
+tok.apply_nfc,auto_probe,DECISION,P-D1 decides,tok,model
+tok.bpe_cache_entries,65536,DECISION,DECISION in the author's parameter dictionary (docs/inputs/pelias-parameter-dictionary.md),tok,model
+ingest.keep_mtp_blk40,true,DECISION,D33 / Stage A,ingest,model
+ingest.drop_vision_tower,true,READ-SRC,"333 vision tensors, 0.832 GiB (shard headers)",ingest,model
+data.max_seq_len,8192,AUTHOR-STATED,never-truncate window,data,model
+data.min_step_tokens,3072,DERIVED,"hides the 1.49 s expert stream at >= 2,000 tok/s compute (TM 5)",data,model
+data.target_step_tokens,16384,DECISION,DECISION in the author's parameter dictionary (docs/inputs/pelias-parameter-dictionary.md),data,model
+data.train_on_turns,all_assistant,DECISION,DECISION in the author's parameter dictionary (docs/inputs/pelias-parameter-dictionary.md),data,model
+train.forward_mode,auto_probe,DECISION,"D6: Batch C (P-K2, P-Q6) decides",train,model
+train.deterministic,true,DECISION,P-T4,train,model
+train.epochs,2,READ-SRC,v0.2 recipe (pelias-trainer master scaffold 2.6),train,model
+train.seed,3407,READ-SRC,v0.2 recipe,train,model
+train.lr,0.0001,READ-SRC,v0.2 run 1 (5e-5 second phase),train,model
+train.warmup_frac,0.05,READ-SRC,v0.2 recipe,train,model
+train.adam_beta1,0.9,READ-SRC,v0.2 recipe,train,model
+train.adam_beta2,0.999,READ-SRC,v0.2 recipe,train,model
+train.adam_eps,1e-08,READ-SRC,v0.2 recipe,train,model
+train.weight_decay,0.0,READ-SRC,v0.2 recipe,train,model
+train.grad_clip_norm,1.0,READ-SRC,v0.2 recipe,train,model
+train.ce_chunk_positions,256,READ-SRC,v0.2 recipe,train,model
+train.boundary_dtype,fp32,DECISION,pelias-trainer master scaffold 5.3,train,model
+train.expert_vram_slots,2,DECISION,pelias-trainer master scaffold 5.3 (2 x 498 MiB),train,model
+train.canary_every_steps,50,DECISION,pelias-trainer master scaffold 9.4,train,model
+lora.rank,16,READ-SRC,v0.2 recipe,lora,model
+lora.alpha,32.0,READ-SRC,v0.2 recipe,lora,model
+lora.rslora,false,DECISION,ablation T-A3,lora,model
+lora.targets,"attn,deltanet,shexp",READ-SRC,310 modules,lora,model
+core.export_mode,mode_q_served,DECISION,D31,core,model
+core.delta_max_mib,0.0,DECISION,"D31, D32",core,model
+mode_l.enabled,false,DECISION,gated G-L1..G-L4,mode_l,model
+mode_b.bimodal_forward,false,DECISION,gated P-E12,mode_b,model
+export.layout,expert_last_2mib,DECISION,F12 (zero byte cost),export,model
+export.write_adapter_gguf,true,DECISION,DECISION in the author's parameter dictionary (docs/inputs/pelias-parameter-dictionary.md),export,model
+export.write_hot_set,true,DECISION,D25,export,model

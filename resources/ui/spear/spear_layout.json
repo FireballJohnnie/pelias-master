@@ -1,0 +1,23 @@
+{
+  "tex_w": 1600,
+  "tex_h": 208,
+  "pad_px": 20,
+  "crop_box": [
+    147,
+    609,
+    2611,
+    929
+  ],
+  "synth_from_tex": 164,
+  "synth_to_tex": 456,
+  "u0": 0.0125,
+  "u1": 0.9875,
+  "source_bbox": [
+    178,
+    640,
+    2579,
+    897
+  ],
+  "scale": 0.649458784346378,
+  "glow_source": "reference image (first section synthesised)"
+}

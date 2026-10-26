@@ -1,0 +1,486 @@
+{
+  "profile_schema": "pelias.profile/1",
+  "profile_name": "Reference machine PELIAS (RTX 4070 12 GB + Ryzen 7 5800X3D + 64 GB DDR4-3200)",
+  "written": "2026-10-26",
+  "copyright": "Copyright (c) 2026 John Lipka and the Pelias contributors",
+  "how_to_use": "pelias import profiles/reference_pelias/pelias_machine_profile.json (or drop it on the Import screen). Hardware facts are replaced by the start-up probe when it measures the same quantity; settings arrive as proposals.",
+  "applies_to": {
+    "machine_state_sha": "computed by the probe at first start",
+    "gpu": "RTX 4070 12 GB",
+    "cpu": "Ryzen 7 5800X3D"
+  },
+  "hardware_snapshot": {
+    "gpu": {
+      "name": "NVIDIA GeForce RTX 4070 12 GB",
+      "compute_capability": "8.9",
+      "sm_count": 46,
+      "vram_total_gib": 11.99,
+      "pcie": "4.0 x16",
+      "rebar": true,
+      "bar1_total_mib": 16384,
+      "driver": "617.42",
+      "label": "MEASURED (P-H1, P-H8, census)"
+    },
+    "gpu_overclock": {
+      "memory_offset_mhz": 1000,
+      "memory_clock_load_mhz": 11501,
+      "core_clock_load_mhz": "2760-2775",
+      "core_voltage_mv": 965,
+      "label": "AUTHOR-STATED settings; MEASURED clocks (P-H3, P-H4)"
+    },
+    "cpu": {
+      "name": "AMD Ryzen 7 5800X3D",
+      "cores": 8,
+      "threads": 16,
+      "isa": [
+        "AVX2",
+        "FMA",
+        "F16C"
+      ],
+      "avx512": false,
+      "l3_mib": 96,
+      "label": "MEASURED (census) / PUBLISHED"
+    },
+    "memory": {
+      "type": "DDR4-3200",
+      "modules": "4 x 16 GB",
+      "channels": 2,
+      "peak_gbps": 51.2,
+      "visible_gib_windows": 63.9,
+      "wsl_memory_cap_gb": 48,
+      "wsl_swap_gb": 48,
+      "label": "MEASURED (Windows facts run, .wslconfig) / PUBLISHED"
+    },
+    "drives": {
+      "C": "Samsung NVMe (Windows, WSL2 disk)",
+      "D": "WD SN580 NVMe at PCIe 3.0 x2 (archives, WSL2 swap)",
+      "label": "MEASURED (HWiNFO records)"
+    },
+    "os": {
+      "windows": "Windows 11 Pro build 26300",
+      "wsl": "WSL2, kernel 6.18.54.1",
+      "wsl_kernel_cmdline": "transparent_hugepage=always swiotlb=65536",
+      "hags": "off",
+      "tdr": "default (2 s)",
+      "power_plan": "Balanced",
+      "pagefile_gib": 32,
+      "label": "MEASURED"
+    },
+    "toolchain": {
+      "wsl": {
+        "nvcc": "13.0.88",
+        "gcc": "15.2.0",
+        "cmake": "4.2.3",
+        "ninja": "1.13.2"
+      },
+      "windows": {
+        "nvcc": "13.4.92",
+        "msvc": "19.44.35229.0",
+        "cmake": "4.4.3",
+        "ninja": "1.13.2"
+      },
+      "avoid": "CUDA toolkit 13.2 (AUTHOR-STATED)",
+      "label": "MEASURED"
+    }
+  },
+  "measured_floors": {
+    "label": "MEASURED, Wave 0 and microbenchmarks 02-07; values are WSL2 / Windows",
+    "cuda_free_after_context_gib": [
+      10.83,
+      10.85
+    ],
+    "context_cost_mib": [
+      154,
+      138
+    ],
+    "tensor_sustained": {
+      "bf16_tflops": 65.2,
+      "fp16_tflops": 64.9,
+      "int8_tops": 259.5,
+      "fp8_tops": 129.8
+    },
+    "vram_read_gbps": [
+      523.3,
+      534.0
+    ],
+    "vram_write_gbps": [
+      447.5,
+      454.0
+    ],
+    "host_read_1t_gbps": [
+      37.1,
+      37.9
+    ],
+    "host_read_4t_gbps_range": [
+      "43.7-45.81",
+      "44.8-46.4"
+    ],
+    "pinned_h2d_gbps": 26.3,
+    "zero_copy_read_gbps": 26.3,
+    "dual_bus": {
+      "cpu_gbps": 26.56,
+      "gpu_zero_copy_gbps": 21.06,
+      "combined_gbps": 47.62
+    },
+    "handoff_us": {
+      "stream_sync": 94.4,
+      "doorbell_median": 13.34,
+      "doorbell_p99": 18.71,
+      "flag": 3.36
+    },
+    "pinned_held_gib": 32,
+    "graph_replay_us_per_kernel": [
+      0.716,
+      0.707
+    ],
+    "overlap": {
+      "unflushed": [
+        0.47,
+        0.52
+      ],
+      "flushed": 0.92,
+      "copy_pair": 0.84
+    },
+    "model_read_gbps": {
+      "wsl_mnt_9p": "0.17-0.52",
+      "wsl_ext4_cold": "2.99-3.06"
+    }
+  },
+  "plan_basis": {
+    "basis": "whole_card",
+    "basis_note": "Peaks below are whole-card NVML readings (they include about 0.9-1.0 GiB held by Windows). The governor enforces the process-only ceiling (decision 7, ruled 2026-10-24), which on this machine leaves about 1.0-1.3 GiB more room; so the recommendation of PELIAS_SYSTEM_MASTERWORK.md 7.6 is expected to fire on the first run.",
+    "vram_ceiling_gib": 10.7,
+    "vram_ceiling_basis": "process_only",
+    "assumed_cuda_free_after_context_gib": 10.83,
+    "margin_gib": 0.13,
+    "source": "whole-card peaks of the llama.cpp tier build; the Pelias engine's own peaks are unmeasured (P-E4)",
+    "bank_7_5_peak_gib_ub2048": "10.67-10.69",
+    "bank_7_5_peak_gib_default_ub": "10.40-10.44",
+    "bank_8_0_peak_gib": "11.0-11.19 (over the ceiling)",
+    "label": "MEASURED peaks; AUTHOR-STATED ceiling (D26)"
+  },
+  "recommend_on_higher_ceiling": true,
+  "recommend_rule": "If the measured ceiling is higher than plan_basis.vram_ceiling_gib, re-solve the plan and list every setting that changes (old, new, why, gain, risk); nothing continues until the user accepts or declines (PELIAS_SYSTEM_MASTERWORK.md 7.6).",
+  "settings": {
+    "system.mode": "standard",
+    "plan.goal_preset": "balanced",
+    "plan.auto_select_default": false,
+    "probe.startup_mode": "quick_every_start",
+    "probe.settle_wait": true,
+    "probe.retry_on_fail": true,
+    "hal.backend": "cuda",
+    "hal.device_id": 0,
+    "hal.gpu_arch": "sm_89",
+    "vram.ceiling_mode": "probe_auto",
+    "vram.ceiling_override_gib": 10.7,
+    "vram.margin_gib": 0.13,
+    "vram.scan_propose_close": true,
+    "host.alloc_backend": "host_alloc",
+    "host.pinned_pool_gib": 0.0,
+    "host.pinned_max_gib": 32.0,
+    "host.fallback_chain_enabled": true,
+    "os.large_pages": "off",
+    "os.high_res_timer_win32": true,
+    "hal.stream_flush_policy": "batch_query",
+    "hal.cuda_graphs": "on",
+    "hal.l2_persisting_mib": 0.0,
+    "hal.rebar_path": "auto_probe",
+    "io.warn_slow_mount_gbps": 0.8,
+    "handoff.mode": "doorbell",
+    "handoff.atomic_order": "acquire_release",
+    "handoff.timeout_us": 50000,
+    "handoff.depth_per_layer": 1,
+    "cpu.isa_level": "avx2",
+    "cpu.threads": 6,
+    "cpu.threads_batch": 8,
+    "cpu.pin_mode": "physical_1t",
+    "cpu.use_ecores": false,
+    "cpu.prefetch_nta": false,
+    "cpu.poll_level": 100,
+    "gpu.cold_zerocopy_branch": "auto_probe",
+    "gpu.cold_share_fraction": 0.44,
+    "gpu.q6k_wide_staging": "shared_mem_uint4",
+    "server.bind_address": "127.0.0.1",
+    "server.port": 8062,
+    "server.ollama_port_alias": 0,
+    "server.max_connections": 8,
+    "server.queue_max": 4,
+    "server.max_header_bytes": 16384,
+    "server.max_body_bytes": 33554432,
+    "server.read_timeout_s": 60,
+    "server.idle_timeout_s": 300,
+    "server.sse_heartbeat_s": 15,
+    "api.log_structure_only": true,
+    "web.solver_url": "http://127.0.0.1:8191/v1",
+    "web.solver_timeout_ms": 60000,
+    "web.page_chars": 6000,
+    "web.redact_before_send": true
+  },
+  "provenance": [
+    {
+      "key": "system.mode",
+      "label": "DECISION",
+      "source": "PELIAS_SYSTEM_MASTERWORK.md 6.1"
+    },
+    {
+      "key": "plan.goal_preset",
+      "label": "DECISION",
+      "source": "DECISION in the author's parameter dictionary (docs/inputs/pelias-parameter-dictionary.md)"
+    },
+    {
+      "key": "plan.auto_select_default",
+      "label": "DECISION",
+      "source": "DECISION in the author's parameter dictionary (docs/inputs/pelias-parameter-dictionary.md); U3: the user picks the plan"
+    },
+    {
+      "key": "probe.startup_mode",
+      "label": "DECISION",
+      "source": "D29 (U1)"
+    },
+    {
+      "key": "probe.settle_wait",
+      "label": "DECISION",
+      "source": "U5"
+    },
+    {
+      "key": "probe.retry_on_fail",
+      "label": "DECISION",
+      "source": "U5"
+    },
+    {
+      "key": "hal.backend",
+      "label": "MEASURED",
+      "source": "P-H1: RTX 4070, compute capability 8.9"
+    },
+    {
+      "key": "hal.device_id",
+      "label": "MEASURED",
+      "source": "single GPU"
+    },
+    {
+      "key": "hal.gpu_arch",
+      "label": "MEASURED",
+      "source": "P-H1"
+    },
+    {
+      "key": "vram.ceiling_mode",
+      "label": "DECISION",
+      "source": "D28"
+    },
+    {
+      "key": "vram.ceiling_override_gib",
+      "label": "AUTHOR-STATED",
+      "source": "D26 (2026-10-23); 10.83 CUDA free minus 0.13 margin"
+    },
+    {
+      "key": "vram.margin_gib",
+      "label": "DERIVED",
+      "source": "10.83 - 10.7 (P-H8 MEASURED, D26)"
+    },
+    {
+      "key": "vram.scan_propose_close",
+      "label": "DECISION",
+      "source": "U6"
+    },
+    {
+      "key": "host.alloc_backend",
+      "label": "DECISION",
+      "source": "PELIAS_SYSTEM_MASTERWORK.md 18.1 C8; P-H7 (cudaHostAlloc pointers identical host/device)"
+    },
+    {
+      "key": "host.pinned_pool_gib",
+      "label": "DECISION",
+      "source": "0 = auto; planner sizes it"
+    },
+    {
+      "key": "host.pinned_max_gib",
+      "label": "MEASURED",
+      "source": "P-H7: 32 GiB held on WSL2 and Windows"
+    },
+    {
+      "key": "host.fallback_chain_enabled",
+      "label": "DECISION",
+      "source": "pelias-trainer master scaffold 5.3"
+    },
+    {
+      "key": "os.large_pages",
+      "label": "DECISION",
+      "source": "off until P-E11 shows >= 5 % end to end (DECISION in the author's parameter dictionary (docs/inputs/pelias-parameter-dictionary.md))"
+    },
+    {
+      "key": "os.high_res_timer_win32",
+      "label": "DECISION",
+      "source": "P-M3 MEASURED: Windows sleep overshoot median 6.14 ms with the default tick"
+    },
+    {
+      "key": "hal.stream_flush_policy",
+      "label": "DECISION",
+      "source": "D27; P-H12 MEASURED 0.92 overlap flushed vs 0.47/0.52"
+    },
+    {
+      "key": "hal.cuda_graphs",
+      "label": "DECISION",
+      "source": "P-H9 MEASURED: replay 0.716/0.707 us per kernel vs eager 4.70/2.18"
+    },
+    {
+      "key": "hal.l2_persisting_mib",
+      "label": "DECISION",
+      "source": "E-A4 UNVERIFIED; off until A/B"
+    },
+    {
+      "key": "hal.rebar_path",
+      "label": "DECISION",
+      "source": "PELIAS_SYSTEM_MASTERWORK.md 10.6 (P-E15)"
+    },
+    {
+      "key": "io.warn_slow_mount_gbps",
+      "label": "DECISION",
+      "source": "DECISION in the author's parameter dictionary (docs/inputs/pelias-parameter-dictionary.md); WSL2 /mnt reads MEASURED 0.17-0.52 GB/s"
+    },
+    {
+      "key": "handoff.mode",
+      "label": "DECISION",
+      "source": "MEASURED 13.34 us median vs 94.4 us stream sync"
+    },
+    {
+      "key": "handoff.atomic_order",
+      "label": "DECISION",
+      "source": "G7 (benefit UNVERIFIED; A/B E-A2)"
+    },
+    {
+      "key": "handoff.timeout_us",
+      "label": "DECISION",
+      "source": "DECISION in the author's parameter dictionary (docs/inputs/pelias-parameter-dictionary.md)"
+    },
+    {
+      "key": "handoff.depth_per_layer",
+      "label": "DECISION",
+      "source": "DECISION in the author's parameter dictionary (docs/inputs/pelias-parameter-dictionary.md)"
+    },
+    {
+      "key": "cpu.isa_level",
+      "label": "MEASURED",
+      "source": "census: AVX2, no AVX-512"
+    },
+    {
+      "key": "cpu.threads",
+      "label": "READ-SRC",
+      "source": "measured on the llama.cpp build (READ-SRC launcher records (start_pelias_server.bat 2026-10-24; tier-n40-hotashotsetb7.5-by32/launch.json; the author's serving model file), -t 6); the Pelias engine re-measures with the E-A1 sweep; PELIAS_SYSTEM_MASTERWORK.md 18.1 C2"
+    },
+    {
+      "key": "cpu.threads_batch",
+      "label": "READ-SRC",
+      "source": "READ-SRC launcher records (start_pelias_server.bat 2026-10-24; tier-n40-hotashotsetb7.5-by32/launch.json; the author's serving model file) (-tb 8)"
+    },
+    {
+      "key": "cpu.pin_mode",
+      "label": "DECISION",
+      "source": "proposed; E-A1 A/B"
+    },
+    {
+      "key": "cpu.use_ecores",
+      "label": "DECISION",
+      "source": "not applicable on the 5800X3D"
+    },
+    {
+      "key": "cpu.prefetch_nta",
+      "label": "DECISION",
+      "source": "PELIAS_SYSTEM_MASTERWORK.md 18.1 C4 (E-A3 UNVERIFIED)"
+    },
+    {
+      "key": "cpu.poll_level",
+      "label": "DECISION",
+      "source": "PELIAS_SYSTEM_MASTERWORK.md 18.1 C3 (proposed; A/B at step 10)"
+    },
+    {
+      "key": "gpu.cold_zerocopy_branch",
+      "label": "DECISION",
+      "source": "on only after the restated E12 gate (PELIAS_SYSTEM_MASTERWORK.md 10.4, C21): GPU share >= 15 GB/s, combined >= 1.0x CPU alone, decode faster on vs off over 3 launches"
+    },
+    {
+      "key": "gpu.cold_share_fraction",
+      "label": "DERIVED",
+      "source": "21.06 / 47.62 GB/s (microbench 04 MEASURED)"
+    },
+    {
+      "key": "gpu.q6k_wide_staging",
+      "label": "DECISION",
+      "source": "P-E10 not run"
+    },
+    {
+      "key": "server.bind_address",
+      "label": "READ-SRC",
+      "source": "READ-SRC launcher records (start_pelias_server.bat 2026-10-24; tier-n40-hotashotsetb7.5-by32/launch.json; the author's serving model file)"
+    },
+    {
+      "key": "server.port",
+      "label": "AUTHOR-STATED",
+      "source": "2026-10-26 (A8): 80xx range, avoids 8012; P16+E5+L12+I9+A1+S19 = 62"
+    },
+    {
+      "key": "server.ollama_port_alias",
+      "label": "DECISION",
+      "source": "DECISION in the author's parameter dictionary (docs/inputs/pelias-parameter-dictionary.md)"
+    },
+    {
+      "key": "server.max_connections",
+      "label": "DECISION",
+      "source": "DECISION in the author's parameter dictionary (docs/inputs/pelias-parameter-dictionary.md)"
+    },
+    {
+      "key": "server.queue_max",
+      "label": "DECISION",
+      "source": "DECISION in the author's parameter dictionary (docs/inputs/pelias-parameter-dictionary.md)"
+    },
+    {
+      "key": "server.max_header_bytes",
+      "label": "DECISION",
+      "source": "DECISION in the author's parameter dictionary (docs/inputs/pelias-parameter-dictionary.md)"
+    },
+    {
+      "key": "server.max_body_bytes",
+      "label": "DECISION",
+      "source": "DECISION in the author's parameter dictionary (docs/inputs/pelias-parameter-dictionary.md)"
+    },
+    {
+      "key": "server.read_timeout_s",
+      "label": "DECISION",
+      "source": "DECISION in the author's parameter dictionary (docs/inputs/pelias-parameter-dictionary.md); PELIAS_SYSTEM_MASTERWORK.md 18.1 C7"
+    },
+    {
+      "key": "server.idle_timeout_s",
+      "label": "DECISION",
+      "source": "DECISION in the author's parameter dictionary (docs/inputs/pelias-parameter-dictionary.md)"
+    },
+    {
+      "key": "server.sse_heartbeat_s",
+      "label": "DECISION",
+      "source": "DECISION in the author's parameter dictionary (docs/inputs/pelias-parameter-dictionary.md)"
+    },
+    {
+      "key": "api.log_structure_only",
+      "label": "DECISION",
+      "source": "privacy rule 7"
+    },
+    {
+      "key": "web.solver_url",
+      "label": "READ-SRC",
+      "source": "the author's web-tools script and dataset builder (FLARESOLVERR_URL)"
+    },
+    {
+      "key": "web.solver_timeout_ms",
+      "label": "READ-SRC",
+      "source": "create_parameters_v2.py (CHALLENGE_TIMEOUT_MS)"
+    },
+    {
+      "key": "web.page_chars",
+      "label": "READ-SRC",
+      "source": "create_parameters_v2.py (page_slice max_chars)"
+    },
+    {
+      "key": "web.redact_before_send",
+      "label": "READ-SRC",
+      "source": "create_parameters_v2.py (redact: cards, e-mail, API keys)"
+    }
+  ]
+}

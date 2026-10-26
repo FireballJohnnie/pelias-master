@@ -1,0 +1,25 @@
+# Decisions log
+
+Every ruling that shapes this repository, with its date and source. AUTHOR-STATED rulings are the author's words; DECISION (proposed) items wait for the author.
+
+| Date and time | Ruling | Label | Source |
+|---|---|---|---|
+| 2026-10-18 23:59 | "if we have to write our own dang program from the ground up and call it Pelias, i'm down for it." | AUTHOR-STATED | Long master 8.3 |
+| 2026-10-22 | Float spread governs the accuracy gate (H6) | AUTHOR-STATED | Engine blueprint |
+| 2026-10-23 | VRAM ceiling 10.7 GiB (D26) | AUTHOR-STATED | Trainer master |
+| 2026-10-24 06:07 | Engine on hold | AUTHOR-STATED | Long master 8.10 (lifted 2026-10-26) |
+| 2026-10-24 06:21 | Draft built for WSL2 and Windows; native Linux held | AUTHOR-STATED | Long master 8.11 (native Linux un-held 2026-10-26) |
+| 2026-10-24 07:39 | Micro-batch is an engine setting; no Q8_0 core by default; Mode Q default (D31, D32, D34) | AUTHOR-STATED | Trainer master |
+| 2026-10-24 08:15 | "when i say i wanted things from the ground up, i meant the ground up." (D37) | AUTHOR-STATED | Long master 8.11 |
+| 2026-10-26 11:44 | Build the whole system now; one masterwork markdown; installers for Linux (WSL first) and Windows 10/11; ground up in C++20/CUDA; universal detection; three paths; server on 8062; web tools with FlareSolverr as the only outside piece | AUTHOR-STATED | Masterwork 0.2 (A1 to A9) |
+| 2026-10-26 11:52 | GPU: the system accounts for other vendors itself; import files for the author's machine, model and parameters; recommend on a higher ceiling; web interface yes; OS-provided HTTPS yes; search the author's proposals folder and use all attachments; everything in pelias-master, ready for git | AUTHOR-STATED | Masterwork 0.2 (A4 to A11) |
+| 2026-10-26 11:55 | Pause for a Fable review of the markdowns before the build is queued | AUTHOR-STATED | Masterwork 0.2 (A12) |
+| 2026-10-26 12:05 | The first build is benchmarked against the official and Unsloth 4-bit files and the unquantized model, and its speed against the ceiling | AUTHOR-STATED | Masterwork 16.4 (A13) |
+| 2026-10-26 12:19 | Record future hypotheses: the bus outside LLMs, kept tuned by a tiny CPU model or by code alone; field applications with on-paper gains; consumer PCs doing data-centre work | AUTHOR-STATED | Masterwork 21 (A14) |
+| 2026-10-26 12:23 | Have Fable review it | AUTHOR-STATED | docs/reviews/FABLE_REVIEW_2026-10-26.md |
+| 2026-10-26 12:24, 12:29 | Add gaming (players and developers) to Section 21; give ballpark end-to-end gains | AUTHOR-STATED | Masterwork 21.5, 21.6 |
+| 2026-10-26 12:26 | Test Direct3D 12 and Vulkan with and without while the review runs; files approved | AUTHOR-STATED | Probe P-G0 |
+| 2026-10-26 12:52 | Run the Direct3D 12 / Vulkan probe now; each other Section 21 area gets its own scripted probe, run against a stock baseline with unchanged output, after pelias-master is built and running | AUTHOR-STATED | Masterwork 21.7 (to be updated) |
+| 2026-10-26 13:21 | Factor all probe data into the Pelias build whether it works or not: probes and every result (failures included) kept in pelias-master; the engine chooses each path (doorbell flag location, submit style, upload path) by startup measurement, with both paths kept behind a setting for testing | AUTHOR-STATED | Masterwork 21.7 |
+| 2026-10-26 13:25 | Publish open source for developers, enthusiasts and end users (repositories stay private until the author says push) | AUTHOR-STATED | Author |
+| 2026-10-26 | Vulkan compute as the second GPU backend; pelias-master as the code repository; own installer; tighter kernel tolerance until measured; reference profile 7.5 GiB bank at `-ub 2048`; poll level 100 | DECISION (proposed) | Masterwork 3.1, 14.1, 13.3, 16.2, 18.1 |

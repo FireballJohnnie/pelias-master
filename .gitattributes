@@ -1,0 +1,4 @@
+# Keep input files and binary assets byte for byte so their hashes stay valid.
+docs/inputs/** -text
+resources/ui/** binary
+*.png binary

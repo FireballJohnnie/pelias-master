@@ -1,0 +1,25 @@
+#version 450
+#extension GL_KHR_memory_scope_semantics : require
+// provenance: original
+// Copyright (c) 2026 John Lipka and the Pelias contributors
+// Doorbell variant for P-G0b: the Vulkan memory model's device-scope acquire + make-visible read of the flag,
+// and release + make-available writes. Needs the vulkanMemoryModel and vulkanMemoryModelDeviceScope features.
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0) buffer Mb { uint d[]; } mb;
+layout(push_constant) uniform PC { uint rounds; uint max_polls; } pc;
+const int kRead = gl_SemanticsAcquire | gl_SemanticsMakeVisible;
+const int kWrite = gl_SemanticsRelease | gl_SemanticsMakeAvailable;
+void main() {
+    atomicStore(mb.d[32], 1u, gl_ScopeDevice, gl_StorageSemanticsBuffer, kWrite);
+    for (uint k = 1u; k <= pc.rounds; ++k) {
+        uint polls = 0u;
+        while (atomicLoad(mb.d[0], gl_ScopeDevice, gl_StorageSemanticsBuffer, kRead) != k) {
+            polls += 1u;
+            if (polls > pc.max_polls) {
+                atomicStore(mb.d[16], 0xFFFFFFFFu, gl_ScopeDevice, gl_StorageSemanticsBuffer, kWrite);
+                return;
+            }
+        }
+        atomicStore(mb.d[16], k, gl_ScopeDevice, gl_StorageSemanticsBuffer, kWrite);
+    }
+}

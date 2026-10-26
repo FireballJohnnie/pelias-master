@@ -1,0 +1,12 @@
+#version 450
+// provenance: original
+// Copyright (c) 2026 John Lipka and the Pelias contributors
+// A compute job of adjustable length (pure arithmetic, no memory traffic) for the overlap test.
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer Out { float d[]; } outb;
+layout(push_constant) uniform PC { uint iters; } pc;
+void main() {
+    float x = float(gl_GlobalInvocationID.x) * 1e-6 + 1.0;
+    for (uint i = 0u; i < pc.iters; ++i) { x = x * 1.0000001 + 1e-7; }
+    if (x == 12345.678) outb.d[gl_GlobalInvocationID.x & 1023u] = x;  // never true; keeps the loop alive
+}

@@ -1,0 +1,25 @@
+#version 450
+// provenance: original
+// Copyright (c) 2026 John Lipka and the Pelias contributors
+// Doorbell variant for P-G0b: the flag is read with an atomic (add 0), which must go to the memory that holds it.
+// Same layout and per-round poll cap as doorbell.comp.
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0) coherent volatile buffer Mb { uint d[]; } mb;
+layout(push_constant) uniform PC { uint rounds; uint max_polls; } pc;
+void main() {
+    mb.d[32] = 1u;
+    memoryBarrierBuffer();
+    for (uint k = 1u; k <= pc.rounds; ++k) {
+        uint polls = 0u;
+        while (atomicAdd(mb.d[0], 0u) != k) {
+            polls += 1u;
+            if (polls > pc.max_polls) {
+                mb.d[16] = 0xFFFFFFFFu;
+                memoryBarrierBuffer();
+                return;
+            }
+        }
+        mb.d[16] = k;
+        memoryBarrierBuffer();
+    }
+}
