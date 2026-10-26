@@ -86,6 +86,7 @@ std::vector<std::uint8_t> GgufBuilder::build(std::uint64_t* data_start) const {
 }
 
 bool write_and_map(const std::string& path, const std::vector<std::uint8_t>& bytes, pelias::os::FileMap& map) {
+  map.close();  // Windows refuses to open a file for writing while a mapping of it is held (Linux allows it)
   std::FILE* f = std::fopen(path.c_str(), "wb");
   if (!f) return false;
   if (!bytes.empty() && std::fwrite(bytes.data(), 1, bytes.size(), f) != bytes.size()) { std::fclose(f); return false; }
