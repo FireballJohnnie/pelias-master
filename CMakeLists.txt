@@ -34,8 +34,15 @@ configure_file(include/pelias/version.h.in ${CMAKE_BINARY_DIR}/generated/pelias/
 pelias_add_module(pelias_os
   SOURCES src/os/status.cpp src/os/log.cpp src/os/file_map.cpp src/os/clock.cpp src/os/dynlib.cpp)
 pelias_add_module(pelias_quant
-  SOURCES src/quant/block_types.cpp
+  SOURCES src/quant/block_types.cpp src/quant/quant_cpu.cpp
   DEPENDS pelias_os)
+# The reference quantizers must round exactly as the reference does: plain float arithmetic, no fused multiply-add
+# (contraction) and no reassociation, whatever architecture flags the rest of the build gets later (P-E6).
+if(MSVC)
+  target_compile_options(pelias_quant PRIVATE /fp:precise)
+else()
+  target_compile_options(pelias_quant PRIVATE -ffp-contract=off -fno-fast-math)
+endif()
 set(PELIAS_HAL_SOURCES src/hal/device.cpp src/hal/nvml.cpp src/hal/vram_governor.cpp)
 if(PELIAS_CUDA)
   list(APPEND PELIAS_HAL_SOURCES src/hal/backend_cuda/cuda_device.cpp)
@@ -68,7 +75,7 @@ target_link_libraries(pelias PRIVATE pelias_plan pelias_io pelias_hal pelias_qua
 if(PELIAS_BUILD_TESTS)
   enable_testing()
   add_executable(pelias_unit tests/unit/main.cpp tests/unit/test_sha256.cpp tests/unit/test_json.cpp tests/unit/test_gguf.cpp
-                 tests/unit/test_safetensors.cpp tests/unit/test_plan.cpp tests/unit/test_block_types.cpp tests/unit/test_number_text.cpp tests/unit/test_nvml_pick.cpp tests/unit/gguf_builder.cpp)
+                 tests/unit/test_safetensors.cpp tests/unit/test_plan.cpp tests/unit/test_block_types.cpp tests/unit/test_number_text.cpp tests/unit/test_nvml_pick.cpp tests/unit/test_quant.cpp tests/unit/gguf_builder.cpp)
   pelias_apply_flags(pelias_unit)
   target_include_directories(pelias_unit PRIVATE tests)
   target_link_libraries(pelias_unit PRIVATE pelias_plan pelias_io pelias_hal pelias_quant pelias_os)
@@ -78,4 +85,19 @@ if(PELIAS_BUILD_TESTS)
   target_include_directories(pelias_mutate PRIVATE tests)
   target_link_libraries(pelias_mutate PRIVATE pelias_io pelias_quant pelias_os)
   add_test(NAME mutate COMMAND pelias_mutate --count 1500 --data ${CMAKE_CURRENT_SOURCE_DIR}/tests/data)
+
+  # Test-only oracle (masterwork 3.3): the reference library at llama.cpp commit 2ca15f5, built unchanged from a
+  # checkout outside this repository, compared byte for byte with Pelias's quantizers. Off unless a path is given;
+  # nothing in the product links it (boundary check BC2).
+  set(PELIAS_GGML_ORACLE_DIR "" CACHE PATH "llama.cpp source at commit 2ca15f5 (test-only oracle)")
+  if(PELIAS_GGML_ORACLE_DIR)
+    set(GGML_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    add_subdirectory(${PELIAS_GGML_ORACLE_DIR}/ggml ${CMAKE_BINARY_DIR}/ggml_oracle EXCLUDE_FROM_ALL)
+    add_executable(pelias_quant_oracle tests/oracle/quant_oracle.cpp)
+    pelias_apply_flags(pelias_quant_oracle)
+    target_include_directories(pelias_quant_oracle SYSTEM PRIVATE ${PELIAS_GGML_ORACLE_DIR}/ggml/include ${PELIAS_GGML_ORACLE_DIR}/ggml/src)
+    target_include_directories(pelias_quant_oracle PRIVATE tests)
+    target_link_libraries(pelias_quant_oracle PRIVATE pelias_quant pelias_io ggml-base)
+  endif()
 endif()

@@ -1,0 +1,600 @@
+// provenance: re-expressed (not copied) from ggml ggml/src/ggml-quants.c and ggml/src/ggml-impl.h at llama.cpp commit
+//   2ca15f5404760548c39e7b92bd43116a09414a1a (MIT; THIRD_PARTY_NOTICES.md), read as a specification so the bytes match
+// Copyright (c) 2026 John Lipka and the Pelias contributors
+//
+// Every float expression below keeps the reference's operand order and grouping, because float arithmetic is not
+// associative: (w*l)*l and w*(l*l) can round differently, and the bytes must match. Integer-to-float conversions
+// happen where the reference has them. Block layouts are written field by field with memcpy, so no struct padding or
+// alignment assumption reaches the output.
+#include "quant/quant_cpu.h"
+
+#include <algorithm>
+#include <bit>
+#include <cmath>
+#include <cstring>
+
+namespace pelias::quant {
+namespace {
+
+constexpr int kQK8 = 32;   // elements per Q8_0 / Q8_1 block
+constexpr int kQKK = 256;  // elements per K-quant super-block
+constexpr float kGroupMaxEps = 1e-15f;
+
+// ---- block layouts (byte offsets inside one block; sizes checked against block_types)
+// Q8_0: d (fp16) | qs[32] (int8)                                         34 bytes
+// Q8_1: d (fp16) | s (fp16) | qs[32]                                     36 bytes
+// Q4_K: d (fp16) | dmin (fp16) | scales[12] | qs[128]                    144 bytes
+// Q6_K: ql[128] | qh[64] | scales[16] (int8) | d (fp16)                  210 bytes
+// Q8_K: d (fp32) | qs[256] (int8) | bsums[16] (int16)                    292 bytes
+constexpr std::size_t kQ8_0Bytes = 34, kQ8_1Bytes = 36, kQ4KBytes = 144, kQ6KBytes = 210, kQ8KBytes = 292;
+
+void put_u16(std::uint8_t* p, std::uint16_t v) { std::memcpy(p, &v, 2); }
+std::uint16_t get_u16(const std::uint8_t* p) {
+  std::uint16_t v;
+  std::memcpy(&v, p, 2);
+  return v;
+}
+
+// The reference's make_qkx2_quants: an asymmetric (scale, min) search over `nstep` + 1 candidate scales.
+float make_qkx2_quants(int n, int nmax, const float* x, const float* weights, std::uint8_t* L, float* the_min,
+                       std::uint8_t* Laux, float rmin, float rdelta, int nstep, bool use_mad) {
+  float min = x[0];
+  float max = x[0];
+  float sum_w = weights[0];
+  float sum_x = sum_w * x[0];
+  for (int i = 1; i < n; ++i) {
+    if (x[i] < min) min = x[i];
+    if (x[i] > max) max = x[i];
+    const float w = weights[i];
+    sum_w += w;
+    sum_x += w * x[i];
+  }
+  if (min > 0) min = 0;
+  if (max == min) {
+    for (int i = 0; i < n; ++i) L[i] = 0;
+    *the_min = -min;
+    return 0.f;
+  }
+  float iscale = static_cast<float>(nmax) / (max - min);
+  float scale = 1 / iscale;
+  float best_error = 0;
+  for (int i = 0; i < n; ++i) {
+    const int l = nearest_int(iscale * (x[i] - min));
+    L[i] = static_cast<std::uint8_t>(std::max(0, std::min(nmax, l)));
+    float diff = scale * static_cast<float>(L[i]) + min - x[i];
+    diff = use_mad ? std::fabs(diff) : diff * diff;
+    const float w = weights[i];
+    best_error += w * diff;
+  }
+  if (nstep < 1) {
+    *the_min = -min;
+    return scale;
+  }
+  for (int is = 0; is <= nstep; ++is) {
+    iscale = (rmin + rdelta * static_cast<float>(is) + static_cast<float>(nmax)) / (max - min);
+    float sum_l = 0, sum_l2 = 0, sum_xl = 0;
+    for (int i = 0; i < n; ++i) {
+      int l = nearest_int(iscale * (x[i] - min));
+      l = std::max(0, std::min(nmax, l));
+      Laux[i] = static_cast<std::uint8_t>(l);
+      const float w = weights[i];
+      const float lf = static_cast<float>(l);
+      sum_l += w * lf;
+      sum_l2 += w * lf * lf;
+      sum_xl += w * lf * x[i];
+    }
+    const float D = sum_w * sum_l2 - sum_l * sum_l;
+    if (D > 0) {
+      float this_scale = (sum_w * sum_xl - sum_x * sum_l) / D;
+      float this_min = (sum_l2 * sum_x - sum_l * sum_xl) / D;
+      if (this_min > 0) {
+        this_min = 0;
+        this_scale = sum_xl / sum_l2;
+      }
+      float cur_error = 0;
+      for (int i = 0; i < n; ++i) {
+        float diff = this_scale * static_cast<float>(Laux[i]) + this_min - x[i];
+        diff = use_mad ? std::fabs(diff) : diff * diff;
+        const float w = weights[i];
+        cur_error += w * diff;
+      }
+      if (cur_error < best_error) {
+        for (int i = 0; i < n; ++i) L[i] = Laux[i];
+        best_error = cur_error;
+        scale = this_scale;
+        min = this_min;
+      }
+    }
+  }
+  *the_min = -min;
+  return scale;
+}
+
+// The reference's make_qx_quants with no importance weights (qw = NULL): a symmetric scale search, levels stored
+// offset by nmax. Only rmse_type 1 is used in this step (Q6_K); the other modes are kept so the routine is complete.
+float make_qx_quants(int n, int nmax, const float* x, std::int8_t* L, int rmse_type) {
+  float max = 0;
+  float amax = 0;
+  for (int i = 0; i < n; ++i) {
+    const float ax = std::fabs(x[i]);
+    if (ax > amax) {
+      amax = ax;
+      max = x[i];
+    }
+  }
+  if (amax < kGroupMaxEps) {
+    for (int i = 0; i < n; ++i) L[i] = 0;
+    return 0.f;
+  }
+  float iscale = static_cast<float>(-nmax) / max;
+  if (rmse_type == 0) {
+    for (int i = 0; i < n; ++i) {
+      const int l = nearest_int(iscale * x[i]);
+      L[i] = static_cast<std::int8_t>(nmax + std::max(-nmax, std::min(nmax - 1, l)));
+    }
+    return 1 / iscale;
+  }
+  bool return_early = false;
+  if (rmse_type < 0) {
+    rmse_type = -rmse_type;
+    return_early = true;
+  }
+  auto weight = [&](float xi) {
+    return rmse_type == 1 ? xi * xi : rmse_type == 2 ? 1.0f : rmse_type == 3 ? std::fabs(xi) : std::sqrt(std::fabs(xi));
+  };
+  float sumlx = 0;
+  float suml2 = 0;
+  for (int i = 0; i < n; ++i) {
+    int l = nearest_int(iscale * x[i]);
+    l = std::max(-nmax, std::min(nmax - 1, l));
+    L[i] = static_cast<std::int8_t>(l + nmax);
+    const float w = weight(x[i]);
+    const float lf = static_cast<float>(l);
+    sumlx += w * x[i] * lf;
+    suml2 += w * lf * lf;
+  }
+  float scale = suml2 != 0.0f ? sumlx / suml2 : 0.0f;
+  if (return_early) return suml2 > 0 ? 0.5f * (scale + 1 / iscale) : 1 / iscale;
+  float best = scale * sumlx;
+  for (int is = -9; is <= 9; ++is) {
+    if (is == 0) continue;
+    iscale = -(static_cast<float>(nmax) + 0.1f * static_cast<float>(is)) / max;
+    sumlx = suml2 = 0;
+    for (int i = 0; i < n; ++i) {
+      int l = nearest_int(iscale * x[i]);
+      l = std::max(-nmax, std::min(nmax - 1, l));
+      const float w = weight(x[i]);
+      const float lf = static_cast<float>(l);
+      sumlx += w * x[i] * lf;
+      suml2 += w * lf * lf;
+    }
+    if (suml2 > 0 && sumlx * sumlx > best * suml2) {
+      for (int i = 0; i < n; ++i) {
+        const int l = nearest_int(iscale * x[i]);
+        L[i] = static_cast<std::int8_t>(nmax + std::max(-nmax, std::min(nmax - 1, l)));
+      }
+      scale = sumlx / suml2;
+      best = scale * sumlx;
+    }
+  }
+  return scale;
+}
+
+// The 12-byte scale and min field of Q4_K: six bits each for eight sub-blocks.
+void get_scale_min_k4(int j, const std::uint8_t* q, std::uint8_t* d, std::uint8_t* m) {
+  if (j < 4) {
+    *d = q[j] & 63;
+    *m = q[j + 4] & 63;
+  } else {
+    *d = static_cast<std::uint8_t>((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4));
+    *m = static_cast<std::uint8_t>((q[j + 4] >> 4) | ((q[j - 0] >> 6) << 4));
+  }
+}
+
+}  // namespace
+
+// ---- scalar conversions
+
+float fp16_to_fp32(std::uint16_t h) {
+  const std::uint32_t sign = static_cast<std::uint32_t>(h & 0x8000u) << 16;
+  const std::uint32_t exp = (h >> 10) & 0x1Fu;
+  std::uint32_t man = h & 0x3FFu;
+  std::uint32_t bits;
+  if (exp == 0) {
+    if (man == 0) {
+      bits = sign;  // signed zero
+    } else {           // subnormal half: normalize into a normal float
+      std::uint32_t e = 113;  // 127 - 15 + 1
+      while ((man & 0x400u) == 0) {
+        man <<= 1;
+        --e;
+      }
+      man &= 0x3FFu;
+      bits = sign | (e << 23) | (man << 13);
+    }
+  } else if (exp == 31) {
+    bits = sign | 0x7F800000u | (man << 13);
+    if (man != 0) bits |= 0x00400000u;  // NaN comes out quiet, as the reference's arithmetic path leaves it
+  } else {
+    bits = sign | ((exp + 112) << 23) | (man << 13);
+  }
+  return std::bit_cast<float>(bits);
+}
+
+std::uint16_t fp32_to_fp16(float f) {
+  const std::uint32_t bits = std::bit_cast<std::uint32_t>(f);
+  const auto sign = static_cast<std::uint16_t>((bits >> 16) & 0x8000u);
+  const std::uint32_t abs = bits & 0x7FFFFFFFu;
+  if (abs > 0x7F800000u) return static_cast<std::uint16_t>(sign | 0x7E00u);  // NaN: the quiet NaN of the reference
+  if (abs >= 0x477FF000u) return static_cast<std::uint16_t>(sign | 0x7C00u);  // >= 65520 (and inf) rounds to inf
+  const std::uint32_t e = abs >> 23;
+  if (abs < 0x38800000u) {  // below the smallest normal half (2^-14): a subnormal half or zero
+    const std::uint32_t m = e == 0 ? (abs & 0x7FFFFFu) : ((abs & 0x7FFFFFu) | 0x800000u);
+    const std::uint32_t s = e == 0 ? 126u : 126u - e;  // value = m * 2^(e-150); unit of a subnormal half = 2^-24
+    if (s >= 32) return sign;
+    std::uint32_t q = m >> s;
+    const std::uint32_t rem = m & ((1u << s) - 1u);
+    const std::uint32_t half = 1u << (s - 1);
+    if (rem > half || (rem == half && (q & 1u))) ++q;
+    return static_cast<std::uint16_t>(sign | q);
+  }
+  std::uint32_t q = ((e - 112u) << 10) | ((abs & 0x7FFFFFu) >> 13);
+  const std::uint32_t rem = abs & 0x1FFFu;
+  if (rem > 0x1000u || (rem == 0x1000u && (q & 1u))) ++q;  // a carry moves into the exponent, as it should
+  return static_cast<std::uint16_t>(sign | q);
+}
+
+float bf16_to_fp32(std::uint16_t h) { return std::bit_cast<float>(static_cast<std::uint32_t>(h) << 16); }
+
+std::uint16_t fp32_to_bf16(float f) {
+  const std::uint32_t u = std::bit_cast<std::uint32_t>(f);
+  if ((u & 0x7FFFFFFFu) > 0x7F800000u) return static_cast<std::uint16_t>((u >> 16) | 64u);  // NaN, made quiet
+  return static_cast<std::uint16_t>((u + (0x7FFFu + ((u >> 16) & 1u))) >> 16);
+}
+
+int nearest_int(float x) {
+  // Adding 1.5 * 2^23 moves the integer part into the low mantissa bits; the hardware's round-to-nearest-even does
+  // the rounding. Identical to the reference for |x| <= 4194303 (its stated range), and identical outside it too.
+  const float v = x + 12582912.f;
+  const auto i = std::bit_cast<std::int32_t>(v);
+  return (i & 0x007FFFFF) - 0x00400000;
+}
+
+// ---- Q8_0 and Q8_1
+
+void quantize_q8_0(const float* x, std::uint8_t* out, std::int64_t n) {
+  const std::int64_t nb = n / kQK8;
+  for (std::int64_t i = 0; i < nb; ++i, x += kQK8, out += kQ8_0Bytes) {
+    float amax = 0.0f;
+    for (int j = 0; j < kQK8; ++j) amax = std::max(amax, std::fabs(x[j]));  // MAX(a, b) = a > b ? a : b
+    const float d = amax / static_cast<float>((1 << 7) - 1);
+    const float id = d != 0.0f ? 1.0f / d : 0.0f;
+    put_u16(out, fp32_to_fp16(d));
+    for (int j = 0; j < kQK8; ++j) {
+      const float x0 = x[j] * id;
+      const auto q = static_cast<std::int8_t>(std::round(x0));
+      std::memcpy(out + 2 + j, &q, 1);
+    }
+  }
+}
+
+void quantize_q8_1(const float* x, std::uint8_t* out, std::int64_t n) {
+  const std::int64_t nb = n / kQK8;
+  for (std::int64_t i = 0; i < nb; ++i, x += kQK8, out += kQ8_1Bytes) {
+    float amax = 0.0f;
+    for (int j = 0; j < kQK8; ++j) amax = std::max(amax, std::fabs(x[j]));
+    const float d = amax / static_cast<float>((1 << 7) - 1);
+    const float id = d != 0.0f ? 1.0f / d : 0.0f;
+    put_u16(out, fp32_to_fp16(d));
+    int sum = 0;
+    for (int j = 0; j < kQK8 / 2; ++j) {
+      const float v0 = x[j] * id;
+      const float v1 = x[kQK8 / 2 + j] * id;
+      const auto q0 = static_cast<std::int8_t>(std::round(v0));
+      const auto q1 = static_cast<std::int8_t>(std::round(v1));
+      std::memcpy(out + 4 + j, &q0, 1);
+      std::memcpy(out + 4 + kQK8 / 2 + j, &q1, 1);
+      sum += q0;
+      sum += q1;
+    }
+    put_u16(out + 2, fp32_to_fp16(static_cast<float>(sum) * d));
+  }
+}
+
+void dequantize_q8_0(const std::uint8_t* in, float* y, std::int64_t n) {
+  const std::int64_t nb = n / kQK8;
+  for (std::int64_t i = 0; i < nb; ++i, in += kQ8_0Bytes, y += kQK8) {
+    const float d = fp16_to_fp32(get_u16(in));
+    for (int j = 0; j < kQK8; ++j) {
+      std::int8_t q;
+      std::memcpy(&q, in + 2 + j, 1);
+      y[j] = static_cast<float>(q) * d;
+    }
+  }
+}
+
+// ---- Q4_K
+
+void quantize_q4_k(const float* x, std::uint8_t* out, std::int64_t n) {
+  const std::int64_t nb = n / kQKK;
+  std::uint8_t L[kQKK];
+  std::uint8_t Laux[32];
+  float weights[32];
+  float mins[kQKK / 32];
+  float scales[kQKK / 32];
+  for (std::int64_t i = 0; i < nb; ++i, x += kQKK, out += kQ4KBytes) {
+    std::uint8_t sc12[12] = {};
+    float max_scale = 0;  // the min is subtracted, so scales are never negative
+    float max_min = 0;
+    for (int j = 0; j < kQKK / 32; ++j) {
+      float sum_x2 = 0;
+      for (int l = 0; l < 32; ++l) sum_x2 += x[32 * j + l] * x[32 * j + l];
+      const float av_x = std::sqrt(sum_x2 / 32);
+      for (int l = 0; l < 32; ++l) weights[l] = av_x + std::fabs(x[32 * j + l]);
+      scales[j] = make_qkx2_quants(32, 15, x + 32 * j, weights, L + 32 * j, &mins[j], Laux, -1.f, 0.1f, 20, false);
+      const float scale = scales[j];
+      if (scale > max_scale) max_scale = scale;
+      const float min = mins[j];
+      if (min > max_min) max_min = min;
+    }
+    const float inv_scale = max_scale > 0 ? 63.f / max_scale : 0.f;
+    const float inv_min = max_min > 0 ? 63.f / max_min : 0.f;
+    for (int j = 0; j < kQKK / 32; ++j) {
+      auto ls = static_cast<std::uint8_t>(nearest_int(inv_scale * scales[j]));  // the reference narrows, then clamps
+      auto lm = static_cast<std::uint8_t>(nearest_int(inv_min * mins[j]));
+      ls = std::min<std::uint8_t>(63, ls);
+      lm = std::min<std::uint8_t>(63, lm);
+      if (j < 4) {
+        sc12[j] = ls;
+        sc12[j + 4] = lm;
+      } else {
+        sc12[j + 4] = static_cast<std::uint8_t>((ls & 0xF) | ((lm & 0xF) << 4));
+        sc12[j - 4] = static_cast<std::uint8_t>(sc12[j - 4] | ((ls >> 4) << 6));
+        sc12[j - 0] = static_cast<std::uint8_t>(sc12[j - 0] | ((lm >> 4) << 6));
+      }
+    }
+    const std::uint16_t d16 = fp32_to_fp16(max_scale / 63.f);
+    const std::uint16_t dmin16 = fp32_to_fp16(max_min / 63.f);
+    for (int j = 0; j < kQKK / 32; ++j) {
+      std::uint8_t sc, m;
+      get_scale_min_k4(j, sc12, &sc, &m);
+      const float d = fp16_to_fp32(d16) * static_cast<float>(sc);
+      if (d == 0.0f) continue;
+      const float dm = fp16_to_fp32(dmin16) * static_cast<float>(m);
+      for (int ii = 0; ii < 32; ++ii) {
+        int l = nearest_int((x[32 * j + ii] + dm) / d);
+        l = std::max(0, std::min(15, l));
+        L[32 * j + ii] = static_cast<std::uint8_t>(l);
+      }
+    }
+    put_u16(out, d16);
+    put_u16(out + 2, dmin16);
+    std::memcpy(out + 4, sc12, 12);
+    std::uint8_t* q = out + 16;
+    for (int j = 0; j < kQKK; j += 64) {
+      for (int l = 0; l < 32; ++l) q[l] = static_cast<std::uint8_t>(L[j + l] | (L[j + l + 32] << 4));
+      q += 32;
+    }
+  }
+}
+
+void dequantize_q4_k(const std::uint8_t* in, float* y, std::int64_t n) {
+  const std::int64_t nb = n / kQKK;
+  for (std::int64_t i = 0; i < nb; ++i, in += kQ4KBytes) {
+    const float d = fp16_to_fp32(get_u16(in));
+    const float min = fp16_to_fp32(get_u16(in + 2));
+    const std::uint8_t* scales = in + 4;
+    const std::uint8_t* q = in + 16;
+    int is = 0;
+    std::uint8_t sc, m;
+    for (int j = 0; j < kQKK; j += 64) {
+      get_scale_min_k4(is + 0, scales, &sc, &m);
+      const float d1 = d * static_cast<float>(sc);
+      const float m1 = min * static_cast<float>(m);
+      get_scale_min_k4(is + 1, scales, &sc, &m);
+      const float d2 = d * static_cast<float>(sc);
+      const float m2 = min * static_cast<float>(m);
+      for (int l = 0; l < 32; ++l) *y++ = d1 * static_cast<float>(q[l] & 0xF) - m1;
+      for (int l = 0; l < 32; ++l) *y++ = d2 * static_cast<float>(q[l] >> 4) - m2;
+      q += 32;
+      is += 2;
+    }
+  }
+}
+
+// ---- Q6_K
+
+void quantize_q6_k(const float* x, std::uint8_t* out, std::int64_t n) {
+  const std::int64_t nb = n / kQKK;
+  std::int8_t L[kQKK];
+  float scales[kQKK / 16];
+  for (std::int64_t i = 0; i < nb; ++i, x += kQKK, out += kQ6KBytes) {
+    float max_scale = 0;
+    float max_abs_scale = 0;
+    for (int ib = 0; ib < kQKK / 16; ++ib) {
+      const float scale = make_qx_quants(16, 32, x + 16 * ib, L + 16 * ib, 1);
+      scales[ib] = scale;
+      const float abs_scale = std::fabs(scale);
+      if (abs_scale > max_abs_scale) {
+        max_abs_scale = abs_scale;
+        max_scale = scale;
+      }
+    }
+    if (max_abs_scale < kGroupMaxEps) {
+      std::memset(out, 0, kQ6KBytes);
+      put_u16(out + 208, fp32_to_fp16(0.f));
+      continue;
+    }
+    std::int8_t sc16[16];
+    const float iscale = -128.f / max_scale;
+    const std::uint16_t d16 = fp32_to_fp16(1 / iscale);
+    for (int ib = 0; ib < kQKK / 16; ++ib) sc16[ib] = static_cast<std::int8_t>(std::min(127, nearest_int(iscale * scales[ib])));
+    for (int j = 0; j < kQKK / 16; ++j) {
+      const float d = fp16_to_fp32(d16) * static_cast<float>(sc16[j]);
+      if (d == 0.0f) continue;
+      for (int ii = 0; ii < 16; ++ii) {
+        int l = nearest_int(x[16 * j + ii] / d);
+        l = std::max(-32, std::min(31, l));
+        L[16 * j + ii] = static_cast<std::int8_t>(l + 32);
+      }
+    }
+    std::uint8_t* ql = out;
+    std::uint8_t* qh = out + 128;
+    for (int j = 0; j < kQKK; j += 128) {
+      for (int l = 0; l < 32; ++l) {
+        const auto u = [&](int k) { return static_cast<std::uint8_t>(L[j + l + k]); };
+        const auto q1 = static_cast<std::uint8_t>(u(0) & 0xF);
+        const auto q2 = static_cast<std::uint8_t>(u(32) & 0xF);
+        const auto q3 = static_cast<std::uint8_t>(u(64) & 0xF);
+        const auto q4 = static_cast<std::uint8_t>(u(96) & 0xF);
+        ql[l + 0] = static_cast<std::uint8_t>(q1 | (q3 << 4));
+        ql[l + 32] = static_cast<std::uint8_t>(q2 | (q4 << 4));
+        qh[l] = static_cast<std::uint8_t>((u(0) >> 4) | ((u(32) >> 4) << 2) | ((u(64) >> 4) << 4) | ((u(96) >> 4) << 6));
+      }
+      ql += 64;
+      qh += 32;
+    }
+    std::memcpy(out + 192, sc16, 16);
+    put_u16(out + 208, d16);
+  }
+}
+
+void dequantize_q6_k(const std::uint8_t* in, float* y, std::int64_t n) {
+  const std::int64_t nb = n / kQKK;
+  for (std::int64_t i = 0; i < nb; ++i, in += kQ6KBytes) {
+    const float d = fp16_to_fp32(get_u16(in + 208));
+    const std::uint8_t* ql = in;
+    const std::uint8_t* qh = in + 128;
+    std::int8_t scv[16];
+    std::memcpy(scv, in + 192, 16);
+    const std::int8_t* sc = scv;
+    for (int k = 0; k < kQKK; k += 128) {
+      for (int l = 0; l < 32; ++l) {
+        const int is = l / 16;
+        const auto q1 = static_cast<std::int8_t>(((ql[l + 0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32);
+        const auto q2 = static_cast<std::int8_t>(((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32);
+        const auto q3 = static_cast<std::int8_t>(((ql[l + 0] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32);
+        const auto q4 = static_cast<std::int8_t>(((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32);
+        y[l + 0] = d * static_cast<float>(sc[is + 0]) * static_cast<float>(q1);
+        y[l + 32] = d * static_cast<float>(sc[is + 2]) * static_cast<float>(q2);
+        y[l + 64] = d * static_cast<float>(sc[is + 4]) * static_cast<float>(q3);
+        y[l + 96] = d * static_cast<float>(sc[is + 6]) * static_cast<float>(q4);
+      }
+      y += 128;
+      ql += 64;
+      qh += 32;
+      sc += 8;
+    }
+  }
+}
+
+// ---- Q8_K (activations on the CPU path)
+
+void quantize_q8_k(const float* x, std::uint8_t* out, std::int64_t n) {
+  const std::int64_t nb = n / kQKK;
+  for (std::int64_t i = 0; i < nb; ++i, x += kQKK, out += kQ8KBytes) {
+    float max = 0;
+    float amax = 0;
+    for (int j = 0; j < kQKK; ++j) {
+      const float ax = std::fabs(x[j]);
+      if (ax > amax) {
+        amax = ax;
+        max = x[j];
+      }
+    }
+    if (amax == 0.0f) {
+      std::memset(out, 0, kQ8KBytes);  // d = 0, qs = 0, and the sums of zeros are zero
+      continue;
+    }
+    const float iscale = -127.f / max;
+    std::int8_t qs[kQKK];
+    for (int j = 0; j < kQKK; ++j) {
+      const int v = nearest_int(iscale * x[j]);
+      qs[j] = static_cast<std::int8_t>(std::min(127, v));
+    }
+    std::int16_t bsums[kQKK / 16];
+    for (int j = 0; j < kQKK / 16; ++j) {
+      int sum = 0;
+      for (int ii = 0; ii < 16; ++ii) sum += qs[j * 16 + ii];
+      bsums[j] = static_cast<std::int16_t>(sum);
+    }
+    const float d = 1 / iscale;
+    std::memcpy(out, &d, 4);
+    std::memcpy(out + 4, qs, kQKK);
+    std::memcpy(out + 4 + kQKK, bsums, sizeof bsums);
+  }
+}
+
+// ---- dispatch
+
+bool can_quantize(Type t) {
+  switch (t) {
+    case Type::f32: case Type::f16: case Type::bf16: case Type::q8_0: case Type::q8_1: case Type::q4_k: case Type::q6_k:
+    case Type::q8_k:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool can_dequantize(Type t) {
+  switch (t) {
+    case Type::f32: case Type::f16: case Type::bf16: case Type::q8_0: case Type::q4_k: case Type::q6_k:
+      return true;
+    default:
+      return false;
+  }
+}
+
+namespace {
+Status check_row(Type t, std::int64_t n, bool quantize) {
+  const TypeInfo ti = type_info(t);
+  if (!(quantize ? can_quantize(t) : can_dequantize(t)))
+    return Status::fail(Code::unsupported, std::string(quantize ? "quantizing to " : "reading ") + ti.name + " is not built yet");
+  if (n < 0 || n % ti.block_elements != 0)
+    return Status::fail(Code::invalid_argument, "row of " + std::to_string(n) + " elements is not a whole number of " + ti.name + " blocks");
+  return Status::good();
+}
+}  // namespace
+
+Status quantize_row(Type t, const float* x, std::uint8_t* out, std::int64_t n) {
+  const Status s = check_row(t, n, true);
+  if (!s) return s;
+  switch (t) {
+    case Type::f32: std::memcpy(out, x, static_cast<std::size_t>(n) * 4); break;
+    case Type::f16:
+      for (std::int64_t i = 0; i < n; ++i) put_u16(out + 2 * i, fp32_to_fp16(x[i]));
+      break;
+    case Type::bf16:
+      for (std::int64_t i = 0; i < n; ++i) put_u16(out + 2 * i, fp32_to_bf16(x[i]));
+      break;
+    case Type::q8_0: quantize_q8_0(x, out, n); break;
+    case Type::q8_1: quantize_q8_1(x, out, n); break;
+    case Type::q4_k: quantize_q4_k(x, out, n); break;
+    case Type::q6_k: quantize_q6_k(x, out, n); break;
+    case Type::q8_k: quantize_q8_k(x, out, n); break;
+    default: return Status::fail(Code::internal, "quantize dispatch");
+  }
+  return Status::good();
+}
+
+Status dequantize_row(Type t, const std::uint8_t* in, float* y, std::int64_t n) {
+  const Status s = check_row(t, n, false);
+  if (!s) return s;
+  switch (t) {
+    case Type::f32: std::memcpy(y, in, static_cast<std::size_t>(n) * 4); break;
+    case Type::f16:
+      for (std::int64_t i = 0; i < n; ++i) y[i] = fp16_to_fp32(get_u16(in + 2 * i));
+      break;
+    case Type::bf16:
+      for (std::int64_t i = 0; i < n; ++i) y[i] = bf16_to_fp32(get_u16(in + 2 * i));
+      break;
+    case Type::q8_0: dequantize_q8_0(in, y, n); break;
+    case Type::q4_k: dequantize_q4_k(in, y, n); break;
+    case Type::q6_k: dequantize_q6_k(in, y, n); break;
+    default: return Status::fail(Code::internal, "dequantize dispatch");
+  }
+  return Status::good();
+}
+
+}  // namespace pelias::quant

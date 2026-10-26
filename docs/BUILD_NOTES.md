@@ -40,3 +40,13 @@ python3 tools/check_module_deps.py && python3 docs/scaffold/verify_inventory.py
 ```
 
 **Stage C (the author, both platforms):** see the RUNBOOK entry of 2026-10-26 and `README.md`; the gate is: clean configure and build with `-DPELIAS_CUDA=ON` on WSL2 (GCC, nvcc 13.0) and Windows (MSVC x64 tools, nvcc 13.4) with warnings as errors; `pelias inspect` on the Unsloth file lists every tensor (733 in that file; the served file of 17.3 has 753) with its type and the count equals the header's; `pelias plan` refuses a bank above the ceiling (exit 3) and proposes the largest that fits; `pelias_mutate` passes; `pelias device` reports the measured ceiling.
+
+### Step 3, stage A: the quantizers (2026-10-26 evening)
+
+**What was built:** `src/quant/quant_cpu` (F32, F16, BF16, Q8_0, Q4_K, Q6_K quantize and dequantize; Q8_1 and Q8_K activation quantizers; fp16 and bf16 conversions; the ties-to-even `nearest_int`), re-expressed from ggml at commit `2ca15f5` (`ggml-quants.c`, `ggml-impl.h`) with every float expression in the reference's operand order. The module is compiled with `-ffp-contract=off -fno-fast-math` (MSVC `/fp:precise`): the reference compiles these routines in its base library with plain float math, and any later architecture flag must not change the bytes.
+
+**The oracle (test-only, masterwork 3.3):** `tests/oracle/quant_oracle.cpp`, built only when `-DPELIAS_GGML_ORACLE_DIR=<llama.cpp checkout at 2ca15f5>` is given; it links the reference's `ggml-base` built unchanged and never touches the product. Results in the sandbox (MEASURED): fp32 to fp16 and to bf16 identical on all 4,294,967,296 bit patterns; fp16 and bf16 to fp32 identical on all 65,536; Q8_0, Q4_K, Q6_K, F16, BF16, Q8_1, Q8_K identical on every block of 11 input kinds (weights rounded to bf16, normal, heavy tails, one-signed, ties, sparse and zero blocks, constant blocks, tiny and subnormal, large, wide range) at 20,000 super-blocks per kind and seed, seeds 20261026, 1, 77, 4242; dequantization of Q8_0, Q4_K, Q6_K identical on random blocks. Identical with our side built by GCC 13 `-O3`, Clang 18 `-O3`, and GCC `-O0` with ASan and UBSan.
+
+**Without the oracle, on every platform:** `tests/unit/quant_golden.h` holds a fixed input built from integers with exact steps (no compiler can make it differ) and the SHA-256 of the REFERENCE's output for each of the seven types; `quant_matches_the_reference_hashes` checks Pelias against them, so the Windows (MSVC) build is checked bit for bit.
+
+**Known detail:** for an all-zero Q8_K block the reference leaves the 16 block sums unwritten (whatever the buffer held); Pelias writes zeros. Q8_K is an activation type, never stored in a file, and a zero block's sums do not enter a dot product.
