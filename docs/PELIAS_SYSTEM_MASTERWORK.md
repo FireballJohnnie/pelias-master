@@ -893,7 +893,7 @@ pelias-master/
 | Step | Build | Gate that closes it | From the plans |
 |---|---|---|---|
 | **R0** | **Fable review of this document and the profiles; findings folded in; the author says go** (A12) | The author's word | — |
-| 1 | Close the measurement gaps: run the Batch C kernel probes (P-K1 to P-K3, P-Q10; rewritten 2026-10-26 13:5x because the 01:50 source never compiled; Windows done in twelve revisions, 17.5; WSL2 run pending), the P-M4 file-read probe, the ReBAR on/off pair (BIOS switch, P-H2/H5/H6/H12 rerun), the graphics probe P-G0 (done 2026-10-26, 21.2.1) and its follow-ups P-G0b, P-E16, P-M5 (21.7) | Results recorded on both platforms | T0, E0, E1 |
+| 1 | Close the measurement gaps: run the Batch C kernel probes (P-K1 to P-K3, P-Q10; rewritten 2026-10-26 13:5x because the 01:50 source never compiled; done on Windows in twelve revisions and on WSL2 with the final one, 17.5), the P-M4 file-read probe, the ReBAR on/off pair (BIOS switch, P-H2/H5/H6/H12 rerun), the graphics probe P-G0 (done 2026-10-26, 21.2.1) and its follow-ups P-G0b, P-E16, P-M5 (21.7) | Results recorded on both platforms | T0, E0, E1 |
 | 2 | Foundations: `os/`, `hal/` (CUDA backend), `plan/`, `io/` (reader, sha256, json, safetensors), `cli/` skeleton, build files, tests, boundary checks | Lists all 753 tensors with types; a plan above the ceiling is refused; corrupt-input gate; clean build on WSL2 and Windows | T1, E2, E3 (reader) |
 | 3 | `quant/` (Q4_K, Q6_K, Q8_0, activations, F16/BF16/F32) and Stage A | P-E6 bit-identical on all tensors; Stage A output equals the reference (P-X6) | T1b, E3 |
 | 4 | `tok/` tokenizer and template renderer; `data/` | P-D1, P-D2: zero mismatches (including `tojson` formatting) | T2, E10 (reuse) |
@@ -1016,9 +1016,9 @@ Everything here is copied from the audited sources; the full set (491 numbers, e
 
 Ceiling 92.0 to 88.2 tok/s (DERIVED). Recorded (tier build): WSL2 Cell A 37.9 short / 42.1 at 12 k; Windows Cell A 47.3, 46.8 short / 53.7, 54.1 at 12 k; WSL2 best cell 53.5 / 53.0 / 49.0. Bank peaks (whole card): 7.5 GiB bank 10.40 to 10.44 GiB at the default micro-batch and 10.67 to 10.69 at `-ub 2048`; 8.0 GiB bank 11.0 to 11.19 (over the ceiling). Prompt 1,670 tok/s at 12 k (tier), 2,238 (stock). MTP draft 2/3: 51.5 to 52.9 tok/s at 12 k against 45.4.
 
-### 17.5 Batch C kernel results (2026-10-26, Windows native; WSL2 pending)
+### 17.5 Batch C kernel results (2026-10-26, Windows native and WSL2)
 
-Raw files, every revision: `data/probe_results/batch_c/` (README there lists each run). Source: `tools/probes/batch_c/`. Weights and activations synthetic; Q4_K arithmetic from llama.cpp (READ-SRC, 5.3); peaks from P-H3 at the author's overclock (bf16 65.2 TFLOPS, int8 259.5 TOPS, fp8 129.8).
+Raw files, every revision: `data/probe_results/batch_c/` (README there lists each run). The table gives Windows; WSL2 ran the final source (revision 12) the same day and matched within the run-to-run spread: P-K1 17/20 shapes (best 0.98x cuBLASLt), int8 v10 0.98x to 1.01x of Windows per shape and 1.45x to 1.84x the bf16 path including norm and conversions, P-K2b and P-Q10 the same; P-K3 452 to 460 GB/s at a memory clock of 10,251 MHz against 11,251 MHz in the Windows P-K3 runs (the ratio of the clocks, 0.91, matches the ratio of the plain reads, 0.92), so the platform difference there is the clock, not WSL2. Source: `tools/probes/batch_c/`. Weights and activations synthetic; Q4_K arithmetic from llama.cpp (READ-SRC, 5.3); peaks from P-H3 at the author's overclock (bf16 65.2 TFLOPS, int8 259.5 TOPS, fp8 129.8).
 
 | Probe | Result (MEASURED) | Rule | Outcome |
 |---|---|---|---|
