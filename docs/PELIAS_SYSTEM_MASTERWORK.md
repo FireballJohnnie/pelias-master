@@ -611,7 +611,7 @@ The first run reproduces the v0.2 recipe (so it can be compared): AdamW (0.9, 0.
 
 ### 8.8 Memory plan and speed targets (reference machine)
 
-Device plan at a window of 8,192 tokens and up to 32 k tokens per step: 7.90 GiB base, 8.70 to 9.00 GiB with the Mode Q `W_eff` copy, leaving 1.70 to 2.00 GiB under 10.7 (DERIVED; working set 2.50 GiB is an ESTIMATE that P-M2 measures). Host: pinned expert store 18.65 GiB plus a boundary store of 5.0 GiB (16 k tokens) or 10.0 GiB (32 k), about 28 to 33 GiB in total under the 48 GiB WSL2 cap (DERIVED; 32 GiB pinned was held on both platforms, MEASURED). Speed targets: 600 tok/s minimum, 1,200 target, 2,000 stretch (DECISION), against v0.2's 247.85 (MEASURED); the prediction is 643 to 2,031 tok/s depending on GEMM efficiency, which is unmeasured until the Batch C probes P-K1 to P-K3 run (DERIVED).
+Device plan at a window of 8,192 tokens and up to 32 k tokens per step: 7.90 GiB base, 8.70 to 9.00 GiB with the Mode Q `W_eff` copy, leaving 1.70 to 2.00 GiB under 10.7 (DERIVED; working set 2.50 GiB is an ESTIMATE that P-M2 measures). Host: pinned expert store 18.65 GiB plus a boundary store of 5.0 GiB (16 k tokens) or 10.0 GiB (32 k), about 28 to 33 GiB in total under the 48 GiB WSL2 cap (DERIVED; 32 GiB pinned was held on both platforms, MEASURED). Speed targets: 600 tok/s minimum, 1,200 target, 2,000 stretch (DECISION), against v0.2's 247.85 (MEASURED); the prediction is 643 to 2,031 tok/s depending on GEMM efficiency, which is unmeasured until the Batch C probes P-K1 to P-K3 run (DERIVED). GEMM efficiency is now MEASURED on Windows (17.5: own bf16 GEMM 0.48 to 0.88 of the P-H3 peak; int8 path 0.25 to 0.37 of the int8 peak, 1.39x to 1.84x the bf16 path including norm and conversions); recomputing the prediction from it is open (O12).
 
 ---
 
@@ -870,6 +870,9 @@ pelias-master/
 | `resources/ui/` | The logo, the spear stages, the baked spear textures and their layout |
 | `support/ui_reference/` | The lithic interface header of 2026-10-24 (the specification for the web interface) |
 | `tools/ui/` | The spear texture baker |
+| `tools/probes/gfx_probe/` | The graphics probe P-G0 / P-G0b (Direct3D 12 and Vulkan) |
+| `tools/probes/batch_c/` | The Batch C kernel probes P-K1, P-K2, P-K2b, P-K3, P-Q10 (with the Wave 0 framework files they build on) |
+| `data/probe_results/` | Every probe result file, failures included: `P-G0/` and `batch_c/` (one folder per revision), each with a README |
 | `logs/` | `BUILD_LOG.md` (every step, dated) and `DECISIONS_LOG.md` (every ruling, dated, with its source) |
 
 ---
@@ -890,7 +893,7 @@ pelias-master/
 | Step | Build | Gate that closes it | From the plans |
 |---|---|---|---|
 | **R0** | **Fable review of this document and the profiles; findings folded in; the author says go** (A12) | The author's word | — |
-| 1 | Close the measurement gaps: run the Batch C kernel probes (P-K1 to P-K3, P-Q10; a source dated 2026-10-26 01:50 exists in the author's results folder with an empty WSL result, not yet reviewed), the P-M4 file-read probe, the ReBAR on/off pair (BIOS switch, P-H2/H5/H6/H12 rerun), the graphics probe P-G0 (done 2026-10-26, 21.2.1) and its follow-ups P-G0b, P-E16, P-M5 (21.7) | Results recorded on both platforms | T0, E0, E1 |
+| 1 | Close the measurement gaps: run the Batch C kernel probes (P-K1 to P-K3, P-Q10; rewritten 2026-10-26 13:5x because the 01:50 source never compiled; Windows done in twelve revisions, 17.5; WSL2 run pending), the P-M4 file-read probe, the ReBAR on/off pair (BIOS switch, P-H2/H5/H6/H12 rerun), the graphics probe P-G0 (done 2026-10-26, 21.2.1) and its follow-ups P-G0b, P-E16, P-M5 (21.7) | Results recorded on both platforms | T0, E0, E1 |
 | 2 | Foundations: `os/`, `hal/` (CUDA backend), `plan/`, `io/` (reader, sha256, json, safetensors), `cli/` skeleton, build files, tests, boundary checks | Lists all 753 tensors with types; a plan above the ceiling is refused; corrupt-input gate; clean build on WSL2 and Windows | T1, E2, E3 (reader) |
 | 3 | `quant/` (Q4_K, Q6_K, Q8_0, activations, F16/BF16/F32) and Stage A | P-E6 bit-identical on all tensors; Stage A output equals the reference (P-X6) | T1b, E3 |
 | 4 | `tok/` tokenizer and template renderer; `data/` | P-D1, P-D2: zero mismatches (including `tojson` formatting) | T2, E10 (reuse) |
@@ -1013,6 +1016,22 @@ Everything here is copied from the audited sources; the full set (491 numbers, e
 
 Ceiling 92.0 to 88.2 tok/s (DERIVED). Recorded (tier build): WSL2 Cell A 37.9 short / 42.1 at 12 k; Windows Cell A 47.3, 46.8 short / 53.7, 54.1 at 12 k; WSL2 best cell 53.5 / 53.0 / 49.0. Bank peaks (whole card): 7.5 GiB bank 10.40 to 10.44 GiB at the default micro-batch and 10.67 to 10.69 at `-ub 2048`; 8.0 GiB bank 11.0 to 11.19 (over the ceiling). Prompt 1,670 tok/s at 12 k (tier), 2,238 (stock). MTP draft 2/3: 51.5 to 52.9 tok/s at 12 k against 45.4.
 
+### 17.5 Batch C kernel results (2026-10-26, Windows native; WSL2 pending)
+
+Raw files, every revision: `data/probe_results/batch_c/` (README there lists each run). Source: `tools/probes/batch_c/`. Weights and activations synthetic; Q4_K arithmetic from llama.cpp (READ-SRC, 5.3); peaks from P-H3 at the author's overclock (bf16 65.2 TFLOPS, int8 259.5 TOPS, fp8 129.8).
+
+| Probe | Result (MEASURED) | Rule | Outcome |
+|---|---|---|---|
+| P-K1 bf16 GEMM (Q4_K dequantized to a bf16 scratch, own tiled mma kernel) | 0.48 to 0.88 of the bf16 peak; 0.72x to 0.96x cuBLASLt; >= 0.85x on 17 of 20 shapes (r2). Below: attn_k M=2048 0.72, router M=2048 0.846, M=4096 0.73 | Adopt own kernel at >= 0.85x; reopen if efficiency < 0.35 | Own kernel adopted on 17 shapes; the three small ones keep the C16 rule |
+| P-K2 int8 path (Q4_K unpacked to int8, mma s8) | Best kernel v10 (r10/r11): 96.3 TOPS best, 0.25 to 0.37 of the int8 peak, 1.50x to 2.00x the bf16 GEMM, 1.39x to 1.84x including norm and conversions on all 20 shapes; correct on all shapes (max relative error 3.2e-6 against fp32 on the same inputs); cosine against the bf16 path 0.999974 | Mode F default at >= 1.3x and KL no worse (P-Q6) | Speed rule met on all 20 shapes; KL still needs P-Q6 |
+| P-K2b (r12) | Split-K on the low-tile shapes: at best 1.04x; bf16 output 0.92x to 0.99x; MoE experts 256 x M=64 in one grouped launch: int8 39.2 to 43.3 TOPS, 2.5x to 3.0x the bf16 kernel grouped the same way (4.7x to 5.0x with the bf16 path's weight dequantization), 2.5x to 2.8x faster than one expert at a time; layer order norm -> router -> q/k/v -> gate/up: L2 reuse of the shared input +0.6 to +1.2 % for the whole slice; int8 slice about 1.7x the bf16 slice | — | Grouped launch adopted for experts; no split-K; fp32 output |
+| P-K3 streamed dequantization | Q4_K 487 of 501 to 506 GB/s, Q6_K 496 to 501 of 510 GB/s (96 to 98 % of a plain read) | ALU-bound below 60 % | Memory-bound: in-register dequantization costs no bandwidth |
+| P-Q10 fp8 data gradient | e4m3 cosine 0.99965 to 0.99976 (>= 0.999); e5m2 0.9986 to 0.9991 (< 0.999); speed 1.99x from the peaks (DERIVED) | Adopt at >= 0.999 and >= 1.3x | e4m3 passes; e5m2 does not |
+
+Why the int8 path stops near a third of its peak (MEASURED with Nsight Compute on r8 to r10, attn_qkv M=4096): tensor busy = 16 cycles per m16n8k32 / (instructions per mma x cycles between a warp's instructions / warps per scheduler). The split is close to an accounting identity; the cause comes from what moved the speed. Fewer instructions per mma moved it (v2 24.7 -> v7 17.4 -> v8 16.8 -> v10 13.4; 27.7 % -> 37.7 % busy); more warps did not (v9 and v11: each warp's waits grew, mostly at barriers and the shared-memory queue). The remaining instructions are the exact Q4_K sub-block scale (a 6-bit integer per 32 weights, applied as an integer multiply-add per accumulator) and its bookkeeping. GeForce Ada runs bf16 and fp16 with fp32 accumulation at half rate, so int8 is the only full-rate path, and the Q4_K scales do not fit inside an int8 operand.
+
+Adopted for the engine (DECISION 2026-10-26, author's go on each revision): dense layers use int8 v10 (3 stages, fp32 output); MoE experts at small M use v12's 64x128 tile in one grouped launch; the activation quantization is fused into the RMSNorm that produces the activations (no separate pass: a separate pass costs a full read at 272 to 431 GB/s cold, the fused norm costs the same as a norm to bf16). Open: O12 to O14 (18.2).
+
 ---
 
 ## 18. Conflicts settled, decisions open (R27)
@@ -1038,7 +1057,7 @@ Sources compared: the reference profile JSON (P), the parameter dictionary (D), 
 | C13 | Interface | U: Dear ImGui (O9) | Web interface | A5 |
 | C14 | Kernel tolerances | U 10.2 vs trainer master 6.11 | The trainer's definitions govern; the universal ones are reported for information | They use different references (16.2) |
 | C15 | GPU backends | U: CUDA, HIP, SYCL/Level Zero, Vulkan | CUDA; Vulkan proposed; HIP and Level Zero later | 3.1 |
-| C16 | cuBLASLt | U: allowed if own GEMM < 0.85×; the Batch C source links it | Test-only comparison; not in the product | R4 ("no additional dependencies") |
+| C16 | cuBLASLt | U: allowed if own GEMM < 0.85×; the Batch C source links it (MEASURED 2026-10-26: own bf16 GEMM >= 0.85x on 17 of 20 shapes, 17.5) | Test-only comparison; not in the product | R4 ("no additional dependencies") |
 | C17 | "Avoid CUDA 13.2" label | U: PUBLISHED; records: AUTHOR-STATED | AUTHOR-STATED | Trainer master |
 | C18 | Training length | D: 8,192 window; the author's builder: rows ≤ 4,096 | Both: window 8,192; the author's rows are ≤ 4,096 | Different limits |
 | C20 | The port inside the training data | The author's dataset (built 2026-10-19) was made with `--server-port 8012` (READ-SRC, audit `options.server_port`) | Rebuild with `--server-port 8062` before the next training run; the Pelias coach writes `server.port` into the data automatically | A8: the trained model should name the port it is served on |
@@ -1073,6 +1092,9 @@ Sources compared: the reference profile JSON (P), the parameter dictionary (D), 
 | N9 | One GPU owner at a time (11.6) | Server unloads before a job; governor checks across processes | Step 11 |
 | N10 | Windows 10 and the CUDA 13.4 driver minimum | Check the toolkit's minimum driver against the final Windows 10 driver; fall back to the 13.0 toolkit for Windows | Step 15 |
 | N11 | SPIR-V compiler for the Vulkan backend | glslang at build time only | Step 16 |
+| O12 | Recompute the 8.8 speed prediction with the measured GEMM efficiencies (17.5) | Redo the 8.8 derivation with P-K1 and P-K2 as inputs | Step 10 |
+| O13 | expert down (K = 512) runs at 0.27 to 0.29 of the int8 peak: per-tile fill and drain over only 8 K steps (split-K, 2 stages and bf16 output measured, none helped) | A persistent kernel that loads the next tile while the current one drains; probe first | Step 5 |
+| O14 | Grouped expert launch with real routing (unequal rows per expert) | Measure with the router's actual counts once the engine routes | Step 7 |
 
 ---
 
@@ -1132,7 +1154,7 @@ Dates up to 2026-10-17 are **file modification dates on the author's drives** (e
 | 2026-10-23 | Windows-native runs; the trainer master; the outside research update; the Wave 0 probes on both platforms; the 10.7 GiB ceiling | Long master 8.2 |
 | 2026-10-24 | Engine hold (06:07); WSL and Windows versions (06:21); final micro-batch and export rulings (07:39); "ground up means the ground up" (08:15); the long master requested (09:09); the interim launchers and the server runbook | Long master 8.2; handoff of 2026-10-24 |
 | 2026-10-25 | The engine records consolidated (1,559-row manifest); the system master with its numbers and the draft-build list; a Batch C probe source written in the early hours of 10-26 (not yet run) | Backup INDEX entries 10 to 13 |
-| 2026-10-26 | The author lifts the holds and asks for this masterwork: one ground-up, universal, installable system, port 8062, Fable review before the build, and a first benchmark against the published 4-bit files | Section 0.2 |
+| 2026-10-26 | The author lifts the holds and asks for this masterwork: one ground-up, universal, installable system, port 8062, Fable review before the build, and a first benchmark against the published 4-bit files. Afternoon: build step 1 starts; Batch C rewritten and run on Windows in twelve revisions, the int8 limit measured and the kernels adopted | Section 0.2; 17.5 |
 
 The thread through all of it, in the long master's words: the project began as a **training** problem, the measurements of that problem raised the **inference** question, and the llama.cpp work was the way to learn what a ground-up server must do. Every speed recorded so far came from the patched llama.cpp build; the first Pelias engine run is the experiment that answers the question the whole project has been asking.
 

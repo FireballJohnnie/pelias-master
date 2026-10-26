@@ -25,7 +25,8 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), 
 INV = 'docs/scaffold/REPO_INVENTORY.tsv'
 SKIP_DIRS = {'.git', 'build', 'out'}
 LOCAL = ('profiles/local_only/', 'support/local_only/')
-TEXT_EXT = {'.md', '.json', '.csv', '.tsv', '.py', '.hpp', '.txt', '.gitignore', '.gitattributes', ''}
+TEXT_EXT = {'.md', '.json', '.csv', '.tsv', '.py', '.hpp', '.txt', '.gitignore', '.gitattributes', '',
+            '.h', '.cpp', '.cu', '.comp', '.idl', '.sh', '.ps1'}  # source code scanned too (2026-10-26, Batch C)
 COPYRIGHT = 'Copyright (c) 2026 John Lipka and the Pelias contributors'
 # Private words are stored as SHA-256 hashes of their lower-case form, so this file does not itself contain them.
 HASHED_WORDS = {
