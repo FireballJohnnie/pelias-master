@@ -1,0 +1,22 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {"major": 3, "minor": 24, "patch": 0},
+  "configurePresets": [
+    {"name": "host", "displayName": "Host-only (no CUDA)", "generator": "Ninja", "binaryDir": "${sourceDir}/build/host",
+     "cacheVariables": {"CMAKE_BUILD_TYPE": "Release", "PELIAS_CUDA": "OFF"}},
+    {"name": "wsl", "displayName": "WSL2 / Linux with CUDA", "generator": "Ninja", "binaryDir": "${sourceDir}/build/wsl",
+     "cacheVariables": {"CMAKE_BUILD_TYPE": "Release", "PELIAS_CUDA": "ON", "CMAKE_CUDA_COMPILER": "/usr/local/cuda/bin/nvcc"}},
+    {"name": "windows", "displayName": "Windows native with CUDA (x64 tools)", "generator": "Ninja", "binaryDir": "${sourceDir}/build/windows",
+     "cacheVariables": {"CMAKE_BUILD_TYPE": "Release", "PELIAS_CUDA": "ON"}}
+  ],
+  "buildPresets": [
+    {"name": "host", "configurePreset": "host"},
+    {"name": "wsl", "configurePreset": "wsl"},
+    {"name": "windows", "configurePreset": "windows"}
+  ],
+  "testPresets": [
+    {"name": "host", "configurePreset": "host", "output": {"outputOnFailure": true}},
+    {"name": "wsl", "configurePreset": "wsl", "output": {"outputOnFailure": true}},
+    {"name": "windows", "configurePreset": "windows", "output": {"outputOnFailure": true}}
+  ]
+}

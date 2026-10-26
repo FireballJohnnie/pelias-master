@@ -2,7 +2,7 @@
 
 **One ground-up program that probes the machine, takes a local GGUF or safetensors model, coaches and runs training or quantization, writes the resulting GGUF, and serves it on port 8062 through its own engine and server.**
 
-> **PRE-RELEASE, PRIVATE. Specification stage, 2026-10-26.** No product code exists yet. The design is complete in [`docs/PELIAS_SYSTEM_MASTERWORK.md`](docs/PELIAS_SYSTEM_MASTERWORK.md), reviewed by Claude Fable on 2026-10-26 (`docs/reviews/`), and waits for the author's go before the build starts. Nothing in this repository is a measured result of this program; the measured numbers it cites come from the sibling repositories' ledgers and probe runs, each with its label.
+> **PRE-RELEASE, PRIVATE. Build step 2 (Foundations) in progress, 2026-10-26.** The first product code exists (`src/`: file mapping, the GGUF and safetensors readers, SHA-256, JSON, the device query and VRAM ceiling, the memory planner, the `pelias` command with `inspect`, `plan`, `key`, `device`); it builds host-only without a GPU and with the CUDA backend on WSL2 and Windows (`docs/BUILD_NOTES.md`). Everything else is specification. The design is complete in [`docs/PELIAS_SYSTEM_MASTERWORK.md`](docs/PELIAS_SYSTEM_MASTERWORK.md), reviewed by Claude Fable on 2026-10-26 (`docs/reviews/`), and waits for the author's go before the build starts. The measured numbers the documents cite come from the probe runs kept in `data/probe_results/` and the sibling repositories' ledgers, each with its label.
 
 **Author and maintainer:** John Lipka. Developed with AI assistance under his direction. Sibling repositories (records of the design and measurements): pelias-trainer, pelias-engine.
 
@@ -48,3 +48,19 @@ Every number carries a label (MEASURED, READ-SRC, PUBLISHED, DERIVED, ESTIMATE, 
 ## Licence
 
 Apache-2.0 (`LICENSE`). Copyright (c) 2026 John Lipka and the Pelias contributors.
+
+
+## Building (step 2 onward)
+
+No third-party libraries: C++20, CMake 3.24+, Ninja; the CUDA toolkit only for `-DPELIAS_CUDA=ON`.
+
+```
+# host-only (any machine, no GPU): build, unit tests, the corrupt-input gate
+cmake --preset host && cmake --build --preset host && ctest --preset host
+# WSL2 / Linux with CUDA
+cmake --preset wsl && cmake --build --preset wsl && ctest --preset wsl
+# Windows: from an x64 Native Tools Command Prompt (where cl -> Hostx64\x64)
+cmake --preset windows && cmake --build --preset windows && ctest --preset windows
+```
+
+Then `build/<preset>/pelias inspect --model <file.gguf>`, `pelias plan --model <file.gguf> [--bank-gib N] [--ceiling-gib C]`, `pelias device`, `pelias key --model <file>`. Repository checks: `python3 tools/check_module_deps.py` (module boundaries) and `python3 docs/scaffold/verify_inventory.py` (inventory and privacy scan).

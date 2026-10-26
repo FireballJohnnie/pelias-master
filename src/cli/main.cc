@@ -1,0 +1,296 @@
+// provenance: original
+// Copyright (c) 2026 John Lipka and the Pelias contributors
+//
+// main.cc - the `pelias` command. Step 2 carries: version, inspect (every tensor of a GGUF with its type, shape and
+// bytes), key (SHA-256 model key), plan (the device memory plan against the ceiling, refused above it), device (what
+// the GPU reports). The later verbs (probe, quantize, train, export, verify, serve, bench, web) are listed as not yet
+// built so the user gets a clear answer instead of a silent failure.
+//
+// Exit codes: 0 ok; 1 usage; 2 the input could not be read (missing, corrupt, unsupported); 3 a gate refused (plan
+// over the ceiling); 4 no device.
+#include <cstdio>
+#include <cstring>
+#include <map>
+#include <string>
+#include <vector>
+
+#include "hal/device.h"
+#include "hal/vram_governor.h"
+#include "io/gguf_reader.h"
+#include "io/safetensors.h"
+#include "io/sha256.h"
+#include "os/clock.h"
+#include "os/file_map.h"
+#include "pelias/log.h"
+#include "pelias/timer.h"
+#include "pelias/version.h"
+#include "plan/memory_plan.h"
+#include "plan/probe_constants.h"
+#include "quant/block_types.h"
+
+namespace {
+
+using namespace pelias;
+
+struct Args {
+  std::vector<std::string> pos;
+  std::vector<std::pair<std::string, std::string>> opts;
+  [[nodiscard]] bool has(const std::string& k) const {
+    for (const auto& o : opts)
+      if (o.first == k) return true;
+    return false;
+  }
+  [[nodiscard]] std::string get(const std::string& k, const std::string& d = "") const {
+    for (const auto& o : opts)
+      if (o.first == k) return o.second;
+    return d;
+  }
+  [[nodiscard]] double num(const std::string& k, double d) const { return has(k) ? std::strtod(get(k).c_str(), nullptr) : d; }
+};
+
+Args parse_args(int argc, char** argv) {
+  Args a;
+  for (int i = 1; i < argc; ++i) {
+    const std::string t = argv[i];
+    if (t.rfind("--", 0) == 0) {
+      const std::size_t eq = t.find('=');
+      if (eq != std::string::npos) {
+        a.opts.emplace_back(t.substr(2, eq - 2), t.substr(eq + 1));
+      } else if (i + 1 < argc && std::string(argv[i + 1]).rfind("--", 0) != 0) {
+        a.opts.emplace_back(t.substr(2), argv[++i]);
+      } else {
+        a.opts.emplace_back(t.substr(2), "1");
+      }
+    } else {
+      a.pos.push_back(t);
+    }
+  }
+  return a;
+}
+
+void usage() {
+  std::puts(
+      "pelias <command> [options]\n"
+      "  version                         build version and backends\n"
+      "  device [--index N]              what the GPU reports (CUDA and NVML), and the VRAM ceiling\n"
+      "  inspect --model FILE [--json] [--header-only]\n"
+      "                                  every tensor of a GGUF or safetensors file: name, type, shape, bytes\n"
+      "                                  (--header-only: read a file whose data is cut off, e.g. a header sample)\n"
+      "  key --model FILE                SHA-256 of the file (the model key)\n"
+      "  plan --model FILE [--bank-gib N] [--ceiling-gib C] [--working-set-gib W] [--index N] [--header-only]\n"
+      "                                  the device memory plan; refused above the ceiling (exit 3)\n"
+      "  probe | quantize | train | export | verify | serve | bench | web   not built yet (later steps)\n"
+      "options: --log debug|info|warn|error (default info)");
+}
+
+int fail_input(const Status& s) {
+  std::fprintf(stderr, "pelias: %s\n", s.text().c_str());
+  return s.code == Code::not_found || s.code == Code::io_error ? 2 : (s.code == Code::corrupt || s.code == Code::unsupported ? 2 : 1);
+}
+
+bool looks_like_safetensors(const os::FileMap& m) {
+  return m.size() >= 9 && std::memcmp(m.data(), "GGUF", 4) != 0 && m.data()[8] == '{';
+}
+
+std::string shape_text(const std::uint64_t* ne, std::uint32_t n) {
+  std::string s = "[";
+  for (std::uint32_t i = 0; i < n; ++i) s += (i ? "," : "") + std::to_string(ne[i]);
+  return s + "]";
+}
+
+int cmd_version() {
+  std::printf("pelias %s (%s, %s) backends: %s\n", kVersion, kGitCommit, kBuildType, kHasCuda ? "cuda" : "none (host-only build)");
+  return 0;
+}
+
+int cmd_device(const Args& a) {
+  const hal::DeviceInfo d = hal::query_device(static_cast<int>(a.num("index", 0)));
+  std::printf("platform: %s\n", os::platform_name().c_str());
+  if (!d.available) {
+    std::printf("device: none (%s)\n", d.note.c_str());
+  } else {
+    std::printf("device %d: %s, compute capability %d.%d, %d SMs\n", d.index, d.name.c_str(), d.cc_major, d.cc_minor, d.sm_count);
+    std::printf("VRAM total %s; free after the context (CUDA) %s\n", plan::format_bytes(d.vram_total).c_str(), plan::format_bytes(d.vram_free_cuda).c_str());
+  }
+  if (d.nvml_available)
+    std::printf("NVML: free %s, used %s, driver %s\n", plan::format_bytes(d.vram_free_nvml).c_str(), plan::format_bytes(d.vram_used_nvml).c_str(), d.driver_version.c_str());
+  else
+    std::printf("NVML: unavailable (%s)\n", d.note.c_str());
+  const hal::Ceiling c = hal::ceiling_from_device(d);
+  if (c.bytes) std::printf("VRAM ceiling: %s (basis %s %s minus margin %s; standing rule 3)\n", plan::format_bytes(c.bytes).c_str(), c.basis, plan::format_bytes(c.basis_free).c_str(), plan::format_bytes(c.margin).c_str());
+  return d.available ? 0 : 4;
+}
+
+int cmd_inspect(const Args& a) {
+  const std::string path = a.get("model");
+  if (path.empty()) {
+    usage();
+    return 1;
+  }
+  os::FileMap m;
+  Status s = m.open(path);
+  if (!s) return fail_input(s);
+  const bool json = a.has("json");
+  Timer t;
+  if (looks_like_safetensors(m)) {
+    io::SafetensorsReader r;
+    s = r.parse(m);
+    if (!s) return fail_input(s);
+    if (json) {
+      io::Json root = io::Json::object();
+      root.set("format", io::Json::string("safetensors"));
+      root.set("file_bytes", io::Json::unsigned_integer(m.size()));
+      root.set("header_bytes", io::Json::unsigned_integer(r.header_bytes()));
+      io::Json ts = io::Json::array();
+      for (const auto& x : r.tensors()) {
+        io::Json j = io::Json::object();
+        j.set("name", io::Json::string(x.name)).set("dtype", io::Json::string(x.dtype));
+        io::Json sh = io::Json::array();
+        for (const auto d : x.shape) sh.push(io::Json::unsigned_integer(d));
+        j.set("shape", sh).set("bytes", io::Json::unsigned_integer(x.bytes())).set("file_offset", io::Json::unsigned_integer(x.file_offset));
+        ts.push(j);
+      }
+      root.set("tensors", ts);
+      std::puts(root.dump(1).c_str());
+    } else {
+      std::printf("safetensors: %zu tensors, header %llu bytes, file %s\n", r.tensors().size(), static_cast<unsigned long long>(r.header_bytes()), plan::format_bytes(m.size()).c_str());
+      for (const auto& x : r.tensors()) {
+        std::string sh = "[";
+        for (std::size_t i = 0; i < x.shape.size(); ++i) sh += (i ? "," : "") + std::to_string(x.shape[i]);
+        std::printf("%-56s %-6s %-24s %14llu bytes\n", x.name.c_str(), x.dtype.c_str(), (sh + "]").c_str(), static_cast<unsigned long long>(x.bytes()));
+      }
+    }
+    return 0;
+  }
+  io::GgufReader r;
+  s = r.parse(m, !a.has("header-only"));
+  if (!s) return fail_input(s);
+  const double parse_ms = t.ms();
+  std::map<std::uint32_t, std::uint64_t> by_type_count, by_type_bytes;
+  for (const auto& x : r.tensors()) {
+    ++by_type_count[x.type];
+    by_type_bytes[x.type] += x.bytes;
+  }
+  if (json) {
+    io::Json root = io::Json::object();
+    root.set("format", io::Json::string("gguf")).set("version", io::Json::unsigned_integer(r.version())).set("alignment", io::Json::unsigned_integer(r.alignment()));
+    root.set("file_bytes", io::Json::unsigned_integer(m.size())).set("data_start", io::Json::unsigned_integer(r.data_start())).set("data_bytes", io::Json::unsigned_integer(r.data_bytes()));
+    root.set("n_kv", io::Json::unsigned_integer(r.kv().size())).set("n_tensors", io::Json::unsigned_integer(r.tensors().size()));
+    root.set("architecture", io::Json::string(r.get_string("general.architecture")));
+    io::Json types = io::Json::array();
+    for (const auto& [id, cnt] : by_type_count) {
+      io::Json j = io::Json::object();
+      j.set("type", io::Json::string(quant::type_info(id).name)).set("id", io::Json::unsigned_integer(id)).set("tensors", io::Json::unsigned_integer(cnt)).set("bytes", io::Json::unsigned_integer(by_type_bytes[id]));
+      types.push(j);
+    }
+    root.set("types", types);
+    io::Json ts = io::Json::array();
+    for (const auto& x : r.tensors()) {
+      io::Json j = io::Json::object();
+      j.set("name", io::Json::string(x.name)).set("type", io::Json::string(quant::type_info(x.type).name)).set("type_id", io::Json::unsigned_integer(x.type));
+      io::Json sh = io::Json::array();
+      for (std::uint32_t i = 0; i < x.n_dims; ++i) sh.push(io::Json::unsigned_integer(x.ne[i]));
+      j.set("shape", sh).set("bytes", io::Json::unsigned_integer(x.bytes)).set("file_offset", io::Json::unsigned_integer(x.file_offset)).set("class", io::Json::string(plan::class_name(plan::classify(x.name))));
+      ts.push(j);
+    }
+    root.set("tensors", ts);
+    std::puts(root.dump(1).c_str());
+    return 0;
+  }
+  std::printf("GGUF version %u, alignment %u; %zu key-value pairs, %zu tensors; data at byte %llu, %s of data in a %s file; architecture %s\n", r.version(), r.alignment(),
+              r.kv().size(), r.tensors().size(), static_cast<unsigned long long>(r.data_start()), plan::format_bytes(r.data_bytes()).c_str(), plan::format_bytes(m.size()).c_str(),
+              r.get_string("general.architecture").c_str());
+  for (const auto& [id, cnt] : by_type_count)
+    std::printf("  %-8s %4llu tensors %14s (%.4g bits per weight)\n", quant::type_info(id).name, static_cast<unsigned long long>(cnt), plan::format_bytes(by_type_bytes[id]).c_str(), quant::bits_per_weight(id));
+  for (const auto& x : r.tensors())
+    std::printf("%-44s %-8s %-24s %14llu bytes  %s\n", x.name.c_str(), quant::type_info(x.type).name, shape_text(x.ne, x.n_dims).c_str(), static_cast<unsigned long long>(x.bytes),
+                plan::class_name(plan::classify(x.name)));
+  std::printf("%zu tensors listed; header parsed in %.1f ms\n", r.tensors().size(), parse_ms);
+  if (r.data_start() + r.data_bytes() > m.size())
+    std::printf("note: header only: the full file would be %llu bytes\n", static_cast<unsigned long long>(r.data_start() + r.data_bytes()));
+  else if (r.data_start() + r.data_bytes() != m.size())
+    std::printf("note: the file has %llu bytes after the last tensor\n", static_cast<unsigned long long>(m.size() - r.data_start() - r.data_bytes()));
+  return 0;
+}
+
+int cmd_key(const Args& a) {
+  const std::string path = a.get("model");
+  if (path.empty()) {
+    usage();
+    return 1;
+  }
+  os::FileMap m;
+  const Status s = m.open(path);
+  if (!s) return fail_input(s);
+  m.advise_sequential();
+  Timer t;
+  io::Sha256 h;
+  const std::uint64_t chunk = std::uint64_t{64} << 20;
+  for (std::uint64_t off = 0; off < m.size(); off += chunk) h.update(m.data() + off, static_cast<std::size_t>(m.size() - off < chunk ? m.size() - off : chunk));
+  const std::string hex = io::Sha256::hex(h.finish());
+  const double sec = t.seconds();
+  std::printf("%s  %llu bytes  (%.2f s, %.2f GB/s)\n", hex.c_str(), static_cast<unsigned long long>(m.size()), sec, sec > 0 ? static_cast<double>(m.size()) / sec / 1e9 : 0.0);
+  return 0;
+}
+
+int cmd_plan(const Args& a) {
+  const std::string path = a.get("model");
+  if (path.empty()) {
+    usage();
+    return 1;
+  }
+  os::FileMap m;
+  Status s = m.open(path);
+  if (!s) return fail_input(s);
+  io::GgufReader r;
+  s = r.parse(m, !a.has("header-only"));  // a plan needs only the tensor table; --header-only plans from a header sample
+  if (!s) return fail_input(s);
+  plan::PlanRequest req;
+  if (a.has("ceiling-gib")) {
+    const hal::Ceiling c = hal::ceiling_stated(static_cast<std::uint64_t>(a.num("ceiling-gib", 0) * static_cast<double>(plan::kGiB)));
+    req.ceiling_bytes = c.bytes;
+    req.ceiling_basis = "stated";
+  } else {
+    const hal::DeviceInfo d = hal::query_device(static_cast<int>(a.num("index", 0)));
+    const hal::Ceiling c = hal::ceiling_from_device(d);
+    if (c.bytes) {
+      req.ceiling_bytes = c.bytes;
+      req.ceiling_basis = std::string("measured now: ") + c.basis + " free " + plan::format_bytes(c.basis_free) + " minus margin " + plan::format_bytes(c.margin);
+    } else {
+      std::fprintf(stderr, "pelias: no device (%s); state a ceiling with --ceiling-gib to plan without one\n", d.note.c_str());
+      return 4;
+    }
+  }
+  if (a.has("bank-gib")) req.bank_bytes = static_cast<std::uint64_t>(a.num("bank-gib", 0) * static_cast<double>(plan::kGiB));
+  if (a.has("working-set-gib")) req.working_set_bytes = static_cast<std::uint64_t>(a.num("working-set-gib", 0) * static_cast<double>(plan::kGiB));
+  const Result<plan::Plan> res = plan::make_plan(r, req);
+  if (res.status.code == Code::invalid_argument) return fail_input(res.status);
+  std::fputs(plan::plan_text(res.value).c_str(), stdout);
+  return res.ok() ? 0 : 3;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  const Args a = parse_args(argc, argv);
+  if (a.pos.empty() || a.has("help")) {
+    usage();
+    return a.pos.empty() ? 1 : 0;
+  }
+  const std::string lv = a.get("log", "info");
+  log::set_level(lv == "debug" ? log::Level::debug : lv == "warn" ? log::Level::warn : lv == "error" ? log::Level::error : log::Level::info);
+  const std::string cmd = a.pos[0];
+  if (cmd == "version") return cmd_version();
+  if (cmd == "device") return cmd_device(a);
+  if (cmd == "inspect") return cmd_inspect(a);
+  if (cmd == "key") return cmd_key(a);
+  if (cmd == "plan") return cmd_plan(a);
+  for (const char* later : {"probe", "quantize", "train", "export", "verify", "serve", "bench", "web"})
+    if (cmd == later) {
+      std::fprintf(stderr, "pelias: '%s' is not built yet (a later step of the order of operations)\n", later);
+      return 1;
+    }
+  std::fprintf(stderr, "pelias: unknown command '%s'\n", cmd.c_str());
+  usage();
+  return 1;
+}

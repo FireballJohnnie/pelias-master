@@ -3,4 +3,6 @@ profiles/local_only/
 support/local_only/
 # Build output
 build/
+build_wsl/
+build_win/
 out/

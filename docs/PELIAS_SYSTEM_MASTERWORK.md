@@ -855,7 +855,7 @@ pelias-master/
 
 ### 14.3 Module dependencies (acyclic; boundary check BC1)
 
-`os` → none; `hal` → os; `quant`, `plan`, `bank` → hal; `bus` → os, hal, quant; `io` → os, hal, quant; `tok` → io (for `io/json`, so there is one JSON parser); `kern` → hal, quant; `model` → hal, quant, io; `ingest` → hal, quant, io; `data` → io, tok; `stream` → hal, bus, model; `sched` → hal, kern, model, stream; `train` → hal, data, model, sched; `export` → hal, quant, io, model, bank; `verify` → hal, io, quant; `cpu` → os, hal, quant, bus; `gpu` → hal, quant, bank, bus, kern; `engine` → os, hal, plan, bus, bank, quant, io, model, kern, cpu, gpu; `server` → os, io, tok, engine, web, flow (the interface's `/api/*` calls and the model's tool calls); `web` → os, io; `project` → io; `startup` → os, hal, plan, io, project; `intake` → io, tok, data; `warn` → io, data, verify, intake; `flow` → plan, startup, project, intake, warn, verify, help; `cli` → everything above. (From the universal specification 4.3, with `web` added and `ui` removed: the interface is now files served by `server`.)
+`os` → none; `hal` → os; `quant`, `bank` → hal; `plan` → hal, io (io added at step 2: the planner reads the tensor table); `bus` → os, hal, quant; `io` → os, hal, quant; `tok` → io (for `io/json`, so there is one JSON parser); `kern` → hal, quant; `model` → hal, quant, io; `ingest` → hal, quant, io; `data` → io, tok; `stream` → hal, bus, model; `sched` → hal, kern, model, stream; `train` → hal, data, model, sched; `export` → hal, quant, io, model, bank; `verify` → hal, io, quant; `cpu` → os, hal, quant, bus; `gpu` → hal, quant, bank, bus, kern; `engine` → os, hal, plan, bus, bank, quant, io, model, kern, cpu, gpu; `server` → os, io, tok, engine, web, flow (the interface's `/api/*` calls and the model's tool calls); `web` → os, io; `project` → io; `startup` → os, hal, plan, io, project; `intake` → io, tok, data; `warn` → io, data, verify, intake; `flow` → plan, startup, project, intake, warn, verify, help; `cli` → everything above. (From the universal specification 4.3, with `web` added and `ui` removed: the interface is now files served by `server`.)
 
 ### 14.4 What this repository holds today (R30)
 
@@ -872,7 +872,10 @@ pelias-master/
 | `tools/ui/` | The spear texture baker |
 | `tools/probes/gfx_probe/` | The graphics probe P-G0 / P-G0b (Direct3D 12 and Vulkan) |
 | `tools/probes/batch_c/` | The Batch C kernel probes P-K1, P-K2, P-K2b, P-K3, P-Q10 (with the Wave 0 framework files they build on) |
-| `data/probe_results/` | Every probe result file, failures included: `P-G0/` and `batch_c/` (one folder per revision), each with a README |
+| `data/probe_results/` | Every probe result file, failures included: `P-G0/`, `batch_c/`, `P-M4/`, `P-E16/`, each with a README |
+| `src/`, `include/pelias/`, `CMakeLists.txt`, `cmake/`, `CMakePresets.json`, `VERSION` | The product tree from step 2 on (os, hal, quant, io, plan, cli; 14.2) |
+| `tests/` | The own test harness, unit tests, the corrupt-input gate (`pelias_mutate`); `tests/data/` is written at test time |
+| `tools/check_module_deps.py` | Boundary checks BC1, BC3, BC4, BC6 (3.4) |
 | `logs/` | `BUILD_LOG.md` (every step, dated) and `DECISIONS_LOG.md` (every ruling, dated, with its source) |
 
 ---
@@ -894,7 +897,7 @@ pelias-master/
 |---|---|---|---|
 | **R0** | **Fable review of this document and the profiles; findings folded in; the author says go** (A12) | The author's word | — |
 | 1 | Close the measurement gaps: run the Batch C kernel probes (P-K1 to P-K3, P-Q10; rewritten 2026-10-26 13:5x because the 01:50 source never compiled; done on Windows in twelve revisions and on WSL2 with the final one, 17.5), the P-M4 file-read probe (done on both platforms 2026-10-26, 17.2), P-E16 (done 2026-10-26, 21.2), P-M5 (deferred to step 10, O16), the ReBAR on/off pair (made optional by the author 2026-10-26 17:29: ReBAR support is built in and the startup probe picks each path on the user's machine, 21.7 ruling of 13:21; the ReBAR-off path is validated on a later build day as an adjustment, not a rewrite, O17; the driver's per-program rBAR setting does not shrink BAR1, so only the BIOS switch is a real "off") (BIOS switch, P-H2/H5/H6/H12 rerun), the graphics probe P-G0 (done 2026-10-26, 21.2.1) and its follow-ups P-G0b, P-E16, P-M5 (21.7) | Results recorded on both platforms | T0, E0, E1 |
-| 2 | Foundations: `os/`, `hal/` (CUDA backend), `plan/`, `io/` (reader, sha256, json, safetensors), `cli/` skeleton, build files, tests, boundary checks | Lists all 753 tensors with types; a plan above the ceiling is refused; corrupt-input gate; clean build on WSL2 and Windows | T1, E2, E3 (reader) |
+| 2 | Foundations: `os/`, `hal/` (CUDA backend), `plan/`, `io/` (reader, sha256, json, safetensors), `cli/` skeleton, build files, tests, boundary checks (stages A and B built and tested host-only 2026-10-26 evening, `docs/BUILD_NOTES.md`; stage C, the gate on both platforms, is the author's run) | Lists every tensor with its type (753 in the served file; 733 in the Unsloth file, whose header is the count that must match); a plan above the ceiling is refused; corrupt-input gate; clean build on WSL2 and Windows | T1, E2, E3 (reader) |
 | 3 | `quant/` (Q4_K, Q6_K, Q8_0, activations, F16/BF16/F32) and Stage A | P-E6 bit-identical on all tensors; Stage A output equals the reference (P-X6) | T1b, E3 |
 | 4 | `tok/` tokenizer and template renderer; `data/` | P-D1, P-D2: zero mismatches (including `tojson` formatting) | T2, E10 (reuse) |
 | 5 | `kern/` spine and expert kernels, slow references first | Rung 1 tolerances; kernel parity | T3 to T6, E4, E5, E7 |

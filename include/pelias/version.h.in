@@ -1,0 +1,12 @@
+// provenance: original
+// Copyright (c) 2026 John Lipka and the Pelias contributors
+//
+// version.h - filled in by CMake from the VERSION file and the git commit, if any.
+#pragma once
+
+namespace pelias {
+inline constexpr const char* kVersion = "@PELIAS_VERSION@";
+inline constexpr const char* kGitCommit = "@PELIAS_GIT_COMMIT@";
+inline constexpr const char* kBuildType = "@CMAKE_BUILD_TYPE@";
+inline constexpr bool kHasCuda = @PELIAS_HAS_CUDA_BOOL@;
+}  // namespace pelias

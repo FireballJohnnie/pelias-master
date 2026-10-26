@@ -1,0 +1,4 @@
+# Test files are written here at test time; the real header sample stays on the author's drive. Only this file and README.md are tracked.
+*
+!.gitignore
+!README.md
