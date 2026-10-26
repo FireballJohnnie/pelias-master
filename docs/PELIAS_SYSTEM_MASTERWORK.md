@@ -893,7 +893,7 @@ pelias-master/
 | Step | Build | Gate that closes it | From the plans |
 |---|---|---|---|
 | **R0** | **Fable review of this document and the profiles; findings folded in; the author says go** (A12) | The author's word | — |
-| 1 | Close the measurement gaps: run the Batch C kernel probes (P-K1 to P-K3, P-Q10; rewritten 2026-10-26 13:5x because the 01:50 source never compiled; done on Windows in twelve revisions and on WSL2 with the final one, 17.5), the P-M4 file-read probe, the ReBAR on/off pair (BIOS switch, P-H2/H5/H6/H12 rerun), the graphics probe P-G0 (done 2026-10-26, 21.2.1) and its follow-ups P-G0b, P-E16, P-M5 (21.7) | Results recorded on both platforms | T0, E0, E1 |
+| 1 | Close the measurement gaps: run the Batch C kernel probes (P-K1 to P-K3, P-Q10; rewritten 2026-10-26 13:5x because the 01:50 source never compiled; done on Windows in twelve revisions and on WSL2 with the final one, 17.5), the P-M4 file-read probe (done on both platforms 2026-10-26, 17.2), the ReBAR on/off pair (tabled: fast boot kept the BIOS from opening; the driver's per-program rBAR setting does not shrink BAR1, so only the BIOS switch is a real "off") (BIOS switch, P-H2/H5/H6/H12 rerun), the graphics probe P-G0 (done 2026-10-26, 21.2.1) and its follow-ups P-G0b, P-E16, P-M5 (21.7) | Results recorded on both platforms | T0, E0, E1 |
 | 2 | Foundations: `os/`, `hal/` (CUDA backend), `plan/`, `io/` (reader, sha256, json, safetensors), `cli/` skeleton, build files, tests, boundary checks | Lists all 753 tensors with types; a plan above the ceiling is refused; corrupt-input gate; clean build on WSL2 and Windows | T1, E2, E3 (reader) |
 | 3 | `quant/` (Q4_K, Q6_K, Q8_0, activations, F16/BF16/F32) and Stage A | P-E6 bit-identical on all tensors; Stage A output equals the reference (P-X6) | T1b, E3 |
 | 4 | `tok/` tokenizer and template renderer; `data/` | P-D1, P-D2: zero mismatches (including `tojson` formatting) | T2, E10 (reuse) |
@@ -1006,6 +1006,7 @@ Everything here is copied from the audited sources; the full set (491 numbers, e
 | Pinned memory (P-H7) | 32 GiB held on both; allocation 0.76 to 1.0 / 0.069 s per GiB |
 | Graphs (P-H9) | Replay 0.716 / 0.707 µs per kernel; eager 4.70 / 2.18 |
 | Overlap (P-H12) | 0.47 / 0.52 unflushed; 0.92 flushed; copy pair 0.84 |
+| Model file read, 22.13 GB Q4_K_M on the C: NVMe (P-M4, 2026-10-26) | Windows: unbuffered 2.51 GB/s (1 MiB reads) and 3.08 (16 MiB), file cache 12.0 / 12.4, memory-mapped 4.6 to 4.7; WSL2 through `/mnt/c` (virtiofs): 1.54 to 1.59 cold and warm alike (the bridge is the limit; the Windows cache is outside WSL's control), memory-mapped 1.22. Load time for the file: about 7 s Windows cold, 14 s WSL2, 2 s from the Windows cache (DERIVED from these). Single-threaded synchronous reads; a loader with several reads in flight is unmeasured. The earlier 1.9 to 2.1 GB/s cold read was the D: drive (PCIe 3.0 x2; author, 16:28) |
 | Long hold, soak, canary, display timeout | All passed with zero mismatches and zero errors |
 
 ### 17.3 Model
