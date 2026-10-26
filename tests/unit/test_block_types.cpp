@@ -13,15 +13,15 @@ TEST(block_types_sizes_match_the_reference_table) {
                       {21, "IQ3_S", 256, 110}, {22, "IQ2_S", 256, 82}, {23, "IQ4_XS", 256, 136}, {29, "IQ1_M", 256, 56}, {30, "BF16", 1, 2}, {34, "TQ1_0", 256, 54},
                       {35, "TQ2_0", 256, 66}, {39, "MXFP4", 32, 17}};
   for (const Row& r : rows) {
-    const TypeInfo t = type_info(r.id);
+    const TypeInfo t = pelias::quant::type_info(r.id);
     CHECK(t.known);
     CHECK_EQ(std::string(t.name), std::string(r.name));
     CHECK_EQ(t.block_elements, r.elems);
     CHECK_EQ(t.block_bytes, r.bytes);
   }
-  CHECK(!type_info(4).known);   // removed ids
-  CHECK(!type_info(31).known);
-  CHECK(!type_info(43).known);
+  CHECK(!pelias::quant::type_info(4).known);   // removed ids
+  CHECK(!pelias::quant::type_info(31).known);
+  CHECK(!pelias::quant::type_info(43).known);
   CHECK_EQ(row_bytes(12, 2048), 2048u / 256 * 144);
   CHECK_EQ(row_bytes(12, 100), 0u);  // not a whole number of blocks
   CHECK(bits_per_weight(12) > 4.49 && bits_per_weight(12) < 4.51);
