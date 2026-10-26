@@ -198,6 +198,7 @@ int cmd_inspect(const Args& a) {
   s = r.parse(m, !a.has("header-only"));
   if (!s) return fail_input(s);
   const double parse_ms = t.ms();
+  const std::uint64_t first_mtp = plan::first_mtp_block(r);
   std::map<std::uint32_t, std::uint64_t> by_type_count, by_type_bytes;
   for (const auto& x : r.tensors()) {
     ++by_type_count[x.type];
@@ -222,7 +223,7 @@ int cmd_inspect(const Args& a) {
       j.set("name", io::Json::string(x.name)).set("type", io::Json::string(quant::type_info(x.type).name)).set("type_id", io::Json::unsigned_integer(x.type));
       io::Json sh = io::Json::array();
       for (std::uint32_t i = 0; i < x.n_dims; ++i) sh.push(io::Json::unsigned_integer(x.ne[i]));
-      j.set("shape", sh).set("bytes", io::Json::unsigned_integer(x.bytes)).set("file_offset", io::Json::unsigned_integer(x.file_offset)).set("class", io::Json::string(plan::class_name(plan::classify(x.name))));
+      j.set("shape", sh).set("bytes", io::Json::unsigned_integer(x.bytes)).set("file_offset", io::Json::unsigned_integer(x.file_offset)).set("class", io::Json::string(plan::class_name(plan::classify(x.name, first_mtp))));
       ts.push(j);
     }
     root.set("tensors", ts);
@@ -236,7 +237,7 @@ int cmd_inspect(const Args& a) {
     std::printf("  %-8s %4llu tensors %14s (%.4g bits per weight)\n", quant::type_info(id).name, static_cast<unsigned long long>(cnt), plan::format_bytes(by_type_bytes[id]).c_str(), quant::bits_per_weight(id));
   for (const auto& x : r.tensors())
     std::printf("%-44s %-8s %-24s %14llu bytes  %s\n", x.name.c_str(), quant::type_info(x.type).name, shape_text(x.ne, x.n_dims).c_str(), static_cast<unsigned long long>(x.bytes),
-                plan::class_name(plan::classify(x.name)));
+                plan::class_name(plan::classify(x.name, first_mtp)));
   std::printf("%zu tensors listed; header parsed in %.1f ms\n", r.tensors().size(), parse_ms);
   if (r.data_start() + r.data_bytes() > m.size())
     std::printf("note: header only: the full file would be %llu bytes\n", static_cast<unsigned long long>(r.data_start() + r.data_bytes()));

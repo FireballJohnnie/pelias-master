@@ -95,3 +95,46 @@ TEST(plan_refuses_over_the_ceiling_and_proposes) {
   CHECK_EQ(p.value.working_set, kWorkingSetEstimateBytes);
   CHECK(!plan_text(p.value).empty());
 }
+
+TEST(plan_counts_the_mtp_head) {
+  // two trunk blocks and one MTP block (block_count 3, nextn_predict_layers 1), as the served file stores it
+  ptest::GgufBuilder b = model();
+  b.kv_u32("qwen35moe.block_count", 3).kv_u32("qwen35moe.nextn_predict_layers", 1);
+  b.tensor("blk.2.attn_q.weight", {256, 1024}, 0);          // 1 MiB, mtp
+  b.tensor("blk.2.nextn.eh_proj.weight", {256, 1024}, 0);   // 1 MiB, mtp
+  b.tensor("blk.2.ffn_down_exps.weight", {256, 2048}, 0);   // 2 MiB, expert (the head's routed experts)
+  os::FileMap m;
+  CHECK(ptest::write_and_map(ptest::data_dir() + "/plan_mtp.gguf", b.build(), m));
+  io::GgufReader r;
+  CHECK(r.parse(m).ok());
+  CHECK_EQ(first_mtp_block(r), 2u);
+  CHECK(classify("blk.2.attn_q.weight", 2) == TensorClass::mtp);
+  CHECK(classify("blk.2.nextn.enorm.weight", 2) == TensorClass::mtp);
+  CHECK(classify("blk.2.ffn_down_exps.weight", 2) == TensorClass::expert);
+  CHECK(classify("blk.1.attn_q.weight", 2) == TensorClass::spine);
+  CHECK(classify("blk.12.attn_q.weight", 2) == TensorClass::mtp);   // 12 >= 2: index read as a number, not a prefix
+  CHECK(classify("blk.2.attn_q.weight") == TensorClass::spine);     // no MTP in the file: ordinary block
+  const ByteMap bm = byte_map(r);
+  CHECK_EQ(bm.mtp_blocks, 1u);
+  CHECK_EQ(bm.mtp, 2 * MiB);
+  CHECK_EQ(bm.mtp_experts, 2 * MiB);
+  CHECK_EQ(bm.experts, 10 * MiB);
+  CHECK_EQ(bm.expert_layers, 3u);
+  CHECK_EQ(bm.always_resident(), 7 * MiB + 1024);   // 5 MiB + 1024 as before, plus the 2 MiB head
+  // the head shrinks the largest bank by exactly its resident bytes
+  PlanRequest q;
+  q.ceiling_basis = "stated";
+  q.working_set_bytes = 1 * MiB;
+  q.ceiling_bytes = 12 * MiB;
+  Result<Plan> p = make_plan(r, q);
+  CHECK(p.ok());
+  CHECK_EQ(p.value.largest_bank_that_fits, 4 * MiB - 1024);
+  CHECK(plan_text(p.value).find("MTP head: 1 block(s)") != std::string::npos);
+  // a file without the keys has no head
+  os::FileMap m2;
+  CHECK(ptest::write_and_map(ptest::data_dir() + "/plan.gguf", model().build(), m2));
+  io::GgufReader r2;
+  CHECK(r2.parse(m2).ok());
+  CHECK_EQ(first_mtp_block(r2), kNoMtp);
+  CHECK(plan_text(make_plan(r2, q).value).find("MTP head: none") != std::string::npos);
+}

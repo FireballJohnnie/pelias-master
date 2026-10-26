@@ -16,19 +16,32 @@
 
 namespace pelias::plan {
 
-enum class TensorClass { embedding, head, spine, expert };
+enum class TensorClass { embedding, head, spine, expert, mtp };
 const char* class_name(TensorClass c);
-// Classification by the GGUF tensor name (qwen35moe and the common llama.cpp names; 5.4).
-TensorClass classify(const std::string& name);
+
+// No MTP block in the file.
+constexpr std::uint64_t kNoMtp = ~std::uint64_t{0};
+// The first block index that belongs to the multi-token-prediction (MTP) head, or kNoMtp. llama.cpp stores the head as
+// the last `<arch>.nextn_predict_layers` blocks of `<arch>.block_count` (READ-SRC: the served file has block_count 41,
+// nextn_predict_layers 1, and blk.40 holds the head's 20 tensors, nextn.* among them).
+std::uint64_t first_mtp_block(const io::GgufReader& r);
+
+// Classification by the GGUF tensor name (qwen35moe and the common llama.cpp names; 5.4). Blocks at or after
+// `first_mtp` are the MTP head: their routed experts stay in the expert pool (the bank decides by hits, like any
+// layer's), every other tensor of the head is `mtp` and always resident (the head runs for every drafted token).
+TensorClass classify(const std::string& name, std::uint64_t first_mtp = kNoMtp);
 
 struct ByteMap {
   std::uint64_t embedding = 0, head = 0, spine = 0, experts = 0;
+  std::uint64_t mtp = 0;                 // the MTP head without its routed experts (always resident)
+  std::uint64_t mtp_experts = 0;         // the MTP head's routed experts (part of `experts`)
+  std::uint64_t mtp_blocks = 0;          // blocks that form the MTP head (0: the file has none)
   std::uint64_t expert_layers = 0;       // layers that have routed experts
   std::uint64_t per_layer_experts = 0;   // expert bytes of the largest layer
   std::uint64_t tensors = 0;
   bool head_tied = false;                // no output.weight: the embedding serves as the head
-  [[nodiscard]] std::uint64_t always_resident() const { return embedding + (head_tied ? 0 : head) + spine; }
-  [[nodiscard]] std::uint64_t total() const { return embedding + head + spine + experts; }
+  [[nodiscard]] std::uint64_t always_resident() const { return embedding + (head_tied ? 0 : head) + spine + mtp; }
+  [[nodiscard]] std::uint64_t total() const { return embedding + head + spine + experts + mtp; }
 };
 ByteMap byte_map(const io::GgufReader& r);
 
@@ -43,7 +56,7 @@ struct Plan {
   ByteMap map;
   std::uint64_t ceiling = 0;
   std::string ceiling_basis;
-  std::uint64_t resident_fixed = 0;      // embedding + head + spine
+  std::uint64_t resident_fixed = 0;      // embedding + head + spine + MTP head
   std::uint64_t working_set = 0;
   std::string working_set_label;
   std::uint64_t bank = 0;                // the bank in this plan

@@ -15,16 +15,47 @@ const char* class_name(TensorClass c) {
     case TensorClass::head: return "head";
     case TensorClass::spine: return "spine";
     case TensorClass::expert: return "expert";
+    case TensorClass::mtp: return "mtp";
   }
   return "?";
 }
 
-TensorClass classify(const std::string& n) {
+std::uint64_t first_mtp_block(const io::GgufReader& r) {
+  const std::string arch = r.get_string("general.architecture");
+  if (arch.empty()) return kNoMtp;
+  bool has_n = false, has_count = false;
+  const std::uint64_t n = r.get_uint(arch + ".nextn_predict_layers", &has_n);
+  const std::uint64_t count = r.get_uint(arch + ".block_count", &has_count);
+  if (!has_n || !has_count || n == 0 || n > count) return kNoMtp;
+  return count - n;
+}
+
+namespace {
+// "blk.N.rest" -> N, or kNoMtp when the name is not a block tensor
+std::uint64_t block_index(const std::string& n) {
+  if (n.rfind("blk.", 0) != 0) return kNoMtp;
+  std::uint64_t v = 0;
+  std::size_t i = 4;
+  if (i >= n.size() || n[i] < '0' || n[i] > '9') return kNoMtp;
+  for (; i < n.size() && n[i] >= '0' && n[i] <= '9'; ++i) {
+    if (v > (kNoMtp - 10) / 10) return kNoMtp;
+    v = v * 10 + static_cast<std::uint64_t>(n[i] - '0');
+  }
+  return i < n.size() && n[i] == '.' ? v : kNoMtp;
+}
+bool routed_expert(const std::string& n) { return n.find("_exps.") != std::string::npos || n.find("_exps_") != std::string::npos; }
+}  // namespace
+
+TensorClass classify(const std::string& n, std::uint64_t first_mtp) {
+  if (first_mtp != kNoMtp && !routed_expert(n)) {
+    const std::uint64_t b = block_index(n);
+    if (b != kNoMtp && b >= first_mtp) return TensorClass::mtp;
+  }
   if (n.rfind("token_embd", 0) == 0) return TensorClass::embedding;
   if (n == "output.weight" || n.rfind("output_norm", 0) == 0 || n == "output.bias") return TensorClass::head;
   // routed experts: ffn_gate_exps, ffn_up_exps, ffn_down_exps (and their biases); shared experts (_shexp) and the
   // router (ffn_gate_inp) stay on the spine
-  if (n.find("_exps.") != std::string::npos || n.find("_exps_") != std::string::npos) return TensorClass::expert;
+  if (routed_expert(n)) return TensorClass::expert;
   return TensorClass::spine;
 }
 
@@ -32,17 +63,24 @@ ByteMap byte_map(const io::GgufReader& r) {
   ByteMap m;
   std::map<std::string, std::uint64_t> per_layer;
   bool has_output = false;
+  const std::uint64_t first_mtp = first_mtp_block(r);
+  if (first_mtp != kNoMtp) {
+    bool found = false;
+    m.mtp_blocks = r.get_uint(r.get_string("general.architecture") + ".nextn_predict_layers", &found);
+  }
   for (const io::GgufTensor& t : r.tensors()) {
     ++m.tensors;
-    switch (classify(t.name)) {
+    switch (classify(t.name, first_mtp)) {
       case TensorClass::embedding: m.embedding += t.bytes; break;
       case TensorClass::head:
         m.head += t.bytes;
         if (t.name == "output.weight") has_output = true;
         break;
       case TensorClass::spine: m.spine += t.bytes; break;
+      case TensorClass::mtp: m.mtp += t.bytes; break;
       case TensorClass::expert: {
         m.experts += t.bytes;
+        if (first_mtp != kNoMtp && block_index(t.name) != kNoMtp && block_index(t.name) >= first_mtp) m.mtp_experts += t.bytes;
         const std::size_t dot = t.name.find('.', 4);  // "blk.N."
         per_layer[t.name.substr(0, dot)] += t.bytes;
         break;
@@ -98,6 +136,11 @@ std::string plan_text(const Plan& p) {
   s += "model bytes: embedding " + format_bytes(p.map.embedding) + ", head " + format_bytes(p.map.head) + (p.map.head_tied ? " (tied to the embedding)" : "") +
        ", spine " + format_bytes(p.map.spine) + ", experts " + format_bytes(p.map.experts) + " in " + std::to_string(p.map.expert_layers) + " layers (largest layer " +
        format_bytes(p.map.per_layer_experts) + "); " + std::to_string(p.map.tensors) + " tensors, " + format_bytes(p.map.total()) + " in all (DERIVED from the tensor table)\n";
+  if (p.map.mtp_blocks)
+    s += "MTP head: " + std::to_string(p.map.mtp_blocks) + " block(s), " + format_bytes(p.map.mtp) + " always resident; its routed experts " + format_bytes(p.map.mtp_experts) +
+         " are in the expert pool\n";
+  else
+    s += "MTP head: none in this file\n";
   s += "ceiling: " + format_bytes(p.ceiling) + " (" + p.ceiling_basis + ")\n";
   s += "always resident: " + format_bytes(p.resident_fixed) + "; working set " + format_bytes(p.working_set) + " (" + p.working_set_label + ")\n";
   std::snprintf(buf, sizeof buf, "hot bank: %s (%.1f %% of the expert bytes)\n", format_bytes(p.bank).c_str(), 100.0 * p.expert_bytes_resident_fraction);
