@@ -106,8 +106,8 @@ Result<Plan> make_plan(const io::GgufReader& r, const PlanRequest& req) {
   p.map = byte_map(r);
   p.ceiling = req.ceiling_bytes;
   p.ceiling_basis = req.ceiling_basis;
-  p.working_set = req.working_set_bytes ? req.working_set_bytes : kWorkingSetEstimateBytes;
-  p.working_set_label = req.working_set_bytes ? "stated" : kWorkingSetLabel;
+  p.working_set = req.working_set_bytes ? req.working_set_bytes : kServingWorkingSetBytes;
+  p.working_set_label = req.working_set_bytes ? "stated" : kServingWorkingSetLabel;
   p.resident_fixed = p.map.always_resident();
   if (p.ceiling == 0) return Result<Plan>::fail(Status::fail(Code::invalid_argument, "no VRAM ceiling: no device was found and none was stated"));
   if (req.bank_bytes > p.map.experts)

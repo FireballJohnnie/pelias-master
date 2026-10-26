@@ -39,3 +39,4 @@ Every ruling that shapes this repository, with its date and source. AUTHOR-STATE
 | 2026-10-26 18:51 | Push | AUTHOR-STATED | pelias-master main 94a0478..d879212 |
 | 2026-10-26 18:55 to 18:58 | Pelias is built for accuracy and speed; MTP must be included (it adds speed and leaves the chosen tokens to the trunk) | AUTHOR-STATED | Masterwork 15.2 step 10, O18 |
 | 2026-10-26 18:5x | Planner: the MTP head's routed experts stay in the expert pool, the rest of the head is always resident; MTP blocks found from `<arch>.nextn_predict_layers` and `<arch>.block_count` | DECISION (step 2, O18) | `src/plan/memory_plan` |
+| 2026-10-26 19:07 | Fix all mistakes found: the serving planner used the training working set (2.50 GiB, 8.8); serving now uses 1.00 GiB, DERIVED upper bound from 17.4 and P-H8 (steps in `src/plan/probe_constants.h`); O18 records the tier build's measured MTP gain | AUTHOR-STATED (fix) / DECISION (figure) | `src/plan`, masterwork 4 and O18, BUILD_NOTES |

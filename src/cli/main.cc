@@ -8,6 +8,7 @@
 //
 // Exit codes: 0 ok; 1 usage; 2 the input could not be read (missing, corrupt, unsupported); 3 a gate refused (plan
 // over the ceiling); 4 no device.
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -147,7 +148,7 @@ int cmd_device(const Args& a) {
   if (d.nvml_available)
     std::printf("NVML: free %s, used %s, driver %s\n", plan::format_bytes(d.vram_free_nvml).c_str(), plan::format_bytes(d.vram_used_nvml).c_str(), d.driver_version.c_str());
   else
-    std::printf("NVML: unavailable (%s)\n", d.note.c_str());
+    std::printf("NVML: unavailable (%s)\n", d.nvml_note.c_str());
   const hal::Ceiling c = hal::ceiling_from_device(d);
   if (c.bytes) std::printf("VRAM ceiling: %s (basis %s %s minus margin %s; standing rule 3)\n", plan::format_bytes(c.bytes).c_str(), c.basis, plan::format_bytes(c.basis_free).c_str(), plan::format_bytes(c.margin).c_str());
   return d.available ? 0 : 4;
@@ -252,17 +253,31 @@ int cmd_key(const Args& a) {
     usage();
     return 1;
   }
-  os::FileMap m;
-  const Status s = m.open(path);
-  if (!s) return fail_input(s);
-  m.advise_sequential();
+  // Plain sequential reads, not the memory map: a failed read then comes back as an error to report, where a mapped
+  // page that cannot be read stops the program (SIGBUS, seen on WSL2's /mnt/c under memory pressure in P-M4).
+  std::FILE* f = std::fopen(path.c_str(), "rb");
+  if (!f) {
+    const int e = errno;
+    return fail_input(Status::fail(e == ENOENT ? Code::not_found : Code::io_error, std::string("cannot open the file: ") + std::strerror(e)));
+  }
   Timer t;
   io::Sha256 h;
-  const std::uint64_t chunk = std::uint64_t{64} << 20;
-  for (std::uint64_t off = 0; off < m.size(); off += chunk) h.update(m.data() + off, static_cast<std::size_t>(m.size() - off < chunk ? m.size() - off : chunk));
+  std::vector<std::uint8_t> buf(std::size_t{16} << 20);  // 16 MiB reads (P-M4: the faster of the two read sizes)
+  std::uint64_t total = 0;
+  while (true) {
+    const std::size_t got = std::fread(buf.data(), 1, buf.size(), f);
+    if (got) {
+      h.update(buf.data(), got);
+      total += got;
+    }
+    if (got < buf.size()) break;
+  }
+  const bool read_error = std::ferror(f) != 0;
+  std::fclose(f);
+  if (read_error) return fail_input(Status::fail(Code::io_error, "read failed after " + std::to_string(total) + " bytes", total));
   const std::string hex = io::Sha256::hex(h.finish());
   const double sec = t.seconds();
-  std::printf("%s  %llu bytes  (%.2f s, %.2f GB/s)\n", hex.c_str(), static_cast<unsigned long long>(m.size()), sec, sec > 0 ? static_cast<double>(m.size()) / sec / 1e9 : 0.0);
+  std::printf("%s  %llu bytes  (%.2f s, %.2f GB/s)\n", hex.c_str(), static_cast<unsigned long long>(total), sec, sec > 0 ? static_cast<double>(total) / sec / 1e9 : 0.0);
   return 0;
 }
 

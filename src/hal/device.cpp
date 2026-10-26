@@ -29,8 +29,8 @@ DeviceInfo query_device(int index) {
     d.vram_free_nvml = m.free;
     d.vram_used_nvml = m.used;
     if (d.vram_total == 0) d.vram_total = m.total;
-  } else if (!m.note.empty()) {
-    d.note += (d.note.empty() ? "" : "; ") + m.note;
+  } else {
+    d.nvml_note = m.note.empty() ? "no reading" : m.note;
   }
   d.driver_version = m.driver_version;
   return d;

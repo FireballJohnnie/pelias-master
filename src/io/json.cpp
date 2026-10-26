@@ -294,7 +294,7 @@ void Json::dump_to(std::string& out, int indent, int depth) const {
   auto newline = [&](int d) {
     if (indent <= 0) return;
     out += '\n';
-    out.append(static_cast<std::size_t>(d * indent), ' ');
+    out.append(static_cast<std::size_t>(d) * static_cast<std::size_t>(indent), ' ');
   };
   switch (kind_) {
     case Kind::null: out += "null"; break;

@@ -10,6 +10,9 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#ifndef LOAD_LIBRARY_SEARCH_DEFAULT_DIRS
+#define LOAD_LIBRARY_SEARCH_DEFAULT_DIRS 0x00001000  // documented value (LoadLibraryEx); older headers may lack it
+#endif
 #else
 #include <dlfcn.h>
 #endif
@@ -22,7 +25,8 @@ bool DynLib::open(const std::vector<std::string>& names) {
   close();
   for (const std::string& n : names) {
 #ifdef _WIN32
-    HMODULE h = LoadLibraryA(n.c_str());
+    // System folders and the program's own folder only: never the current directory (DLL planting).
+    HMODULE h = LoadLibraryExA(n.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
     if (h) {
       h_ = h;
       name_ = n;

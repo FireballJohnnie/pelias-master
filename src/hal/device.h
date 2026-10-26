@@ -27,7 +27,8 @@ struct DeviceInfo {
   std::uint64_t vram_free_nvml = 0;    // bytes free as NVML reports (whole card)
   std::uint64_t vram_used_nvml = 0;
   std::string driver_version;          // from NVML when available
-  std::string note;                    // why something is unavailable (user-readable, no paths)
+  std::string note;                    // why the CUDA device is unavailable (user-readable, no paths)
+  std::string nvml_note;               // why NVML is unavailable
 };
 
 // Opens device `index` (creates its context) and reads both views. Never throws.

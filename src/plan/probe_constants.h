@@ -11,10 +11,24 @@ namespace pelias::plan {
 
 inline constexpr std::uint64_t kGiB = std::uint64_t{1} << 30;
 
-// Working set of the decode loop beyond the weights (KV cache, activations, scratch) at the reference window:
-// 2.50 GiB, an ESTIMATE from the masterwork 8.8 that probe P-M2 measures. Used only until P-M2 has run.
-inline constexpr std::uint64_t kWorkingSetEstimateBytes = std::uint64_t{2684354560};  // 2.50 GiB, ESTIMATE (8.8, P-M2)
-inline constexpr const char* kWorkingSetLabel = "ESTIMATE (masterwork 8.8; P-M2 measures it)";
+// Working set of SERVING (decode and prefill) beyond the weights: KV cache, recurrent state, activations, scratch.
+// DERIVED upper bound from the tier build's MEASURED peak on the served file (masterwork 17.4, 5.3):
+//   whole-card peak at a 7.5 GiB bank and -ub 2048 (the reference profile, C9)   10.69 GiB  = 10,946.6 MiB  MEASURED
+//   minus what Windows held before the process started (P-H8: 914 / 1,031 MiB)   -   914 MiB                MEASURED
+//   minus the bank                                                               - 7,680 MiB
+//   minus the weights certainly on the card (head 397.9 + spine 905.0 + MTP head 23.4; the embedding,
+//   272.8 MiB, is left in: where that run kept it is not recorded)               - 1,326.3 MiB              DERIVED
+//   = 1,026.3 MiB, rounded up to 1.00 GiB.
+// Each choice makes the figure larger, not smaller (the smaller Windows reading; a bank of exactly 7.5 GiB, although
+// the run's cap was 7,800 MiB; the embedding counted as working set if it was on the card; the llama.cpp process's
+// own CUDA context counted
+// as working set, while the planner's ceiling already excludes Pelias's context), so it is an upper bound for that
+// run. It is llama.cpp's working set, not Pelias's: the engine's own peak (P-E4, step 10) replaces it.
+// The 2.50 GiB of masterwork 8.8 is the TRAINING working set (8,192-token window, up to 32 k tokens per step); the
+// serving planner used it by mistake until 2026-10-26 19:0x.
+inline constexpr std::uint64_t kServingWorkingSetBytes = kGiB;  // 1.00 GiB, DERIVED upper bound (17.4, P-H8)
+inline constexpr const char* kServingWorkingSetLabel =
+    "DERIVED upper bound from the tier build's measured peak (17.4, P-H8); P-E4 measures the engine's own";
 
 // Reference machine ceiling, MEASURED (P-H8, D26/D28): 10.7 GiB. Used only when the user states no ceiling and no
 // device is present (the plan then says so).

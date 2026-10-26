@@ -4,7 +4,7 @@
 // memory_plan.h - the device memory plan for serving a GGUF model (10.3, 5.4): what stays in VRAM (spine, embedding,
 // head, the hot expert bank) against the measured ceiling. A plan over the ceiling is refused (gate PG3), and the
 // largest bank that fits is proposed instead (7.6). The byte map comes straight from the tensor table, so every number
-// in the plan is DERIVED from the file; the working-set term is an ESTIMATE until P-M2 runs and is labelled so.
+// in the plan is DERIVED from the file; the working-set term is a DERIVED upper bound until the engine's own peak is measured (P-E4) and is labelled so.
 #pragma once
 
 #include <cstdint>
@@ -49,7 +49,7 @@ struct PlanRequest {
   std::uint64_t ceiling_bytes = 0;       // from hal::Ceiling
   std::string ceiling_basis;             // "cuda", "nvml", "stated", "reference"
   std::uint64_t bank_bytes = 0;          // requested hot bank; 0 = as large as fits
-  std::uint64_t working_set_bytes = 0;   // 0 = the estimate
+  std::uint64_t working_set_bytes = 0;   // 0 = the serving figure of probe_constants.h
 };
 
 struct Plan {

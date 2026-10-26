@@ -88,11 +88,13 @@ TEST(plan_refuses_over_the_ceiling_and_proposes) {
   q.ceiling_bytes = 0;
   q.bank_bytes = 0;
   CHECK(make_plan(r, q).status.code == Code::invalid_argument);
-  // the default working set is the labelled estimate
+  // the default working set is the labelled serving figure (not the training 2.50 GiB)
   q.ceiling_bytes = 100 * MiB;
   q.working_set_bytes = 0;
   p = make_plan(r, q);
-  CHECK_EQ(p.value.working_set, kWorkingSetEstimateBytes);
+  CHECK_EQ(p.value.working_set, kServingWorkingSetBytes);
+  CHECK_EQ(kServingWorkingSetBytes, kGiB);
+  CHECK(p.value.working_set_label.find("DERIVED") != std::string::npos);
   CHECK(!plan_text(p.value).empty());
 }
 

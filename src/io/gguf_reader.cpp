@@ -166,6 +166,7 @@ Status GgufReader::parse(const os::FileMap& map, bool require_data) {
         }
       } else {
         const std::uint64_t es = scalar_size(kv.value.array_type);
+        if (es == 0) return Status::fail(Code::internal, "array element type has no size", c.pos(), kv.key);  // unreachable: string and array are handled above
         if (n > std::numeric_limits<std::uint64_t>::max() / es) return Status::fail(Code::corrupt, "array size overflows", c.pos(), kv.key);
         s = c.skip(n * es, "array elements", kv.key);
         if (!s) return s;
