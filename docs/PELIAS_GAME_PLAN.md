@@ -193,13 +193,13 @@ $LLAMA_BIN/llama-perplexity -m $T/qwen36-Q4_K_M.pelias.gguf --kl-divergence --kl
 | a | `--act-int8 all --act-int8-block 256` (the CPU path) | within ±0.0005 of GP1-02 |
 | b | `--act-int8 all --act-int8-block 32` (the GPU path) | within ±0.0005 of 0.041124 |
 | c | `--act-int8 _exps --act-int8-block 32` (experts only) | between 0.0390 and run b |
-| d | `--act-int8 attn,ssm_out,shexp --act-int8-block 32` (dense only) | between 0.0390 and run b |
+| d | `--act-int8 attn,ssm_,shexp,output --act-int8-block 32` (dense only: attention, every DeltaNet projection, shared experts, `lm_head`) | between 0.0390 and run b |
 
 **Base command:**
 ```
 $PELIAS kld --model $T/qwen36-Q4_K_M.pelias.gguf --base $T/kld-base-bf16-100chunks.bin --threads 16 --dump-kld $R/GP1-03/<run>.kld <flags>
 ```
-- Group strings match tensor names by substring. `_exps` matches the three routed-expert tensors in every layer. `attn` matches `attn_q`, `attn_k`, `attn_v`, `attn_output`, `attn_qkv` and `attn_gate`.
+- Group strings match tensor names by substring. `_exps` matches the three routed-expert tensors in every layer. `attn` matches `attn_q`, `attn_k`, `attn_v`, `attn_output`, `attn_qkv` and `attn_gate`. `ssm_` matches `ssm_out`, `ssm_alpha` and `ssm_beta` (Q4_K in the stock file). `output` matches `output.weight`, the `lm_head`. Runs c and d together cover every quantized product.
 - F32/F16/BF16 weights are never rounded: the routers, norms and `ssm_alpha`/`ssm_beta` when F32.
 
 **Comparisons** (seconds each):
