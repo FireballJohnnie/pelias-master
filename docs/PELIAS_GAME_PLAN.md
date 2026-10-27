@@ -1,0 +1,983 @@
+# PELIAS GAME PLAN: tests first, then fixes, then the build, then the final tests
+
+Written 2026-10-27 at 13:5x, at the author's request. Every step has enough detail to write its script without guessing.
+
+Copyright (c) 2026 John Lipka and the Pelias contributors
+
+**What this file is:**
+- The single list of what happens next, in order.
+- Part 1: tests that must run before any further building.
+- Part 2: fixes that follow from those tests.
+- Part 3: the rest of the build.
+- Part 4: the tests that tune and finalise the finished build.
+- Appendices: the ID map (old names to new), the decisions waiting on the author, the scripting rules, and the sources.
+
+**Labels** (same as every Pelias document): MEASURED, READ-SRC, PUBLISHED, DERIVED, ESTIMATE, UNVERIFIED, DECISION, AUTHOR-STATED. Every time estimate names its basis.
+
+**Owners:**
+- **A** = the author runs it on the PC.
+- **C** = Claude writes, builds and checks it in the sandbox.
+- **A+C** = Claude writes it; the author runs it.
+
+**Privacy:**
+- No dataset text, persona wording or private equations appear here.
+- Machine paths are variables. Their values live in `profiles/local_only/GAME_PLAN_PATHS.env`, which git ignores.
+
+---
+
+## 0. Conventions every script in this plan follows
+
+### 0.1 Variables (values in `profiles/local_only/GAME_PLAN_PATHS.env`)
+
+| Variable | What it points to | Checked by preflight |
+|---|---|---|
+| `PELIAS` | The `pelias` binary built at the commit named in the step, with `PELIAS_CPU_AVX2=ON` | `$PELIAS version` runs; the build's `CMakeCache.txt` has `PELIAS_CPU_AVX2:BOOL=ON`; `git -C $PELIAS_REPO rev-parse --short HEAD` equals the expected commit |
+| `PELIAS_REPO` | The author's WSL clone of pelias-master | `.git` exists |
+| `LLAMA_BIN` | The unchanged llama.cpp build at commit 2ca15f540 (test oracle only); the one that wrote every sweep log | `$LLAMA_BIN/llama-perplexity --version` prints `2ca15f540` |
+| `T` | The test folder on D: (`kld-base-bf16-100chunks.bin`, `qwen36-bf16.llamacpp.gguf`, `qwen36-Q4_K_M.pelias.gguf`, `sweep/`) | each file exists with the byte size in 0.3 |
+| `M` | The model folder on C: where new candidate files are written | free space |
+| `U` | The Unsloth folder (`Qwen3.6-35B-A3B-UD-Q4_K_M.gguf`, `imatrix_unsloth.gguf_file`) | exists, sizes |
+| `R` | The results folder for this plan (one subfolder per test ID) | writable |
+| `WIKI` | `wiki.test.raw` (WikiText-2 test), needed only to make new bases | exists; the 512 base already holds its own tokens |
+
+### 0.2 Script rules (all scripts, no exceptions)
+
+1. **Header.** `bash` with `set -euo pipefail`. The first lines print the test ID, the start time, the commit, the prediction (written before the run) and the time estimate.
+2. **Logs.** Every long command goes through `tee "$R/<ID>/<name>.log"`. Never `| tail` and never `> /dev/null` on a long run, so progress and the ETA stay visible.
+3. **Never overwrite.** Each output path is checked first and the script stops if it exists. `pelias kld --dump-kld` and `pelias imatrix` also refuse by themselves.
+4. **Free space.** Before writing a large file (a GGUF or a base), print `df -h` for C: and D:. Stop if either drive would drop below 50 GB after the write (author's rule). Expected size = the DERIVED size in the step.
+5. **Nothing else heavy runs.** No llama-server, no other `pelias kld`, no training. CPU runs are timed, and a second job slows both.
+6. **Type check.** After every quantize, `$PELIAS inspect --model OUT --json` is compared against the recipe tensor by tensor (0.4). Any difference stops the script before the drift test. This is the lesson of the shared `attn_v`/`attn_qkv` counter (PEL_QUANT_DECISION_DATA 3.3).
+7. **Size check.** The output's byte size must equal the expected byte size where one is MEASURED or DERIVED (to ±32 bytes for DERIVED sizes, exact for MEASURED rebuilds). Expected size = `recipe.py data-bytes RECIPE SOURCE` + 10,991,136. That offset is MEASURED identical for PEL-6, T5 and T8 (data start plus trailing padding, same metadata).
+8. **Summary line.** One line is appended to `$R/summary.tsv` with these columns: date-time, test ID, file, bytes, mean KLD, ± (per-token SE as printed), same-top-p, PPL, wall seconds, log path.
+9. **Results first.** The author sends the summary lines and logs. Claude labels each number MEASURED and checks the prediction before anything else is decided.
+
+### 0.3 Fixed inputs (MEASURED sizes; a script stops if a size differs)
+
+| File | Bytes | What it is |
+|---|---|---|
+| `$T/kld-base-bf16-100chunks.bin` | 12,664,728,820 | llama-perplexity KL base: bf16 model, WikiText-2 test, 100 chunks × 512, made with the GPU visible and `-ngl 0 -t 8` (56 min 54 s) |
+| `$T/qwen36-bf16.llamacpp.gguf` | 71,066,995,072 | llama.cpp's bf16 conversion, the source of every candidate |
+| `$T/qwen36-Q4_K_M.pelias.gguf` | 21,713,463,328 (on disk) | Pelias stock Q4_K_M. llama.cpp read 0.041124 and Pelias read 0.039013 |
+| `$U/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` | 22,134,528,992 | Unsloth: the bar, 0.013605 with llama.cpp |
+| `$U/imatrix_unsloth.gguf_file` | 192,223,904 | Unsloth's importance matrix |
+| `$M/qwen36-Q4_K_M-typesU.gguf` | 22,660,245,536 | Experiment (b): Unsloth's types, no imatrix (0.014174) |
+| `$M/qwen36-Q4_K_M-imatU.gguf` | 21,713,463,616 | Experiment (a): stock types plus Unsloth's imatrix (0.027317) |
+| `$T/sweep/q-*.log` | — | llama-quantize logs of every sweep and T run. They hold the exact type of every tensor (0.4) |
+
+Note: the stock file's size on disk (21,713,463,328) is 32 bytes more than the figure in older notes (21,713,463,296). Scripts check the on-disk value, and Claude confirms it from `pelias inspect` before the first run.
+
+### 0.4 Recipes: one exact type per tensor
+
+A recipe is a TSV file with 753 rows: `tensor_name<TAB>type`, where type is a ggml type name in upper case (`Q4_K`, `Q8_0`, `F32`, ...). Recipes live in `$R/recipes/` until Part 2 moves the final ones into the repository.
+
+- **From a file that exists:** `$PELIAS inspect --model FILE --json`, then read `tensors[].name` and `tensors[].type`.
+- **From a llama-quantize log:** read every line of the form
+  ```
+  [  N/ 753] NAME - [ d0, d1, d2, d3], type =   SRC, converting to DST .. size = ...
+  [  N/ 753] NAME - [ d0, d1, d2, d3], type =   f32, size = ...
+  ```
+  The parse regex is `^\[\s*(\d+)/\s*753\]\s+(\S+)\s+-\s+\[[^\]]*\],\s+type =\s+(\S+),\s+(?:converting to (\S+)|size)`. The type is DST if present, else SRC. Upper-case it. The script requires exactly 753 matches.
+- **Feeding a recipe to llama-quantize** (until `pelias quantize --recipe` exists, Part 3):
+  - `python3 tools/recipe.py llama-file RECIPE.tsv $T/qwen36-bf16.llamacpp.gguf TYPES.txt --pelias $PELIAS` writes a `--tensor-type-file`.
+  - One line `^<escaped name>$=<type>` for every tensor, including those whose type equals the source's. Without a line, llama-quantize would apply its mix rule to a tensor. A 1-D tensor that may not be quantized keeps its type whatever its line says.
+  - llama-quantize reads the file as whitespace-separated `pattern=type` tokens. It lower-cases the pattern, matches with `std::regex_search`, uses the first matching pattern, and reads type names case-insensitively (READ-SRC: tools/quantize/quantize.cpp `parse_tensor_type_file`, src/llama-quant.cpp `llama_tensor_get_type`, at 2ca15f5).
+  - A tensor that matches a pattern skips llama-quantize's own mix rules and its per-layer counters. So with every quantized tensor named, nothing else can move.
+  - Command: `$LLAMA_BIN/llama-quantize --tensor-type-file TYPES.txt $T/qwen36-bf16.llamacpp.gguf OUT.gguf Q4_K_M 16`.
+  - The type check (0.2 rule 6, `tools/recipe.py check`) is what proves it on every file. The tool's own test on the tiny model is in its unit run.
+- **With an importance matrix:** add `--imatrix FILE`. Type-check exactly the same way.
+
+### 0.5 How two results are compared (applies to every drift comparison from now on)
+
+- Every Pelias drift run writes `--dump-kld $R/<ID>/<name>.kld` (25,500 records per 100-chunk run, 612,036 bytes; DERIVED from the format).
+- A comparison is always `pelias kld-compare --a A.kld --b B.kld --name-a … --name-b …`. It is paired token by token. Its standard error is clustered by chunk, and its interval uses Student's t with chunks − 1 degrees of freedom (99 for 100 chunks: t = 1.984).
+- **Verdict:**
+  - Interval entirely below 0: A has less drift than B.
+  - Interval entirely above 0: B has less drift.
+  - Interval contains 0: a tie on this text.
+- Unpaired "±" values from a single run are never used to rank files again. The old "±0.0006" rule is retired.
+- Scripts parse the line `difference (A - B) <d>   SE per token <s1>   SE per chunk (used) <s2>   95% interval [<lo>, <hi>] (t <t>, <df> df)   t-stat <z>` and the line starting `VERDICT:`.
+- kld-compare refuses two files scored on different tokens (exit 2, or 1 for an argument error). A script treats that as a stop, not as a tie.
+
+### 0.6 Predictions
+
+Each test below carries a prediction written now (ESTIMATE). Claude checks it against the result and logs right or wrong in the RUNBOOK and TALLY.
+
+Where a llama.cpp number exists, the Pelias-scale prediction is the range between two models of llama.cpp's activation-rounding effect, both taken from the stock file (MEASURED: 0.041124 llama.cpp against 0.039013 Pelias):
+- **multiplicative:** Pelias = llama × 0.94867;
+- **additive:** Pelias = llama − 0.002111.
+
+Which model holds is itself a finding (Part 1, GP1-04).
+
+---
+
+## Part 1. Tests before any further building
+
+Ordered so each block feeds the next. Blocks A to C need no new code; they can run today on commit 3a272b3 or later.
+
+The recipe tool `tools/recipe.py` (0.4) is written before Block C, which needs it. Blocks D to F need further **measurement tools only**: scripts or flags that produce numbers and add no product feature. Each tool is specified below so it can be written without guessing. Claude writes them, and they pass the unit/clang/asan/oracle routine before hand-over.
+
+### Block A: preflight and determinism (A; about 25 min)
+
+#### GP1-00 Preflight (A, 2 min)
+
+**Checks:**
+- Every variable in 0.1 resolves.
+- Every size in 0.3 matches.
+- `$PELIAS` was built at commit ≥ 3a272b3 with AVX2.
+- `git status` is clean in `$PELIAS_REPO`.
+- `df -h` shows C: and D: free space.
+- `nproc` ≥ 16.
+- Nothing named `llama-server` or `pelias` is running (`pgrep`).
+
+**Rebuild if needed:**
+```
+cd $PELIAS_REPO && git pull
+cmake --preset wsl -DPELIAS_CPU_AVX2=ON
+cmake --build build/wsl -j16
+```
+- Configure again every time. The version string's commit is captured at configure time and goes stale otherwise (MEASURED in the sandbox: a build at 3a272b3 printed 686926d). Fix item GP2-14.
+
+**Pass:** all checks print OK.
+
+#### GP1-01 Stock Q4_K_M through Pelias again, with the per-token file (A, 22 min)
+
+**Question:** is Pelias's drift number deterministic on the real model, and does the new per-token file match the printed mean?
+
+**Command:**
+```
+$PELIAS kld --model $T/qwen36-Q4_K_M.pelias.gguf --base $T/kld-base-bf16-100chunks.bin --threads 16 --dump-kld $R/GP1-01/stock.kld
+```
+
+**Time:** 1309.3 s for this exact command without the dump (MEASURED, Milestone 1). The dump adds under 1 s (DERIVED: 612 KB).
+
+**Prediction:**
+- Mean KLD 0.039013, PPL 6.6898, Same top p 91.573 %, identical in every printed digit.
+- The mean of the 25,500 `kld` values in the file equals the printed mean to 6 digits.
+
+**Pass / decision:**
+- Identical digits: the reference is deterministic at 16 threads.
+- Any difference: stop. Find the cause (thread count, build flags) before any other Pelias number is trusted.
+
+Results file: `stock.kld` is the stock anchor for every later comparison.
+
+### Block B: closing the llama.cpp measurement questions (A; about 2 h 10 min)
+
+#### GP1-02 llama.cpp with the GPU path switched off (old name F3) (A, ESTIMATE 15–45 min)
+
+**Question:** did the earlier llama.cpp drift runs (GPU visible, `-ngl 0`, batch 2048) multiply on the GPU with q8_1 activations? Fable's audit says they may have. The masterwork records that op-offload changed prompt speed (MEASURED).
+
+**Command** (same as every earlier llama.cpp drift run, plus the one switch):
+```
+$LLAMA_BIN/llama-perplexity -m $T/qwen36-Q4_K_M.pelias.gguf --kl-divergence --kl-divergence-base $T/kld-base-bf16-100chunks.bin -c 512 --chunks 100 -ngl 0 -t 8 --no-op-offload 2>&1 | tee $R/GP1-02/stock_nooffload.log
+```
+- `-f` is not needed: in compare mode the tokens come from the base file (READ-SRC, perplexity.cpp `kl_divergence`).
+- If `--no-op-offload` is not accepted by this build, run the same command with `CUDA_VISIBLE_DEVICES=""` in front and log which route was used.
+
+**Time:** the GPU-visible run took about 4 min (MEASURED). CPU-only prompt processing is slower; its rate on this file is unmeasured, hence the 15–45 min ESTIMATE. The tool prints progress per chunk.
+
+**Prediction:** 0.0405–0.0425. The direction is unknown: on the tiny model, CPU-style Q8_K rounding added more drift than GPU-style q8_1, 1.344 against 1.285 (MEASURED, sandbox).
+
+**Decision:**
+- If it differs from 0.041124 by more than 0.0005: every earlier llama.cpp number is labelled "GPU q8_1 path".
+- From then on, llama.cpp is used only to screen candidates (fast); Pelias confirms them (exact).
+
+#### GP1-03 Activation rounding in Pelias on the real model (old name F6) (A, 4 runs × 22 min = 88 min)
+
+**Question:** how much drift does 8-bit activation rounding add, and where? This decides how the engine and the trainer's Mode F may round (GP2-05).
+
+**Commands** (each writes its own dump):
+
+| Run | Extra flags | Prediction |
+|---|---|---|
+| a | `--act-int8 all --act-int8-block 256` (the CPU path) | within ±0.0005 of GP1-02 |
+| b | `--act-int8 all --act-int8-block 32` (the GPU path) | within ±0.0005 of 0.041124 |
+| c | `--act-int8 _exps --act-int8-block 32` (experts only) | between 0.0390 and run b |
+| d | `--act-int8 attn,ssm_out,shexp --act-int8-block 32` (dense only) | between 0.0390 and run b |
+
+**Base command:**
+```
+$PELIAS kld --model $T/qwen36-Q4_K_M.pelias.gguf --base $T/kld-base-bf16-100chunks.bin --threads 16 --dump-kld $R/GP1-03/<run>.kld <flags>
+```
+- Group strings match tensor names by substring. `_exps` matches the three routed-expert tensors in every layer. `attn` matches `attn_q`, `attn_k`, `attn_v`, `attn_output`, `attn_qkv` and `attn_gate`.
+- F32/F16/BF16 weights are never rounded: the routers, norms and `ssm_alpha`/`ssm_beta` when F32.
+
+**Comparisons** (seconds each):
+- `kld-compare` of each run against `GP1-01/stock.kld`.
+- Run c against run d.
+
+**Pass:**
+- Runs a and b reproduce llama.cpp's numbers within ±0.0005. That closes the 5.1 % gap and proves the reference matches llama.cpp's arithmetic when asked to.
+- If they do not, the remaining difference is llama.cpp's f16 KV cache or its order of operations. Log it, and decide whether a `--kv-f16` option is worth adding (measurement tool, Block D).
+
+#### GP1-04 The bench set through Pelias, with the llama.cpp rankings (A, 3 quantizes + 3 Pelias runs, about 80 min)
+
+**Question:** do the llama.cpp sweep rankings hold under the exact reference? Is llama.cpp's rounding effect additive or multiplicative?
+
+**Rebuild the three files** from the bf16 with llama-quantize; they were overwritten after the sweep:
+
+| File | Recipe from | Expected bytes (MEASURED) | llama.cpp KLD |
+|---|---|---|---|
+| `$M/pel6.gguf` (PEL-6: `ssm_out` Q8_0) | `$T/sweep/q-4.log`. Checked 2026-10-27 in the sandbox: against the stock recipe it changes exactly the 30 `ssm_out` tensors to Q8_0 (`recipe.py diff`). Note `q-0.log` is the `token_embd` run, not stock; the stock recipe comes from `recipe.py from-gguf` of the stock file | 21,839,292,448 | 0.031616 |
+| `$M/t8.gguf` | `$T/sweep/q-t8_pel4_udexp_embd8.log` | 22,495,815,712 | 0.014834 |
+| `$M/pel3a.gguf` (T5) | `$T/sweep/q-t5_pel3a.log` | 17,887,414,304 | 0.045287 |
+
+**Steps per file:**
+1. Recipe from the log (0.4).
+2. ```
+   $LLAMA_BIN/llama-quantize <--tensor-type list> $T/qwen36-bf16.llamacpp.gguf $M/<name>.gguf Q4_K_M 16 2>&1 | tee …
+   ```
+3. Type check against the recipe.
+4. Size check (exact).
+5. `$PELIAS kld … --dump-kld $R/GP1-04/<name>.kld`
+
+**Time per file:** 253.5 s to quantize (MEASURED, T8) + 1309 s Pelias (MEASURED, stock) ≈ 26 min.
+
+**Predictions** (Pelias scale, 0.6):
+
+| File | Prediction |
+|---|---|
+| PEL-6 | 0.0295–0.0300 |
+| T8 | 0.0127–0.0141 |
+| PEL3-a | 0.0432–0.0430 (both models agree within 0.0002) |
+
+Ranking: PEL3-a > stock > PEL-6 > T8, with every pair resolved by kld-compare.
+
+**Decision:**
+- The ranking holds: every llama.cpp screening result stands as a ranking.
+- It breaks: the sweep conclusions are reopened before Part 2.
+- Which prediction model fits: additive means llama.cpp adds a fixed noise floor (it matters most for the best files). Multiplicative means it scales.
+
+**Disk:** +62.2 GB on C: (DERIVED from the three sizes). Check rule 4.
+
+### Block C: the Unsloth question on the exact reference (A; about 92 min)
+
+#### GP1-05 Unsloth, imatrix and IQ4_XS through Pelias (old name Block 2)
+
+| Run | File | How it is made | Expected bytes | Prediction (Pelias) |
+|---|---|---|---|---|
+| a | Unsloth UD-Q4_K_M | exists | 22,134,528,992 | 0.0115–0.0130 |
+| b | T8 + Unsloth imatrix | T8 recipe + `--imatrix $U/imatrix_unsloth.gguf_file` | 22,495,815,712 (types unchanged) | 0.0121–0.0136 |
+| c | T9 = T8 + imatrix, gate/up experts IQ4_XS | T8 recipe with `ffn_gate_exps` and `ffn_up_exps` set to IQ4_XS in all 41 blocks, + imatrix | 21,807,949,856 (DERIVED: T8 minus 82 tensors × 8,388,608 bytes; IQ4_XS is 136 against Q4_K's 144 bytes per 256 weights, READ-SRC ggml-common.h). The script also computes it with `recipe.py data-bytes` + 10,991,136 | 0.0125–0.0145 |
+
+**Comparisons** (the decisive ones of this plan):
+- a vs b (does T8 + imatrix tie or beat Unsloth?)
+- a vs c
+- b vs c
+- b vs GP1-04 T8 (the imatrix's own worth, paired)
+
+**Time:** 2 × 4.2 min quantize + 3 × 22 min Pelias ≈ 75 min, plus the type checks. About 92 min with checks (ESTIMATE).
+
+**Decision:**
+- Any candidate whose interval against Unsloth is entirely below zero beats Unsloth on this text.
+- A tie means the next levers (Blocks D to F, Part 3) are needed.
+- Size is judged at the same time: without blk.40, T8 is 21.97 GB against Unsloth's 22.13 GB.
+
+### Block D: measurement tools, then the tests that need them (C builds; A runs)
+
+The tools come first. Each is small, has unit tests, and adds no product feature.
+
+| Tool | What it does | Spec |
+|---|---|---|
+| D-T1 `tools/recipe.py` (written now, before Block C) | `from-log`, `from-gguf`, `edit --set REGEX=TYPE`, `llama-file`, `check`, `data-bytes`, `diff` | Python 3 standard library only. Rules of 0.4. Block sizes READ-SRC from ggml-common.h. Exits 1 on any mismatch, 2 on bad input; never overwrites. Later addition: `overlap` (64-token shingles through `pelias tokenize`) for GP1-10 |
+| D-T2 `pelias kld --route-dump OUT.bin` | For every scored token and each of the 40 trunk layers: the top-8 expert ids in rank order, their routing weights (fp32), the 8th and 9th router logits | Header `PELROUT1`, n_ctx, chunks, scored, the same token hash as `--dump-kld`. Then per token per layer: 8 × u8 ids, 8 × f32 weights, f32 logit8, f32 logit9 (52 bytes). 25,500 × 40 × 52 = 53.0 MB per run (DERIVED) |
+| D-T3 `pelias route-compare --a A.bin --b B.bin [--kld K.kld]` | Per layer: share of tokens whose top-8 set differs; share whose order differs; mean weight mass on changed experts. Per token: number of changed layers. With `--kld`: mean KL of tokens with 0, 1, 2–3, ≥4 changed layers, and the share of total KL carried by tokens with any change. Margin histogram (logit8 − logit9) in 0.01-wide bins | Refuses different token hashes |
+| D-T4 `pelias kld --layer-subset` | Not needed; dropped. Per-layer tests use recipes (Block E) | — |
+| D-T5 `pelias requant-check --model FILE [--imatrix F] [--tensors REGEX]` | For each quantized tensor: dequantize to fp32, quantize again with Pelias's quantizer at the same type (with or without the imatrix), then count blocks that come back byte-identical. Report per tensor and per type | Uses `quantize_rows`, the oracle-checked quantizer. Read-only on the input |
+| D-T6 `tools/adapter_stats.py` | From the v0.2 LoRA adapter (safetensors; path given by the author): per module, ‖scale·B·A‖ RMS, ‖W‖ RMS of the matching served weight (dequantized), their ratio, and the share of entries of scale·B·A smaller than half a quantization step of the served type at that position | Python with numpy (test-only). Reads the served GGUF through `pelias inspect --json` offsets |
+| D-T7 `pelias imatrix --gram TENSORS` | Next to the diagonal sums, accumulate the full Gram matrix XᵀX (fp64) for the named dense input spaces | Writes `W.gram` (cols × cols, f32 after the chunk average) into a sidecar GGUF; dense tensors only (2048 or 4096 columns: 16 or 64 MB each, DERIVED) |
+
+Routine for each tool: unit tests, gcc/clang/asan, oracle where one exists, privacy scan, dependency check, commit, push on the author's word, bundle, backup.
+
+#### GP1-06 Routing flips (old name L3) (A, ESTIMATE 2 runs, see time)
+
+**Question:** is the KL tail caused by quantization changing which experts are chosen?
+
+**Runs:**
+1. ```
+   $PELIAS kld --model $T/qwen36-bf16.llamacpp.gguf --base $T/kld-base-bf16-100chunks.bin --threads 16 --chunks 10 --dump-kld $R/GP1-06/bf16_10.kld --route-dump $R/GP1-06/bf16_10.rt
+   ```
+   This is the bf16 file through the reference. It also gives **the floor of the base itself** (GP1-07).
+2. The same 10 chunks for the stock file and for T8, with `--chunks 10 --route-dump`.
+
+**Time:**
+- bf16: unmeasured. The 71 GB file does not fit the 48 GB WSL memory cap, so each chunk reads most of it from D: through the Windows mount. The engine measured that mount at about 0.5 GB/s for large files, so ESTIMATE 2–3 min per chunk, 20–30 min for 10 chunks.
+- The tool prints the ETA after chunk 1. Stop rule: if the ETA exceeds 2 h, stop and copy the file to the WSL disk first (it was measured at 2.99–3.06 GB/s).
+- Stock and T8: 10/100 of 22 min ≈ 2.5 min each.
+
+**Compare:** `pelias route-compare` of bf16 against stock, and of bf16 against T8, each with that file's KL dump.
+
+**Prediction (ESTIMATE):**
+- In 2–8 % of token-layers the top-8 set differs.
+- Tokens with ≥ 1 changed layer carry over half of the mean KL. The H6 tail note says "likely flips, not tested".
+
+**Decision:**
+- The tail is carried by flips: routing-preserving weighting (Part 3, GP3-06) goes ahead.
+- It is not: drop it.
+
+**Also measured:** the margin histogram, i.e. how close the 8th and 9th experts are (P-E3).
+
+#### GP1-07 The floor of the base (new) (A, comes from GP1-06 run 1)
+
+**Question:** the base was written by llama.cpp from bf16 weights with bf16 or f16 arithmetic on the GPU path. How far is that from Pelias's fp32 reading of the same bf16 weights? Every candidate's drift sits on top of this number.
+
+**Measure:** the mean KLD printed by GP1-06 run 1 (10 chunks, 2,550 tokens).
+
+**Prediction:** 0.0005–0.003 (ESTIMATE).
+
+**Decision:**
+- If it is more than a quarter of the gap between T8 and Unsloth, a Pelias-made base (fp32 reference logits from the bf16 file) replaces the llama.cpp base for final rankings. That is a measurement tool (`pelias kld-base`) written in Part 2.
+
+#### GP1-08 Grid idempotence (P-E7) and the fine-tune size (ΔW ≈ 3 % σ) (A+C)
+
+**Run 1: re-quantization on the served weights.**
+```
+$PELIAS requant-check --model $T/qwen36-Q4_K_M.pelias.gguf
+```
+Then the same with `--imatrix $U/imatrix_unsloth.gguf_file`, and on `$M/t8.gguf`.
+- Time ESTIMATE 5–15 min each (one dequantize and one quantize pass over 21 GB, 16 threads).
+- **Question:** if Mode Q re-quantizes an unchanged weight, does it get the same bytes back?
+- **Prediction (ESTIMATE):** Q8_0 ≥ 99 % identical blocks. Q4_K/Q6_K without imatrix below 90 % (the scale search starts from the data, not from the grid). With imatrix lower still.
+- **Decision:** the Mode Q design (GP2-04). Below about 99 %, Mode Q must skip unchanged rows or quantize only the delta-touched rows, or the rounding change itself becomes drift. That drift is measured with `pelias kld` on the re-quantized file.
+
+**Run 2: adapter statistics.**
+```
+python3 tools/adapter_stats.py --adapter <v0.2 adapter> --model $T/qwen36-Q4_K_M.pelias.gguf
+```
+- The author gives the adapter path (local only).
+- **Question:** the scaffold presumes ΔW ≈ 3 % of σ. What is it really, and what share of the update is smaller than half a Q4_K step (and would be erased by a merge)?
+- **Prediction:** unknown (UNVERIFIED by design).
+- **Decision:** the core type and Mode Q requirement (scaffold 4.3, 9.4).
+
+### Block E: the second and third evaluation texts and long context (A; base generation is the long part)
+
+#### GP1-09 A 4096-token base (old name F4) (A, ESTIMATE 2 h base + 45–60 min per Pelias file)
+
+**Make the base:**
+```
+$LLAMA_BIN/llama-perplexity -m $T/qwen36-bf16.llamacpp.gguf -f $WIKI -c 4096 --chunks 25 -ngl 0 -t 8 --kl-divergence-base $T/kld-base-bf16-25x4096.bin 2>&1 | tee …
+```
+- Same mode as the 512 base (GPU visible), so the two bases share arithmetic.
+- 25 chunks × 4096 = 102,400 tokens, 2 × the 512 base. WikiText-2 test has enough: UNVERIFIED, so the tool's chunk count is checked in the log.
+- Scored: positions 2048–4094, so 2,047 per chunk and 51,175 in total.
+- Size DERIVED from the 512 base: 126.6 MB per 256 stored rows, so about 1.01 GB per chunk and **25.3 GB** in total. On D: (140 GB free).
+- Time ESTIMATE about 2 h: the 512 base took 57 min for half the tokens, and attention cost grows with context.
+
+**Runs:** `pelias kld --base $T/kld-base-bf16-25x4096.bin --dump-kld …` on stock, T8 and Unsloth. Time ESTIMATE 45–60 min each: twice the tokens; the 10 full-attention layers' cost grows with length.
+
+**Question:** do the rankings and the T8–Unsloth verdict hold at 8 × the context?
+
+**Prediction:**
+- Same ranking.
+- Absolute KLD within ±30 % of the 512 values. Later positions carry more context, so drift could go either way.
+
+**Decision:** the rankings hold, or long context becomes its own selection criterion.
+
+#### GP1-10 A domain base (old name F5) (A; the author chooses the text)
+
+**Candidate texts:**
+- `code_cpp.txt` (1,628,968 bytes, C++ source already in the P-D1 corpus; public).
+- A tool-call / agent text.
+- The local-only calibration text from the v2 dataset build (2026-10-19).
+
+**Rule:** the evaluation text must never be the calibration text of any imatrix being judged. Overlap is checked with a 64-token shingle comparison before use (tool D-T1 `--overlap`).
+
+**Base:** as GP1-09 at `-c 512 --chunks 100` (57 min, MEASURED for WikiText).
+
+**Runs:** stock, T8, Unsloth, and the winner of GP1-05.
+
+**Question:** does the choice change with the text? Unsloth calibrates on chat and code; their imatrix lowered WikiText KLD but raised its PPL (MEASURED, experiment a).
+
+**Decision:** the final PEL recipe is chosen on the paired verdicts of both texts. A candidate must not lose on either.
+
+#### GP1-11 KV cache q8_0 against f16 at long context (A, llama.cpp only, ESTIMATE 2 × 15 min)
+
+**Question:** the engine's default KV cache is q8_0. Its quality was never measured (masterwork 18).
+
+**Commands:**
+```
+$LLAMA_BIN/llama-perplexity -m $T/qwen36-Q4_K_M.pelias.gguf --kl-divergence --kl-divergence-base $T/kld-base-bf16-25x4096.bin -c 4096 --chunks 25 -ngl 99 --n-cpu-moe 40 -fa on 2>&1 | tee …
+```
+- Run it once as is (f16 cache), then once with `-ctk q8_0 -ctv q8_0` added.
+- The GPU path is used on purpose: this is the serving arithmetic.
+
+**Measure:** the difference between the two mean KLDs. Pairing is not available from llama.cpp output.
+
+**Decision:** q8_0 stays the default if the difference is below the smallest gap between finalists. Otherwise f16 or bf16 KV becomes the default and its VRAM cost is planned (masterwork 18.2).
+
+### Block F: per-layer allocation (Unsloth's "dynamic" lever) and the own imatrix (A; screening with llama.cpp, confirmation with Pelias)
+
+#### GP1-12 Per-layer `ffn_down_exps` sweep (A, ESTIMATE 8 × 8.5 min screening + 2 × 26 min confirmation)
+
+**Question:** in which layers does Q6_K (or Q5_K) for the down experts pay?
+
+**Screening:**
+- Start from the T8 recipe. Raise `ffn_down_exps` to Q6_K in one group of 5 layers at a time: 0–4, 5–9, …, 35–39. That is 8 runs.
+- Each run: quantize (4.2 min), then llama.cpp KLD (4 min, the GPU-visible path, consistent within the screen).
+- Size Δ per group (DERIVED by D-T1). Rank by KLD drop per GB.
+
+**Refinement:** inside the two best groups, single layers (10 runs).
+
+**Confirmation:** the best two allocations through Pelias with dumps, paired against T8.
+
+**Prediction:** the first and last layers pay most. Stock already favours 0–4 and 34–39, and Unsloth uses Q6_K at 34, 38 and 39.
+
+**Decision:** a per-layer down layout inside the 22.13 GB budget (without blk.40).
+
+#### GP1-13 Own importance matrix (A, ESTIMATE 45 min + 26 min)
+
+**Command:**
+```
+$PELIAS imatrix --model $T/qwen36-Q4_K_M.pelias.gguf --file <calibration text> --out $M/imat_own.gguf --ctx 512 --chunks 200 --threads 16
+```
+- Time ESTIMATE about 12 s per chunk: the forward pass without the output layer is slightly under the 12.7 s per chunk of `kld`. So about 40 min for 200 chunks.
+- Calibration text: the author's choice, never the evaluation text (GP1-10 rule).
+- Computed on the stock Q4_K_M file. Collecting on bf16 would be more exact but slower (GP1-06 timing). DECISION, proposed: stock file first, bf16 later if GP1-07 shows the floor matters.
+
+**Then:** T8 + own imatrix (llama-quantize `--imatrix $M/imat_own.gguf`, type check), then Pelias with dump, paired against GP1-05 run b (T8 + Unsloth's imatrix) on both evaluation texts.
+
+**Decision:** the calibration source for PEL.
+
+### Block G: reading what the build must respect (C; no machine time)
+
+#### GP1-14 Spec checks Claude does from files
+
+| Check | How | Feeds |
+|---|---|---|
+| Attention scale | The GGUF key `qwen35moe.attention.scale` is read by `src/model/spec.cpp`. Confirm whether the served file and Unsloth's file carry it, and what the trainer scaffold hard-codes | GP2-03 |
+| Norm +1 convention (P-S2) | Already exercised by the reference forward pass (MEASURED equal to llama.cpp on the tiny model). Record as DONE for the reference; the GPU kernels inherit the test | GP2-02 |
+| IMRoPE, V-head order, conv tap order, top-k ties (P-S3, P-S4, P-S1, P-S8) | Same: the reference matches llama.cpp end to end on the tiny model (MEASURED), which covers these semantics for the CPU. Record each as "DONE by the reference, CPU", with the GPU repeat at step 5 | GP2-02 |
+| MTP block semantics (P-S5) | Not covered: the reference does not run blk.40. Stays open for the decode loop (GP3-08) | GP3-08 |
+
+---
+
+## Part 2. What gets fixed after the tests
+
+Each fix names the test that triggers it. Fixes with no trigger are corrections known now.
+
+### GP2-01 Accuracy gates rewritten around paired comparisons (known now)
+
+- **Replace** "KL ≤ 1.0 × σ_float (0.017353)" everywhere: trainer scaffold 10.2, 9.6, K1–K3, rungs 3 and 7, P-X7, P-Q3, P-Q5, P-Q6; engine blueprint E3/E7. σ_float is larger than T8's whole drift, so it cannot separate mixes.
+- **New wording:**
+
+| Gate | New definition |
+|---|---|
+| K1 (the trainer's forward pass vs the reference on the same GGUF) | Mean KLD of the trainer forward against Pelias's CPU reference ≤ the GP1-07 floor, with the paired interval reported |
+| K2 (exported file vs the trainer's own reference) | Paired kld-compare of exported against trainer-reference logits shows no regression: interval upper bound ≤ 0 + the tolerance set from GP1-03 |
+| K3 (engine vs the reference) | The engine's KLD against the bf16 base is within the activation-rounding cost measured in GP1-03 for the rounding mode the engine uses |
+| P-X7 | Gets a pass line: the Pelias file is no worse than the stock reference file on a paired comparison |
+
+- **Pick one KL method:**
+  - Full-vocabulary KL for anything computed on the CPU reference.
+  - "Top-256 + lumped tail" only where storage forces it (trainer teacher logits). Its bias against full KL is measured once on 10 chunks (DERIVED from the same logits).
+
+### GP2-02 Status corrections in the trainer scaffold, notes, engine docs and master (known now)
+
+- **P-E10:** partly done (13.31 GB/s, Q4_K rows only).
+- **P-X7:** partly done (stock 0.039013 against bf16, CPU reference).
+- **P-S6/P-Q6:** partly done by GP1-03.
+- **P-S1–S4, S7, S8:** done for the CPU reference (GP1-14).
+- **P-D1:** done.
+- **P-E6, P-X6:** done.
+- **G15 (pinned memory):** refuted above 20.4 GiB (32 GiB held).
+- **Probe count:** settle at 102.
+- **P-E13:** partly done.
+- **ID collisions:** renamed by Appendix A of this file.
+
+### GP2-02b Stale records found by the reader of the masterwork and the attached specifications (known now)
+
+| Where | What is stale or in conflict | Fix |
+|---|---|---|
+| Masterwork header | Still says "No product code exists" | Name what exists (reader, quantizers, tokenizer, Stage A, CPU reference, `kld`, `imatrix`, `kld-compare`) |
+| Masterwork 18.2 | Step numbers predate the revised 15.2 order (Vulkan is step 16; Mode L step 16; intake/coach step 13; installers step 15; dense step 14). O12 and O13 each mean two things | Renumber; split the O12/O13 meanings |
+| Masterwork O20 | Says the 0.53 GB size difference to Unsloth is "not yet explained" | It is explained, exact to the byte: blk.40 under (b)'s layout is 525,716,544 bytes and Unsloth's file has no MTP head (PEL_QUANT_DECISION_DATA 2.3) |
+| Masterwork 17.2, P-M4 | The P-M4 row reads a "22.13 GB Q4_K_M" file. That size is Unsloth's file, not the served Q4_K_M (21.71 GB) | Name the file that was read |
+| Masterwork step 11 gate | Dropped the persona criterion (≤ 12 of 111 not-pass) that the ground-up specification carries | Restore it (GP3-15) |
+| Masterwork 3.3 | Says the reference is fp64 (`tests/ref/`) | Record the fp32 C++ reference behind `pelias kld` and the 0.039013 reading |
+| Masterwork | P-G0b is both "repeats pending" (intro) and "done" (21.7) | Settle as done |
+| Universal build master, ground-up specification | Port 8012, the 10.9 GiB ceiling, "native Linux held", P-M4 "awaits", Batch C "next" | Frozen input copies. The registry marks each line as superseded (A8, D26/D28, A2, 17.2, 17.5) |
+| LoRA scaling | rsLoRA α/√r in the research update and the parameter dictionary option, against α/r in the Mode Q formula and in v0.2. A 4 × difference in the update at r = 16, α = 32 | Author ruling (Appendix B, B12). Affects training code |
+| Rung 5 stall gate | "N ≥ 3,072" (universal build master) against "≥ 16 k tokens per step" (masterwork) | The masterwork governs (3,072 is the default minimum step, not the stall gate) |
+| Rung 1 tolerances | Two tables: against the unrounded op (universal) and against the same rounded inputs (trainer 6.11) | The trainer's governs (C14). The universal values are recorded for information |
+| Stream time | 1.49 s (80 fetches) against 1.47 s (79 fetches) | 79 fetches; 1.47 s (C23) |
+| v0.2 numbers | 3.01 M against 3.72 M processed tokens; median 247.85 against "about 300 tok/s averaged" | Different definitions (median against mean; processed against training tokens). Label them |
+| "Spine" size | 1,409.0 M core parameters against about 1.94 B / 3.62 GiB (The Accidental Find) | Different scope (the latter includes routers, `lm_head`, norms). Label them |
+| Hardware research plan (2026-10-23) | Uses the retired 57.0 tok/s as data in 9 places, including the E0 gate (within ±3 % of 57.0) and the E1 gate, which cannot pass as written. Stock baseline "32–38" against the measured 41.1–42.0. Reference numbers in its body run one behind its source list | Mark the file "audited hypothesis list, not a measurement source" (engine blueprint already does). E0/E1 gates come from the engine blueprint, not from this file |
+| Parameter dictionary row `api.special_in_user_content` | The row is cut off mid-sentence | Restore from the masterwork (O10) |
+| Ground-up master specification | Ends mid-sentence in 10.2 | The repo copy under `docs/inputs/` is checked for the same cut; the masterwork governs |
+
+### GP2-03 Trainer spec numbers that were presumed (after Block D and G)
+
+- **Attention scale:** read from the GGUF key when present, else 1/√head_dim. Never hard-coded.
+- **ΔW:** the measured value from GP1-08 run 2 replaces "≈ 3 % σ".
+- **Mode Q:** designed from the GP1-08 run 1 idempotence numbers. If below about 99 %, quantize only rows whose delta is non-zero, and record the rounding drift of untouched rows.
+- **MTP:** an MTP oracle is defined. The reference forward pass gains blk.40 (GP3-08), and its draft logits are compared with llama.cpp's MTP path (oracle only).
+- **v0.2 mismatch:** experts were trained as affine group-64 4-bit but served as Q4_K. Fixed by design in the new trainer (frozen experts are the served bytes). Proven by P-X1 (hash) at export.
+
+### GP2-04 Author rulings needed before the build continues (Appendix B lists them all)
+
+The tests supply the facts. The author rules. The main ones:
+- D9/D33 (stock map, no imatrix) against PEL mixes with imatrix.
+- The bit-exact rule against L1/L2.
+- Whether PEL recipes become the trainer's base.
+
+### GP2-05 Activation rounding policy for the engine and Mode F (after GP1-03)
+
+- Per tensor group: fp16/bf16 activations or int8 (q8_1 or Q8_K).
+- **Rule:** a group may round to int8 only if its paired cost (GP1-03 c or d) is below a tolerance the author sets. Proposed: a quarter of the gap between the chosen PEL mix and the next candidate.
+- Recorded as a DECISION in the masterwork. Engine kernels and Mode F follow it.
+
+### GP2-06 KV cache default (after GP1-11)
+
+q8_0 or f16/bf16, with the VRAM cost from the planner.
+
+### GP2-07 Parameter conflicts (known now; author rules each)
+
+| Parameter | Ruling | Status |
+|---|---|---|
+| Server port | Pelias **8062** (A8); llama.cpp comparison server stays **8012** (author, 2026-10-27 13:50) | Ruled |
+| Decode threads | 6 (dictionary) against 7 (CSV) | Open |
+| `--prio` | CSV default 2 against the master's "never use --prio 2" | Open |
+| Thinking default | true against false | Open |
+| `max_tokens` default | −1 against 256 | Open |
+| `poll` | 50 against 100 | Open |
+| NTA prefetch | off against on | Open |
+| Defaults that cite a measurement | The q8_0 "12/12 needles" is a capability test, not a drift test (GP1-11) | Open |
+| Tier bypass default | 32 in both the dictionary and the CSV, but 32 is the tier build's crash path for 13–31-token chunks; production used 9 | Open. The Pelias engine gets its own crash sweep (GP4-02) |
+| Pinned pointers | "Identical host and device pointers guaranteed on WSL2" (dictionary) against "dev_base − host_base offset, Path A" (CSV) | Open. Pointer rule: use dev_base, never assume equality, and test both |
+| Sampling temperature | 1.0 "vendor thinking default" (no citation) against the vendor's 0.6 for coding in thinking mode (VRAM guide) | Open. Cite the model card |
+| One flag, two meanings | `PELIAS_TIER_MAX_MIB` (ceiling and bank, GiB vs MiB); `--load-mode` (alloc backend vs load mode); stream flush (once per batch vs every enqueue, both citing D27); `--prio` applies `cpu_dma_latency` on Linux while the dictionary keeps it off | Open. The one dictionary (masterwork 7.1) decides each |
+| Ranges and enum names that differ | Bank, pinned pool, ctx, batch, ubatch, top_p, top_k, seed, timeouts, KV types, backend, pin modes, hot-set objective names, L2 persist maximum, doorbell backoff (`__nanosleep` 64 against 200), zero-copy share (0.44 against "0.60 Pass 1"), MTP load naming, `max_connections` (8, "16 max", range 1–64) | Open. One dictionary row each, with a source |
+
+### GP2-08 Training data port (known now)
+
+The dataset was built with `--server-port 8012` (masterwork C20). It is rebuilt with 8062 before the next training run. Check: a grep of the rebuilt data for the old port returns nothing (count only, no text printed).
+
+### GP2-09 PEL recipes locked (after Blocks C, E, F)
+
+- **Files:** the winning recipes go into `profiles/pel/` as TSV plus a small JSON: name, version, the source bf16 hash, the imatrix file hash and its calibration text's SHA-256 (the hash only, never the text), measured KLD on each evaluation text, size with and without blk.40, and the date.
+- **Naming:** PEL4 vN, PEL3 vN (author DECISION 01:59).
+- **GGUF metadata keys:** `pelias.pel.recipe`, `pelias.pel.version`, `pelias.pel.calibration_sha256`.
+
+### GP2-10 Docs updated with every result (after each block)
+
+`PEL_QUANT_DECISION_DATA.md`, the masterwork O20 section, BUILD_LOG, RUNBOOK, TALLY (one row per result, with the "faster (time saved; %)" column).
+
+### GP2-11 The 4096 and domain bases get IDs in the docs (after Block E)
+
+All new base files are recorded with size, hash and how they were made.
+
+### GP2-12 A Pelias-made base, if GP1-07 says the floor matters
+
+`pelias kld-base --model BF16 --file TEXT --ctx N --chunks K --out BASE.bin` writes the same base layout as llama-perplexity from the fp32 reference. Then every ranking is repeated on it, with paired comparisons only.
+
+### GP2-13 Engine and trainer docs carry the new namespace (Appendix A)
+
+### GP2-14 Version string refresh (known now)
+
+The build records the commit at configure time only (MEASURED: a stale hash after a rebuild). Fix: regenerate `version.h` at build time from `git rev-parse` (CMake custom target that always runs, writes only on change). Test: build, commit, build again; `pelias version` prints the new hash.
+
+---
+
+## Part 3. Finishing the build
+
+Order: each step's gate closes it. A failed gate stops that branch and is logged. Steps follow masterwork 15.2, with the work items found today inserted where they belong.
+
+The steady routine applies to every step:
+- Code in the sandbox, unit tests, gcc/clang/asan, oracle, privacy scan, dependency check.
+- Commit; push only on the author's word; bundle and backup.
+- The author runs anything that touches the GPU or the real model.
+
+### GP3-01 `pelias quantize --recipe FILE [--imatrix F]` (task 86, needed by everything after)
+
+**Build:** per-tensor types from a recipe TSV, with the weighted quantizer (oracle-checked) when an imatrix is given. GGUF metadata keys from GP2-09.
+
+**Gate:**
+1. T8 built by Pelias equals T8 built by llama-quantize from the same recipe, byte for byte (`pelias verify`, exit 0), with and without Unsloth's imatrix. The first run is by the author: 2 × ~4 min.
+2. The imatrix name map handles the expert slices (READ-SRC: imatrix + (row / rows-per-expert) × n_per_row).
+
+### GP3-02 Per-expert types, "cold experts" (task 3)
+
+**Inputs:** `--expert-stats` from stock and T8 on both evaluation texts. Each Pelias run already writes this CSV when asked. Add `--expert-stats` to the GP1-04/05 runs at no time cost.
+
+**Format:**
+- GGUF holds one type per tensor. Per-expert types need the expert tensors split into a hot and a cold tensor plus an index map. This is a Pelias-only GGUF extension; llama.cpp cannot read it (masterwork PEL-3 note).
+- Recorded as DECISION (proposed) before code. The author rules on the format.
+
+**Gate:**
+- The reference reads the split file and gives identical logits to the unsplit file when both halves keep the same type (KLD 0.000000).
+- Then a cold-at-lower-bits variant is measured paired against its parent.
+
+### GP3-03 AWQ-style scale folding (old name L1)
+
+**Exactness first (C, sandbox):**
+- On the tiny model, fold per-channel scales s into `attn_norm` / `post_attention_norm`. Divide the matching input columns of every consumer by s: the q/k/v/qkv/gate projections; the F32 router `ffn_gate_inp` (exact, F32); `ffn_gate_inp_shexp`; the shared and routed experts' gate/up.
+- **Gate:** logits identical within fp32 rounding (KLD ≤ 1e-6 on the tiny base) before any quantization.
+- Gated `ssm_norm` and the +1 convention are handled explicitly or excluded.
+
+**Search (A+C):**
+- Per layer and input space, s = mean|x|^α with α on a grid {0, 0.1, …, 1}, using `in_sum` / `in_sum2` from the imatrix. No new calibration pass is needed.
+- Objective: the output error of the quantized weight, weighted by activations (the Gram from D-T7 if available, else the diagonal).
+
+**Gate:**
+- The folded T8 (quantized with Pelias, imatrix-weighted) beats T8 + imatrix on a paired comparison on both evaluation texts.
+- Requires the author's ruling on D9/D33 (calibration on the base).
+
+### GP3-04 GPTQ-style error feedback inside the K-quant blocks (old name L2)
+
+**Data:** the Gram matrices from D-T7 for the dense groups first (`ssm_out`, `attn_output`, `attn_gate`, `shexp`; the groups the sweep ranks highest).
+
+**Method:**
+- Quantize columns in order. Spread each column's rounding error onto the not-yet-quantized columns through the inverse-Hessian update, keeping the K-quant block structure: per-block scales are found first, then values are re-rounded with feedback.
+- The result is a valid Q4_K/Q6_K/Q8_0 block; any reader decodes it.
+
+**Gate:**
+1. The file is readable by llama.cpp and by the reference.
+2. A paired win over the same recipe without feedback, on both texts.
+
+**Ruling needed:** it breaks "byte-identical to ggml's quantizer" for these tensors by design. Proposed: byte identity stays the rule for stock types under stock names; PEL types are defined by Pelias's own quantizer, with their own golden hashes.
+
+### GP3-05 Remaining step 4: chat-template renderer (P-D2) and data pipeline
+
+**Renderer:** the Qwen template subset (158 lines, 8,057 bytes, MEASURED census), rendered natively.
+
+**Gate:**
+- P-D2: every assistant turn of the author's dataset and of a public set renders byte-identical to the Hugging Face Jinja render. Zero mismatches, including `tojson` formatting and the think-tag trap (82 of 3,000 turns, scaffold).
+- Data audits A-LEN, A-TOK, A-TPL, A-MASK, A-DUP, A-SPECIAL, A-FAMILY with their rules (scaffold).
+- The dataset port rebuild (GP2-08) happens here.
+
+### GP3-06 Routing-preserving weighting (only if GP1-06 says flips carry the tail)
+
+The imatrix or the GPTQ objective adds weight to the router's input space and to the experts whose margins are small.
+
+**Gate:** a paired win plus a measured drop in the flip share (route-compare).
+
+### GP3-07 Decode loop and sampling on the CPU reference (task 4)
+
+**Build:**
+- KV cache and DeltaNet state carried across steps (the reference today runs one sequence from position 0).
+- Greedy, temperature, top-k, top-p, min-p, and the penalties of the dictionary.
+- A seeded RNG (counter-based Philox; dictionary seed default 20261019).
+
+**Gate:**
+- Greedy decode on 20 fixed prompts equals llama.cpp's greedy decode token for token for 128 tokens. Run llama.cpp CPU-only with `--no-op-offload`, and the reference with `--act-int8 all --act-int8-block 256`, so the arithmetic matches.
+- Without matched rounding, the first differing position is reported, not failed.
+- Incremental decode equals the full re-run of the same sequence: logits within 1e-5 relative.
+
+### GP3-08 MTP head in the reference (O18; needed by the engine)
+
+**Build:** blk.40 run after the trunk as the model's graph does (READ-SRC llama.cpp at 2ca15f5).
+
+**Gate:**
+- The draft logits equal llama.cpp's MTP path on the tiny model within the float tolerance.
+- Greedy drafted decode equals plain greedy decode (masterwork 15.2 step 10).
+
+### GP3-09 Shared blocks, `arch_dense` and a small test model (task 5)
+
+**Build:** the trunk split into reusable blocks (attention, DeltaNet, MoE, dense FFN). A dense architecture module. A tiny random dense model in the sandbox, plus one real small dense model the author supplies (never downloaded by the program).
+
+**Gate:** both match llama.cpp end to end on F32 and on a quantized file (as Milestone 1).
+
+### GP3-10 Fast CPU kernels, then GPU kernels (task 6 = masterwork step 5)
+
+**CPU:**
+- AVX2 dot products for Q4_K, Q5_K, Q6_K, Q8_0, IQ4_XS against fp32 and int8 activations, following the GP2-05 policy.
+- Threadpool with 1-thread-per-core pinning (E-A1 A/B).
+- **Gate:** outputs within the rung-1 tolerances against the reference (16.2). Throughput at or above llama.cpp's CPU expert path (about 27 GB/s effective, DERIVED, E4).
+
+**GPU (sm_89):**
+- Dequant-in-register GEMV/GEMM for the same types, RMSNorm, IMRoPE, attention, DeltaNet chunked and recurrent, router, top-k.
+- **Gate:** rung 1 (fp64 reference, zero compute-sanitizer errors) and kernel parity. The author runs the GPU tests.
+
+**Rung 1 edge shapes (universal build master):**
+- Expert token counts M_e ∈ {0, 1, 7, 8, 63, 64, 65}.
+- All tokens routed to one expert; zero tokens to the others. This is the negative-ID / hole crash class seen in the tier build.
+- Element-wise kernels: 0 NaN/Inf on zero, denormal and outlier inputs.
+- compute-sanitizer memcheck, racecheck, initcheck and synccheck all at 0.
+
+**Open kernel items to close here:**
+- O13: the expert down projection (K = 512) runs at 0.27–0.29 of the int8 peak. Try a persistent next-tile kernel, probe first.
+- O14: the grouped launch with real, unequal routing counts.
+- O15: the two untested correct doorbell ordering forms.
+
+### GP3-11 FP8 safetensors, then NVFP4 (task 7)
+
+**Build:** readers and dequantizers for FP8 (e4m3/e5m2) safetensors and NVFP4 (scale layout READ-SRC from the published configs).
+
+**Gate:** a small published file in each format decodes equal to its reference library's dequantization (oracle only).
+
+### GP3-12 Masterwork steps 6–9: verify harness, one layer to full forward on the GPU, backward + LoRA + Mode Q, training loop + export
+
+The gates are the ladder rungs 2–7 (masterwork 16.1), with the K-gates of GP2-01:
+- 79 fetches per step;
+- zero allocations in the step loop;
+- the P-X1 hash proof;
+- probes P-K4 to P-K13, P-Q2, P-Q5, P-Q7–P-Q9, P-Q11, P-S7, P-T1–P-T13, P-D2–P-D6, P-X1–P-X5, P-M1, P-M2, P-M5, at the stages the scaffold names (T3–T12).
+
+### GP3-12b The trainer's central claims, tested (The Accidental Find 14.1 and 15.2; 03 blueprint H1, H2, H8)
+
+| Test | What | Pass / falsified if |
+|---|---|---|
+| Parity on a small MoE (bp-H1, 15.2) | LoRA against a frozen quantized base and bf16 LoRA, on a small MoE that fits both ways; 3 seeds each | Loss curves within seed noise, and a downstream score within noise. Falsified by a gap larger than seed noise |
+| Train/serve gap (bp-H2, 14.1-c) | KL of the exported file against the bf16 merge of the same adapter, on held-out text | Reported with a paired interval. In the new design, Mode Q exports the served bytes directly. This test is the check that the design closed the gap |
+| Quantized-trained against bf16-trained adapter on the served file (bp-H8) | Both adapters judged on the served quantized model | The quantized-trained adapter is no worse (paired) |
+| General ability, long context, identity, tool calls (14.1-d to g) | Base against tuned: an ability battery; retrieval at 16 k, 32 k, 64 k, 128 k; identity with thinking on and off, no system prompt and other clients' prompts; tool-call format through the serving stack | Reported; no regression beyond the paired interval |
+| Peak logging | The true maximum over every micro-batch of a step, not the last micro-batch (the v0.2 lesson: a run peaked 0.39 GiB above its smoke test) | The governor logs the step maximum |
+
+### GP3-13 Repair training against a bf16 teacher (old name L4; right after GP2-03's spec corrections)
+
+**Teacher:**
+- Pelias CPU reference logits of the bf16 file on a calibration text: top-256 plus lumped tail per position, stored once.
+- Time unmeasured; GP1-06 gives the per-chunk rate of the bf16 reference.
+
+**Student and objective:**
+- The PEL file in Mode Q: core LoRA through the exact quantizer, plus optional norms and router. Experts frozen at their served bytes.
+- Objective: KL(teacher ‖ student) on positions of the calibration text.
+
+**Gate:**
+- A paired win against the untrained PEL file on both evaluation texts (never the calibration text).
+- No regression on the domain text.
+- P-X1 hash proof on every frozen tensor.
+
+### GP3-14 Masterwork step 10: the engine
+
+**Scope:**
+- CPU cold kernels, GPU bank, doorbell, decode loop, prefill.
+- MTP drafting.
+- The hot set re-profiled on the clean base.
+- P-E4: NVML used before start and at peak.
+- The ceiling read again before and during loading.
+
+**Gates:** E4–E9, G3 (≥ 55.0 tok/s at 12 k), K3 (GP2-01).
+
+### GP3-15 Masterwork step 11: the server on 8062 and the web interface
+
+**Gates:**
+- A drop-in replacement for the interim launcher.
+- Client replay: captured requests compared by structure with the llama.cpp server on 8012.
+- A Visual Studio session works.
+- PG14 (Host/Origin checks, session token, `web.fetch` refuses private addresses).
+
+### GP3-15b Server details carried from the specifications
+
+- Persona criterion restored to the step 11 gate: ≤ 12 of 111 not-pass, baseline 9 (ground-up specification).
+- One GPU owner at a time: the server unloads before a job, and the governor checks VRAM and pinned RAM across processes (masterwork 11.6, N9).
+- O10: policy for special-token text inside user content (pass and count, escape, or refuse). Author ruling.
+
+### GP3-16 Masterwork steps 13–17
+
+Checks before step 15:
+- The Windows 10 driver check: does the last Windows 10 driver meet the CUDA 13.4 minimum? Else build with the 13.0 toolkit.
+- The CUDA static runtime redistribution licence is read (UNVERIFIED).
+
+Start-up and intake checks (masterwork 4.1, 6.3–6.5, 7.1):
+- Quick-pass running time measured.
+- APU path (unified memory, hot bank 0) offered only when H1 is measured on one.
+- Installer requirement checks (driver, OS, disk, `.wslconfig` cap) report with fix steps.
+- Import report (lines read, keys matched, unknown keys, out-of-range values).
+- Coach checks (duplicates, empty descriptions, answers parse, every parameter covered).
+- USER-FORCED trial (the forced value is allocated and touched for 2 s).
+- Dictionary check (every key used by a module, every module key in the dictionary).
+- P-E15: ReBAR routes A (Vulkan host-visible device-local) and B (D3D12 write-combined) against zero-copy; `auto_probe` turns one on only on a measured gain.
+
+Universality items:
+- O21: the CPU-only gate (measured tok/s against the ceiling recomputed per mix; the 40 tok/s target needs ≤ 1.15 GB per token or about 1.7 accepted MTP tokens per pass, DERIVED in masterwork O21).
+- E13: a second MoE through the plug-in, and a dense model passing the K-gate.
+
+- Start-up probes, plan card, intake, coach (U1–U11).
+- Universality part a: AVX-512/VNNI, CPU-only mode, dense plug-in.
+- Web tools and installers (PG11, PG12, BC7).
+- Universality part b: Vulkan, gated extras (zero-copy third branch, ReBAR path, Mode L, LRU).
+- Release gates PG1–PG14.
+
+---
+
+## Part 4. Tests on the finished build: tune, then finalise
+
+### GP4-01 The first benchmark (masterwork 16.4, repeated on the release build)
+
+| Item | Detail |
+|---|---|
+| Files | F0 bf16 (P-Q11 layer-major or the CPU reference); F1 Pelias base; F2 stock Q4_K_M; F3 official 4-bit upload if the author supplies one; F4 Unsloth; F5 Pelias trained (Mode Q); F6 the final PEL recipe |
+| Quality | Paired KLD against F0 on WikiText 512, WikiText 4096 and the domain text; same-top-p; PPL as a sanity check only; the author's gauntlet and client matrix; published task benchmarks only where the settings match the model card, otherwise "not comparable" |
+| Speed | Decode and prefill at short, 4 k and 12 k context, 3 launches per side with 2 warm-ups, spread reported (launch-to-launch spread was 5–21 %, MEASURED) |
+| Memory | Peak VRAM (NVML whole card and process) against the 10.7 GiB ceiling |
+| Rule | No invented pass mark: the table is the result |
+
+### GP4-02 Engine tuning sweeps (each an A/B with 3 launches per side; a change is kept only if its gain exceeds the spread)
+
+| Knob | Range | Measure |
+|---|---|---|
+| Bank size | 6.5, 7.0, 7.5 GiB, and the largest that fits the measured ceiling (P-E4) | tok/s at 12 k, live hit rate, peak VRAM |
+| Bank objective | byte-weighted hit against zero-miss share (P-E2 regression of c0, c1) | tok/s |
+| Decode threads | 5–8; 1 thread per physical core against SMT (E-A1) | tok/s, spread |
+| Poll level, handoff order | acquire/release against seq_cst (E-A2) | handoff p99, tok/s |
+| NTA prefetch (E-A3), L2 persisting window (E-A4), 2 MiB pages (P-E11) | on/off | tok/s, cold read GB/s |
+| Bypass N, `-ub` | 9, 16, 32; 2048 or 4096 | prefill tok/s, peak VRAM, crash sweep 1–64 tokens |
+| Zero-copy third branch | off/on with the restated gate (masterwork 10.4) | combined GB/s, tok/s |
+| MTP draft count | 0–3 | acceptance rate, tok/s; greedy equality |
+| Activation rounding per group | per GP2-05 | K3 paired KLD and tok/s together |
+| KV type | per GP2-06 | needles, KLD, VRAM |
+
+### GP4-03 Capability and acceptance (masterwork 16.3, engine E10, 03 blueprint 8.6)
+
+- Persona probe: not-pass ≤ 12 of 111 (baseline 9).
+- Needles 12/12 to 120 k.
+- Tool-call test.
+- Loop test: replies that hit the output cap, counted.
+- Thinking on and off.
+- Client replay (Visual Studio Copilot, odysseus-ai, web UI, Ollama alias).
+- A real Visual Studio session with the server log open.
+- The four client unknowns, read from the server log: does the client send a thinking-off switch; does it send its own system prompt every turn; how does it declare tools; does it truncate context on its side.
+- An Ollama-style client: its template renders byte-identical to the server's rendering of the same conversation.
+- SSE heartbeat: a long prefill does not time the client out (the 15 s default is untested).
+
+### GP4-04 Hardware leftovers (only what the engine's choices depend on)
+
+- Stock-clock repeats of P-H3, P-H4, P-H10.
+- The ReBAR on/off pair (optional, O17).
+- Power plan.
+- The VRAM disturbance margin (sets the ceiling margin).
+- P-M5 (zero allocations in the hot loop).
+- P-E4 per bank and context.
+- The Windows timer fix with P-M3 again.
+- Three launches per side for any Windows-against-WSL speed claim.
+- The PCIe link width read under load (4.0 × 16 is assumed from throughput; never read from the GPU tool under load).
+- Native Linux floors (E-A6, E1), now that native Linux is no longer held: the floor tests 02, 03, 04, 07 and the base cell.
+
+### GP4-05 Release gates
+
+- PG1–PG14 and BC1–BC7 (masterwork 16.3).
+- PG10: runs with the oracles deleted.
+- A fresh clone on a clean machine installs and passes the CPU tests from the README alone.
+
+### GP4-05b After the release: the future-hypothesis tests (masterwork 21; nothing starts without the author's word)
+
+| Test | What |
+|---|---|
+| P-W1 | Energy per token: a plug-in wall meter during the speed runs, J/token at short, 4 k and 12 k; plus the idle cost of a spinning doorbell |
+| P-G1 | Games: a small Vulkan scene with and without the bus; average fps, 1 % low, frame-time variance |
+| H-U1 | The bus outside LLMs: port one workload to `libpelias_substrate`, compare with its best conventional version |
+| H-U2 / H-U3 | A tiny CPU model keeps the bus tuned, against a coded rule. The model's CPU time per decision must be below the miss time it saves; compare three residency policies |
+| The 14 per-field probes (masterwork 21.3) | Each against a stock baseline with unchanged output, measuring its own f and k |
+
+### GP4-06 Freeze
+
+1. The final PEL recipe and its numbers are written into the GGUF metadata and the docs.
+2. The benchmark table is regenerated from the release build.
+3. Every result carries its log path.
+
+---
+
+## Appendix A. ID map: old names to the names in this file (fixes the collisions found by the readers)
+
+| Old name (where) | Meaning | New ID |
+|---|---|---|
+| F1 (today's plan) | Per-token dump + paired compare | done in 3a272b3; first real use GP1-01 |
+| F2 (today's plan) | Doc fix: 25,500 scored tokens | done |
+| F3 (today's plan) | llama.cpp `--no-op-offload` | GP1-02 |
+| F4 (today's plan) | 4096-context base | GP1-09 |
+| F5 (today's plan) | Domain base | GP1-10 |
+| F6 (today's plan) | Activation-rounding sweep | GP1-03 (code done in 3a272b3) |
+| L1 / L2 / L3 / L4 (today's plan) | AWQ folding / GPTQ feedback / routing flips / repair training | GP3-03 / GP3-04 / GP1-06 + GP3-06 / GP3-13 |
+| Block 1 / Block 2 (today's messages) | Bench set through Pelias / Unsloth + imatrix + IQ4_XS | GP1-04 / GP1-05 |
+| F1–F9 (trainer scaffold, v0.2 findings) | Findings of the old trainer | keep as "v0.2-F1…F9" |
+| L1 (trainer scaffold) | Chunked cross-entropy kernel | keep as "kern L1" |
+| K1–K3 (trainer) and P-K1–K3 (probes) | KL gates and kernel probes | KL gates renamed "KG1–KG3" in GP2-01 |
+| G1–G18 (claims), G1–G18 (server gaps), G1–G7 (trainer gates), G0–G3 (prototype) | Four lists | "claim-G", "gap-G", "gate-G", "proto-G" |
+| E0–E13 (engine phases), E0–E7 (prototype track 2), E-A1–A7 (audited hypotheses), E1–E5 (elementwise kernels), E-A…E-F (export options) | Five lists | "phase-E", "proto-E", "E-A" kept, "kern-E", "export-E" |
+| R1–R16 (risks), R1–R22 (requirements), R1–R3 (router kernels), R1–R4 (checkpoint registries), [sync R1–R4] (rulings) | Five lists | "risk-R", "req-R", "kern-R", "ckpt-R", "sync-R" |
+| T1–T8 (O20 tests) and T0–T14 (trainer stages) | Two lists | "O20-T1…T8" and "stage-T0…T14" |
+| H1–H8 (03 blueprint), H6 (engine accuracy gate), H9/H11/H12 (engine notes) | Different things | "bp-H1…H8", "gate-H6", "eng-H9/H11/H12" |
+| M0–M10 (03 blueprint milestones) | General-tool milestones | "bp-M0…M10" (they follow Part 3) |
+| P-M5 | Zero allocations in the hot loop (scaffold, universal) against RAM busy % per memory level (masterwork O16) | "P-M5" keeps the scaffold meaning; the masterwork one becomes "P-M5b" |
+| P-Q11 | bf16 reference logits by layer streaming (masterwork) against a GEMM gate probe (ground-up specification) | masterwork meaning "P-Q11"; the other "P-Q11g" |
+| PEL-6 / PEL-4 / PEL-5 / PEL-1… (experiment shapes) and PEL4 / PEL3 (family names = bit width) | PEL-6 is `ssm_out` at Q8_0, not a 6-bit mix | experiment shapes renamed "shape-6, shape-6+, shape-4, …"; family names stay PEL4, PEL3 |
+| H1–H5 (masterwork hardware requirements) = R1–R5 (universal build master) | The same five requirements | "bus-H1…H5" |
+| PG1–PG14 (universal numbering) against the engine runtime specification's PG list (its PG3 is the tokenizer) | Two gate lists | universal numbering governs; the engine list becomes "rt-PG" |
+| Step numbers: masterwork 15.2 (R0, 1–17) against the ground-up specification 9.2 (1–15) | Different content per number | masterwork 15.2 governs |
+
+## Appendix B. Decisions waiting on the author (the tests above give each its facts)
+
+| # | Decision | Facts from |
+|---|---|---|
+| B1 | D9/D33 (stock map, no imatrix) against PEL mixes with an importance matrix as the base | GP1-05, GP1-10, GP1-13 |
+| B2 | Whether PEL types may differ from ggml's quantizer bytes (L2, AWQ folding) while stock types stay byte-identical | GP3-03, GP3-04 |
+| B3 | The calibration text (and that it is never an evaluation text) | GP1-13 |
+| B4 | The domain evaluation text | GP1-10 |
+| B5 | Activation-rounding tolerance per group | GP1-03 |
+| B6 | KV cache default | GP1-11 |
+| B7 | Per-expert type container (a Pelias-only extension) | GP3-02 |
+| B8 | Parameter conflicts (threads, prio, thinking, max_tokens, poll, prefetch) | GP2-07 |
+| B9 | Whether a Pelias-made base replaces the llama.cpp base for final rankings | GP1-07 |
+| B10 | `token_embd` placement (host RAM, so its Q8_0 costs file size only) | PEL_QUANT_DECISION_DATA 9.2 |
+| B11 | The 7.5 GiB bank as a ruling or a derived value (O1) | GP4-02 |
+| B12 | LoRA scaling: α/r or rank-stabilised α/√r. They differ 4 × at r = 16, α = 32. The Mode Q formula and v0.2 use α/r | GP2-02b; ablation T-A3 |
+| B13 | The size bar with MTP required (O18): T8 is 21.97 GB without blk.40 and 22.50 GB with it. Unsloth's 22.13 GB file has no MTP head. Proposed: compare without blk.40 (like for like), and report the blk.40 cost separately | PEL_QUANT_DECISION_DATA 1, 2.3 |
+| B14 | Which reading is the O20 bar: llama.cpp's (8-bit activations) or Pelias's fp32 reference. Proposed: Pelias's, with Unsloth re-measured the same way (GP1-05 run a) | GP1-03, GP1-05 |
+
+## Appendix C. Time and disk summary for Part 1 (ESTIMATE unless marked)
+
+| Block | Author's machine time | New disk |
+|---|---|---|
+| A | about 25 min | under 1 MB |
+| B | about 2 h 10 min (GP1-02 15–45 min; GP1-03 88 min) | under 3 MB |
+| C bench (GP1-04) | about 80 min (MEASURED parts: 253.5 s quantize, 1309 s Pelias) | +62.2 GB on C: |
+| C Unsloth (GP1-05) | about 92 min | +about 44 GB on C: (T8+imat, T9) |
+| D | tools first (Claude), then GP1-06 about 30–60 min, GP1-08 about 30–45 min | +about 0.2 GB |
+| E | GP1-09 about 2 h base + 3 × 45–60 min; GP1-10 57 min base + 4 × 26 min; GP1-11 about 30 min | +25.3 GB (4096 base) + 12.7 GB (domain base) on D: |
+| F | GP1-12 about 2 h 30 min; GP1-13 about 70 min | +22–45 GB on C: (screening files are overwritten one by one) |
+
+Free space after Part 1, if nothing is deleted: C: about 191 − 62 − 44 − 45 ≈ 40 GB, under the 50 GB warning line. **Before Block F, the author decides which candidate files to delete** (only on the author's word).
+
+## Appendix D. Sources used for this plan
+
+- **Read in full this session:**
+  - the private master (2026-10-25 version, 8,542 lines);
+  - the trainer CUDA master scaffold (2,515 lines);
+  - the trainer notes (267 lines);
+  - the engine master scaffold (482 lines);
+  - the engine blueprint, system master, the 10-24 server handoff and runbook, the 10-21 handoff;
+  - the 02 VRAM guide and 03 blueprint;
+  - the hardware research plan;
+  - the parameter dictionary and server parameter CSV.
+- **Being read in full by reader agents at the time of writing** (their findings are folded in when they arrive):
+  - the masterwork (2026-10-27);
+  - the universal build master;
+  - the ground-up master specification;
+  - the research update;
+  - the Accidental Find;
+  - a second reader of the six newly attached files.
+- **Repository:** `docs/PEL_QUANT_DECISION_DATA.md` v5, `docs/PELIAS_SYSTEM_MASTERWORK.md` 15–16, `logs/BUILD_LOG.md`, the RUNBOOK and TALLY, the sweep logs `sweep/q-*.log` and `summary*.txt`.
+
+## Appendix E. Open items from earlier eras, and where each one went (so nothing is lost)
+
+| Item (source) | Disposition |
+|---|---|
+| T0 log backup of `~/p1` (10-21 handoff) | Carried: GP1-00 preflight asks whether `~/p1` is in the backup folder; a copy command is given if not |
+| T1 "no key 12", T2 bypass-9 sweep, T4 crash fix, sanitizer results (10-21 handoff) | Tier build only, which D37 retires from the product. Carried as a design rule for the Pelias engine: unique slot ids, no duplicate zero-slot id, and the crash sweep of GP4-02 |
+| T3 H6 yardsticks (10-21 handoff) | Done 2026-10-22 (stock16 0.017353, stock1024 0.018286, tier8_nobank 0.0017). Superseded as a gate by GP2-01 |
+| H6 definition (10-21 handoff) | Ruled 2026-10-22 (float spread governs). Replaced by the paired gates of GP2-01 |
+| Bank-size sweep, B1 rerun, drift repeat before trusting `-t 7` / `--poll 100` (10-21) | GP4-02 |
+| Match the 11,294 MiB reading to its log line (10-21) | Superseded by D28 (the ceiling is measured at start). Kept as a curiosity only |
+| Fold the pin edit into `pelias_tier_v1.patch` (10-21) | Record only (D37). No action |
+| Ledger claims: "MMVQ ignores −1"; RESULTS §3 stream order and 9.59 GB/s (10-21) | MMVQ: tier only, retired. 9.59 GB/s: carried to P-E10 (GP3-10 GPU kernels) |
+| Lane D promotion (70/30 copy-aware LRU) (10-21) | GP4-02 bank policy |
+| Remove the PELIAS-DEBUG fprintf (10-21) | Tier only, retired |
+| Trademark web check for "Pelias" (10-21) | Carried to release (GP4-05) |
+| Defender exclusion result (10-21) | Carried to the installers (GP3-16) |
+| Q6_K shared-memory kernel (10-21) | GP3-10 (P-E10) |
+| The 12 parked trainer problem areas (10-21) | In the trainer scaffold; GP3-12 |
+| Finish-5 (overlap under real CPU load), Finish-6 (KL and accuracy) (10-21) | Finish-5: GP3-14 engine gates (E6, P-E2). Finish-6: Part 1 |
+| The research queue R1 (10-21) | Tier crash analysis; retired with the tier build |
+| Research plan E0.1–E0.6 (10-23) | E0.2 timeline: engine timers at GP3-14. E0.3 live hit rate: GP4-02. E0.4 overlap and 1T/2T: GP3-10, GP4-02. E0.5 wide load: GP3-10. E0.6 huge pages and large pages: GP4-02. Its gates are rewritten without the retired 57.0 |
+| Research plan E1.1–E1.3 (native Linux) | GP4-04 |
+| 03 blueprint H3 (long rows compute-bound, short rows copy-bound) | GP3-12 (rung 5 stall measurements at several step sizes) |
+| 03 blueprint H4 (faster PCIe), H5 (more resident layers on a 24 GB card) | Need other hardware. Parked with the Threadripper notes |
+| 03 blueprint H6 (activation memory linear to 16 k and 32 k) | GP3-12: P-M2 at 8 k, 16 k and 32 k step windows |
+| 03 blueprint H7 (speed-up against a conventional recipe on the same card) | Before any "x times faster" claim: GP4-01 adds a QLoRA-or-offload baseline run if the author wants that claim |
+| 03 blueprint M0–M10 | M1 = GP3-12b parity; M2, M3 = GP3-09 plug-in and E13; M4 = the planner (step 13); M5 = levers (GP3-12); M6 = 16 k / 32 k (GP3-12); M7 = third family (step 14); M8 = disk tier (parked); M9 = export and serve for two models (step 14); M10 = packaging (GP4-05) |
+| 02 VRAM guide: smoke stage, guard rails, data audits, loop checks, persona-test design | Guard rails and smoke: the trainer's governor (GP3-12). Data audits: GP3-05. Loop checks and persona design: GP4-03 |
+| 02 VRAM guide: confirm the 8.02 GiB main-run peak against the full log | v0.2 Python only. Kept as a note; the new trainer logs the step maximum (GP3-12b) |
+| The Accidental Find: launcher banner said "thinking switched off" while it was on | v0.2 launcher only. Noted; no action in the C++ product |
+| The Accidental Find 14.1-a to h, 15.2 parity gate, 15.3 maths review | GP3-12b |
