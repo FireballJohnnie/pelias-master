@@ -553,6 +553,29 @@ $PELIAS imatrix --model $T/qwen36-Q4_K_M.pelias.gguf --file <calibration text> -
 | IMRoPE, V-head order, conv tap order, top-k ties (P-S3, P-S4, P-S1, P-S8) | Same: the reference matches llama.cpp end to end on the tiny model (MEASURED), which covers these semantics for the CPU. Record each as "DONE by the reference, CPU", with the GPU repeat at step 5 | GP2-02 |
 | MTP block semantics (P-S5) | Not covered: the reference does not run blk.40. Stays open for the decode loop (GP3-08) | GP3-08 |
 
+### Block H: one activation format for CPU and GPU (author's idea, 10-27; A then C)
+
+**Background (MEASURED 10-27, GP1-03 a and b, paired against the fp32 stock run):**
+- llama.cpp's CPU activation format for K-quant weights (Q8_K, one scale per 256 values) costs +0.002383 drift, 95 % interval [+0.001640, +0.003126].
+- The GPU format (q8_1, one scale per 32 values) costs +0.000610, interval [+0.000115, +0.001104]. About a quarter.
+- Every llama.cpp drift number on record (Unsloth's 0.013605 included) carries the CPU cost: the GPU-visible runs used the CPU path (0.041124 against 0.041468 with the GPU off and 0.041397 for Pelias's CPU-format model).
+
+**Idea:** round each activation once, in groups of 32 with a scale each, laid out so eight groups form the 256-value block the CPU K-quant loop walks. The GPU reads the groups as q8_1 does; the CPU reads eight in a row as one block. One rounding, identical inputs on both sides, about a quarter of fp32's bytes across PCIe.
+
+**Why the CPU should not lose speed (DERIVED, to be measured):** the author's CPU (AMD Ryzen 7 5800X3D, AVX2, no AVX-512; READ from /proc/cpuinfo) holds 32 int8 values per 256-bit register, so a group of 32 is one register. The K-quant dot product already works per sub-block (32 for Q4_K, 16 for Q6_K) to apply the weight's sub-scale; an activation sub-scale adds one multiply per group. Bytes per 256 values: Q8_K 292, eight q8_1 groups 288.
+
+#### GP1-15 Accuracy of the shared format (A, about 25 min)
+- **Code (measurement only):** an activation format `q8_k32` in `act_round_row` (block 256 laid out as eight groups of 32, each with its own fp16 scale, the same precision as q8_1), selected with `--act-int8-path cpu32`. Unit test: identical rounded values to q8_1 on the same row.
+- **Run:** `block_h.sh 15`: `pelias kld` on the stock file with `--act-int8 all --act-int8-path cpu32 --dump-kld`, then `kld-compare` against `GP1-01/stock.kld` and `GP1-03/b_allgpu.kld`.
+- **Prediction:** equal to run b (0.039623) in every digit if the scale is fp16 per 32, because the rounded values are the same; a variant with 8-bit sub-scales under one fp32 scale is predicted between run b and run a.
+- **Decision:** feeds GP2-05 (the engine's activation policy) and GP3's CPU expert kernels.
+
+#### GP1-16 CPU speed of the shared format (A, ESTIMATE under 10 min)
+- **Code (measurement only):** an AVX2 Q4_K × `q8_k32` dot product next to the existing Q4_K × Q8_K one, same loop shape, checked against the scalar reference first.
+- **Run:** both kernels on the real expert shapes (row lengths read from the file with `pelias inspect`) over many rows, 5 repeats, median.
+- **Prediction:** within 5 % of the Q8_K kernel (DERIVED from one extra multiply per 32-value group; the 5 % line is proposed, the author sets it).
+- **Pass:** within 5 %, or the accuracy gain from GP1-15 judged worth the cost by the author.
+
 ---
 
 ## Part 2. What gets fixed after the tests
@@ -1028,6 +1051,7 @@ The bf16 model is zero drift. The bar to beat is Unsloth UD-Q4_K_M.
 6. **Protecting routing.** If the worst tokens come from changed expert picks, weight the router's inputs and low-margin experts during quantization. Test: GP1-06, then GP3-06.
 7. **Repair training against a bf16 teacher.** Train the core through the exact quantizer, with experts frozen. Test: GP3-13.
 8. **An activation-rounding policy per tensor group.** Keep 16-bit activations on the groups where int8 costs drift; serving then gives up nothing the file won. Test: GP1-03, which sets the policy in GP2-05.
+9. **One activation format for CPU and GPU (author, 10-27).** Groups of 32 with their own scale, laid out as 256-value blocks for the CPU: GPU-level rounding cost (+0.0006 instead of +0.0024) on the CPU expert path too, one rounding for both sides. Tests: GP1-15, GP1-16 (Block H).
 
 ---
 
