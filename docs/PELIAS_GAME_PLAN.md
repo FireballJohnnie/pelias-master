@@ -6,10 +6,12 @@ Copyright (c) 2026 John Lipka and the Pelias contributors
 
 **What this file is:**
 - The single list of what happens next, in order.
+- Status: what is settled (with results), what is retired, what is open.
 - Part 1: tests that must run before any further building.
 - Part 2: fixes that follow from those tests.
 - Part 3: the rest of the build.
 - Part 4: the tests that tune and finalise the finished build.
+- Theories to get closer to the speed ceiling and to bf16 accuracy, each with its test.
 - Appendices: the ID map (old names to new), the decisions waiting on the author, the scripting rules, and the sources.
 
 **Labels** (same as every Pelias document): MEASURED, READ-SRC, PUBLISHED, DERIVED, ESTIMATE, UNVERIFIED, DECISION, AUTHOR-STATED. Every time estimate names its basis.
@@ -22,6 +24,95 @@ Copyright (c) 2026 John Lipka and the Pelias contributors
 **Privacy:**
 - No dataset text, persona wording or private equations appear here.
 - Machine paths are variables. Their values live in `profiles/local_only/GAME_PLAN_PATHS.env`, which git ignores.
+
+---
+
+## Status on 2026-10-27 (15:0x): what is settled, what is open
+
+### Where we are
+
+- **Build:**
+  - Steps 1–3 are done: measuring the machine, foundations, quantizers and conversion.
+  - Step 4 is half done: the tokenizer is finished; the chat template and data pipeline remain.
+  - Milestone 1 (the CPU reference that scores drift) is done.
+  - Tasks 1 and 2 are done: the importance matrix and the weighted quantizer.
+  - Tasks 3–7 haven't started.
+- **Latest commit:** cc22071, with the Fable review folded in. Unit tests pass on gcc, clang and asan.
+- **Goal (O20):** a 4-bit PEL mix with less drift than Unsloth. Best so far is T8: 0.014834 against Unsloth's 0.013605, measured by llama.cpp. That is close, but not proven better or worse.
+
+### Settled: no need to test again (all MEASURED)
+
+**Correctness: Pelias matches the reference**
+
+| What | Result |
+|---|---|
+| Our quantizer vs llama.cpp's (P-E6) | 753 of 753 tensors identical; whole file byte-identical |
+| Converting the original weights (P-X6) | 744 of 753 identical. The other 9 differ in 13 values by 1 rounding step, and ours are the correctly rounded ones (accepted by the author) |
+| Tokenizer vs llama.cpp | 0 mismatches over 2,455,727 tokens |
+| Tokenizer vs Hugging Face | 8 of 8 files identical, 2,764,292 tokens; Unicode probe 0 differences |
+| Reading every GGUF type, 1 to 8 bit | 0 values differ from llama.cpp's own decoder |
+| Weighted (importance-matrix) quantizer | Byte-identical to llama.cpp, 0 differences |
+| Our importance matrix vs llama.cpp's | Same effect on drift (5.4326 vs 5.4352 on the tiny model) |
+| CPU reference on the real model | Stock file: 0.039013 (llama.cpp reads 0.041124 on the same file) |
+| Why those two differ | llama.cpp rounds activations to 8 bits. With the corrected option (cc22071), the tiny model closes 96.3 % of the gap on the Q6_K file and 93.5 % on the Q8_0 file. The rest is most likely llama.cpp's 16-bit attention cache |
+| Determinism | llama.cpp's drift test repeats to every digit |
+
+**Drift results (llama.cpp's scale, WikiText-2, 100 chunks)**
+
+| File | Drift | Size without the MTP block |
+|---|---|---|
+| Stock Q4_K_M | 0.040965 | 21.17 GB |
+| Stock + Unsloth's matrix (a) | 0.027317 | — |
+| PEL-6 (`ssm_out` 8-bit) | 0.031616 | 21.29 GB |
+| T6 (`ssm_out` 6-bit) | 0.032472 | 21.23 GB |
+| T1 / PEL-6+ | 0.025958 | 21.34 GB |
+| T2 / PEL-4 | 0.016450 | 21.64 GB |
+| T3 / PEL-5 | 0.016493 | 21.80 GB |
+| T4 | 0.015176 | — |
+| T7 | 0.015454 | 21.72 GB |
+| **T8** | **0.014834** | **21.97 GB** |
+| (b) Unsloth's layout, no matrix | 0.014174 | 22.13 GB |
+| **Unsloth UD-Q4_K_M** | **0.013605** | **22.13 GB** |
+| T5 / PEL3-a (3-bit) | 0.045287 | 17.48 GB |
+
+**What those results proved**
+- Which bits go where does almost all the work. The importance matrix adds only about 0.0006 on top of a good layout.
+- `ssm_out` is the most drift-sensitive group (22.8 % of stock's drift on its own).
+- Gains add up across groups, and slightly more than the single runs predicted.
+- 6-bit is nearly as good as 8-bit: `attn_qkv`/`attn_q` gain nothing from 8 over 6, and `ssm_out` at 6-bit keeps 91 % of its 8-bit gain.
+- Raising whole expert groups to 8-bit costs 4–5.5 GB each, which is poor value per byte.
+- Unsloth's expert layout is worth 0.0013 for only 41 MB.
+- The 0.53 GB size difference to Unsloth is exactly the MTP block, to the byte.
+- llama-quantize quietly changes other tensors when `attn_v` or `attn_qkv` is overridden (they share a counter). The recipe tool makes that impossible.
+
+**Hardware (Wave 0, Batch C)**
+- **Card:** 46 SMs; free VRAM 10.83 GiB, giving the 10.7 GiB ceiling; 26.3 GB/s pinned transfers.
+- **Host:** 32 GiB of pinned memory held.
+- **Kernels:** our bf16 kernel reaches ≥ 0.85× cuBLASLt on 17 of 20 shapes. The int8 path is 1.39–1.84× faster (its accuracy half is still open). Dequantization is memory-bound. fp8 e4m3 passes; e5m2 fails.
+- **Handoff:** the CPU–GPU doorbell answers in 2.4 µs.
+- **CPU-only speed:** stock llama.cpp runs at 16.28 tok/s.
+- **Drift base:** the bf16 base file used for all drift tests took 57 min to make and doesn't need remaking.
+
+### Retired (don't use again)
+
+- **The "±0.0006 is noise" rule:** never proven. Only paired per-token comparisons decide (0.5).
+- **The 0.017353 float spread as a pass mark:** it's larger than T8's whole drift, so it can't tell mixes apart (GP2-01).
+- **The 57.0 tok/s Windows figure.**
+- **The patched llama.cpp tier build as a product:** it's now only a record.
+- **The 98 % figure for the first activation-rounding option (3a272b3):** it used one format for every weight type and skipped the output layer.
+
+### Open (Part 1 answers these)
+
+| # | Question | Test |
+|---|---|---|
+| 1 | Do the llama.cpp rankings hold under Pelias's exact scoring? (T8 vs Unsloth not yet paired token by token) | GP1-04 |
+| 2 | Were the old llama.cpp runs secretly using the GPU's rounding path? | GP1-02, GP1-03 |
+| 3 | Does T8 + an importance matrix, or T9 with IQ4_XS experts, beat Unsloth? | GP1-05 |
+| 4 | Do the results hold at long context (4096) and on a second kind of text? | GP1-09, GP1-10 |
+| 5 | How much error does the bf16 base carry itself? Do routing flips cause the worst tokens? | GP1-07, GP1-06 |
+| 6 | Does re-quantizing an unchanged weight give the same bytes back? | GP1-08 |
+
+Until question 1 is settled, all the llama.cpp drift numbers count as rankings, not exact values.
 
 ---
 
@@ -878,6 +969,64 @@ Universality items:
 
 ---
 
+## Theories to get closer to the ceilings
+
+Every item is a hypothesis: it names the measurement behind it and the test that settles it.
+
+### Speed
+
+The modelled ceiling is 88.2–92.0 tok/s (DERIVED). The best recorded run is about 54 tok/s (MEASURED, patched llama.cpp tier build).
+
+1. **Replace the per-layer handoff.**
+   - Measured gap: the recorded runs spend 4.6–5.0 ms per token in handoff, against 0.25 ms in the model.
+   - The tier build waits on a stream sync of about 94 µs per layer; 40 layers × 94 µs = 3.76 ms (DERIVED). The doorbell answers in 2.4 µs (MEASURED, P-E16), so 40 × 2.4 µs = 0.10 ms (DERIVED).
+   - **Theory:** about 3.7 ms per token comes back from this alone.
+   - Test: engine timers (GP3-14).
+2. **Make the CPU and GPU actually overlap.**
+   - Measured gap: zero overlap. The CPU's cold-expert work took 10.1 ms against the 2.86 ms modelled.
+   - **Theory:** our own AVX2 cold-expert kernels close most of that gap: one thread per physical core (E-A1), non-temporal prefetch to protect the 96 MB L3 (E-A3), int8 activations where GP2-05 allows. Running them at the same time as the GPU removes most of the rest.
+   - Test: GP3-10 (≥ 27 GB/s effective) and GP4-02.
+3. **Wide loads for GPU reads of cold experts from system RAM.**
+   - Measured gap: the compute kernel reads at 9.59 GB/s; the first 16-byte-load version reached 13.31; the copy ceiling is 26.2.
+   - Test: P-E10 (GP3-10).
+4. **More zero-miss layers.**
+   - 36.1 % of layer-steps already need no cold expert (MEASURED).
+   - **Theory:** filling the bank for zero-miss layers, rather than for raw hit rate, saves more time if a layer's first miss costs much more than later ones.
+   - Test: P-E2 measures that cost; the bank objective is swept in GP4-02.
+5. **Spend bytes where they buy speed.**
+   - Denser dense types take bank room: about −1.3 tok/s for T8 (DERIVED, PEL_QUANT_DECISION_DATA 9.3).
+   - **Theories:**
+     - Keep `token_embd` in host RAM (one row per token), so its 8-bit cost is file size only (B10).
+     - Use 6-bit where 6 ≈ 8 is proven.
+     - Lower-bit cold experts mean fewer bytes read on a miss (GP3-02).
+     - The 3-bit mix fits 24.7 % more experts per GiB of bank (DERIVED) for 0.0043 more drift (MEASURED).
+6. **MTP drafting.**
+   - It gave 1.13–1.17× in the tier build (MEASURED).
+   - It is required in the engine (step 10), with greedy-equality and KL gates.
+7. **CUDA graphs and the flush rule.**
+   - A graph launch costs 0.716 µs against 4.70 µs per eager kernel (MEASURED, P-H9).
+   - Flushing after each submission lifts copy/compute overlap from 0.47 to 0.92 (MEASURED, P-H12).
+   - **Theory:** both are already in the design and remove most launch overhead per token.
+   - Test: GP3-14.
+8. **Platform.**
+   - Windows-native was 5.1–5.2 ms per token faster than WSL in the reference cell. That is two launches against one, so it is not a claim yet; three launches per side settle it (GP4-04).
+   - Native Linux floors are untested (GP4-04).
+
+### Accuracy
+
+The bf16 model is zero drift. The bar to beat is Unsloth UD-Q4_K_M.
+
+1. **Per-layer bit allocation**, which is Unsloth's "dynamic" method. Unsloth's expert layout alone was worth 0.0013 for 41 MB (MEASURED). Test: GP1-12.
+2. **An importance matrix built from our own calibration text.** It is worth about 0.0006 on a good layout (MEASURED with Unsloth's matrix), and our text may fit the intended use better. Test: GP1-13.
+3. **IQ4_XS gate/up experts with the matrix (T9).** Frees 687,865,856 bytes (DERIVED) to spend on sensitive groups. Test: GP1-05.
+4. **AWQ-style scale folding into the norm weights.** Exact before quantization, and needs no new data (it uses the importance-matrix sums). Test: GP3-03.
+5. **GPTQ-style error feedback inside the Q4_K/Q6_K blocks**, dense groups first. The files stay readable by any loader. Test: GP3-04.
+6. **Protecting routing.** If the worst tokens come from changed expert picks, weight the router's inputs and low-margin experts during quantization. Test: GP1-06, then GP3-06.
+7. **Repair training against a bf16 teacher.** Train the core through the exact quantizer, with experts frozen. Test: GP3-13.
+8. **An activation-rounding policy per tensor group.** Keep 16-bit activations on the groups where int8 costs drift; serving then gives up nothing the file won. Test: GP1-03, which sets the policy in GP2-05.
+
+---
+
 ## Appendix A. ID map: old names to the names in this file (fixes the collisions found by the readers)
 
 | Old name (where) | Meaning | New ID |
@@ -950,13 +1099,14 @@ Free space after Part 1, if nothing is deleted: C: about 191 − 62 − 44 − 4
   - the 02 VRAM guide and 03 blueprint;
   - the hardware research plan;
   - the parameter dictionary and server parameter CSV.
-- **Being read in full by reader agents at the time of writing** (their findings are folded in when they arrive):
+- **Read in full by reader agents** (findings folded in; full reports in the author's backup folder, 2026-10-27/bk_1413):
   - the masterwork (2026-10-27);
   - the universal build master;
   - the ground-up master specification;
   - the research update;
   - the Accidental Find;
   - a second reader of the six newly attached files.
+- **Fable's read-only review** of the plan, the code and Blocks A and B (2026-10-27): every finding checked and fixed in cc22071.
 - **Repository:** `docs/PEL_QUANT_DECISION_DATA.md` v5, `docs/PELIAS_SYSTEM_MASTERWORK.md` 15–16, `logs/BUILD_LOG.md`, the RUNBOOK and TALLY, the sweep logs `sweep/q-*.log` and `summary*.txt`.
 
 ## Appendix E. Open items from earlier eras, and where each one went (so nothing is lost)
