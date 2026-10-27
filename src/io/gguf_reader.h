@@ -82,6 +82,10 @@ class GgufReader {
   [[nodiscard]] double get_float(std::string_view key, bool* found = nullptr) const;
   // The i-th string of a string array (bounds-checked; empty and `found` false otherwise).
   [[nodiscard]] std::string array_string(const GgufValue& v, std::uint64_t i, bool* found = nullptr) const;
+  // Every element of a string array, read in one pass (the i-th accessor above walks from the start each call).
+  [[nodiscard]] Status array_strings(const GgufValue& v, std::vector<std::string>& out) const;
+  // Every element of an integer array (any integer element type, widened to int64).
+  [[nodiscard]] Status array_ints(const GgufValue& v, std::vector<std::int64_t>& out) const;
 
  private:
   const os::FileMap* map_ = nullptr;

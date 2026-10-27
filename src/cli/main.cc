@@ -5,7 +5,8 @@
 // bytes), key (SHA-256 model key), plan (the device memory plan against the ceiling, refused above it), device (what
 // the GPU reports). Step 3 adds quantize (a GGUF to a stock mix, byte-identical to the reference), convert (a model
 // folder of safetensors shards to a GGUF, BF16 or a stock mix, Stage A) and verify (two GGUFs compared tensor by tensor
-// and byte for byte, gates P-E6 and P-X6). The later verbs are listed as not yet built so the user gets a clear answer
+// and byte for byte, gates P-E6 and P-X6). Step 4 adds tokenize (text to token ids with the model's own tokenizer,
+// gate P-D1). The later verbs are listed as not yet built so the user gets a clear answer
 // instead of a silent failure.
 //
 // Exit codes: 0 ok; 1 usage; 2 the input could not be read (missing, corrupt, unsupported); 3 a gate refused (plan
@@ -36,6 +37,8 @@
 #include "plan/probe_constants.h"
 #include "quant/block_types.h"
 #include "quant/type_rules.h"
+#include "io/text_file.h"
+#include "tok/tokenizer.h"
 
 namespace {
 
@@ -123,6 +126,9 @@ void usage() {
       "                                  or a stock mix as the reference quantizer writes it from that BF16 file (exit 6 on a write failure)\n"
       "  verify --model A.gguf --reference B.gguf\n"
       "                                  every tensor compared by name, then the files byte for byte (exit 5 if anything differs)\n"
+      "  tokenize --model FILE (--text S | --file F) [--no-nfc] [--no-special] [--pieces] [--header-only]\n"
+      "                                  token ids as a list [a, b, ...] (--pieces: one 'id -> piece' per line);\n"
+      "                                  --no-nfc skips NFC (as llama.cpp does), --no-special leaves control tokens as text\n"
       "  probe | train | export | serve | bench | web   not built yet (later steps)\n"
       "options: --log debug|info|warn|error (default info)");
 }
@@ -433,6 +439,53 @@ int cmd_convert(const Args& a) {
   return 0;
 }
 
+int cmd_tokenize(const Args& a) {
+  const std::string path = a.get("model");
+  if (path.empty() || (a.has("text") == a.has("file"))) {
+    usage();
+    return 1;
+  }
+  os::FileMap m;
+  Status s = m.open(path);
+  if (!s) return fail_input(s);
+  io::GgufReader g;
+  s = g.parse(m, !a.has("header-only"));
+  if (!s) return fail_input(s);
+  Timer t;
+  Result<tok::Tokenizer> tk = tok::Tokenizer::from_gguf(g);
+  if (!tk.ok()) return fail_input(tk.status);
+  const double load_ms = t.ms();
+  std::string text;
+  if (a.has("file")) {
+    Result<std::string> r = io::read_text_file(a.get("file"));
+    if (!r.ok()) return fail_input(r.status);
+    text = std::move(r.value);
+  } else {
+    text = a.get("text");
+  }
+  tok::EncodeOptions opt;
+  opt.nfc = !a.has("no-nfc");
+  opt.parse_special = !a.has("no-special");
+  Timer te;
+  const std::vector<std::int32_t> ids = tk.value.encode(text, opt);
+  const double enc_ms = te.ms();
+  if (a.has("pieces")) {
+    for (std::int32_t id : ids) std::printf("%6d -> '%s'\n", id, tk.value.piece(id).c_str());
+  } else {
+    std::string out = "[";
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+      if (i) out += ", ";
+      out += std::to_string(ids[i]);
+    }
+    out += "]";
+    std::puts(out.c_str());
+  }
+  std::fprintf(stderr, "pelias: %zu tokens from %zu bytes; vocabulary %zu (load %.1f ms, encode %.1f ms); NFC %s, specials %s\n",
+               ids.size(), text.size(), tk.value.vocab_size(), load_ms, enc_ms, opt.nfc ? "on" : "off",
+               opt.parse_special ? "parsed" : "as text");
+  return 0;
+}
+
 int cmd_verify(const Args& a) {
   const std::string pa = a.get("model"), pb = a.get("reference");
   if (pa.empty() || pb.empty()) {
@@ -484,6 +537,7 @@ int main(int argc, char** argv) {
   if (cmd == "quantize") return cmd_quantize(a);
   if (cmd == "convert") return cmd_convert(a);
   if (cmd == "verify") return cmd_verify(a);
+  if (cmd == "tokenize") return cmd_tokenize(a);
   for (const char* later : {"probe", "train", "export", "serve", "bench", "web"})
     if (cmd == later) {
       std::fprintf(stderr, "pelias: '%s' is not built yet (a later step of the order of operations)\n", later);
