@@ -265,28 +265,35 @@ struct Ctx {
   std::uint32_t il = 0;  // the layer being run
 };
 
-// whether the inputs of `w` are rounded to 8 bits (ForwardOptions::act_int8); float weights never are, as in the reference
-bool act_rounded(const ForwardOptions& o, const WeightView& w) {
-  if (o.act_int8.empty()) return false;
+// the 8-bit activation format the inputs of `w` are rounded to (ForwardOptions::act_int8), or none; float weights never
+// are, as in the reference
+enum class ActFmt { none, q8_0, q8_1, q8_k };
+
+ActFmt act_format(const ForwardOptions& o, const WeightView& w) {
+  if (o.act_int8.empty() || !w.present()) return ActFmt::none;
   const auto t = static_cast<quant::Type>(w.type);
-  if (t == quant::Type::f32 || t == quant::Type::f16 || t == quant::Type::bf16) return false;
+  if (t == quant::Type::f32 || t == quant::Type::f16 || t == quant::Type::bf16) return ActFmt::none;
+  bool hit = false;
   for (const std::string& g : o.act_int8)
-    if (g == "all" || w.name.find(g) != std::string::npos) return true;
-  return false;
+    if (g == "all" || w.name.find(g) != std::string::npos) hit = true;
+  if (!hit) return ActFmt::none;
+  if (o.act_int8_gpu) return ActFmt::q8_1;
+  switch (t) {
+    case quant::Type::q4_0: case quant::Type::q5_0: case quant::Type::q8_0: case quant::Type::iq4_nl: case quant::Type::mxfp4:
+      return ActFmt::q8_0;
+    case quant::Type::q4_1: case quant::Type::q5_1:
+      return ActFmt::q8_1;
+    default:
+      return ActFmt::q8_k;
+  }
 }
 
-// one row to the 8-bit activation format and back: Q8_K (256: d fp32, qs int8) or q8_1 (32: d fp16, s fp16, qs int8)
-void act_round_row(float* x, int64_t n, int block) {
-  if (block == 32) {
-    std::uint8_t b[36];
-    for (int64_t i = 0; i < n; i += 32) {
-      quant::quantize_q8_1(x + i, b, 32);
-      std::uint16_t dh;
-      std::memcpy(&dh, b, 2);
-      const float d = quant::fp16_to_fp32(dh);
-      for (int j = 0; j < 32; ++j) x[i + j] = d * static_cast<float>(static_cast<std::int8_t>(b[4 + j]));
-    }
-  } else {
+int act_block(ActFmt f) { return f == ActFmt::q8_k ? 256 : 32; }
+
+// one row to the 8-bit format and back: Q8_0 (32: d fp16, qs int8), q8_1 (32: d fp16, s fp16, qs int8) or Q8_K
+// (256: d fp32, qs int8, sums). The row length is a multiple of the block (checked once by check_act_rounding).
+void act_round_row(float* x, int64_t n, ActFmt f) {
+  if (f == ActFmt::q8_k) {
     std::uint8_t b[292];
     for (int64_t i = 0; i < n; i += 256) {
       quant::quantize_q8_k(x + i, b, 256);
@@ -294,18 +301,45 @@ void act_round_row(float* x, int64_t n, int block) {
       std::memcpy(&d, b, 4);
       for (int j = 0; j < 256; ++j) x[i + j] = d * static_cast<float>(static_cast<std::int8_t>(b[4 + j]));
     }
+    return;
   }
+  std::uint8_t b[36];
+  const int qs = f == ActFmt::q8_1 ? 4 : 2;  // q8_1 carries d and s (2 x fp16) before the values; Q8_0 only d
+  for (int64_t i = 0; i < n; i += 32) {
+    if (f == ActFmt::q8_1) quant::quantize_q8_1(x + i, b, 32);
+    else quant::quantize_q8_0(x + i, b, 32);
+    std::uint16_t dh;
+    std::memcpy(&dh, b, 2);
+    const float d = quant::fp16_to_fp32(dh);
+    for (int j = 0; j < 32; ++j) x[i + j] = d * static_cast<float>(static_cast<std::int8_t>(b[qs + j]));
+  }
+}
+
+// every rounded input row must be a whole number of blocks (the reference's own requirement for these products)
+Status check_act_rounding(const ForwardOptions& o, const Qwen35MoeWeights& w) {
+  if (o.act_int8.empty()) return Status::good();
+  std::vector<const WeightView*> v{&w.output};
+  for (const Qwen35MoeLayer& l : w.layers)
+    for (const WeightView* p : {&l.wq, &l.wk, &l.wv, &l.wo, &l.wqkv, &l.wgate, &l.wbeta, &l.walpha, &l.ssm_out, &l.gate_inp, &l.up_exps,
+                                &l.gate_exps, &l.down_exps, &l.up_shexp, &l.gate_shexp, &l.down_shexp})
+      v.push_back(p);
+  for (const WeightView* p : v) {
+    const ActFmt f = act_format(o, *p);
+    if (f != ActFmt::none && p->ne[0] % static_cast<std::uint64_t>(act_block(f)) != 0)
+      return Status::fail(Code::invalid_argument, "8-bit activation rounding: the row length is not a whole number of blocks", 0, p->name);
+  }
+  return Status::good();
 }
 
 // matmul over the whole matrix, recording the activations for the importance matrix when asked
 void mm(const Ctx& c, const WeightView& w, const float* x, int64_t n_tok, int64_t ldx, float* y, int64_t ldy) {
   if (c.opt.imatrix) c.opt.imatrix->add_dense(w.name, x, n_tok, ldx, static_cast<int64_t>(w.ne[0]));
-  if (act_rounded(c.opt, w)) {
+  if (const ActFmt f = act_format(c.opt, w); f != ActFmt::none) {
     const int64_t k = static_cast<int64_t>(w.ne[0]);
     std::vector<float> xr(z(n_tok * k));
     for (int64_t t = 0; t < n_tok; ++t) {
       std::memcpy(xr.data() + t * k, x + t * ldx, z(k) * sizeof(float));
-      act_round_row(xr.data() + t * k, k, c.opt.act_int8_block);
+      act_round_row(xr.data() + t * k, k, f);
     }
     matmul(w, xr.data(), n_tok, k, y, ldy, c.threads, c.sc);
     return;
@@ -508,15 +542,17 @@ void moe(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* out) {
     sc.ue.resize(z(m * ff));
     sc.ye.resize(z(m * e));
     for (int64_t r = 0; r < m; ++r) std::memcpy(sc.xe.data() + r * e, xn + (list[z(r)] / nu) * e, z(e) * sizeof(float));
-    if (act_rounded(c.opt, l.gate_exps) || act_rounded(c.opt, l.up_exps))  // one input feeds both, rounded once
-      for (int64_t r = 0; r < m; ++r) act_round_row(sc.xe.data() + r * e, e, c.opt.act_int8_block);
+    // one input feeds both gate and up, rounded once (in llama.cpp both are the same type, so the same format)
+    const ActFmt fgu = act_format(c.opt, l.gate_exps) != ActFmt::none ? act_format(c.opt, l.gate_exps) : act_format(c.opt, l.up_exps);
+    if (fgu != ActFmt::none)
+      for (int64_t r = 0; r < m; ++r) act_round_row(sc.xe.data() + r * e, e, fgu);
     matmul_rows(l.gate_exps, static_cast<uint64_t>(ex), 0, ff, sc.xe.data(), m, e, sc.ge.data(), ff, sc);
     matmul_rows(l.up_exps, static_cast<uint64_t>(ex), 0, ff, sc.xe.data(), m, e, sc.ue.data(), ff, sc);
     for (int64_t i = 0; i < m * ff; ++i) sc.ge[z(i)] = silu(sc.ge[z(i)]) * sc.ue[z(i)];
     if (!hs.empty())
       for (int64_t r = 0; r < m; ++r) std::memcpy(hs.data() + list[z(r)] * ff, sc.ge.data() + r * ff, z(ff) * sizeof(float));
-    if (act_rounded(c.opt, l.down_exps))
-      for (int64_t r = 0; r < m; ++r) act_round_row(sc.ge.data() + r * ff, ff, c.opt.act_int8_block);
+    if (const ActFmt fd = act_format(c.opt, l.down_exps); fd != ActFmt::none)
+      for (int64_t r = 0; r < m; ++r) act_round_row(sc.ge.data() + r * ff, ff, fd);
     matmul_rows(l.down_exps, static_cast<uint64_t>(ex), 0, e, sc.ge.data(), m, ff, sc.ye.data(), e, sc);
     for (int64_t r = 0; r < m; ++r) {
       const int64_t slot = list[z(r)];
@@ -619,6 +655,7 @@ Status forward_reference(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, cons
   if (n_tokens <= 0 || out_begin < 0 || out_end > n_tokens || out_begin >= out_end)
     return Status::fail(Code::invalid_argument, "the token count or the output range is empty or out of range");
   if (w.layers.size() != s.n_layer) return Status::fail(Code::invalid_argument, "the weights were bound for another spec");
+  if (Status st = check_act_rounding(opt, w); !st) return st;
   const int threads = opt.threads > 0 ? opt.threads : static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
   const int64_t n = n_tokens, e = s.n_embd;
   std::vector<Scratch> sc(z(threads));
@@ -646,7 +683,7 @@ Status forward_reference(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, cons
   if (!logits) return Status::good();  // the activations were all the caller wanted (importance matrix)
   const int64_t m = out_end - out_begin;
   for (int64_t t = 0; t < m; ++t) rms_norm(x.data() + (out_begin + t) * e, w.output_norm.data(), xn.data() + t * e, e, s.rms_eps);
-  matmul(w.output, xn.data(), m, e, logits, s.n_vocab, threads, sc);
+  mm(c, w.output, xn.data(), m, e, logits, s.n_vocab);  // through mm(), so --act-int8 reaches the output layer too
   return Status::good();
 }
 

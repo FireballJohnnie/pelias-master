@@ -254,7 +254,7 @@ std::uint64_t get_le(const std::uint8_t* p, int bytes) {
 
 Status kl_dump_write(const std::string& path, const KlDump& d) {
   std::vector<std::uint8_t> o;
-  o.reserve(40 + d.tokens.size() * 24);
+  o.reserve(36 + d.tokens.size() * 24);
   for (char ch : std::string("PELKLD01")) o.push_back(static_cast<std::uint8_t>(ch));
   put_le(o, d.n_ctx, 4);
   put_le(o, d.chunks, 4);
@@ -296,7 +296,7 @@ Result<KlDump> kl_dump_read(const std::string& path) {
   d.scored = static_cast<std::uint32_t>(get_le(b.data() + 16, 4));
   d.token_hash = get_le(b.data() + 20, 8);
   const std::uint64_t n = get_le(b.data() + 28, 8);
-  if (b.size() != 36 + n * 24) return R::fail(Status::fail(Code::corrupt, "the per-token file's size does not match its record count", 28));
+  if (n > (b.size() - 36) / 24 || b.size() != 36 + n * 24) return R::fail(Status::fail(Code::corrupt, "the per-token file's size does not match its record count", 28));
   d.tokens.resize(static_cast<std::size_t>(n));
   for (std::uint64_t i = 0; i < n; ++i) {
     const std::uint8_t* p = b.data() + 36 + i * 24;
@@ -329,7 +329,8 @@ double t975(std::size_t df) {
 
 Result<std::string> kl_compare(const KlDump& a, const KlDump& b, const std::string& name_a, const std::string& name_b) {
   using R = Result<std::string>;
-  if (a.token_hash != b.token_hash || a.tokens.size() != b.tokens.size() || a.scored != b.scored || a.scored == 0)
+  if (a.token_hash != b.token_hash || a.tokens.size() != b.tokens.size() || a.scored != b.scored || a.scored == 0 || a.n_ctx != b.n_ctx ||
+      a.chunks != b.chunks || a.tokens.size() != static_cast<std::size_t>(a.chunks) * a.scored)
     return R::fail(Status::fail(Code::invalid_argument, "the two files were not scored on the same tokens (different base, chunk count or context)"));
   const std::size_t n = a.tokens.size();
   const std::size_t per = a.scored;
@@ -370,8 +371,11 @@ Result<std::string> kl_compare(const KlDump& a, const KlDump& b, const std::stri
   o += buf;
   std::snprintf(buf, sizeof buf, "mean KLD   %s %.6f   %s %.6f\n", name_a.c_str(), sa / nn, name_b.c_str(), sb / nn);
   o += buf;
-  std::snprintf(buf, sizeof buf, "difference (A - B) %+.6f   SE per token %.6f   SE per chunk (used) %.6f   95%% interval [%+.6f, %+.6f] (t %.3f, %zu df)   t-stat %.2f\n",
-                mean, se_tok, se_chunk, lo, hi, tc, chunks - 1, se_chunk > 0 ? mean / se_chunk : 0.0);
+  char tst[48];
+  if (se_chunk > 0) std::snprintf(tst, sizeof tst, "%.2f", mean / se_chunk);
+  else std::snprintf(tst, sizeof tst, "%s", mean == 0 ? "n/a (no difference)" : "n/a (same difference on every chunk)");
+  std::snprintf(buf, sizeof buf, "difference (A - B) %+.6f   SE per token %.6f   SE per chunk (used) %.6f   95%% interval [%+.6f, %+.6f] (t %.3f, %zu df)   t-stat %s\n",
+                mean, se_tok, se_chunk, lo, hi, tc, chunks - 1, tst);
   o += buf;
   std::snprintf(buf, sizeof buf, "tokens where A has the lower KL: %.2f %%; mean ln(PPL) difference %+.6f\n", 100.0 * static_cast<double>(a_lower) / nn, snll / nn);
   o += buf;

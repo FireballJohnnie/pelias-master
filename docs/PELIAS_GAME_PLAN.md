@@ -33,7 +33,7 @@ Copyright (c) 2026 John Lipka and the Pelias contributors
 |---|---|---|
 | `PELIAS` | The `pelias` binary built at the commit named in the step, with `PELIAS_CPU_AVX2=ON` | `$PELIAS version` runs; the build's `CMakeCache.txt` has `PELIAS_CPU_AVX2:BOOL=ON`; `git -C $PELIAS_REPO rev-parse --short HEAD` equals the expected commit |
 | `PELIAS_REPO` | The author's WSL clone of pelias-master | `.git` exists |
-| `LLAMA_BIN` | The unchanged llama.cpp build at commit 2ca15f540 (test oracle only); the one that wrote every sweep log | `$LLAMA_BIN/llama-perplexity --version` prints `2ca15f540` |
+| `LLAMA_BIN` | The unchanged llama.cpp build at commit 2ca15f540 (test oracle only); the one that wrote every sweep log | `$LLAMA_BIN/llama-perplexity --version` shows the short hash `2ca15f5` |
 | `T` | The test folder on D: (`kld-base-bf16-100chunks.bin`, `qwen36-bf16.llamacpp.gguf`, `qwen36-Q4_K_M.pelias.gguf`, `sweep/`) | each file exists with the byte size in 0.3 |
 | `M` | The model folder on C: where new candidate files are written | free space |
 | `U` | The Unsloth folder (`Qwen3.6-35B-A3B-UD-Q4_K_M.gguf`, `imatrix_unsloth.gguf_file`) | exists, sizes |
@@ -48,8 +48,8 @@ Copyright (c) 2026 John Lipka and the Pelias contributors
 4. **Free space.** Before writing a large file (a GGUF or a base), print `df -h` for C: and D:. Stop if either drive would drop below 50 GB after the write (author's rule). Expected size = the DERIVED size in the step.
 5. **Nothing else heavy runs.** No llama-server, no other `pelias kld`, no training. CPU runs are timed, and a second job slows both.
 6. **Type check.** After every quantize, `$PELIAS inspect --model OUT --json` is compared against the recipe tensor by tensor (0.4). Any difference stops the script before the drift test. This is the lesson of the shared `attn_v`/`attn_qkv` counter (PEL_QUANT_DECISION_DATA 3.3).
-7. **Size check.** The output's byte size must equal the expected byte size where one is MEASURED or DERIVED (to ±32 bytes for DERIVED sizes, exact for MEASURED rebuilds). Expected size = `recipe.py data-bytes RECIPE SOURCE` + 10,991,136. That offset is MEASURED identical for PEL-6, T5 and T8 (data start plus trailing padding, same metadata).
-8. **Summary line.** One line is appended to `$R/summary.tsv` with these columns: date-time, test ID, file, bytes, mean KLD, ± (per-token SE as printed), same-top-p, PPL, wall seconds, log path.
+7. **Size check.** The output's byte size must equal the expected byte size where one is MEASURED or DERIVED (to ±32 bytes for DERIVED sizes, exact for MEASURED rebuilds). Expected size = `recipe.py data-bytes RECIPE SOURCE` + 10,991,136. That offset is MEASURED identical for PEL-6, T5 and T8 (data start plus trailing padding, same metadata). It stays constant only while the metadata and the last tensor's padded size are unchanged; the type check, not the size, is the proof.
+8. **Summary line.** One line is appended to `$R/summary.tsv` with these columns: date-time, test ID, file (and route), the tool's `Mean    KLD` line, its `Same top p:` line, wall seconds, log path. The file's byte size goes in the quantize step's own log.
 9. **Results first.** The author sends the summary lines and logs. Claude labels each number MEASURED and checks the prediction before anything else is decided.
 
 ### 0.3 Fixed inputs (MEASURED sizes; a script stops if a size differs)
@@ -77,10 +77,10 @@ A recipe is a TSV file with 753 rows: `tensor_name<TAB>type`, where type is a gg
   [  N/ 753] NAME - [ d0, d1, d2, d3], type =   SRC, converting to DST .. size = ...
   [  N/ 753] NAME - [ d0, d1, d2, d3], type =   f32, size = ...
   ```
-  The parse regex is `^\[\s*(\d+)/\s*753\]\s+(\S+)\s+-\s+\[[^\]]*\],\s+type =\s+(\S+),\s+(?:converting to (\S+)|size)`. The type is DST if present, else SRC. Upper-case it. The script requires exactly 753 matches.
+  A tensor's record starts at `^\[\s*(\d+)/\s*(\d+)\]\s+(\S+)\s+-\s+\[[^\]]*\],\s+type =\s+(\S+),` and runs to the next record. Imatrix notices can land inside a record when stdout and stderr share the log, so the result is searched for in the whole span. The type is the `converting to DST ..` value if present, else SRC (the record then says `size =`). Upper-case it. The tool requires as many records as the log announces, numbered in order (753 for this model's files; Unsloth's file has 733, so a recipe from it cannot be applied to the 753-tensor bf16 source: `llama-file` refuses the count mismatch).
 - **Feeding a recipe to llama-quantize** (until `pelias quantize --recipe` exists, Part 3):
   - `python3 tools/recipe.py llama-file RECIPE.tsv $T/qwen36-bf16.llamacpp.gguf TYPES.txt --pelias $PELIAS` writes a `--tensor-type-file`.
-  - One line `^<escaped name>$=<type>` for every tensor, including those whose type equals the source's. Without a line, llama-quantize would apply its mix rule to a tensor. A 1-D tensor that may not be quantized keeps its type whatever its line says.
+  - One line `^<escaped name>$=<type>` for every tensor, including those whose type equals the source's. Without a line, llama-quantize would apply its mix rule to a tensor. A tensor llama-quantize never quantizes (norms, the routers `ffn_gate_inp`, `ssm_conv1d`; READ-SRC `tensor_allows_quantization`) keeps its type whatever its line says.
   - llama-quantize reads the file as whitespace-separated `pattern=type` tokens. It lower-cases the pattern, matches with `std::regex_search`, uses the first matching pattern, and reads type names case-insensitively (READ-SRC: tools/quantize/quantize.cpp `parse_tensor_type_file`, src/llama-quant.cpp `llama_tensor_get_type`, at 2ca15f5).
   - A tensor that matches a pattern skips llama-quantize's own mix rules and its per-layer counters. So with every quantized tensor named, nothing else can move.
   - Command: `$LLAMA_BIN/llama-quantize --tensor-type-file TYPES.txt $T/qwen36-bf16.llamacpp.gguf OUT.gguf Q4_K_M 16`.
@@ -97,7 +97,7 @@ A recipe is a TSV file with 753 rows: `tensor_name<TAB>type`, where type is a gg
   - Interval contains 0: a tie on this text.
 - Unpaired "±" values from a single run are never used to rank files again. The old "±0.0006" rule is retired.
 - Scripts parse the line `difference (A - B) <d>   SE per token <s1>   SE per chunk (used) <s2>   95% interval [<lo>, <hi>] (t <t>, <df> df)   t-stat <z>` and the line starting `VERDICT:`.
-- kld-compare refuses two files scored on different tokens (exit 2, or 1 for an argument error). A script treats that as a stop, not as a tie.
+- kld-compare refuses two files scored on different tokens, chunk counts or contexts with **exit 1**; a missing or damaged file is exit 2. A script treats any non-zero exit as a stop, never as a tie.
 
 ### 0.6 Predictions
 
@@ -113,7 +113,7 @@ Which model holds is itself a finding (Part 1, GP1-04).
 
 ## Part 1. Tests before any further building
 
-Ordered so each block feeds the next. Blocks A to C need no new code; they can run today on commit 3a272b3 or later.
+Ordered so each block feeds the next. Blocks A to C need no new code; they run on the commit that carries the Fable review fixes (named in the RUNBOOK and the handoff) or later.
 
 The recipe tool `tools/recipe.py` (0.4) is written before Block C, which needs it. Blocks D to F need further **measurement tools only**: scripts or flags that produce numbers and add no product feature. Each tool is specified below so it can be written without guessing. Claude writes them, and they pass the unit/clang/asan/oracle routine before hand-over.
 
@@ -124,17 +124,19 @@ The recipe tool `tools/recipe.py` (0.4) is written before Block C, which needs i
 **Checks:**
 - Every variable in 0.1 resolves.
 - Every size in 0.3 matches.
-- `$PELIAS` was built at commit ≥ 3a272b3 with AVX2.
-- `git status` is clean in `$PELIAS_REPO`.
+- `$PELIAS` was built at the commit this plan names for the block (Block A: the fixes after the Fable review) with AVX2.
+- `git status --porcelain` is empty in `$PELIAS_REPO` before the pull (local edits would block or mix into the build).
 - `df -h` shows C: and D: free space.
 - `nproc` ≥ 16.
-- Nothing named `llama-server` or `pelias` is running (`pgrep`).
+- Nothing named `llama-server` or `pelias` is running: `pgrep` inside WSL and `tasklist.exe` for the Windows side (the interim Windows server is invisible to `pgrep`).
 
 **Rebuild if needed:**
 ```
-cd $PELIAS_REPO && git pull
-cmake --preset wsl -DPELIAS_CPU_AVX2=ON
-cmake --build build/wsl -j16
+cd $PELIAS_REPO && git pull --ff-only
+# Block A finds the existing build folder (build/wsl, build/host, build_wsl, build, build/cpu, in that order),
+# configures it again with AVX2 on and builds it; with none found it makes a CPU-only build/cpu.
+cmake -S . -B <that folder> -DPELIAS_CPU_AVX2=ON
+cmake --build <that folder> -j16
 ```
 - Configure again every time. The version string's commit is captured at configure time and goes stale otherwise (MEASURED in the sandbox: a build at 3a272b3 printed 686926d). Fix item GP2-14.
 
@@ -165,7 +167,7 @@ Results file: `stock.kld` is the stock anchor for every later comparison.
 
 #### GP1-02 llama.cpp with the GPU path switched off (old name F3) (A, ESTIMATE 15–45 min)
 
-**Question:** did the earlier llama.cpp drift runs (GPU visible, `-ngl 0`, batch 2048) multiply on the GPU with q8_1 activations? Fable's audit says they may have. The masterwork records that op-offload changed prompt speed (MEASURED).
+**Question:** did the earlier llama.cpp drift runs (GPU visible, `-ngl 0`, batch 2048) multiply on the GPU with q8_1 activations? Fable's audit says they may have. The private master records that turning op-offload off changed prompt speed (MEASURED, its line 5665).
 
 **Command** (same as every earlier llama.cpp drift run, plus the one switch):
 ```
@@ -190,16 +192,23 @@ $LLAMA_BIN/llama-perplexity -m $T/qwen36-Q4_K_M.pelias.gguf --kl-divergence --kl
 
 | Run | Extra flags | Prediction |
 |---|---|---|
-| a | `--act-int8 all --act-int8-block 256` (the CPU path) | within ±0.0005 of GP1-02 |
-| b | `--act-int8 all --act-int8-block 32` (the GPU path) | within ±0.0005 of 0.041124 |
-| c | `--act-int8 _exps --act-int8-block 32` (experts only) | between 0.0390 and run b |
-| d | `--act-int8 attn,ssm_,shexp,output --act-int8-block 32` (dense only: attention, every DeltaNet projection, shared experts, `lm_head`) | between 0.0390 and run b |
+| a | `--act-int8 all --act-int8-path cpu` (llama.cpp's CPU format for each weight type: Q8_K for the K-quants, Q8_0 for Q8_0 weights) | within ±0.0005 of GP1-02 |
+| b | `--act-int8 all --act-int8-path gpu` (q8_1 for every type) | within ±0.0005 of 0.041124 |
+| c | `--act-int8 _exps --act-int8-path gpu` (experts only) | between 0.0390 and run b |
+| d | `--act-int8 attn,ssm_,shexp,output --act-int8-path gpu` (dense only: attention, every DeltaNet projection, shared experts, `lm_head`) | between 0.0390 and run b |
+
+**Checked on the tiny model before hand-over (MEASURED, sandbox, after the Fable review fixes):**
+- Off: output identical to before.
+- Q6_K file, `all` cpu: 1.341948 against llama.cpp's CPU-only 1.346882 (fp32 1.214946): 96.3 % of the gap.
+- Q8_0 file, `all` cpu: 0.352762 against llama.cpp's 0.352261 (fp32 0.359950): 93.5 %. The rest is most likely llama.cpp's f16 KV cache and summation order (the reference keeps the KV cache in fp32); not modelled.
+- The output layer is rounded too (it was missed before the review).
 
 **Base command:**
 ```
 $PELIAS kld --model $T/qwen36-Q4_K_M.pelias.gguf --base $T/kld-base-bf16-100chunks.bin --threads 16 --dump-kld $R/GP1-03/<run>.kld <flags>
 ```
-- Group strings match tensor names by substring. `_exps` matches the three routed-expert tensors in every layer. `attn` matches `attn_q`, `attn_k`, `attn_v`, `attn_output`, `attn_qkv` and `attn_gate`. `ssm_` matches `ssm_out`, `ssm_alpha` and `ssm_beta` (Q4_K in the stock file). `output` matches `output.weight`, the `lm_head`. Runs c and d together cover every quantized product.
+- `--act-int8-path` is new after the review (it replaced `--act-int8-block 256|32`, which used one format for every weight type, unlike llama.cpp's CPU path). A bare `--act-int8` with no value is refused.
+- Group strings match tensor names by substring. `_exps` matches the three routed-expert tensors in every layer. `attn` matches `attn_q`, `attn_k`, `attn_v`, `attn_output`, `attn_qkv` and `attn_gate`. `ssm_` matches `ssm_out`, `ssm_alpha` and `ssm_beta` (Q4_K in the stock file). `output` matches `output.weight` (the `lm_head`) and also `attn_output`, which `attn` already covers. Runs c and d together cover every quantized product.
 - F32/F16/BF16 weights are never rounded: the routers, norms and `ssm_alpha`/`ssm_beta` when F32.
 
 **Comparisons** (seconds each):
@@ -239,7 +248,7 @@ $PELIAS kld --model $T/qwen36-Q4_K_M.pelias.gguf --base $T/kld-base-bf16-100chun
 |---|---|
 | PEL-6 | 0.0295–0.0300 |
 | T8 | 0.0127–0.0141 |
-| PEL3-a | 0.0432–0.0430 (both models agree within 0.0002) |
+| PEL3-a | 0.0430–0.0432 (both models agree within 0.0002) |
 
 Ranking: PEL3-a > stock > PEL-6 > T8, with every pair resolved by kld-compare.
 
@@ -360,7 +369,7 @@ $LLAMA_BIN/llama-perplexity -m $T/qwen36-bf16.llamacpp.gguf -f $WIKI -c 4096 --c
 - Same mode as the 512 base (GPU visible), so the two bases share arithmetic.
 - 25 chunks × 4096 = 102,400 tokens, 2 × the 512 base. WikiText-2 test has enough: UNVERIFIED, so the tool's chunk count is checked in the log.
 - Scored: positions 2048–4094, so 2,047 per chunk and 51,175 in total.
-- Size DERIVED from the 512 base: 126.6 MB per 256 stored rows, so about 1.01 GB per chunk and **25.3 GB** in total. On D: (140 GB free).
+- Size DERIVED from the base format (496,648 bytes per scored row; the 512 base's 12,664,728,820 bytes reproduce exactly from it at 255 rows per chunk): 2,047 rows per chunk, about 1.017 GB per chunk and **25.4 GB** in total. On D: (140 GB free).
 - Time ESTIMATE about 2 h: the 512 base took 57 min for half the tokens, and attention cost grows with context.
 
 **Runs:** `pelias kld --base $T/kld-base-bf16-25x4096.bin --dump-kld …` on stock, T8 and Unsloth. Time ESTIMATE 45–60 min each: twice the tokens; the 10 full-attention layers' cost grows with length.
@@ -660,7 +669,7 @@ The imatrix or the GPTQ objective adds weight to the router's input space and to
 - A seeded RNG (counter-based Philox; dictionary seed default 20261019).
 
 **Gate:**
-- Greedy decode on 20 fixed prompts equals llama.cpp's greedy decode token for token for 128 tokens. Run llama.cpp CPU-only with `--no-op-offload`, and the reference with `--act-int8 all --act-int8-block 256`, so the arithmetic matches.
+- Greedy decode on 20 fixed prompts equals llama.cpp's greedy decode token for token for 128 tokens. Run llama.cpp CPU-only with `--no-op-offload`, and the reference with `--act-int8 all --act-int8-path cpu`, so the arithmetic matches.
 - Without matched rounding, the first differing position is reported, not failed.
 - Incremental decode equals the full re-run of the same sequence: logits within 1e-5 relative.
 
@@ -925,7 +934,7 @@ Universality items:
 | C bench (GP1-04) | about 80 min (MEASURED parts: 253.5 s quantize, 1309 s Pelias) | +62.2 GB on C: |
 | C Unsloth (GP1-05) | about 92 min | +about 44 GB on C: (T8+imat, T9) |
 | D | tools first (Claude), then GP1-06 about 30–60 min, GP1-08 about 30–45 min | +about 0.2 GB |
-| E | GP1-09 about 2 h base + 3 × 45–60 min; GP1-10 57 min base + 4 × 26 min; GP1-11 about 30 min | +25.3 GB (4096 base) + 12.7 GB (domain base) on D: |
+| E | GP1-09 about 2 h base + 3 × 45–60 min; GP1-10 57 min base + 4 × 26 min; GP1-11 about 30 min | +25.4 GB (4096 base) + 12.7 GB (domain base) on D: |
 | F | GP1-12 about 2 h 30 min; GP1-13 about 70 min | +22–45 GB on C: (screening files are overwritten one by one) |
 
 Free space after Part 1, if nothing is deleted: C: about 191 − 62 − 44 − 45 ≈ 40 GB, under the 50 GB warning line. **Before Block F, the author decides which candidate files to delete** (only on the author's word).

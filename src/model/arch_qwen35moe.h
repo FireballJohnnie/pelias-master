@@ -71,11 +71,14 @@ struct ForwardOptions {
   // Optional importance-matrix collection (model/imatrix.h); the caller calls finish_chunk() after each call.
   ImatrixCollector* imatrix = nullptr;
   // Optional 8-bit activation rounding, to measure what a serving or training kernel that rounds its inputs would add:
-  // the inputs of every quantized weight whose name contains one of these strings ("all": every quantized weight)
-  // are rounded to the reference's 8-bit activation format and back before the product. Block 256 = Q8_K (the
-  // reference's CPU path), block 32 = q8_1 (its GPU path).
+  // the inputs of every quantized weight whose name contains one of these strings ("all": every quantized weight,
+  // the output layer included) are rounded to the reference's 8-bit activation format and back before the product.
+  // Path "cpu": the format llama.cpp's CPU path pairs with each weight type (READ-SRC ggml-cpu.c type_traits_cpu
+  // vec_dot_type: Q8_K for the K-quants, IQ2/IQ3/IQ1/IQ4_XS and TQ types; Q8_0 for Q4_0, Q5_0, Q8_0, IQ4_NL, MXFP4;
+  // Q8_1 for Q4_1, Q5_1). Path "gpu": q8_1 (32 values, fp16 scale) for every type, as its MMVQ kernels use; its MMQ
+  // kernels keep the q8_1 scale in fp32 for some types, which this does not model (a second-order difference).
   std::vector<std::string> act_int8;
-  int act_int8_block = 256;
+  bool act_int8_gpu = false;
 };
 
 // Runs tokens[0..n_tokens) and writes the logits of positions [out_begin, out_end) to `logits`

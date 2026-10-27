@@ -139,10 +139,11 @@ void usage() {
       "                                  KL divergence of the model against a base file written by llama-perplexity\n"
       "                                  --kl-divergence-base, computed by Pelias's fp32 CPU reference forward pass;\n"
       "                                  --expert-stats: per layer and expert, how often it was picked and its routing weight\n"
-      "      [--dump-kld OUT.bin] [--act-int8 GROUPS] [--act-int8-block 256|32]\n"
+      "      [--dump-kld OUT.bin] [--act-int8 GROUPS] [--act-int8-path cpu|gpu]\n"
       "                                  --dump-kld: every scored token's KL, NLLs, delta-p and top-token match (for kld-compare);\n"
       "                                  --act-int8: round the inputs of quantized weights whose names contain one of the\n"
-      "                                  comma-separated GROUPS (or 'all') to 8 bits first (256 = the CPU path, 32 = the GPU path)\n"
+      "                                  comma-separated GROUPS (or 'all') to 8 bits first: cpu (default) = llama.cpp's CPU\n"
+      "                                  format for each weight type (Q8_K / Q8_0 / Q8_1), gpu = q8_1\n"
       "  kld-compare --a A.bin --b B.bin [--name-a S] [--name-b S]\n"
       "                                  paired comparison of two --dump-kld files scored on the same base: mean difference,\n"
       "                                  chunk-clustered standard error, 95 % interval, top-token disagreements, verdict\n"
@@ -599,6 +600,10 @@ int cmd_kld(const Args& a) {
   fo.threads = threads;
   if (a.has("act-int8")) {
     const std::string groups = a.get("act-int8");
+    if (groups == "1") {  // the argument parser's value for a flag given with no value
+      std::fprintf(stderr, "pelias: --act-int8 needs a value: 'all' or comma-separated parts of tensor names\n");
+      return 1;
+    }
     for (std::size_t p = 0; p <= groups.size();) {
       const std::size_t q = std::min(groups.find(',', p), groups.size());
       if (q > p) fo.act_int8.push_back(groups.substr(p, q - p));
@@ -610,12 +615,20 @@ int cmd_kld(const Args& a) {
     }
   }
   if (a.has("act-int8-block")) {
-    const std::string b = a.get("act-int8-block");
-    if (b != "256" && b != "32") {
-      std::fprintf(stderr, "pelias: --act-int8-block is 256 (Q8_K, the CPU path) or 32 (q8_1, the GPU path)\n");
+    std::fprintf(stderr, "pelias: --act-int8-block was replaced by --act-int8-path cpu|gpu (the format follows each weight's type)\n");
+    return 1;
+  }
+  if (a.has("act-int8-path")) {
+    const std::string b = a.get("act-int8-path");
+    if (fo.act_int8.empty()) {
+      std::fprintf(stderr, "pelias: --act-int8-path needs --act-int8\n");
       return 1;
     }
-    fo.act_int8_block = std::stoi(b);
+    if (b != "cpu" && b != "gpu") {
+      std::fprintf(stderr, "pelias: --act-int8-path is cpu (llama.cpp's CPU formats per weight type) or gpu (q8_1)\n");
+      return 1;
+    }
+    fo.act_int8_gpu = b == "gpu";
   }
   const std::string dump_path = a.get("dump-kld");
   if (!dump_path.empty() && std::ifstream(dump_path, std::ios::binary)) {
@@ -626,7 +639,7 @@ int cmd_kld(const Args& a) {
   if (!fo.act_int8.empty()) {
     std::string list;
     for (const std::string& x : fo.act_int8) list += (list.empty() ? "" : ",") + x;
-    std::fprintf(stderr, "pelias kld: 8-bit activation rounding (block %d) on: %s\n", fo.act_int8_block, list.c_str());
+    std::fprintf(stderr, "pelias kld: 8-bit activation rounding (%s path) on: %s\n", fo.act_int8_gpu ? "gpu" : "cpu", list.c_str());
   }
   const std::string stats_path = a.get("expert-stats");
   const std::size_t n_route = static_cast<std::size_t>(spec.value.n_layer) * spec.value.n_expert;
