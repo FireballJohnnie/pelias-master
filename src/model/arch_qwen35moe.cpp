@@ -265,9 +265,51 @@ struct Ctx {
   std::uint32_t il = 0;  // the layer being run
 };
 
+// whether the inputs of `w` are rounded to 8 bits (ForwardOptions::act_int8); float weights never are, as in the reference
+bool act_rounded(const ForwardOptions& o, const WeightView& w) {
+  if (o.act_int8.empty()) return false;
+  const auto t = static_cast<quant::Type>(w.type);
+  if (t == quant::Type::f32 || t == quant::Type::f16 || t == quant::Type::bf16) return false;
+  for (const std::string& g : o.act_int8)
+    if (g == "all" || w.name.find(g) != std::string::npos) return true;
+  return false;
+}
+
+// one row to the 8-bit activation format and back: Q8_K (256: d fp32, qs int8) or q8_1 (32: d fp16, s fp16, qs int8)
+void act_round_row(float* x, int64_t n, int block) {
+  if (block == 32) {
+    std::uint8_t b[36];
+    for (int64_t i = 0; i < n; i += 32) {
+      quant::quantize_q8_1(x + i, b, 32);
+      std::uint16_t dh;
+      std::memcpy(&dh, b, 2);
+      const float d = quant::fp16_to_fp32(dh);
+      for (int j = 0; j < 32; ++j) x[i + j] = d * static_cast<float>(static_cast<std::int8_t>(b[4 + j]));
+    }
+  } else {
+    std::uint8_t b[292];
+    for (int64_t i = 0; i < n; i += 256) {
+      quant::quantize_q8_k(x + i, b, 256);
+      float d;
+      std::memcpy(&d, b, 4);
+      for (int j = 0; j < 256; ++j) x[i + j] = d * static_cast<float>(static_cast<std::int8_t>(b[4 + j]));
+    }
+  }
+}
+
 // matmul over the whole matrix, recording the activations for the importance matrix when asked
 void mm(const Ctx& c, const WeightView& w, const float* x, int64_t n_tok, int64_t ldx, float* y, int64_t ldy) {
   if (c.opt.imatrix) c.opt.imatrix->add_dense(w.name, x, n_tok, ldx, static_cast<int64_t>(w.ne[0]));
+  if (act_rounded(c.opt, w)) {
+    const int64_t k = static_cast<int64_t>(w.ne[0]);
+    std::vector<float> xr(z(n_tok * k));
+    for (int64_t t = 0; t < n_tok; ++t) {
+      std::memcpy(xr.data() + t * k, x + t * ldx, z(k) * sizeof(float));
+      act_round_row(xr.data() + t * k, k, c.opt.act_int8_block);
+    }
+    matmul(w, xr.data(), n_tok, k, y, ldy, c.threads, c.sc);
+    return;
+  }
   matmul(w, x, n_tok, ldx, y, ldy, c.threads, c.sc);
 }
 
@@ -466,11 +508,15 @@ void moe(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* out) {
     sc.ue.resize(z(m * ff));
     sc.ye.resize(z(m * e));
     for (int64_t r = 0; r < m; ++r) std::memcpy(sc.xe.data() + r * e, xn + (list[z(r)] / nu) * e, z(e) * sizeof(float));
+    if (act_rounded(c.opt, l.gate_exps) || act_rounded(c.opt, l.up_exps))  // one input feeds both, rounded once
+      for (int64_t r = 0; r < m; ++r) act_round_row(sc.xe.data() + r * e, e, c.opt.act_int8_block);
     matmul_rows(l.gate_exps, static_cast<uint64_t>(ex), 0, ff, sc.xe.data(), m, e, sc.ge.data(), ff, sc);
     matmul_rows(l.up_exps, static_cast<uint64_t>(ex), 0, ff, sc.xe.data(), m, e, sc.ue.data(), ff, sc);
     for (int64_t i = 0; i < m * ff; ++i) sc.ge[z(i)] = silu(sc.ge[z(i)]) * sc.ue[z(i)];
     if (!hs.empty())
       for (int64_t r = 0; r < m; ++r) std::memcpy(hs.data() + list[z(r)] * ff, sc.ge.data() + r * ff, z(ff) * sizeof(float));
+    if (act_rounded(c.opt, l.down_exps))
+      for (int64_t r = 0; r < m; ++r) act_round_row(sc.ge.data() + r * ff, ff, c.opt.act_int8_block);
     matmul_rows(l.down_exps, static_cast<uint64_t>(ex), 0, e, sc.ge.data(), m, ff, sc.ye.data(), e, sc);
     for (int64_t r = 0; r < m; ++r) {
       const int64_t slot = list[z(r)];

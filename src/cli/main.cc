@@ -15,6 +15,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <map>
 #include <string>
@@ -138,6 +139,13 @@ void usage() {
       "                                  KL divergence of the model against a base file written by llama-perplexity\n"
       "                                  --kl-divergence-base, computed by Pelias's fp32 CPU reference forward pass;\n"
       "                                  --expert-stats: per layer and expert, how often it was picked and its routing weight\n"
+      "      [--dump-kld OUT.bin] [--act-int8 GROUPS] [--act-int8-block 256|32]\n"
+      "                                  --dump-kld: every scored token's KL, NLLs, delta-p and top-token match (for kld-compare);\n"
+      "                                  --act-int8: round the inputs of quantized weights whose names contain one of the\n"
+      "                                  comma-separated GROUPS (or 'all') to 8 bits first (256 = the CPU path, 32 = the GPU path)\n"
+      "  kld-compare --a A.bin --b B.bin [--name-a S] [--name-b S]\n"
+      "                                  paired comparison of two --dump-kld files scored on the same base: mean difference,\n"
+      "                                  chunk-clustered standard error, 95 % interval, top-token disagreements, verdict\n"
       "  imatrix --model FILE --file TEXT --out OUT.gguf [--ctx 512] [--chunks N] [--threads N] [--no-nfc]\n"
       "                                  importance matrix from a calibration text, by the fp32 reference pass, in the\n"
       "                                  reference's GGUF imatrix format (llama-quantize --imatrix reads it)\n"
@@ -589,6 +597,37 @@ int cmd_kld(const Args& a) {
   verify::KlStats stats;
   model::ForwardOptions fo;
   fo.threads = threads;
+  if (a.has("act-int8")) {
+    const std::string groups = a.get("act-int8");
+    for (std::size_t p = 0; p <= groups.size();) {
+      const std::size_t q = std::min(groups.find(',', p), groups.size());
+      if (q > p) fo.act_int8.push_back(groups.substr(p, q - p));
+      p = q + 1;
+    }
+    if (fo.act_int8.empty()) {
+      std::fprintf(stderr, "pelias: --act-int8 needs 'all' or comma-separated parts of tensor names\n");
+      return 1;
+    }
+  }
+  if (a.has("act-int8-block")) {
+    const std::string b = a.get("act-int8-block");
+    if (b != "256" && b != "32") {
+      std::fprintf(stderr, "pelias: --act-int8-block is 256 (Q8_K, the CPU path) or 32 (q8_1, the GPU path)\n");
+      return 1;
+    }
+    fo.act_int8_block = std::stoi(b);
+  }
+  const std::string dump_path = a.get("dump-kld");
+  if (!dump_path.empty() && std::ifstream(dump_path, std::ios::binary)) {
+    std::fprintf(stderr, "pelias: %s already exists (nothing is overwritten)\n", dump_path.c_str());
+    return 1;
+  }
+  verify::KlDump dump;
+  if (!fo.act_int8.empty()) {
+    std::string list;
+    for (const std::string& x : fo.act_int8) list += (list.empty() ? "" : ",") + x;
+    std::fprintf(stderr, "pelias kld: 8-bit activation rounding (block %d) on: %s\n", fo.act_int8_block, list.c_str());
+  }
   const std::string stats_path = a.get("expert-stats");
   const std::size_t n_route = static_cast<std::size_t>(spec.value.n_layer) * spec.value.n_expert;
   std::vector<std::uint64_t> picks(stats_path.empty() ? 0 : n_route, 0);
@@ -619,12 +658,25 @@ int cmd_kld(const Args& a) {
       });
     for (auto& th : pool) th.join();
     for (const verify::KlToken& t : per) stats.add(t);
+    if (!dump_path.empty()) dump.tokens.insert(dump.tokens.end(), per.begin(), per.end());
     std::printf("%s", verify::kl_chunk_line(c + 1, stats).c_str());
     std::fflush(stdout);
     if (c == 0)
       std::fprintf(stderr, "pelias kld: %.2f seconds per chunk - ETA %.1f minutes\n", tc.seconds(), tc.seconds() * (n_chunk - 1) / 60.0);
   }
   std::printf("\n%s", verify::kl_report(stats).c_str());
+  if (!dump_path.empty()) {
+    dump.n_ctx = static_cast<std::uint32_t>(n_ctx);
+    dump.chunks = static_cast<std::uint32_t>(n_chunk);
+    dump.scored = static_cast<std::uint32_t>(scored);
+    dump.token_hash = verify::kl_token_hash(base.tokens().data(), static_cast<std::size_t>(n_chunk) * static_cast<std::size_t>(n_ctx));
+    s = verify::kl_dump_write(dump_path, dump);
+    if (!s) {
+      std::fprintf(stderr, "pelias: %s\n", s.text().c_str());
+      return 6;
+    }
+    std::fprintf(stderr, "pelias kld: %zu per-token records written\n", dump.tokens.size());
+  }
   if (!stats_path.empty()) {
     std::string csv = "layer,expert,picks,weight_sum\n";
     for (std::uint32_t il = 0; il < spec.value.n_layer; ++il)
@@ -644,6 +696,22 @@ int cmd_kld(const Args& a) {
     std::fprintf(stderr, "pelias kld: expert statistics written (%u layers x %u experts)\n", spec.value.n_layer, spec.value.n_expert);
   }
   std::fprintf(stderr, "pelias kld: %d chunks in %.1f s\n", n_chunk, total.seconds());
+  return 0;
+}
+
+int cmd_kld_compare(const Args& a) {
+  const std::string pa = a.get("a"), pb = a.get("b");
+  if (pa.empty() || pb.empty()) {
+    usage();
+    return 1;
+  }
+  const Result<verify::KlDump> da = verify::kl_dump_read(pa);
+  if (!da.ok()) return fail_input(da.status);
+  const Result<verify::KlDump> db = verify::kl_dump_read(pb);
+  if (!db.ok()) return fail_input(db.status);
+  const Result<std::string> r = verify::kl_compare(da.value, db.value, a.has("name-a") ? a.get("name-a") : "A", a.has("name-b") ? a.get("name-b") : "B");
+  if (!r.ok()) return fail_input(r.status);
+  std::printf("%s", r.value.c_str());
   return 0;
 }
 
@@ -747,6 +815,7 @@ int main(int argc, char** argv) {
   if (cmd == "verify") return cmd_verify(a);
   if (cmd == "tokenize") return cmd_tokenize(a);
   if (cmd == "kld") return cmd_kld(a);
+  if (cmd == "kld-compare") return cmd_kld_compare(a);
   if (cmd == "imatrix") return cmd_imatrix(a);
   for (const char* later : {"probe", "train", "export", "serve", "bench", "web"})
     if (cmd == later) {

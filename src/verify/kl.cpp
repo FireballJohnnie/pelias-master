@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <iterator>
 
 namespace pelias::verify {
 
@@ -226,6 +227,162 @@ std::string kl_report(const KlStats& s) {
   const double top = 1.0 * static_cast<double>(s.n_same_top) / static_cast<double>(s.count);
   o += fmt("Same top p: %6.3lf \xc2\xb1 %5.3lf %%\n", 100.0 * top, 100.0 * std::sqrt(top * (1.0 - top) / static_cast<double>(s.count - 1)));
   return o;
+}
+
+std::uint64_t kl_token_hash(const std::int32_t* tokens, std::size_t n) {
+  std::uint64_t h = 1469598103934665603ull;
+  for (std::size_t i = 0; i < n; ++i) {
+    const auto u = static_cast<std::uint32_t>(tokens[i]);
+    for (int b = 0; b < 4; ++b) {
+      h ^= (u >> (8 * b)) & 0xFF;
+      h *= 1099511628211ull;
+    }
+  }
+  return h;
+}
+
+namespace {
+void put_le(std::vector<std::uint8_t>& o, std::uint64_t v, int bytes) {
+  for (int b = 0; b < bytes; ++b) o.push_back(static_cast<std::uint8_t>(v >> (8 * b)));
+}
+std::uint64_t get_le(const std::uint8_t* p, int bytes) {
+  std::uint64_t v = 0;
+  for (int b = 0; b < bytes; ++b) v |= static_cast<std::uint64_t>(p[b]) << (8 * b);
+  return v;
+}
+}  // namespace
+
+Status kl_dump_write(const std::string& path, const KlDump& d) {
+  std::vector<std::uint8_t> o;
+  o.reserve(40 + d.tokens.size() * 24);
+  for (char ch : std::string("PELKLD01")) o.push_back(static_cast<std::uint8_t>(ch));
+  put_le(o, d.n_ctx, 4);
+  put_le(o, d.chunks, 4);
+  put_le(o, d.scored, 4);
+  put_le(o, d.token_hash, 8);
+  put_le(o, d.tokens.size(), 8);
+  for (const KlToken& t : d.tokens) {
+    std::uint64_t k;
+    std::memcpy(&k, &t.kld, 8);
+    put_le(o, k, 8);
+    for (float f : {t.nll, t.nll_base, t.p_diff}) {
+      std::uint32_t u;
+      std::memcpy(&u, &f, 4);
+      put_le(o, u, 4);
+    }
+    o.push_back(t.same_top ? 1 : 0);
+    o.push_back(0);
+    o.push_back(0);
+    o.push_back(0);
+  }
+  std::ifstream exists(path, std::ios::binary);
+  if (exists) return Status::fail(Code::invalid_argument, "the per-token file already exists (nothing is overwritten)");
+  std::ofstream f(path, std::ios::binary);
+  if (!f) return Status::fail(Code::io_error, "the per-token file could not be created");
+  f.write(reinterpret_cast<const char*>(o.data()), static_cast<std::streamsize>(o.size()));
+  if (!f) return Status::fail(Code::io_error, "the per-token file could not be written");
+  return Status::good();
+}
+
+Result<KlDump> kl_dump_read(const std::string& path) {
+  using R = Result<KlDump>;
+  std::ifstream f(path, std::ios::binary);
+  if (!f) return R::fail(Status::fail(Code::not_found, "the per-token file could not be opened"));
+  std::vector<std::uint8_t> b((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+  if (b.size() < 36 || std::memcmp(b.data(), "PELKLD01", 8) != 0) return R::fail(Status::fail(Code::corrupt, "not a Pelias per-token KL file"));
+  KlDump d;
+  d.n_ctx = static_cast<std::uint32_t>(get_le(b.data() + 8, 4));
+  d.chunks = static_cast<std::uint32_t>(get_le(b.data() + 12, 4));
+  d.scored = static_cast<std::uint32_t>(get_le(b.data() + 16, 4));
+  d.token_hash = get_le(b.data() + 20, 8);
+  const std::uint64_t n = get_le(b.data() + 28, 8);
+  if (b.size() != 36 + n * 24) return R::fail(Status::fail(Code::corrupt, "the per-token file's size does not match its record count", 28));
+  d.tokens.resize(static_cast<std::size_t>(n));
+  for (std::uint64_t i = 0; i < n; ++i) {
+    const std::uint8_t* p = b.data() + 36 + i * 24;
+    KlToken& t = d.tokens[static_cast<std::size_t>(i)];
+    const std::uint64_t k = get_le(p, 8);
+    std::memcpy(&t.kld, &k, 8);
+    float* fs[3] = {&t.nll, &t.nll_base, &t.p_diff};
+    for (int j = 0; j < 3; ++j) {
+      const auto u = static_cast<std::uint32_t>(get_le(p + 8 + 4 * j, 4));
+      std::memcpy(fs[j], &u, 4);
+    }
+    t.same_top = p[20] != 0;
+  }
+  return R::good(std::move(d));
+}
+
+namespace {
+// two-sided 95 % critical value of Student's t with df degrees of freedom (the chunk means are few: 100 chunks give
+// 99, a quick 4-chunk check gives 3, where 1.96 would make the interval far too narrow)
+double t975(std::size_t df) {
+  static const double kTable[30] = {12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228,
+                                    2.201,  2.179, 2.160, 2.145, 2.131, 2.120, 2.110, 2.101, 2.093, 2.086,
+                                    2.080,  2.074, 2.069, 2.064, 2.060, 2.056, 2.052, 2.048, 2.045, 2.042};
+  if (df == 0) return 0.0;
+  if (df <= 30) return kTable[df - 1];
+  const double z = 1.959964, v = static_cast<double>(df);  // Cornish-Fisher expansion, within 0.001 for df > 30
+  return z + (z * z * z + z) / (4 * v) + (5 * std::pow(z, 5) + 16 * z * z * z + 3 * z) / (96 * v * v);
+}
+}  // namespace
+
+Result<std::string> kl_compare(const KlDump& a, const KlDump& b, const std::string& name_a, const std::string& name_b) {
+  using R = Result<std::string>;
+  if (a.token_hash != b.token_hash || a.tokens.size() != b.tokens.size() || a.scored != b.scored || a.scored == 0)
+    return R::fail(Status::fail(Code::invalid_argument, "the two files were not scored on the same tokens (different base, chunk count or context)"));
+  const std::size_t n = a.tokens.size();
+  const std::size_t per = a.scored;
+  const std::size_t chunks = n / per;
+  double sa = 0, sb = 0, sd = 0, sd2 = 0, snll = 0;
+  std::size_t a_only = 0, b_only = 0, a_lower = 0;
+  std::vector<double> cm(chunks, 0.0);
+  for (std::size_t i = 0; i < n; ++i) {
+    const KlToken& x = a.tokens[i];
+    const KlToken& y = b.tokens[i];
+    const double d = x.kld - y.kld;
+    sa += x.kld;
+    sb += y.kld;
+    sd += d;
+    sd2 += d * d;
+    snll += static_cast<double>(x.nll) - static_cast<double>(y.nll);
+    if (x.same_top && !y.same_top) ++a_only;
+    if (!x.same_top && y.same_top) ++b_only;
+    if (x.kld < y.kld) ++a_lower;
+    if (i / per < chunks) cm[i / per] += d / static_cast<double>(per);
+  }
+  const double nn = static_cast<double>(n);
+  const double mean = sd / nn;
+  const double var_tok = (sd2 / nn - mean * mean) * nn / (nn - 1);
+  const double se_tok = std::sqrt(std::max(0.0, var_tok) / nn);
+  double cmean = 0, cvar = 0;
+  for (double v : cm) cmean += v;
+  cmean /= static_cast<double>(chunks);
+  for (double v : cm) cvar += (v - cmean) * (v - cmean);
+  cvar /= static_cast<double>(chunks > 1 ? chunks - 1 : 1);
+  const double se_chunk = std::sqrt(cvar / static_cast<double>(chunks));
+  if (chunks < 2) return R::fail(Status::fail(Code::invalid_argument, "a paired comparison needs at least 2 chunks (the standard error is taken between chunks)"));
+  const double tc = t975(chunks - 1);
+  const double lo = mean - tc * se_chunk, hi = mean + tc * se_chunk;
+  char buf[2048];
+  std::string o;
+  std::snprintf(buf, sizeof buf, "paired on %zu scored tokens (%zu chunks of %zu)\n", n, chunks, per);
+  o += buf;
+  std::snprintf(buf, sizeof buf, "mean KLD   %s %.6f   %s %.6f\n", name_a.c_str(), sa / nn, name_b.c_str(), sb / nn);
+  o += buf;
+  std::snprintf(buf, sizeof buf, "difference (A - B) %+.6f   SE per token %.6f   SE per chunk (used) %.6f   95%% interval [%+.6f, %+.6f] (t %.3f, %zu df)   t-stat %.2f\n",
+                mean, se_tok, se_chunk, lo, hi, tc, chunks - 1, se_chunk > 0 ? mean / se_chunk : 0.0);
+  o += buf;
+  std::snprintf(buf, sizeof buf, "tokens where A has the lower KL: %.2f %%; mean ln(PPL) difference %+.6f\n", 100.0 * static_cast<double>(a_lower) / nn, snll / nn);
+  o += buf;
+  const double disc = static_cast<double>(a_only + b_only);
+  std::snprintf(buf, sizeof buf, "top token: right only in A %zu, only in B %zu (z %.2f)\n", a_only, b_only,
+                disc > 0 ? (static_cast<double>(a_only) - static_cast<double>(b_only)) / std::sqrt(disc) : 0.0);
+  o += buf;
+  if (hi < 0) o += "VERDICT: A has less drift than B (the 95 % interval is below zero)\n";
+  else if (lo > 0) o += "VERDICT: B has less drift than A (the 95 % interval is above zero)\n";
+  else o += "VERDICT: no difference this test can resolve (the 95 % interval contains zero)\n";
+  return R::good(o);
 }
 
 }  // namespace pelias::verify

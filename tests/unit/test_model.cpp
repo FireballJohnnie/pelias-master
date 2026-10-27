@@ -2,6 +2,7 @@
 //   tools/perplexity/perplexity.cpp log_softmax at commit 2ca15f5404760548c39e7b92bd43116a09414a1a)
 // Copyright (c) 2026 John Lipka and the Pelias contributors
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -132,4 +133,72 @@ TEST(kl_stats_report_layout) {
   CHECK(rep.find("Mean    KLD:   0.020000") != std::string::npos);
   CHECK(rep.find("Same top p: 90.000") != std::string::npos);
   CHECK(pelias::verify::kl_chunk_line(1, st).rfind("   1", 0) == 0);
+}
+
+namespace {
+pelias::verify::KlDump dump_of(const std::vector<double>& klds, std::uint32_t per, std::uint64_t hash) {
+  pelias::verify::KlDump d;
+  d.n_ctx = 2 * per + 2;
+  d.scored = per;
+  d.chunks = static_cast<std::uint32_t>(klds.size() / per);
+  d.token_hash = hash;
+  for (std::size_t i = 0; i < klds.size(); ++i) {
+    pelias::verify::KlToken t;
+    t.kld = klds[i];
+    t.nll = 1.5f + static_cast<float>(i) * 0.25f;
+    t.nll_base = 1.25f;
+    t.p_diff = -0.125f;
+    t.same_top = i % 3 != 0;
+    d.tokens.push_back(t);
+  }
+  return d;
+}
+}  // namespace
+
+TEST(kl_dump_round_trips_and_refuses_overwrite) {
+  const std::vector<std::int32_t> toks = {1, 2, 3, 70000};
+  const std::uint64_t h = pelias::verify::kl_token_hash(toks.data(), toks.size());
+  CHECK(h != pelias::verify::kl_token_hash(toks.data(), 3));
+  const pelias::verify::KlDump d = dump_of({0.5, 0.25, 0.125, 1.0, 2.0, 0.0}, 3, h);
+  const std::string path = ptest::data_dir() + "/kl_dump_rt.bin";
+  std::remove(path.c_str());
+  CHECK(pelias::verify::kl_dump_write(path, d).ok());
+  CHECK(!pelias::verify::kl_dump_write(path, d).ok());  // never overwrites
+  const auto r = pelias::verify::kl_dump_read(path);
+  CHECK(r.ok());
+  CHECK(r.value.n_ctx == d.n_ctx && r.value.chunks == 2 && r.value.scored == 3 && r.value.token_hash == h);
+  CHECK(r.value.tokens.size() == 6);
+  for (std::size_t i = 0; i < 6; ++i) {
+    CHECK(r.value.tokens[i].kld == d.tokens[i].kld);
+    CHECK(r.value.tokens[i].nll == d.tokens[i].nll);
+    CHECK(r.value.tokens[i].p_diff == d.tokens[i].p_diff);
+    CHECK(r.value.tokens[i].same_top == d.tokens[i].same_top);
+  }
+  std::remove(path.c_str());
+}
+
+TEST(kl_compare_paired_statistics) {
+  // A = B - 0.1 on every token, with chunk-level variation: difference -0.1 exactly, zero spread -> resolved
+  std::vector<double> b, a;
+  for (int i = 0; i < 40; ++i) {
+    b.push_back(0.2 + 0.01 * (i % 7));
+    a.push_back(b.back() - 0.1);
+  }
+  const auto da = dump_of(a, 10, 7), db = dump_of(b, 10, 7);
+  const auto r = pelias::verify::kl_compare(da, db, "A", "B");
+  CHECK(r.ok());
+  CHECK(r.value.find("difference (A - B) -0.100000") != std::string::npos);
+  CHECK(r.value.find("(t 3.182, 3 df)") != std::string::npos);
+  CHECK(r.value.find("VERDICT: A has less drift") != std::string::npos);
+  // identical files: no difference
+  const auto same = pelias::verify::kl_compare(db, db, "B", "B");
+  CHECK(same.ok() && same.value.find("contains zero") != std::string::npos);
+  // chunk means of the difference +0.1, -0.1, +0.1, -0.1: mean 0, unresolved
+  std::vector<double> c;
+  for (int i = 0; i < 40; ++i) c.push_back(b[static_cast<std::size_t>(i)] + ((i / 10) % 2 ? -0.1 : 0.1));
+  const auto mixed = pelias::verify::kl_compare(dump_of(c, 10, 7), db, "C", "B");
+  CHECK(mixed.ok() && mixed.value.find("contains zero") != std::string::npos);
+  // different tokens, or a single chunk: refused
+  CHECK(!pelias::verify::kl_compare(da, dump_of(b, 10, 8), "A", "B").ok());
+  CHECK(!pelias::verify::kl_compare(dump_of(a, 40, 7), dump_of(b, 40, 7), "A", "B").ok());
 }

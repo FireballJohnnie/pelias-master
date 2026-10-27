@@ -6,8 +6,9 @@
 //
 // arch_qwen35moe.h - the qwen35moe trunk, written once in plain fp32 as the reference every faster path is checked
 // against (Milestone 1: CPU reference forward pass). Weights stay in the file in whatever type it stores them and are
-// dequantized row by row as they are used; activations are fp32 throughout (no 8-bit activation rounding, no fp16 KV
-// cache), so this measures what the weights do and nothing else.
+// dequantized row by row as they are used; activations are fp32 throughout by default (no 8-bit activation rounding, no
+// fp16 KV cache), so this measures what the weights do and nothing else. ForwardOptions::act_int8 adds the reference's
+// 8-bit activation rounding on chosen weights, to measure that effect on its own.
 //
 // One call runs one sequence from position 0 with fresh state (zero DeltaNet and conv state, empty attention cache),
 // the way a perplexity or KL-divergence chunk is evaluated. The MTP block is loaded by the file but not run here.
@@ -69,6 +70,12 @@ struct ForwardOptions {
   double* expert_weight = nullptr;
   // Optional importance-matrix collection (model/imatrix.h); the caller calls finish_chunk() after each call.
   ImatrixCollector* imatrix = nullptr;
+  // Optional 8-bit activation rounding, to measure what a serving or training kernel that rounds its inputs would add:
+  // the inputs of every quantized weight whose name contains one of these strings ("all": every quantized weight)
+  // are rounded to the reference's 8-bit activation format and back before the product. Block 256 = Q8_K (the
+  // reference's CPU path), block 32 = q8_1 (its GPU path).
+  std::vector<std::string> act_int8;
+  int act_int8_block = 256;
 };
 
 // Runs tokens[0..n_tokens) and writes the logits of positions [out_begin, out_end) to `logits`

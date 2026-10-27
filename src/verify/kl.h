@@ -62,6 +62,21 @@ struct KlStats {
   void add(const KlToken& t);
 };
 
+// ---- per-token records, for paired comparisons of two files scored on the same base (the same tokens)
+// File: "PELKLD01", u32 n_ctx, u32 chunks, u32 scored per chunk, u64 FNV-1a of the scored chunks' tokens, u64 records;
+// then per scored token, in order: f64 kld, f32 nll, f32 nll_base, f32 p_diff, u8 same_top, 3 zero bytes (24 bytes).
+struct KlDump {
+  std::uint32_t n_ctx = 0, chunks = 0, scored = 0;
+  std::uint64_t token_hash = 0;
+  std::vector<KlToken> tokens;
+};
+std::uint64_t kl_token_hash(const std::int32_t* tokens, std::size_t n);
+Status kl_dump_write(const std::string& path, const KlDump& d);
+Result<KlDump> kl_dump_read(const std::string& path);
+// A against B, token by token: mean difference of KL with a token-level and a chunk-level (clustered) standard error,
+// the 95 % interval from the chunk-level one, top-token agreement differences (discordant pairs), and a verdict.
+Result<std::string> kl_compare(const KlDump& a, const KlDump& b, const std::string& name_a, const std::string& name_b);
+
 // The reference's per-chunk line: chunk, PPL, ln(PPL(Q)/PPL(base)), KL divergence, delta-p RMS, same top p.
 std::string kl_chunk_line(int chunk, const KlStats& s);
 std::string kl_chunk_header();
