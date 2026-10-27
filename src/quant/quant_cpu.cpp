@@ -27,6 +27,9 @@ constexpr float kGroupMaxEps = 1e-15f;
 // Q6_K: ql[128] | qh[64] | scales[16] (int8) | d (fp16)                  210 bytes
 // Q8_K: d (fp32) | qs[256] (int8) | bsums[16] (int16)                    292 bytes
 constexpr std::size_t kQ8_0Bytes = 34, kQ8_1Bytes = 36, kQ4KBytes = 144, kQ6KBytes = 210, kQ8KBytes = 292;
+constexpr std::size_t kQ2KBytes = 84, kQ3KBytes = 110, kQ5KBytes = 176, kIQ4XSBytes = 136;
+// the IQ4_NL / IQ4_XS non-linear 4-bit levels (ggml-common.h kvalues_iq4nl)
+constexpr std::int8_t kValuesIq4nl[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
 
 void put_u16(std::uint8_t* p, std::uint16_t v) { std::memcpy(p, &v, 2); }
 std::uint16_t get_u16(const std::uint8_t* p) {
@@ -527,6 +530,122 @@ void quantize_q8_k(const float* x, std::uint8_t* out, std::int64_t n) {
 
 // ---- dispatch
 
+// ---- read-only types (no quantizer yet): Q2_K, Q3_K, Q5_K, IQ4_XS
+
+// Q2_K block (84 bytes): scales[16] (low nibble scale, high nibble min), qs[64] (2-bit quants), d, dmin (fp16)
+void dequantize_q2_k(const std::uint8_t* in, float* y, std::int64_t n) {
+  const std::int64_t nb = n / kQKK;
+  for (std::int64_t i = 0; i < nb; ++i, in += kQ2KBytes) {
+    const std::uint8_t* scales = in;
+    const std::uint8_t* q = in + 16;
+    const float d = fp16_to_fp32(get_u16(in + 80));
+    const float min = fp16_to_fp32(get_u16(in + 82));
+    int is = 0;
+    for (int n0 = 0; n0 < kQKK; n0 += 128) {
+      int shift = 0;
+      for (int j = 0; j < 4; ++j) {
+        std::uint8_t sc = scales[is++];
+        float dl = d * static_cast<float>(sc & 0xF);
+        float ml = min * static_cast<float>(sc >> 4);
+        for (int l = 0; l < 16; ++l) *y++ = dl * static_cast<float>((q[l] >> shift) & 3) - ml;
+        sc = scales[is++];
+        dl = d * static_cast<float>(sc & 0xF);
+        ml = min * static_cast<float>(sc >> 4);
+        for (int l = 0; l < 16; ++l) *y++ = dl * static_cast<float>((q[l + 16] >> shift) & 3) - ml;
+        shift += 2;
+      }
+      q += 32;
+    }
+  }
+}
+
+// Q3_K block (110 bytes): hmask[32] (high bit), qs[64] (low 2 bits), scales[12] (sixteen 6-bit scales, offset 32), d
+void dequantize_q3_k(const std::uint8_t* in, float* y, std::int64_t n) {
+  const std::int64_t nb = n / kQKK;
+  constexpr std::uint32_t kmask1 = 0x03030303, kmask2 = 0x0f0f0f0f;
+  for (std::int64_t i = 0; i < nb; ++i, in += kQ3KBytes) {
+    const std::uint8_t* hm = in;
+    const std::uint8_t* q = in + 32;
+    const float d_all = fp16_to_fp32(get_u16(in + 108));
+    std::uint32_t aux[4];
+    std::memcpy(aux, in + 96, 12);
+    const std::uint32_t tmp = aux[2];
+    aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+    aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+    aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+    aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+    std::int8_t scales[16];
+    std::memcpy(scales, aux, 16);  // the reference reads the words as bytes in memory order (little-endian)
+    int is = 0;
+    std::uint8_t m = 1;
+    for (int n0 = 0; n0 < kQKK; n0 += 128) {
+      int shift = 0;
+      for (int j = 0; j < 4; ++j) {
+        float dl = d_all * static_cast<float>(scales[is++] - 32);
+        for (int l = 0; l < 16; ++l)
+          *y++ = dl * static_cast<float>(static_cast<int>((q[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4));
+        dl = d_all * static_cast<float>(scales[is++] - 32);
+        for (int l = 0; l < 16; ++l)
+          *y++ = dl * static_cast<float>(static_cast<int>((q[l + 16] >> shift) & 3) - ((hm[l + 16] & m) ? 0 : 4));
+        shift += 2;
+        m = static_cast<std::uint8_t>(m << 1);
+      }
+      q += 32;
+    }
+  }
+}
+
+// Q5_K block (176 bytes): d, dmin (fp16), scales[12] (as Q4_K), qh[32] (fifth bit), qs[128] (low 4 bits)
+void dequantize_q5_k(const std::uint8_t* in, float* y, std::int64_t n) {
+  const std::int64_t nb = n / kQKK;
+  for (std::int64_t i = 0; i < nb; ++i, in += kQ5KBytes) {
+    const float d = fp16_to_fp32(get_u16(in));
+    const float min = fp16_to_fp32(get_u16(in + 2));
+    const std::uint8_t* scales = in + 4;
+    const std::uint8_t* qh = in + 16;
+    const std::uint8_t* ql = in + 48;
+    int is = 0;
+    std::uint8_t sc, m;
+    std::uint8_t u1 = 1, u2 = 2;
+    for (int j = 0; j < kQKK; j += 64) {
+      get_scale_min_k4(is + 0, scales, &sc, &m);
+      const float d1 = d * static_cast<float>(sc);
+      const float m1 = min * static_cast<float>(m);
+      get_scale_min_k4(is + 1, scales, &sc, &m);
+      const float d2 = d * static_cast<float>(sc);
+      const float m2 = min * static_cast<float>(m);
+      for (int l = 0; l < 32; ++l) *y++ = d1 * static_cast<float>((ql[l] & 0xF) + ((qh[l] & u1) ? 16 : 0)) - m1;
+      for (int l = 0; l < 32; ++l) *y++ = d2 * static_cast<float>((ql[l] >> 4) + ((qh[l] & u2) ? 16 : 0)) - m2;
+      ql += 32;
+      is += 2;
+      u1 = static_cast<std::uint8_t>(u1 << 2);
+      u2 = static_cast<std::uint8_t>(u2 << 2);
+    }
+  }
+}
+
+// IQ4_XS block (136 bytes): d (fp16), scales_h (u16), scales_l[4], qs[128]; eight 32-element groups, 6-bit scales
+// offset 32, levels from the non-linear table
+void dequantize_iq4_xs(const std::uint8_t* in, float* y, std::int64_t n) {
+  const std::int64_t nb = n / kQKK;
+  for (std::int64_t i = 0; i < nb; ++i, in += kIQ4XSBytes) {
+    const float d = fp16_to_fp32(get_u16(in));
+    const std::uint16_t scales_h = get_u16(in + 2);
+    const std::uint8_t* scales_l = in + 4;
+    const std::uint8_t* qs = in + 8;
+    for (int ib = 0; ib < kQKK / 32; ++ib) {
+      const int ls = ((scales_l[ib / 2] >> 4 * (ib % 2)) & 0xf) | (((scales_h >> 2 * ib) & 3) << 4);
+      const float dl = d * static_cast<float>(ls - 32);
+      for (int j = 0; j < 16; ++j) {
+        y[j + 0] = dl * static_cast<float>(kValuesIq4nl[qs[j] & 0xf]);
+        y[j + 16] = dl * static_cast<float>(kValuesIq4nl[qs[j] >> 4]);
+      }
+      y += 32;
+      qs += 16;
+    }
+  }
+}
+
 bool can_quantize(Type t) {
   switch (t) {
     case Type::f32: case Type::f16: case Type::bf16: case Type::q8_0: case Type::q8_1: case Type::q4_k: case Type::q6_k:
@@ -540,6 +659,7 @@ bool can_quantize(Type t) {
 bool can_dequantize(Type t) {
   switch (t) {
     case Type::f32: case Type::f16: case Type::bf16: case Type::q8_0: case Type::q4_k: case Type::q6_k:
+    case Type::q2_k: case Type::q3_k: case Type::q5_k: case Type::iq4_xs:
       return true;
     default:
       return false;
@@ -592,6 +712,10 @@ Status dequantize_row(Type t, const std::uint8_t* in, float* y, std::int64_t n) 
     case Type::q8_0: dequantize_q8_0(in, y, n); break;
     case Type::q4_k: dequantize_q4_k(in, y, n); break;
     case Type::q6_k: dequantize_q6_k(in, y, n); break;
+    case Type::q2_k: dequantize_q2_k(in, y, n); break;
+    case Type::q3_k: dequantize_q3_k(in, y, n); break;
+    case Type::q5_k: dequantize_q5_k(in, y, n); break;
+    case Type::iq4_xs: dequantize_iq4_xs(in, y, n); break;
     default: return Status::fail(Code::internal, "dequantize dispatch");
   }
   return Status::good();

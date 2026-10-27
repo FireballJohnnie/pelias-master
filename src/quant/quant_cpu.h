@@ -10,6 +10,7 @@
 // kernels, checked against these.
 //
 // Types in this step (5.3 build order): F32, F16, BF16, Q8_0, Q4_K, Q6_K for weights; Q8_1 and Q8_K for activations.
+// Read only (dequantize, no quantizer yet; Milestone 1 / O19): Q2_K, Q3_K, Q5_K, IQ4_XS.
 #pragma once
 
 #include <cstddef>
@@ -45,5 +46,9 @@ void quantize_q8_k(const float* x, std::uint8_t* out, std::int64_t n);
 void dequantize_q8_0(const std::uint8_t* in, float* y, std::int64_t n);
 void dequantize_q4_k(const std::uint8_t* in, float* y, std::int64_t n);
 void dequantize_q6_k(const std::uint8_t* in, float* y, std::int64_t n);
+void dequantize_q2_k(const std::uint8_t* in, float* y, std::int64_t n);
+void dequantize_q3_k(const std::uint8_t* in, float* y, std::int64_t n);
+void dequantize_q5_k(const std::uint8_t* in, float* y, std::int64_t n);
+void dequantize_iq4_xs(const std::uint8_t* in, float* y, std::int64_t n);
 
 }  // namespace pelias::quant

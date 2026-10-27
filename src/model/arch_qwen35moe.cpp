@@ -261,6 +261,8 @@ struct Ctx {
   int threads;
   std::vector<Scratch>& sc;
   int64_t n;  // tokens
+  const ForwardOptions& opt;
+  std::uint32_t il = 0;  // the layer being run
 };
 
 void full_attention(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* out) {
@@ -422,6 +424,13 @@ void moe(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* out) {
       if (s.expert_weights_scale != 0.0f && s.expert_weights_scale != 1.0f) wsel[z(t * nu + k)] *= s.expert_weights_scale;
     }
   }
+  if (c.opt.expert_picks || c.opt.expert_weight) {
+    const int64_t base = static_cast<int64_t>(c.il) * ne;
+    for (int64_t i = 0; i < n * nu; ++i) {
+      if (c.opt.expert_picks) ++c.opt.expert_picks[base + sel[z(i)]];
+      if (c.opt.expert_weight) c.opt.expert_weight[base + sel[z(i)]] += static_cast<double>(wsel[z(i)]);
+    }
+  }
   // tokens per expert, in token order
   std::vector<std::vector<int64_t>> slots(z(ne));  // entries t * nu + k
   for (int64_t t = 0; t < n; ++t)
@@ -542,7 +551,7 @@ Status forward_reference(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, cons
   const int threads = opt.threads > 0 ? opt.threads : static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
   const int64_t n = n_tokens, e = s.n_embd;
   std::vector<Scratch> sc(z(threads));
-  Ctx c{s, threads, sc, n};
+  Ctx c{s, threads, sc, n, opt};
 
   // embedding rows
   std::vector<float> x(z(n * e)), xn(z(n * e)), y(z(n * e));
@@ -554,6 +563,7 @@ Status forward_reference(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, cons
   }
   for (std::uint32_t il = 0; il < s.n_layer; ++il) {
     const Qwen35MoeLayer& l = w.layers[il];
+    c.il = il;
     for (int64_t t = 0; t < n; ++t) rms_norm(x.data() + t * e, l.attn_norm.data(), xn.data() + t * e, e, s.rms_eps);
     if (l.recurrent) delta_net(c, l, xn.data(), y.data());
     else full_attention(c, l, xn.data(), y.data());

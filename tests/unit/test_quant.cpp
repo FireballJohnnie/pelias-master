@@ -35,6 +35,25 @@ TEST(quant_matches_the_reference_hashes) {
   }
 }
 
+TEST(quant_dequantizers_match_the_reference_hashes) {
+  // Q2_K, Q3_K, Q5_K, IQ4_XS: the floats the reference produced from fixed blocks (every platform, bit for bit)
+  for (const auto& g : ptest::kDequantGolden) {
+    const std::vector<std::uint8_t> in = ptest::dequant_golden_input(g);
+    const auto n = static_cast<std::int64_t>(64 * q::type_info(g.type_id).block_elements);
+    std::vector<float> y(static_cast<std::size_t>(n));
+    CHECK(q::dequantize_row(static_cast<q::Type>(g.type_id), in.data(), y.data(), n).ok());
+    std::vector<std::uint8_t> bytes(y.size() * 4);
+    for (std::size_t i = 0; i < y.size(); ++i) {  // little-endian, whatever the host
+      std::uint32_t u;
+      std::memcpy(&u, &y[i], 4);
+      for (int b = 0; b < 4; ++b) bytes[i * 4 + static_cast<std::size_t>(b)] = static_cast<std::uint8_t>(u >> (8 * b));
+    }
+    const std::string got = io::Sha256::hex_of(bytes.data(), bytes.size());
+    CHECK_EQ(got, std::string(g.sha256));
+    if (got != g.sha256) std::printf("      %s: got %s\n", g.type, got.c_str());
+  }
+}
+
 TEST(quant_rounding_and_halves) {
   CHECK_EQ(q::nearest_int(2.5f), 2);  // ties to even
   CHECK_EQ(q::nearest_int(3.5f), 4);

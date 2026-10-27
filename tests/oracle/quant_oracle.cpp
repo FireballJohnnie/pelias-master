@@ -6,7 +6,7 @@
 //   1. fp32 -> fp16 and fp32 -> bf16 on all 2^32 bit patterns; fp16 -> fp32 and bf16 -> fp32 on all 2^16
 //   2. Q8_0, Q4_K, Q6_K, F16, BF16 through the reference's quantize-chunk entry (no importance matrix, as a stock
 //      quantization uses), and the activation quantizers Q8_1 and Q8_K, on many generated rows of several shapes
-//   3. Q8_0, Q4_K, Q6_K dequantization on random blocks
+//   3. Q8_0, Q4_K, Q6_K, Q2_K, Q3_K, Q5_K, IQ4_XS dequantization on random blocks
 // Exit 0 only when every byte (and every float bit pattern) matches. Usage: quant_oracle [--blocks N] [--seed S]
 #include <cmath>
 #include <cstdint>
@@ -223,8 +223,12 @@ void check_dequantizers(std::uint64_t blocks, std::uint64_t seed) {
     q::Type ours;
     ggml_type ref;
     const char* name;
+    int d_at, dmin_at;  // byte offsets of the block's fp16 scale and fp16 min scale (-1: none)
   };
-  const T types[] = {{q::Type::q8_0, GGML_TYPE_Q8_0, "Q8_0"}, {q::Type::q4_k, GGML_TYPE_Q4_K, "Q4_K"}, {q::Type::q6_k, GGML_TYPE_Q6_K, "Q6_K"}};
+  const T types[] = {{q::Type::q8_0, GGML_TYPE_Q8_0, "Q8_0", 0, -1},     {q::Type::q4_k, GGML_TYPE_Q4_K, "Q4_K", 0, 2},
+                     {q::Type::q6_k, GGML_TYPE_Q6_K, "Q6_K", 208, -1},   {q::Type::q2_k, GGML_TYPE_Q2_K, "Q2_K", 80, 82},
+                     {q::Type::q3_k, GGML_TYPE_Q3_K, "Q3_K", 108, -1},   {q::Type::q5_k, GGML_TYPE_Q5_K, "Q5_K", 0, 2},
+                     {q::Type::iq4_xs, GGML_TYPE_IQ4_XS, "IQ4_XS", 0, -1}};
   for (const T& t : types) {
     std::mt19937_64 rng(seed + 7);
     const std::size_t block_bytes = ggml_type_size(t.ref);
@@ -236,9 +240,8 @@ void check_dequantizers(std::uint64_t blocks, std::uint64_t seed) {
     for (std::size_t k = 0; k < blocks; ++k) {
       std::uint8_t* blk = in.data() + k * block_bytes;
       const std::uint16_t d = q::fp32_to_fp16(sc(rng)), m = q::fp32_to_fp16(sc(rng));
-      if (t.ours == q::Type::q6_k) std::memcpy(blk + 208, &d, 2);
-      else std::memcpy(blk, &d, 2);
-      if (t.ours == q::Type::q4_k) std::memcpy(blk + 2, &m, 2);
+      std::memcpy(blk + t.d_at, &d, 2);
+      if (t.dmin_at >= 0) std::memcpy(blk + t.dmin_at, &m, 2);
     }
     const std::size_t n = blocks * block_elems;
     std::vector<float> a(n), b(n);
@@ -284,6 +287,20 @@ void check_golden() {
     for (const auto& g : ptest::kGoldenHashes)
       if (std::string(g.type) == t.name) in_header = g.sha256;
     std::printf("golden %-5s reference %s  ours %s  header %s\n", t.name, hr.c_str(), ho == hr ? "same" : "DIFFERENT", in_header == hr ? "same" : in_header.c_str());
+    if (ho != hr) ++g_fail;
+  }
+  // the read-only types: the reference's dequantized floats on the fixed blocks
+  for (const auto& g : ptest::kDequantGolden) {
+    const std::vector<std::uint8_t> in = ptest::dequant_golden_input(g);
+    const auto ref_type = static_cast<ggml_type>(g.type_id);
+    const auto nd = static_cast<std::int64_t>(64 * ggml_blck_size(ref_type));
+    std::vector<float> ref(static_cast<std::size_t>(nd)), ours(static_cast<std::size_t>(nd));
+    ggml_get_type_traits(ref_type)->to_float(in.data(), ref.data(), nd);
+    (void)q::dequantize_row(static_cast<q::Type>(g.type_id), in.data(), ours.data(), nd);
+    const std::string hr = pelias::io::Sha256::hex_of(reinterpret_cast<const std::uint8_t*>(ref.data()), ref.size() * 4);
+    const std::string ho = pelias::io::Sha256::hex_of(reinterpret_cast<const std::uint8_t*>(ours.data()), ours.size() * 4);
+    std::printf("golden %-6s dequantized: reference %s  ours %s  header %s\n", g.type, hr.c_str(), ho == hr ? "same" : "DIFFERENT",
+                std::string(g.sha256) == hr ? "same" : g.sha256);
     if (ho != hr) ++g_fail;
   }
 }

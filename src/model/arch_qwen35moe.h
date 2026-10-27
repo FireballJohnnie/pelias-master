@@ -62,6 +62,10 @@ Result<Qwen35MoeWeights> bind_qwen35moe(const io::GgufReader& r, const std::uint
 
 struct ForwardOptions {
   int threads = 0;  // 0: every hardware thread
+  // Optional routing statistics, spec.n_layer x spec.n_expert entries each (layer-major), added to on every call:
+  // how many times each expert was among a token's chosen experts, and the sum of the routing weights it got.
+  std::uint64_t* expert_picks = nullptr;
+  double* expert_weight = nullptr;
 };
 
 // Runs tokens[0..n_tokens) and writes the logits of positions [out_begin, out_end) to `logits`

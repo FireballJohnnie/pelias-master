@@ -134,9 +134,10 @@ void usage() {
       "  tokenize --model FILE (--text S | --file F) [--no-nfc] [--no-special] [--pieces] [--header-only]\n"
       "                                  token ids as a list [a, b, ...] (--pieces: one 'id -> piece' per line);\n"
       "                                  --no-nfc skips NFC (as llama.cpp does), --no-special leaves control tokens as text\n"
-      "  kld --model FILE --base BASE.bin [--chunks N] [--threads N]\n"
+      "  kld --model FILE --base BASE.bin [--chunks N] [--threads N] [--expert-stats OUT.csv]\n"
       "                                  KL divergence of the model against a base file written by llama-perplexity\n"
-      "                                  --kl-divergence-base, computed by Pelias's fp32 CPU reference forward pass\n"
+      "                                  --kl-divergence-base, computed by Pelias's fp32 CPU reference forward pass;\n"
+      "                                  --expert-stats: per layer and expert, how often it was picked and its routing weight\n"
       "  probe | train | export | serve | bench | web   not built yet (later steps)\n"
       "options: --log debug|info|warn|error (default info)");
 }
@@ -585,6 +586,14 @@ int cmd_kld(const Args& a) {
   verify::KlStats stats;
   model::ForwardOptions fo;
   fo.threads = threads;
+  const std::string stats_path = a.get("expert-stats");
+  const std::size_t n_route = static_cast<std::size_t>(spec.value.n_layer) * spec.value.n_expert;
+  std::vector<std::uint64_t> picks(stats_path.empty() ? 0 : n_route, 0);
+  std::vector<double> weights(stats_path.empty() ? 0 : n_route, 0.0);
+  if (!stats_path.empty()) {
+    fo.expert_picks = picks.data();
+    fo.expert_weight = weights.data();
+  }
   Timer total;
   std::printf("%s", verify::kl_chunk_header().c_str());
   for (int c = 0; c < n_chunk; ++c) {
@@ -613,6 +622,24 @@ int cmd_kld(const Args& a) {
       std::fprintf(stderr, "pelias kld: %.2f seconds per chunk - ETA %.1f minutes\n", tc.seconds(), tc.seconds() * (n_chunk - 1) / 60.0);
   }
   std::printf("\n%s", verify::kl_report(stats).c_str());
+  if (!stats_path.empty()) {
+    std::string csv = "layer,expert,picks,weight_sum\n";
+    for (std::uint32_t il = 0; il < spec.value.n_layer; ++il)
+      for (std::uint32_t ex = 0; ex < spec.value.n_expert; ++ex) {
+        const std::size_t k = static_cast<std::size_t>(il) * spec.value.n_expert + ex;
+        char row[96];
+        std::snprintf(row, sizeof row, "%u,%u,%llu,%.6f\n", il, ex, static_cast<unsigned long long>(picks[k]), weights[k]);
+        csv += row;
+      }
+    std::FILE* f = std::fopen(stats_path.c_str(), "wb");
+    if (!f || std::fwrite(csv.data(), 1, csv.size(), f) != csv.size()) {
+      if (f) std::fclose(f);
+      std::fprintf(stderr, "pelias: the expert statistics could not be written\n");
+      return 6;
+    }
+    std::fclose(f);
+    std::fprintf(stderr, "pelias kld: expert statistics written (%u layers x %u experts)\n", spec.value.n_layer, spec.value.n_expert);
+  }
   std::fprintf(stderr, "pelias kld: %d chunks in %.1f s\n", n_chunk, total.seconds());
   return 0;
 }
