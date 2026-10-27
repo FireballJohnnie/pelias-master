@@ -122,8 +122,8 @@ Until question 1 is settled, all the llama.cpp drift numbers count as rankings, 
 
 | Variable | What it points to | Checked by preflight |
 |---|---|---|
-| `PELIAS` | The `pelias` binary built at the commit named in the step, with `PELIAS_CPU_AVX2=ON` | `$PELIAS version` runs; the build's `CMakeCache.txt` has `PELIAS_CPU_AVX2:BOOL=ON`; `git -C $PELIAS_REPO rev-parse --short HEAD` equals the expected commit |
-| `PELIAS_REPO` | The author's WSL clone of pelias-master | `.git` exists |
+| `PELIAS` | The `pelias` binary in the clone's `build/m1` folder (the Release, Ninja, AVX2, CPU-only build that produced Milestone 1; MEASURED 10-27), rebuilt at the commit named in the step | `$PELIAS version` runs; the build's `CMakeCache.txt` has `PELIAS_CPU_AVX2:BOOL=ON`; `git -C $PELIAS_REPO rev-parse --short HEAD` equals the expected commit |
+| `PELIAS_REPO` | The author's WSL clone of pelias-master (its real name is in the paths file; MEASURED 10-27). Its `origin` is a backup bundle, not GitHub, so `git pull` cannot reach new commits: updates come from the newest bundle with `git fetch <bundle> main` then `git merge --ff-only FETCH_HEAD` | `.git` exists; `git status --porcelain` is empty |
 | `LLAMA_BIN` | The unchanged llama.cpp build at commit 2ca15f540 (test oracle only); the one that wrote every sweep log | `$LLAMA_BIN/llama-perplexity --version` shows the short hash `2ca15f5` |
 | `T` | The test folder on D: (`kld-base-bf16-100chunks.bin`, `qwen36-bf16.llamacpp.gguf`, `qwen36-Q4_K_M.pelias.gguf`, `sweep/`) | each file exists with the byte size in 0.3 |
 | `M` | The model folder on C: where new candidate files are written | free space |
@@ -134,14 +134,16 @@ Until question 1 is settled, all the llama.cpp drift numbers count as rankings, 
 ### 0.2 Script rules (all scripts, no exceptions)
 
 1. **Header.** `bash` with `set -euo pipefail`. The first lines print the test ID, the start time, the commit, the prediction (written before the run) and the time estimate.
-2. **Logs.** Every long command goes through `tee "$R/<ID>/<name>.log"`. Never `| tail` and never `> /dev/null` on a long run, so progress and the ETA stay visible.
+2. **Logs.** Each run writes its own log, `$R/<ID>/<name>_<date>_<time>.log` (a new name every run, so a retry never overwrites), and the same lines go into one fixed file, `$R/live.log`, which the author can follow live from any terminal (`tail -f` in WSL, or `Get-Content -Wait` in PowerShell). Only a few summary lines (prediction, result, verdict, log path) go to the console. Never `| tail` and never `> /dev/null` on a long run's log, so progress and the ETA stay visible in the log.
 3. **Never overwrite.** Each output path is checked first and the script stops if it exists. `pelias kld --dump-kld` and `pelias imatrix` also refuse by themselves.
 4. **Free space.** Before writing a large file (a GGUF or a base), print `df -h` for C: and D:. Stop if either drive would drop below 50 GB after the write (author's rule). Expected size = the DERIVED size in the step.
 5. **Nothing else heavy runs.** No llama-server, no other `pelias kld`, no training. CPU runs are timed, and a second job slows both.
 6. **Type check.** After every quantize, `$PELIAS inspect --model OUT --json` is compared against the recipe tensor by tensor (0.4). Any difference stops the script before the drift test. This is the lesson of the shared `attn_v`/`attn_qkv` counter (PEL_QUANT_DECISION_DATA 3.3).
 7. **Size check.** The output's byte size must equal the expected byte size where one is MEASURED or DERIVED (to ±32 bytes for DERIVED sizes, exact for MEASURED rebuilds). Expected size = `recipe.py data-bytes RECIPE SOURCE` + 10,991,136. That offset is MEASURED identical for PEL-6, T5 and T8 (data start plus trailing padding, same metadata). It stays constant only while the metadata and the last tensor's padded size are unchanged; the type check, not the size, is the proof.
 8. **Summary line.** One line is appended to `$R/summary.tsv` with these columns: date-time, test ID, file (and route), the tool's `Mean    KLD` line, its `Same top p:` line, wall seconds, log path. The file's byte size goes in the quantize step's own log.
-9. **Results first.** The author sends the summary lines and logs. Claude labels each number MEASURED and checks the prediction before anything else is decided.
+9. **Results first.** Claude reads the summary lines (and the log where needed), labels each number MEASURED and checks the prediction before anything else is decided.
+10. **How a block runs (from 10-27).** The blocks are script files in `$R` (`common.sh`, `block_a.sh`, `block_b.sh`, later blocks alike; a copy of each sits in the git-ignored `profiles/local_only/gp/` and in the backup folder). Claude runs them on the author's machine through the host command tool as `wsl bash $R/<block>.sh [step]`, one call per run, and only after the author's OK. Before asking, Claude states what the run is for, its log path, and its ETA. No single call may exceed the tool's 7,200 s window, so Block B and later blocks take a step argument and run one test per call. Every script was dry-run end to end in the sandbox on the tiny model (paths overridden, `GP_TEST=1` skipping only the real-file size checks) before it was copied over; its SHA-256 on the author's drive is checked against the tested copy.
+11. **No deletions.** No script deletes anything. If a file must go, Claude prints the command for the author to review and run by hand.
 
 ### 0.3 Fixed inputs (MEASURED sizes; a script stops if a size differs)
 
@@ -216,18 +218,18 @@ The recipe tool `tools/recipe.py` (0.4) is written before Block C, which needs i
 - Every variable in 0.1 resolves.
 - Every size in 0.3 matches.
 - `$PELIAS` was built at the commit this plan names for the block (Block A: the fixes after the Fable review) with AVX2.
-- `git status --porcelain` is empty in `$PELIAS_REPO` before the pull (local edits would block or mix into the build).
+- `git status --porcelain` is empty in `$PELIAS_REPO` before the update from the bundle (local edits would block or mix into the build).
 - `df -h` shows C: and D: free space.
 - `nproc` ≥ 16.
 - Nothing named `llama-server` or `pelias` is running: `pgrep` inside WSL and `tasklist.exe` for the Windows side (the interim Windows server is invisible to `pgrep`).
 
 **Rebuild if needed:**
 ```
-cd $PELIAS_REPO && git pull --ff-only
-# Block A finds the existing build folder (build/wsl, build/host, build_wsl, build, build/cpu, in that order),
-# configures it again with AVX2 on and builds it; with none found it makes a CPU-only build/cpu.
-cmake -S . -B <that folder> -DPELIAS_CPU_AVX2=ON
-cmake --build <that folder> -j16
+cd $PELIAS_REPO && git fetch <newest backup bundle> main && git merge --ff-only FETCH_HEAD
+# the clone's origin is a bundle, so git pull cannot reach new commits (0.1)
+# build/m1 must already have PELIAS_CPU_AVX2:BOOL=ON and PELIAS_CUDA:BOOL=OFF (the script stops otherwise)
+cmake -S . -B build/m1
+cmake --build build/m1 -j16
 ```
 - Configure again every time. The version string's commit is captured at configure time and goes stale otherwise (MEASURED in the sandbox: a build at 3a272b3 printed 686926d). Fix item GP2-14.
 
@@ -255,6 +257,8 @@ $PELIAS kld --model $T/qwen36-Q4_K_M.pelias.gguf --base $T/kld-base-bf16-100chun
 Results file: `stock.kld` is the stock anchor for every later comparison.
 
 ### Block B: closing the llama.cpp measurement questions (A; about 2 h 10 min)
+
+Run one test per call (0.2 rule 10): `block_b.sh nooffload`, then `a`, `b`, `c`, `d`. Run `d` compares c with d when c is done. Each call refuses a run that already has its result.
 
 #### GP1-02 llama.cpp with the GPU path switched off (old name F3) (A, ESTIMATE 15–45 min)
 
