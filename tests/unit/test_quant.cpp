@@ -98,9 +98,10 @@ TEST(quant_round_trip_error_is_bounded) {
 TEST(quant_refuses_what_it_cannot_do) {
   std::vector<float> x(256, 1.0f);
   std::vector<std::uint8_t> buf(1024);
-  CHECK(q::quantize_row(q::Type::q5_k, x.data(), buf.data(), 256).code == Code::unsupported);  // not built yet
+  CHECK(q::quantize_row(q::Type::iq2_xxs, x.data(), buf.data(), 256).code == Code::unsupported);  // not built yet (grid search)
   CHECK(q::quantize_row(q::Type::q4_k, x.data(), buf.data(), 100).code == Code::invalid_argument);  // not whole blocks
   CHECK(q::dequantize_row(q::Type::q8_k, buf.data(), x.data(), 256).code == Code::unsupported);    // activation type
   CHECK(q::can_quantize(q::Type::q6_k));
-  CHECK(!q::can_quantize(q::Type::iq4_xs));
+  CHECK(q::can_quantize(q::Type::iq4_xs));
+  CHECK(!q::can_quantize(q::Type::iq2_xxs));
 }
