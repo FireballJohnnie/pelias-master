@@ -42,7 +42,7 @@ So PEL ranks each choice by **drift removed per byte, in the place that byte goe
 | Bar to beat | Unsloth UD-Q4_K_M: mean KLD **0.013605**, same top token 94.851 %, file 22,134,528,992 bytes | MEASURED |
 | Size target | **≤ 22.13 GB without blk.40, or ≤ 22.66 GB with blk.40** (see 2.3) | DERIVED |
 | CPU-only speed | Exploratory sub-goal (author target about 40 tok/s); it is recorded but cannot veto a choice | DECISION (author) |
-| Drift test | llama-perplexity `--kl-divergence` against the bf16 reference, WikiText-2 test, 100 chunks of 512 tokens (51,200 tokens), `-ngl 0 -t 8`; deterministic (a repeat gave identical digits) | MEASURED |
+| Drift test | llama-perplexity `--kl-divergence` against the bf16 reference, WikiText-2 test, 100 chunks of 512 tokens (51,200 tokens read; 25,500 scored: positions 256 to 510 of each chunk, READ-SRC), `-ngl 0 -t 8`; deterministic (a repeat gave identical digits) | MEASURED |
 
 ## 2. Whole-file drift results (same test, same bf16 base)
 

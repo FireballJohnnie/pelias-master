@@ -4,8 +4,8 @@
 //
 // quant_oracle - compares Pelias's quantizers with the reference library's, byte for byte:
 //   1. fp32 -> fp16 and fp32 -> bf16 on all 2^32 bit patterns; fp16 -> fp32 and bf16 -> fp32 on all 2^16
-//   2. Q8_0, Q4_K, Q6_K, F16, BF16 through the reference's quantize-chunk entry (no importance matrix, as a stock
-//      quantization uses), and the activation quantizers Q8_1 and Q8_K, on many generated rows of several shapes
+//   2. Q8_0, Q2_K..Q6_K, IQ4_NL, IQ4_XS, F16, BF16 through the reference's quantize-chunk entry, without and with an
+//      importance matrix, and the activation quantizers Q8_1 and Q8_K, on many generated rows of several shapes
 //   3. dequantization of every weight type Pelias reads, on random blocks
 // Exit 0 only when every byte (and every float bit pattern) matches. Usage: quant_oracle [--blocks N] [--seed S]
 #include <cmath>
@@ -153,9 +153,13 @@ void check_quantizers(std::uint64_t blocks256, std::uint64_t seed) {
     const char* name;
   };
   const T types[] = {{q::Type::q8_0, GGML_TYPE_Q8_0, "Q8_0"}, {q::Type::q4_k, GGML_TYPE_Q4_K, "Q4_K"}, {q::Type::q6_k, GGML_TYPE_Q6_K, "Q6_K"},
-                     {q::Type::f16, GGML_TYPE_F16, "F16"},    {q::Type::bf16, GGML_TYPE_BF16, "BF16"}};
+                     {q::Type::f16, GGML_TYPE_F16, "F16"},    {q::Type::bf16, GGML_TYPE_BF16, "BF16"}, {q::Type::q2_k, GGML_TYPE_Q2_K, "Q2_K"},
+                     {q::Type::q3_k, GGML_TYPE_Q3_K, "Q3_K"}, {q::Type::q5_k, GGML_TYPE_Q5_K, "Q5_K"}, {q::Type::iq4_nl, GGML_TYPE_IQ4_NL, "IQ4_NL"},
+                     {q::Type::iq4_xs, GGML_TYPE_IQ4_XS, "IQ4_XS"}};
   const std::int64_t shapes[][2] = {{1, 256}, {3, 512}, {7, 2048}, {2, 4096}};  // rows x elements per row
+  for (int wmode = 0; wmode < 2; ++wmode)  // without, then with an importance matrix
   for (const T& t : types) {
+    if (wmode == 1 && !q::uses_importance(t.ours) && t.ours != q::Type::q8_0) continue;
     for (const Case& c : kCases) {
       std::mt19937_64 rng(seed);
       std::uint64_t checked = 0, bad = 0;
@@ -170,15 +174,21 @@ void check_quantizers(std::uint64_t blocks256, std::uint64_t seed) {
         c.gen(rng, x.data(), n);
         const std::size_t bytes = ggml_row_size(t.ref, per_row) * static_cast<std::size_t>(rows);
         std::vector<std::uint8_t> a(bytes, 0), b(bytes, 0);
-        for (std::int64_t row = 0; row < rows; ++row) {
-          const pelias::Status s = q::quantize_row(t.ours, x.data() + row * per_row, a.data() + static_cast<std::size_t>(row) * ggml_row_size(t.ref, per_row), per_row);
-          if (!s) {
-            std::printf("quantize_row failed: %s\n", s.text().c_str());
-            ++g_fail;
-            return;
-          }
+        // importance weights shaped like real ones (sum of squares / count): positive, spread over several octaves
+        std::vector<float> imat;
+        if (wmode == 1) {
+          std::normal_distribution<float> nd(0.0f, 1.5f);
+          imat.resize(static_cast<std::size_t>(per_row));
+          for (float& v : imat) v = std::exp(nd(rng));
         }
-        ggml_quantize_chunk(t.ref, x.data(), b.data(), 0, rows, per_row, nullptr);
+        const float* im = wmode == 1 ? imat.data() : nullptr;
+        const pelias::Status s = q::quantize_rows(t.ours, x.data(), a.data(), rows, per_row, im);
+        if (!s) {
+          std::printf("quantize_rows failed: %s\n", s.text().c_str());
+          ++g_fail;
+          return;
+        }
+        ggml_quantize_chunk(t.ref, x.data(), b.data(), 0, rows, per_row, im);
         const std::size_t block_bytes = ggml_type_size(t.ref);
         checked += bytes / block_bytes;
         if (a != b) {
@@ -188,7 +198,7 @@ void check_quantizers(std::uint64_t blocks256, std::uint64_t seed) {
         }
         done += n / 256;
       }
-      report((std::string(t.name) + " / " + c.name).c_str(), checked, bad, first);
+      report((std::string(t.name) + (wmode == 1 ? " +imatrix" : "") + " / " + c.name).c_str(), checked, bad, first);
     }
   }
   // activation quantizers: called on their reference entries directly

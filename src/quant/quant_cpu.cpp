@@ -7,6 +7,7 @@
 // happen where the reference has them. Block layouts are written field by field with memcpy, so no struct padding or
 // alignment assumption reaches the output.
 #include "quant/quant_cpu.h"
+#include "quant/quant_internal.h"
 
 #include <algorithm>
 #include <bit>
@@ -30,6 +31,11 @@ constexpr std::size_t kQ8_0Bytes = 34, kQ8_1Bytes = 36, kQ4KBytes = 144, kQ6KByt
 constexpr std::size_t kQ2KBytes = 84, kQ3KBytes = 110, kQ5KBytes = 176, kIQ4XSBytes = 136;
 // the IQ4_NL / IQ4_XS non-linear 4-bit levels (ggml-common.h kvalues_iq4nl)
 constexpr std::int8_t kValuesIq4nl[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+
+}  // namespace
+
+// helpers shared with quant_weighted.cpp (quant_internal.h)
+namespace detail {
 
 void put_u16(std::uint8_t* p, std::uint16_t v) { std::memcpy(p, &v, 2); }
 std::uint16_t get_u16(const std::uint8_t* p) {
@@ -113,9 +119,9 @@ float make_qkx2_quants(int n, int nmax, const float* x, const float* weights, st
   return scale;
 }
 
-// The reference's make_qx_quants with no importance weights (qw = NULL): a symmetric scale search, levels stored
-// offset by nmax. Only rmse_type 1 is used in this step (Q6_K); the other modes are kept so the routine is complete.
-float make_qx_quants(int n, int nmax, const float* x, std::int8_t* L, int rmse_type) {
+// The reference's make_qx_quants: a symmetric scale search, levels stored offset by nmax; `qw` (importance weights,
+// may be null) replaces the rmse_type weighting when given.
+float make_qx_quants(int n, int nmax, const float* x, std::int8_t* L, int rmse_type, const float* qw) {
   float max = 0;
   float amax = 0;
   for (int i = 0; i < n; ++i) {
@@ -142,8 +148,9 @@ float make_qx_quants(int n, int nmax, const float* x, std::int8_t* L, int rmse_t
     rmse_type = -rmse_type;
     return_early = true;
   }
-  auto weight = [&](float xi) {
-    return rmse_type == 1 ? xi * xi : rmse_type == 2 ? 1.0f : rmse_type == 3 ? std::fabs(xi) : std::sqrt(std::fabs(xi));
+  auto weight_at = [&](int i) {
+    const float xi = x[i];
+    return qw ? qw[i] : rmse_type == 1 ? xi * xi : rmse_type == 2 ? 1.0f : rmse_type == 3 ? std::fabs(xi) : std::sqrt(std::fabs(xi));
   };
   float sumlx = 0;
   float suml2 = 0;
@@ -151,7 +158,7 @@ float make_qx_quants(int n, int nmax, const float* x, std::int8_t* L, int rmse_t
     int l = nearest_int(iscale * x[i]);
     l = std::max(-nmax, std::min(nmax - 1, l));
     L[i] = static_cast<std::int8_t>(l + nmax);
-    const float w = weight(x[i]);
+    const float w = weight_at(i);
     const float lf = static_cast<float>(l);
     sumlx += w * x[i] * lf;
     suml2 += w * lf * lf;
@@ -166,7 +173,7 @@ float make_qx_quants(int n, int nmax, const float* x, std::int8_t* L, int rmse_t
     for (int i = 0; i < n; ++i) {
       int l = nearest_int(iscale * x[i]);
       l = std::max(-nmax, std::min(nmax - 1, l));
-      const float w = weight(x[i]);
+      const float w = weight_at(i);
       const float lf = static_cast<float>(l);
       sumlx += w * x[i] * lf;
       suml2 += w * lf * lf;
@@ -194,6 +201,10 @@ void get_scale_min_k4(int j, const std::uint8_t* q, std::uint8_t* d, std::uint8_
   }
 }
 
+}  // namespace detail
+
+namespace {
+using namespace detail;
 }  // namespace
 
 // ---- scalar conversions
@@ -415,7 +426,7 @@ void quantize_q6_k(const float* x, std::uint8_t* out, std::int64_t n) {
     float max_scale = 0;
     float max_abs_scale = 0;
     for (int ib = 0; ib < kQKK / 16; ++ib) {
-      const float scale = make_qx_quants(16, 32, x + 16 * ib, L + 16 * ib, 1);
+      const float scale = make_qx_quants(16, 32, x + 16 * ib, L + 16 * ib, 1, nullptr);
       scales[ib] = scale;
       const float abs_scale = std::fabs(scale);
       if (abs_scale > max_abs_scale) {
@@ -649,7 +660,7 @@ void dequantize_iq4_xs(const std::uint8_t* in, float* y, std::int64_t n) {
 bool can_quantize(Type t) {
   switch (t) {
     case Type::f32: case Type::f16: case Type::bf16: case Type::q8_0: case Type::q8_1: case Type::q4_k: case Type::q6_k:
-    case Type::q8_k:
+    case Type::q8_k: case Type::q2_k: case Type::q3_k: case Type::q5_k: case Type::iq4_nl: case Type::iq4_xs:
       return true;
     default:
       return false;
@@ -696,6 +707,11 @@ Status quantize_row(Type t, const float* x, std::uint8_t* out, std::int64_t n) {
     case Type::q4_k: quantize_q4_k(x, out, n); break;
     case Type::q6_k: quantize_q6_k(x, out, n); break;
     case Type::q8_k: quantize_q8_k(x, out, n); break;
+    case Type::q2_k: quantize_q2_k(x, out, n); break;
+    case Type::q3_k: quantize_q3_k(x, out, n); break;
+    case Type::q5_k: quantize_q5_k(x, out, n); break;
+    case Type::iq4_nl: quantize_iq4_nl(x, out, n); break;
+    case Type::iq4_xs: quantize_iq4_xs(x, out, n); break;
     default: return Status::fail(Code::internal, "quantize dispatch");
   }
   return Status::good();

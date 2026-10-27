@@ -38,12 +38,24 @@ bool can_dequantize(Type t);  // this step's dequantizers (the activation types 
 Status quantize_row(Type t, const float* x, std::uint8_t* out, std::int64_t n);
 Status dequantize_row(Type t, const std::uint8_t* in, float* y, std::int64_t n);
 
+// ---- with an importance matrix (quant_weighted.cpp): nrow rows of n_per_row values, as the reference's
+// ggml_quantize_chunk does. `imatrix` holds n_per_row weights (one per column; for a stack of experts the caller passes
+// that expert's slice) or is null. The types that use it: Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS; every other
+// type quantizes as without it.
+bool uses_importance(Type t);
+Status quantize_rows(Type t, const float* x, std::uint8_t* out, std::int64_t nrow, std::int64_t n_per_row, const float* imatrix);
+
 // ---- per type, for tests and for callers that already checked the type (n a multiple of the block)
 void quantize_q8_0(const float* x, std::uint8_t* out, std::int64_t n);
 void quantize_q8_1(const float* x, std::uint8_t* out, std::int64_t n);
 void quantize_q4_k(const float* x, std::uint8_t* out, std::int64_t n);
 void quantize_q6_k(const float* x, std::uint8_t* out, std::int64_t n);
 void quantize_q8_k(const float* x, std::uint8_t* out, std::int64_t n);
+void quantize_q2_k(const float* x, std::uint8_t* out, std::int64_t n);  // quant_weighted.cpp (the reference's "ref" routines)
+void quantize_q3_k(const float* x, std::uint8_t* out, std::int64_t n);
+void quantize_q5_k(const float* x, std::uint8_t* out, std::int64_t n);
+void quantize_iq4_nl(const float* x, std::uint8_t* out, std::int64_t n);
+void quantize_iq4_xs(const float* x, std::uint8_t* out, std::int64_t n);
 void dequantize_q8_0(const std::uint8_t* in, float* y, std::int64_t n);
 void dequantize_q4_k(const std::uint8_t* in, float* y, std::int64_t n);
 void dequantize_q6_k(const std::uint8_t* in, float* y, std::int64_t n);

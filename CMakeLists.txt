@@ -34,7 +34,7 @@ configure_file(include/pelias/version.h.in ${CMAKE_BINARY_DIR}/generated/pelias/
 pelias_add_module(pelias_os
   SOURCES src/os/status.cpp src/os/log.cpp src/os/file_map.cpp src/os/clock.cpp src/os/dynlib.cpp)
 pelias_add_module(pelias_quant
-  SOURCES src/quant/block_types.cpp src/quant/quant_cpu.cpp src/quant/dequant_more.cpp src/quant/iq_tables.cpp src/quant/type_rules.cpp
+  SOURCES src/quant/block_types.cpp src/quant/quant_cpu.cpp src/quant/dequant_more.cpp src/quant/quant_weighted.cpp src/quant/iq_tables.cpp src/quant/type_rules.cpp
   DEPENDS pelias_os)
 # The reference quantizers must round exactly as the reference does: plain float arithmetic, no fused multiply-add
 # (contraction) and no reassociation, whatever architecture flags the rest of the build gets later (P-E6).
