@@ -327,7 +327,8 @@ Status GgufReader::array_ints(const GgufValue& v, std::vector<std::int64_t>& out
   if (!map_ || v.type != GgufValueType::array) return Status::fail(Code::invalid_argument, "not an array");
   const GgufValueType t = v.array_type;
   const bool is_int = t == GgufValueType::u8 || t == GgufValueType::i8 || t == GgufValueType::u16 || t == GgufValueType::i16 ||
-                      t == GgufValueType::u32 || t == GgufValueType::i32 || t == GgufValueType::u64 || t == GgufValueType::i64;
+                      t == GgufValueType::u32 || t == GgufValueType::i32 || t == GgufValueType::u64 || t == GgufValueType::i64 ||
+                      t == GgufValueType::boolean;
   if (!is_int) return Status::fail(Code::invalid_argument, "not an integer array");
   Cursor c(map_->data(), map_->size());
   Status s = c.skip(v.array_offset, "array");
@@ -336,7 +337,8 @@ Status GgufReader::array_ints(const GgufValue& v, std::vector<std::int64_t>& out
   for (std::uint64_t k = 0; k < v.array_count; ++k) {
     std::int64_t x = 0;
     switch (t) {
-      case GgufValueType::u8: { std::uint8_t e = 0; s = c.read(e, "array element"); x = e; break; }
+      case GgufValueType::u8:
+      case GgufValueType::boolean: { std::uint8_t e = 0; s = c.read(e, "array element"); x = e; break; }
       case GgufValueType::i8: { std::int8_t e = 0; s = c.read(e, "array element"); x = e; break; }
       case GgufValueType::u16: { std::uint16_t e = 0; s = c.read(e, "array element"); x = e; break; }
       case GgufValueType::i16: { std::int16_t e = 0; s = c.read(e, "array element"); x = e; break; }

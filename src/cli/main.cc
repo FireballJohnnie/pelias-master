@@ -6,8 +6,9 @@
 // the GPU reports). Step 3 adds quantize (a GGUF to a stock mix, byte-identical to the reference), convert (a model
 // folder of safetensors shards to a GGUF, BF16 or a stock mix, Stage A) and verify (two GGUFs compared tensor by tensor
 // and byte for byte, gates P-E6 and P-X6). Step 4 adds tokenize (text to token ids with the model's own tokenizer,
-// gate P-D1). The later verbs are listed as not yet built so the user gets a clear answer
-// instead of a silent failure.
+// gate P-D1). Milestone 1 adds kld (the CPU reference forward pass scored against a KL-divergence base file, the same
+// statistics as the reference's perplexity tool). The later verbs are listed as not yet built so the user gets a clear
+// answer instead of a silent failure.
 //
 // Exit codes: 0 ok; 1 usage; 2 the input could not be read (missing, corrupt, unsupported); 3 a gate refused (plan
 // over the ceiling); 4 no device; 5 verify found differences; 6 quantize or convert failed while writing (disk, I/O).
@@ -17,6 +18,7 @@
 #include <limits>
 #include <map>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "hal/device.h"
@@ -38,7 +40,10 @@
 #include "quant/block_types.h"
 #include "quant/type_rules.h"
 #include "io/text_file.h"
+#include "model/arch_qwen35moe.h"
+#include "model/spec.h"
 #include "tok/tokenizer.h"
+#include "verify/kl.h"
 
 namespace {
 
@@ -129,6 +134,9 @@ void usage() {
       "  tokenize --model FILE (--text S | --file F) [--no-nfc] [--no-special] [--pieces] [--header-only]\n"
       "                                  token ids as a list [a, b, ...] (--pieces: one 'id -> piece' per line);\n"
       "                                  --no-nfc skips NFC (as llama.cpp does), --no-special leaves control tokens as text\n"
+      "  kld --model FILE --base BASE.bin [--chunks N] [--threads N]\n"
+      "                                  KL divergence of the model against a base file written by llama-perplexity\n"
+      "                                  --kl-divergence-base, computed by Pelias's fp32 CPU reference forward pass\n"
       "  probe | train | export | serve | bench | web   not built yet (later steps)\n"
       "options: --log debug|info|warn|error (default info)");
 }
@@ -518,6 +526,97 @@ int cmd_verify(const Args& a) {
   return all_tensors && rep.files_identical ? 0 : 5;
 }
 
+int cmd_kld(const Args& a) {
+  const std::string path = a.get("model"), base_path = a.get("base");
+  if (path.empty() || base_path.empty()) {
+    usage();
+    return 1;
+  }
+  int threads = static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
+  if (a.has("threads")) {
+    const Result<std::uint64_t> r = io::parse_whole(a.get("threads"), 4096);
+    if (!r.ok() || r.value == 0) {
+      std::fprintf(stderr, "pelias: --threads needs a whole number from 1 to 4096\n");
+      return 1;
+    }
+    threads = static_cast<int>(r.value);
+  }
+  os::FileMap m;
+  Status s = m.open(path);
+  if (!s) return fail_input(s);
+  io::GgufReader g;
+  s = g.parse(m);
+  if (!s) return fail_input(s);
+  const Result<model::Qwen35MoeSpec> spec = model::read_qwen35moe_spec(g);
+  if (!spec.ok()) return fail_input(spec.status);
+  const Result<model::Qwen35MoeWeights> w = model::bind_qwen35moe(g, m.data(), spec.value);
+  if (!w.ok()) return fail_input(w.status);
+  verify::KlBaseFile base;
+  s = base.open(base_path);
+  if (!s) return fail_input(s);
+  if (static_cast<std::uint32_t>(base.n_vocab()) != spec.value.n_vocab) {
+    std::fprintf(stderr, "pelias: the base file's vocabulary (%d) is not the model's (%u)\n", base.n_vocab(), spec.value.n_vocab);
+    return 2;
+  }
+  int n_chunk = base.n_chunk();
+  if (a.has("chunks")) {
+    const Result<std::uint64_t> r = io::parse_whole(a.get("chunks"), static_cast<std::uint64_t>(base.n_chunk()));
+    if (!r.ok() || r.value == 0) {
+      std::fprintf(stderr, "pelias: --chunks needs a whole number from 1 to %d (the base file's chunks)\n", base.n_chunk());
+      return 1;
+    }
+    n_chunk = static_cast<int>(r.value);
+  }
+  // a model that adds BOS gets it in place of each chunk's first token, as the reference's tool does
+  bool found = false;
+  const bool add_bos = g.find("tokenizer.ggml.add_bos_token") && g.find("tokenizer.ggml.add_bos_token")->b;
+  const std::uint64_t bos = g.get_uint("tokenizer.ggml.bos_token_id", &found);
+  if (add_bos && !found) {
+    std::fprintf(stderr, "pelias: the model adds a BOS token but names none\n");
+    return 2;
+  }
+  const int n_ctx = static_cast<int>(base.n_ctx()), first = base.first(), scored = base.scored();
+  const std::int64_t nv = spec.value.n_vocab, rec = base.record_u16();
+  std::fprintf(stderr, "pelias kld: %d chunks of %d tokens, positions %d..%d scored, vocabulary %lld, %d threads, fp32 reference pass\n",
+               n_chunk, n_ctx, first, n_ctx - 2, static_cast<long long>(nv), threads);
+  std::vector<float> logits(static_cast<std::size_t>(scored) * static_cast<std::size_t>(nv));
+  std::vector<std::uint16_t> records;
+  std::vector<verify::KlToken> per(static_cast<std::size_t>(scored));
+  verify::KlStats stats;
+  model::ForwardOptions fo;
+  fo.threads = threads;
+  Timer total;
+  std::printf("%s", verify::kl_chunk_header().c_str());
+  for (int c = 0; c < n_chunk; ++c) {
+    Timer tc;
+    std::vector<std::int32_t> toks(base.tokens().begin() + static_cast<std::ptrdiff_t>(c) * n_ctx,
+                                   base.tokens().begin() + static_cast<std::ptrdiff_t>(c + 1) * n_ctx);
+    if (add_bos) toks[0] = static_cast<std::int32_t>(bos);
+    s = model::forward_reference(spec.value, w.value, toks.data(), n_ctx, first, n_ctx - 1, logits.data(), fo);
+    if (!s) return fail_input(s);
+    s = base.read_chunk(records);
+    if (!s) return fail_input(s);
+    std::vector<std::int32_t> orig(base.tokens().begin() + static_cast<std::ptrdiff_t>(c) * n_ctx,
+                                   base.tokens().begin() + static_cast<std::ptrdiff_t>(c + 1) * n_ctx);
+    std::vector<std::thread> pool;
+    for (int k = 0; k < threads; ++k)
+      pool.emplace_back([&, k] {
+        for (int i = k; i < scored; i += threads)
+          per[static_cast<std::size_t>(i)] = verify::kl_token(static_cast<std::int32_t>(nv), logits.data() + static_cast<std::ptrdiff_t>(i) * nv,
+                                                              records.data() + static_cast<std::ptrdiff_t>(i) * rec, orig[static_cast<std::size_t>(first + i + 1)]);
+      });
+    for (auto& th : pool) th.join();
+    for (const verify::KlToken& t : per) stats.add(t);
+    std::printf("%s", verify::kl_chunk_line(c + 1, stats).c_str());
+    std::fflush(stdout);
+    if (c == 0)
+      std::fprintf(stderr, "pelias kld: %.2f seconds per chunk - ETA %.1f minutes\n", tc.seconds(), tc.seconds() * (n_chunk - 1) / 60.0);
+  }
+  std::printf("\n%s", verify::kl_report(stats).c_str());
+  std::fprintf(stderr, "pelias kld: %d chunks in %.1f s\n", n_chunk, total.seconds());
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -538,6 +637,7 @@ int main(int argc, char** argv) {
   if (cmd == "convert") return cmd_convert(a);
   if (cmd == "verify") return cmd_verify(a);
   if (cmd == "tokenize") return cmd_tokenize(a);
+  if (cmd == "kld") return cmd_kld(a);
   for (const char* later : {"probe", "train", "export", "serve", "bench", "web"})
     if (cmd == later) {
       std::fprintf(stderr, "pelias: '%s' is not built yet (a later step of the order of operations)\n", later);
