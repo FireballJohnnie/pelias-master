@@ -3,12 +3,13 @@
 //
 // main.cc - the `pelias` command. Step 2 carries: version, inspect (every tensor of a GGUF with its type, shape and
 // bytes), key (SHA-256 model key), plan (the device memory plan against the ceiling, refused above it), device (what
-// the GPU reports). Step 3 adds quantize (a GGUF to a stock mix, byte-identical to the reference) and verify (two GGUFs
-// compared tensor by tensor and byte for byte, gates P-E6 and P-X6). The later verbs are listed as not yet built so
-// the user gets a clear answer instead of a silent failure.
+// the GPU reports). Step 3 adds quantize (a GGUF to a stock mix, byte-identical to the reference), convert (a model
+// folder of safetensors shards to a GGUF, BF16 or a stock mix, Stage A) and verify (two GGUFs compared tensor by tensor
+// and byte for byte, gates P-E6 and P-X6). The later verbs are listed as not yet built so the user gets a clear answer
+// instead of a silent failure.
 //
 // Exit codes: 0 ok; 1 usage; 2 the input could not be read (missing, corrupt, unsupported); 3 a gate refused (plan
-// over the ceiling); 4 no device; 5 verify found differences; 6 quantize failed while writing (disk, I/O).
+// over the ceiling); 4 no device; 5 verify found differences; 6 quantize or convert failed while writing (disk, I/O).
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -19,6 +20,7 @@
 
 #include "hal/device.h"
 #include "hal/vram_governor.h"
+#include "ingest/stage_a.h"
 #include "io/gguf_compare.h"
 #include "io/gguf_reader.h"
 #include "io/number_text.h"
@@ -116,6 +118,9 @@ void usage() {
       "                                  the device memory plan; refused above the ceiling (exit 3)\n"
       "  quantize --model IN.gguf --out OUT.gguf [--type Q4_K_M|Q6_K|Q8_0|BF16|F16|F32] [--threads N]\n"
       "                                  a new GGUF in a stock mix (default Q4_K_M), identical to the reference's (exit 6 on a write failure)\n"
+      "  convert --model FOLDER --out OUT.gguf [--type BF16|Q4_K_M|Q6_K|Q8_0] [--threads N]\n"
+      "                                  a Hugging Face folder (safetensors) to a GGUF: BF16 as the reference converter writes it,\n"
+      "                                  or a stock mix as the reference quantizer writes it from that BF16 file (exit 6 on a write failure)\n"
       "  verify --model A.gguf --reference B.gguf\n"
       "                                  every tensor compared by name, then the files byte for byte (exit 5 if anything differs)\n"
       "  probe | train | export | serve | bench | web   not built yet (later steps)\n"
@@ -379,6 +384,55 @@ int cmd_quantize(const Args& a) {
   return 0;
 }
 
+int cmd_convert(const Args& a) {
+  const std::string in_path = a.get("model"), out_path = a.get("out");
+  if (in_path.empty() || out_path.empty()) {
+    usage();
+    return 1;
+  }
+  const Result<quant::FileType> ft = quant::file_type_from_name(a.get("type", "BF16"));
+  if (!ft.ok()) return fail_input(ft.status);
+  int threads = 0;
+  if (a.has("threads")) {
+    const Result<std::uint64_t> t = io::parse_whole(a.get("threads"), 1024);
+    if (!t.ok() || t.value == 0) {
+      std::fprintf(stderr, "pelias: --threads %s\n", t.ok() ? "must be at least 1" : t.status.message.c_str());
+      return 1;
+    }
+    threads = static_cast<int>(t.value);
+  }
+  ingest::ConvertOptions opt;
+  opt.ftype = ft.value;
+  opt.threads = threads;
+  std::printf("converting the folder '%s' to %s\n", ingest::folder_name(in_path).c_str(), quant::file_type_name(ft.value));
+  std::fflush(stdout);
+  std::size_t last_pct = 0;
+  const Result<io::RequantReport> res = ingest::convert_folder(in_path, out_path, opt, [&](std::size_t i, std::size_t n, const std::string&, std::uint32_t) {
+    const std::size_t pct = (i + 1) * 100 / n;
+    if (pct >= last_pct + 10 || i + 1 == n) {
+      last_pct = pct;
+      std::printf("  %3zu %% (%zu of %zu tensors)\n", pct, i + 1, n);
+      std::fflush(stdout);
+    }
+  });
+  if (!res.ok()) {
+    std::fprintf(stderr, "pelias: %s\n", res.status.text().c_str());
+    return res.status.code == Code::io_error ? 6 : 2;
+  }
+  const io::RequantReport& rep = res.value;
+  if (ft.value == quant::FileType::bf16)
+    std::printf("done: %llu tensors (%llu copied as BF16, %llu converted to F32), %s in, %s out, %.1f s\n", static_cast<unsigned long long>(rep.tensors),
+                static_cast<unsigned long long>(rep.copied), static_cast<unsigned long long>(rep.quantized), plan::format_bytes(rep.bytes_in).c_str(),
+                plan::format_bytes(rep.bytes_out).c_str(), rep.seconds);
+  else
+    std::printf("done: %llu tensors (%llu quantized, %llu copied unchanged), %s in, %s out, %.1f s\n", static_cast<unsigned long long>(rep.tensors),
+                static_cast<unsigned long long>(rep.quantized), static_cast<unsigned long long>(rep.copied), plan::format_bytes(rep.bytes_in).c_str(),
+                plan::format_bytes(rep.bytes_out).c_str(), rep.seconds);
+  for (std::uint32_t t = 0; t < 64; ++t)
+    if (rep.by_type[t]) std::printf("  %-6s %llu tensors\n", quant::type_info(t).name, static_cast<unsigned long long>(rep.by_type[t]));
+  return 0;
+}
+
 int cmd_verify(const Args& a) {
   const std::string pa = a.get("model"), pb = a.get("reference");
   if (pa.empty() || pb.empty()) {
@@ -396,7 +450,7 @@ int cmd_verify(const Args& a) {
   s = rb.parse(mb);
   if (!s) return fail_input(s);
   Timer t;
-  const io::GgufCompareReport rep = io::compare_gguf(ma, ra, mb, rb);
+  const io::GgufCompareReport rep = io::compare_gguf(ma, ra, mb, rb, 64);
   std::printf("tensors: %llu / %llu; identical %llu; type differs %llu; shape differs %llu; data differs %llu; only in one file %llu / %llu\n",
               static_cast<unsigned long long>(rep.tensors_a), static_cast<unsigned long long>(rep.tensors_b), static_cast<unsigned long long>(rep.identical),
               static_cast<unsigned long long>(rep.type_differs), static_cast<unsigned long long>(rep.shape_differs),
@@ -428,6 +482,7 @@ int main(int argc, char** argv) {
   if (cmd == "key") return cmd_key(a);
   if (cmd == "plan") return cmd_plan(a);
   if (cmd == "quantize") return cmd_quantize(a);
+  if (cmd == "convert") return cmd_convert(a);
   if (cmd == "verify") return cmd_verify(a);
   for (const char* later : {"probe", "train", "export", "serve", "bench", "web"})
     if (cmd == later) {

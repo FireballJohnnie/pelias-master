@@ -11,6 +11,34 @@
 namespace pelias::io {
 namespace {
 
+// Floats as ordered integers, so the distance between two values counts the representable values between them (units
+// in the last place); sign-magnitude mapped to a monotone scale.
+std::int64_t ordered(std::uint32_t bits, int width) {
+  const std::uint32_t sign = width == 32 ? 0x80000000u : 0x8000u;
+  const std::uint32_t mag = bits & (sign - 1);
+  return (bits & sign) ? -static_cast<std::int64_t>(mag) : static_cast<std::int64_t>(mag);
+}
+
+// For float tensors: how many values differ and by at most how many units in the last place.
+std::string float_difference(std::uint32_t type, const std::uint8_t* x, const std::uint8_t* y, std::uint64_t bytes) {
+  int width = 0;
+  if (type == static_cast<std::uint32_t>(quant::Type::f32)) width = 32;
+  else if (type == static_cast<std::uint32_t>(quant::Type::bf16) || type == static_cast<std::uint32_t>(quant::Type::f16)) width = 16;
+  if (!width) return {};
+  const std::uint64_t es = static_cast<std::uint64_t>(width / 8), n = bytes / es;
+  std::uint64_t differ = 0, max_ulp = 0;
+  for (std::uint64_t i = 0; i < n; ++i) {
+    std::uint32_t a = 0, b = 0;
+    std::memcpy(&a, x + i * es, static_cast<std::size_t>(es));
+    std::memcpy(&b, y + i * es, static_cast<std::size_t>(es));
+    if (a == b) continue;
+    ++differ;
+    const std::int64_t d = ordered(a, width) - ordered(b, width);
+    max_ulp = std::max<std::uint64_t>(max_ulp, static_cast<std::uint64_t>(d < 0 ? -d : d));
+  }
+  return "; " + std::to_string(differ) + " of " + std::to_string(n) + " values differ, by at most " + std::to_string(max_ulp) + " units in the last place";
+}
+
 std::string shape_of(const GgufTensor& t) {
   std::string s = "[";
   for (std::uint32_t i = 0; i < t.n_dims; ++i) s += (i ? "," : "") + std::to_string(t.ne[i]);
@@ -80,7 +108,9 @@ GgufCompareReport compare_gguf(const os::FileMap& ma, const GgufReader& a, const
           while (k < n && ma.data()[x.file_offset + k] == mb.data()[y.file_offset + k]) ++k;
         const quant::TypeInfo ti = quant::type_info(x.type);
         const std::uint64_t bb = ti.block_bytes ? ti.block_bytes : 1;
-        note(x.name + ": data differs from byte " + std::to_string(k) + " (block " + std::to_string(k / bb) + ")");
+        std::string extra;
+        if (in_range_a && in_range_b && x.bytes == y.bytes) extra = float_difference(x.type, ma.data() + x.file_offset, mb.data() + y.file_offset, x.bytes);
+        note(x.name + ": data differs from byte " + std::to_string(k) + " (block " + std::to_string(k / bb) + ")" + extra);
       }
     }
     if (same) ++r.identical;

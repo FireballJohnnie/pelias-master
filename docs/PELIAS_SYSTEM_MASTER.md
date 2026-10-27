@@ -173,7 +173,7 @@ Each step starts only when the gate of the step before it is met. Trainer steps 
 |---|---|---|---|---|---|
 | 1 | Measure the machine; the author signs the switches | T0 | E0, E1 | Switch summary signed; the gap between the modelled ceiling and the live speed explained | Wave 0 ran on WSL2 and Windows-native. The gap split is DERIVED, not isolated. Not run: P-M4, the Batch C kernel probes (source not finished), P-E10, P-E11 |
 | 2 | Foundations: device layer, VRAM governor, arenas, file mapping, GGUF reader, memory solver, test harness | T1 | E2, E3 (reader) | Lists all 753 tensors; a plan above 10.7 GiB is refused; clean build on WSL2 and Windows-native | Trainer framework builds host-only; `io/gguf_reader` is a stub. Engine: no code |
-| 3 | Block formats and quantizers, then the base file from the bf16 shards | T1b | E3, E4 | P-E6 byte-identical to the oracle; ingest output equals the reference (P-X6) | Not started |
+| 3 | Block formats and quantizers, then the base file from the bf16 shards | T1b | E3, E4 | P-E6 byte-identical to the oracle; ingest output equals the reference (P-X6) | Built; P-E6 passed; P-X6 waiting for the author's run |
 | 4 | Tokenizer, chat-template renderer, data pipeline | T2 | E10 (reuse) | P-D1 and P-D2: zero mismatches | Not started |
 | 5 | Kernel families, each with a slow reference first | T3 to T6 | E4, E5, E7 | Rung 1 tolerances; kernel parity | Not started |
 | 6 | The external oracle harness and the project's own comparators | T12 (verify) | E3 | Oracle reproduces the stock noise floor (KL 0.017353 at batch 16, 0.018286 at batch 1024) | Not started |

@@ -47,15 +47,77 @@ int block_number(const std::string& name) {
   return l;
 }
 
+// value type ids of the GGUF format
+constexpr std::int32_t kU32 = 4, kI32 = 5, kF32 = 6, kBool = 7, kStr = 8, kArr = 9;
+
+GgufKvBlob kv_head(const std::string& key, std::int32_t type) {
+  GgufKvBlob b;
+  append_string(b, key);
+  append(b, &type, 4);
+  return b;
+}
+
 }  // namespace
 
 GgufKvBlob gguf_kv_u32(const std::string& key, std::uint32_t value) {
-  GgufKvBlob b;
-  append_string(b, key);
-  const std::int32_t type = 4;  // u32
-  append(b, &type, 4);
+  GgufKvBlob b = kv_head(key, kU32);
   append(b, &value, 4);
   return b;
+}
+GgufKvBlob gguf_kv_i32(const std::string& key, std::int32_t value) {
+  GgufKvBlob b = kv_head(key, kI32);
+  append(b, &value, 4);
+  return b;
+}
+GgufKvBlob gguf_kv_f32(const std::string& key, float value) {
+  GgufKvBlob b = kv_head(key, kF32);
+  append(b, &value, 4);
+  return b;
+}
+GgufKvBlob gguf_kv_bool(const std::string& key, bool value) {
+  GgufKvBlob b = kv_head(key, kBool);
+  const std::uint8_t v = value ? 1 : 0;
+  append(b, &v, 1);
+  return b;
+}
+GgufKvBlob gguf_kv_str(const std::string& key, const std::string& value) {
+  GgufKvBlob b = kv_head(key, kStr);
+  append_string(b, value);
+  return b;
+}
+GgufKvBlob gguf_kv_arr_str(const std::string& key, const std::vector<std::string>& values) {
+  GgufKvBlob b = kv_head(key, kArr);
+  append(b, &kStr, 4);
+  const std::uint64_t n = values.size();
+  append(b, &n, 8);
+  for (const auto& v : values) append_string(b, v);
+  return b;
+}
+GgufKvBlob gguf_kv_arr_i32(const std::string& key, const std::vector<std::int32_t>& values) {
+  GgufKvBlob b = kv_head(key, kArr);
+  append(b, &kI32, 4);
+  const std::uint64_t n = values.size();
+  append(b, &n, 8);
+  if (n) append(b, values.data(), values.size() * 4);
+  return b;
+}
+GgufKvBlob gguf_kv_arr_bool(const std::string& key, const std::vector<bool>& values) {
+  GgufKvBlob b = kv_head(key, kArr);
+  append(b, &kBool, 4);
+  const std::uint64_t n = values.size();
+  append(b, &n, 8);
+  for (const bool v : values) {
+    const std::uint8_t x = v ? 1 : 0;
+    append(b, &x, 1);
+  }
+  return b;
+}
+std::string gguf_kv_key(const GgufKvBlob& blob) {
+  if (blob.size() < 8) return {};
+  std::uint64_t n;
+  std::memcpy(&n, blob.data(), 8);
+  if (n > blob.size() - 8) return {};
+  return std::string(reinterpret_cast<const char*>(blob.data()) + 8, static_cast<std::size_t>(n));
 }
 
 std::vector<std::size_t> reference_order(const std::vector<std::string>& names) {
@@ -73,7 +135,7 @@ std::vector<std::size_t> reference_order(const std::vector<std::string>& names) 
 std::uint64_t gguf_meta_bytes(const std::vector<GgufKvBlob>& kv, const std::vector<GgufOutTensor>& tensors, std::uint32_t alignment) {
   std::uint64_t n = 4 + 4 + 8 + 8;
   for (const auto& b : kv) n += b.size();
-  for (const auto& t : tensors) n += 8 + t.name.size() + 4 + 8ull * n_dims_of(t.ne) + 4 + 8;
+  for (const auto& t : tensors) n += 8 + t.name.size() + 4 + 8ull * (t.n_dims ? t.n_dims : n_dims_of(t.ne)) + 4 + 8;
   return padded(n, alignment);
 }
 
@@ -133,7 +195,7 @@ Status GgufFileWriter::begin(const std::string& path, const std::vector<GgufKvBl
   std::uint64_t offset = 0;
   for (const auto& t : tensors) {
     append_string(h, t.name);
-    const std::uint32_t nd = n_dims_of(t.ne);
+    const std::uint32_t nd = t.n_dims ? t.n_dims : n_dims_of(t.ne);
     append(h, &nd, 4);
     for (std::uint32_t d = 0; d < nd; ++d) append(h, &t.ne[d], 8);
     const auto type = static_cast<std::int32_t>(t.type);

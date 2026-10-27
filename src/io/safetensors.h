@@ -47,4 +47,18 @@ class SafetensorsReader {
   std::uint64_t header_bytes_ = 0;
 };
 
+// One shard opened for reading: its memory map and its parsed header (a model folder holds several; ingest/ opens one
+// per file named in the folder's index).
+class SafetensorsShard {
+ public:
+  Status open(const std::string& path);
+  [[nodiscard]] const SafetensorsReader& reader() const { return reader_; }
+  // The tensor's data (its bytes are reader-checked to lie inside the file).
+  [[nodiscard]] const std::uint8_t* data(const SafetensorsTensor& t) const { return map_.data() + t.file_offset; }
+
+ private:
+  os::FileMap map_;
+  SafetensorsReader reader_;
+};
+
 }  // namespace pelias::io

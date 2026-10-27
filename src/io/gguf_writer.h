@@ -23,11 +23,23 @@ struct GgufOutTensor {
   std::uint64_t ne[4] = {1, 1, 1, 1};
   std::uint32_t type = 0;
   std::uint64_t bytes = 0;  // size of the data (without padding)
+  // Dimensions written to the file. 0 = the reference quantizer's rule (ggml_n_dims: up to the last dimension larger
+  // than 1). The reference converter writes the source array's own rank instead, so a [1, 2048] tensor keeps 2.
+  std::uint32_t n_dims = 0;
 };
 
 // One key-value entry already encoded as the file stores it (key string, type, value).
 using GgufKvBlob = std::vector<std::uint8_t>;
 GgufKvBlob gguf_kv_u32(const std::string& key, std::uint32_t value);
+GgufKvBlob gguf_kv_i32(const std::string& key, std::int32_t value);
+GgufKvBlob gguf_kv_f32(const std::string& key, float value);
+GgufKvBlob gguf_kv_bool(const std::string& key, bool value);
+GgufKvBlob gguf_kv_str(const std::string& key, const std::string& value);
+GgufKvBlob gguf_kv_arr_str(const std::string& key, const std::vector<std::string>& values);
+GgufKvBlob gguf_kv_arr_i32(const std::string& key, const std::vector<std::int32_t>& values);
+GgufKvBlob gguf_kv_arr_bool(const std::string& key, const std::vector<bool>& values);
+// The key of an encoded entry (the string at its start).
+std::string gguf_kv_key(const GgufKvBlob& blob);
 
 // The reference quantizer's tensor order: by the block number in "blk.N." (names without one count as -1), then by
 // name. Returns the indices of `names` in that order.

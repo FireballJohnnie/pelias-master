@@ -94,4 +94,10 @@ Status SafetensorsReader::parse(const os::FileMap& map) {
   return Status::good();
 }
 
+Status SafetensorsShard::open(const std::string& path) {
+  Status s = map_.open(path);
+  if (!s) return s;
+  return reader_.parse(map_);
+}
+
 }  // namespace pelias::io
