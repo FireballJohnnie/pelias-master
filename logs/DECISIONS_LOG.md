@@ -45,3 +45,5 @@ Every ruling that shapes this repository, with its date and source. AUTHOR-STATE
 | 2026-10-26 19:40 | Add 2-bit and 3-bit support (logged for the future) | AUTHOR-STATED | Masterwork 5.3, O19 |
 | 2026-10-26 19:56 | Go on stage B | AUTHOR-STATED | Step 3 |
 | 2026-10-26 20:1x | Driver for GGUF-to-GGUF quantization lives in `io/` (io may depend on quant, 14.3); offered mixes Q4_K_M, Q6_K, Q8_0, BF16, F16, F32 (the types this build can write); inputs with an alignment other than 32 refused (the reference writes 32 whatever the input said); exit codes 5 (verify differs) and 6 (write failed) | DECISION (step 3) | `src/io/requantize`, `src/cli/main.cc` |
+| 2026-10-26 20:30 | Add a "Pelias mix" (more accurate 4-bit variant) to the plan; the benchmark's question is accuracy | AUTHOR-STATED | Masterwork O20 |
+| 2026-10-26 20:31 | P-E6 passed (byte-identical on the real model); push; add a "Pelias mix" (more accurate 4-bit variant, judged by KL against bf16) to the plan | AUTHOR-STATED | Masterwork O20; RUNBOOK |
