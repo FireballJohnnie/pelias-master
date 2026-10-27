@@ -133,6 +133,7 @@ Status GgufReader::parse(const os::FileMap& map, bool require_data) {
   for (std::int64_t i = 0; i < n_kv; ++i) {
     GgufKv kv;
     const std::uint64_t at = c.pos();
+    kv.file_begin = at;
     s = c.read_string(kv.key, "a key");
     if (!s) return s;
     if (kv.key.empty()) return Status::fail(Code::corrupt, "empty key at key-value pair " + std::to_string(i), at);
@@ -175,6 +176,7 @@ Status GgufReader::parse(const os::FileMap& map, bool require_data) {
       s = read_scalar(c, static_cast<GgufValueType>(t), kv.value, kv.key);
       if (!s) return s;
     }
+    kv.file_end = c.pos();
     kv_.push_back(std::move(kv));
   }
 

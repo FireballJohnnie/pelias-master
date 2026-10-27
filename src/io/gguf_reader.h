@@ -44,6 +44,8 @@ struct GgufValue {
 struct GgufKv {
   std::string key;
   GgufValue value;
+  std::uint64_t file_begin = 0;  // byte range of the whole entry (key, type, value) in the file, so a writer can copy it
+  std::uint64_t file_end = 0;
 };
 
 struct GgufTensor {
