@@ -6,7 +6,7 @@
 //   1. fp32 -> fp16 and fp32 -> bf16 on all 2^32 bit patterns; fp16 -> fp32 and bf16 -> fp32 on all 2^16
 //   2. Q8_0, Q4_K, Q6_K, F16, BF16 through the reference's quantize-chunk entry (no importance matrix, as a stock
 //      quantization uses), and the activation quantizers Q8_1 and Q8_K, on many generated rows of several shapes
-//   3. Q8_0, Q4_K, Q6_K, Q2_K, Q3_K, Q5_K, IQ4_XS dequantization on random blocks
+//   3. dequantization of every weight type Pelias reads, on random blocks
 // Exit 0 only when every byte (and every float bit pattern) matches. Usage: quant_oracle [--blocks N] [--seed S]
 #include <cmath>
 #include <cstdint>
@@ -228,7 +228,14 @@ void check_dequantizers(std::uint64_t blocks, std::uint64_t seed) {
   const T types[] = {{q::Type::q8_0, GGML_TYPE_Q8_0, "Q8_0", 0, -1},     {q::Type::q4_k, GGML_TYPE_Q4_K, "Q4_K", 0, 2},
                      {q::Type::q6_k, GGML_TYPE_Q6_K, "Q6_K", 208, -1},   {q::Type::q2_k, GGML_TYPE_Q2_K, "Q2_K", 80, 82},
                      {q::Type::q3_k, GGML_TYPE_Q3_K, "Q3_K", 108, -1},   {q::Type::q5_k, GGML_TYPE_Q5_K, "Q5_K", 0, 2},
-                     {q::Type::iq4_xs, GGML_TYPE_IQ4_XS, "IQ4_XS", 0, -1}};
+                     {q::Type::iq4_xs, GGML_TYPE_IQ4_XS, "IQ4_XS", 0, -1}, {q::Type::q4_0, GGML_TYPE_Q4_0, "Q4_0", 0, -1},
+                     {q::Type::q4_1, GGML_TYPE_Q4_1, "Q4_1", 0, 2},      {q::Type::q5_0, GGML_TYPE_Q5_0, "Q5_0", 0, -1},
+                     {q::Type::q5_1, GGML_TYPE_Q5_1, "Q5_1", 0, 2},      {q::Type::iq4_nl, GGML_TYPE_IQ4_NL, "IQ4_NL", 0, -1},
+                     {q::Type::mxfp4, GGML_TYPE_MXFP4, "MXFP4", -1, -1}, {q::Type::tq1_0, GGML_TYPE_TQ1_0, "TQ1_0", 52, -1},
+                     {q::Type::tq2_0, GGML_TYPE_TQ2_0, "TQ2_0", 64, -1}, {q::Type::iq2_xxs, GGML_TYPE_IQ2_XXS, "IQ2_XXS", 0, -1},
+                     {q::Type::iq2_xs, GGML_TYPE_IQ2_XS, "IQ2_XS", 0, -1}, {q::Type::iq2_s, GGML_TYPE_IQ2_S, "IQ2_S", 0, -1},
+                     {q::Type::iq3_xxs, GGML_TYPE_IQ3_XXS, "IQ3_XXS", 0, -1}, {q::Type::iq3_s, GGML_TYPE_IQ3_S, "IQ3_S", 0, -1},
+                     {q::Type::iq1_s, GGML_TYPE_IQ1_S, "IQ1_S", 0, -1},  {q::Type::iq1_m, GGML_TYPE_IQ1_M, "IQ1_M", -1, -1}};
   for (const T& t : types) {
     std::mt19937_64 rng(seed + 7);
     const std::size_t block_bytes = ggml_type_size(t.ref);
@@ -240,7 +247,7 @@ void check_dequantizers(std::uint64_t blocks, std::uint64_t seed) {
     for (std::size_t k = 0; k < blocks; ++k) {
       std::uint8_t* blk = in.data() + k * block_bytes;
       const std::uint16_t d = q::fp32_to_fp16(sc(rng)), m = q::fp32_to_fp16(sc(rng));
-      std::memcpy(blk + t.d_at, &d, 2);
+      if (t.d_at >= 0) std::memcpy(blk + t.d_at, &d, 2);  // otherwise random (MXFP4 exponent byte, IQ1_M scale nibbles)
       if (t.dmin_at >= 0) std::memcpy(blk + t.dmin_at, &m, 2);
     }
     const std::size_t n = blocks * block_elems;

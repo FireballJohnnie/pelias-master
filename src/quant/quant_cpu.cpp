@@ -660,6 +660,9 @@ bool can_dequantize(Type t) {
   switch (t) {
     case Type::f32: case Type::f16: case Type::bf16: case Type::q8_0: case Type::q4_k: case Type::q6_k:
     case Type::q2_k: case Type::q3_k: case Type::q5_k: case Type::iq4_xs:
+    case Type::q4_0: case Type::q4_1: case Type::q5_0: case Type::q5_1: case Type::iq4_nl: case Type::mxfp4:
+    case Type::tq1_0: case Type::tq2_0: case Type::iq2_xxs: case Type::iq2_xs: case Type::iq2_s: case Type::iq3_xxs:
+    case Type::iq3_s: case Type::iq1_s: case Type::iq1_m:
       return true;
     default:
       return false;
@@ -716,6 +719,21 @@ Status dequantize_row(Type t, const std::uint8_t* in, float* y, std::int64_t n) 
     case Type::q3_k: dequantize_q3_k(in, y, n); break;
     case Type::q5_k: dequantize_q5_k(in, y, n); break;
     case Type::iq4_xs: dequantize_iq4_xs(in, y, n); break;
+    case Type::q4_0: dequantize_q4_0(in, y, n); break;
+    case Type::q4_1: dequantize_q4_1(in, y, n); break;
+    case Type::q5_0: dequantize_q5_0(in, y, n); break;
+    case Type::q5_1: dequantize_q5_1(in, y, n); break;
+    case Type::iq4_nl: dequantize_iq4_nl(in, y, n); break;
+    case Type::mxfp4: dequantize_mxfp4(in, y, n); break;
+    case Type::tq1_0: dequantize_tq1_0(in, y, n); break;
+    case Type::tq2_0: dequantize_tq2_0(in, y, n); break;
+    case Type::iq2_xxs: dequantize_iq2_xxs(in, y, n); break;
+    case Type::iq2_xs: dequantize_iq2_xs(in, y, n); break;
+    case Type::iq2_s: dequantize_iq2_s(in, y, n); break;
+    case Type::iq3_xxs: dequantize_iq3_xxs(in, y, n); break;
+    case Type::iq3_s: dequantize_iq3_s(in, y, n); break;
+    case Type::iq1_s: dequantize_iq1_s(in, y, n); break;
+    case Type::iq1_m: dequantize_iq1_m(in, y, n); break;
     default: return Status::fail(Code::internal, "dequantize dispatch");
   }
   return Status::good();

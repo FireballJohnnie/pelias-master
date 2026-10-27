@@ -10,7 +10,8 @@
 // kernels, checked against these.
 //
 // Types in this step (5.3 build order): F32, F16, BF16, Q8_0, Q4_K, Q6_K for weights; Q8_1 and Q8_K for activations.
-// Read only (dequantize, no quantizer yet; Milestone 1 / O19): Q2_K, Q3_K, Q5_K, IQ4_XS.
+// Read only (dequantize, no quantizer yet; Milestone 1 / O19): Q2_K, Q3_K, Q5_K, IQ4_XS; Q4_0, Q4_1, Q5_0, Q5_1,
+// IQ4_NL, MXFP4, TQ1_0, TQ2_0, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, IQ1_M (quant/dequant_more.cpp).
 #pragma once
 
 #include <cstddef>
@@ -50,5 +51,20 @@ void dequantize_q2_k(const std::uint8_t* in, float* y, std::int64_t n);
 void dequantize_q3_k(const std::uint8_t* in, float* y, std::int64_t n);
 void dequantize_q5_k(const std::uint8_t* in, float* y, std::int64_t n);
 void dequantize_iq4_xs(const std::uint8_t* in, float* y, std::int64_t n);
+void dequantize_q4_0(const std::uint8_t* in, float* y, std::int64_t n);
+void dequantize_q4_1(const std::uint8_t* in, float* y, std::int64_t n);
+void dequantize_q5_0(const std::uint8_t* in, float* y, std::int64_t n);
+void dequantize_q5_1(const std::uint8_t* in, float* y, std::int64_t n);
+void dequantize_iq4_nl(const std::uint8_t* in, float* y, std::int64_t n);
+void dequantize_mxfp4(const std::uint8_t* in, float* y, std::int64_t n);
+void dequantize_tq1_0(const std::uint8_t* in, float* y, std::int64_t n);
+void dequantize_tq2_0(const std::uint8_t* in, float* y, std::int64_t n);
+void dequantize_iq2_xxs(const std::uint8_t* in, float* y, std::int64_t n);
+void dequantize_iq2_xs(const std::uint8_t* in, float* y, std::int64_t n);
+void dequantize_iq2_s(const std::uint8_t* in, float* y, std::int64_t n);
+void dequantize_iq3_xxs(const std::uint8_t* in, float* y, std::int64_t n);
+void dequantize_iq3_s(const std::uint8_t* in, float* y, std::int64_t n);
+void dequantize_iq1_s(const std::uint8_t* in, float* y, std::int64_t n);
+void dequantize_iq1_m(const std::uint8_t* in, float* y, std::int64_t n);
 
 }  // namespace pelias::quant

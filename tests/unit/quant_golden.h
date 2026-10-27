@@ -81,6 +81,7 @@ struct DequantGolden {
   std::uint32_t block_bytes;
   int d_at, dmin_at;          // byte offsets of the fp16 scale and min scale (-1: none)
   const char* sha256;
+  int scale_kind = 0;         // 0: fp16 at d_at; 1: IQ1_M (the fp16 scale in the top nibbles of 4 u16 at 48); 2: E8M0 byte at 0
 };
 inline std::vector<std::uint8_t> dequant_golden_input(const DequantGolden& g) {
   std::uint64_t s = 0xD1B54A32D192ED03ull ^ g.type_id;
@@ -95,6 +96,15 @@ inline std::vector<std::uint8_t> dequant_golden_input(const DequantGolden& g) {
     // fp16 0x2000 + k*64: 2^-7 up to about 0.13, exact and finite; the min scale a little smaller
     const std::uint16_t d = static_cast<std::uint16_t>(0x2000u + k * 64u), m = static_cast<std::uint16_t>(0x1C00u + k * 32u);
     std::uint8_t* blk = b.data() + k * g.block_bytes;
+    if (g.scale_kind == 1) {
+      for (int nib = 0; nib < 4; ++nib)
+        blk[48 + 2 * nib + 1] = static_cast<std::uint8_t>((blk[48 + 2 * nib + 1] & 0x0F) | (((d >> (4 * nib)) & 0xF) << 4));
+      continue;
+    }
+    if (g.scale_kind == 2) {
+      blk[0] = static_cast<std::uint8_t>(112 + k % 24);  // 2^-16 .. 2^7 (times the half)
+      continue;
+    }
     blk[g.d_at] = static_cast<std::uint8_t>(d & 0xFF);
     blk[g.d_at + 1] = static_cast<std::uint8_t>(d >> 8);
     if (g.dmin_at >= 0) {
@@ -109,5 +119,20 @@ inline const DequantGolden kDequantGolden[] = {
     {"Q3_K", 11, 110, 108, -1, "85ab74478dd8c3fdd1e05972c23e795cf40f6909e86a958d334f0438898ba525"},
     {"Q5_K", 13, 176, 0, 2, "9f8c64c3885b464a2b59471f14866ae2c54ac8d7c826210a006a2c4801737d46"},
     {"IQ4_XS", 23, 136, 0, -1, "56b6e3e3bb5f330aabc6780a18e7bc1cc5aa59c0850adbab4a05af12aef3f04f"},
+    {"Q4_0", 2, 18, 0, -1, "9638f7c7d66529aad19837440bf3fb84eae5430872b77902c87cc5e3b745a9d7"},
+    {"Q4_1", 3, 20, 0, 2, "124484f8073fa13b783b0270d335734b48b4792a235e042701d52f87e20a820b"},
+    {"Q5_0", 6, 22, 0, -1, "104da7851b20e69bcd5b304739a08e7c2b4a4127248d57914ee6d54c1099b208"},
+    {"Q5_1", 7, 24, 0, 2, "856958866b778ef5103e4cc38970da2b61f930e0f6f5e361c7b8d808a0fc452c"},
+    {"IQ4_NL", 20, 18, 0, -1, "fa976eef0df72e975f276802eda56aa6b4534687c249cbae20d295e8f90bc379"},
+    {"MXFP4", 39, 17, 0, -1, "ea0fdcf059fcabc050576d30fb98733eeee17835b2928318ed0b51b0990fcd5a", 2},
+    {"TQ1_0", 34, 54, 52, -1, "944b1634471b2f98073b7a925c052a6d16959ece2a58019b3922dbd26a44bfc4"},
+    {"TQ2_0", 35, 66, 64, -1, "109e0d087352383a00e375b4ac3f78312589426b89a7c32223af45c798366d2f"},
+    {"IQ2_XXS", 16, 66, 0, -1, "866545bb07a3235de1b1f02152dfbac2ef2205837cfb7b7c7af5c25d52e838c0"},
+    {"IQ2_XS", 17, 74, 0, -1, "4b19a6a52fe9450d4007edaaed046ab9be4749c38f4e274ade3969e6359ddf55"},
+    {"IQ2_S", 22, 82, 0, -1, "c654c67b358b06b7316c0289f233507e3bf025c572a4ba796cd7013b18e0eb3d"},
+    {"IQ3_XXS", 18, 98, 0, -1, "0251e05c3fce76a4f8e2df61c710c6718638308b10bb04f9af790c0cdb3c80d2"},
+    {"IQ3_S", 21, 110, 0, -1, "9f7e3ec676f01fdc71262820c0613346c1687b2c6a8ba3b7de9b45b219d18df1"},
+    {"IQ1_S", 19, 50, 0, -1, "7bbf53e28c44b80a657af66ae861cd10683a70357dfd324e6f40f3b3a7acfa95"},
+    {"IQ1_M", 29, 56, 0, -1, "ed685dbfaa8a7536d3711c561efb4053abab5260d736c44b1b243e465ca19879", 1},
 };
 }  // namespace ptest
