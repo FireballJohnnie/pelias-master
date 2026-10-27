@@ -265,14 +265,20 @@ struct Ctx {
   std::uint32_t il = 0;  // the layer being run
 };
 
+// matmul over the whole matrix, recording the activations for the importance matrix when asked
+void mm(const Ctx& c, const WeightView& w, const float* x, int64_t n_tok, int64_t ldx, float* y, int64_t ldy) {
+  if (c.opt.imatrix) c.opt.imatrix->add_dense(w.name, x, n_tok, ldx, static_cast<int64_t>(w.ne[0]));
+  matmul(w, x, n_tok, ldx, y, ldy, c.threads, c.sc);
+}
+
 void full_attention(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* out) {
   const Qwen35MoeSpec& s = c.s;
   const int64_t n = c.n, hd = s.head_dim, nh = s.n_head, nkv = s.n_head_kv, e = s.n_embd;
   const int64_t q_w = 2 * hd * nh, kv_w = hd * nkv;
   std::vector<float> qg(z(n * q_w)), k(z(n * kv_w)), v(z(n * kv_w)), att(z(n * hd * nh));
-  matmul(l.wq, xn, n, e, qg.data(), q_w, c.threads, c.sc);
-  matmul(l.wk, xn, n, e, k.data(), kv_w, c.threads, c.sc);
-  matmul(l.wv, xn, n, e, v.data(), kv_w, c.threads, c.sc);
+  mm(c, l.wq, xn, n, e, qg.data(), q_w);
+  mm(c, l.wk, xn, n, e, k.data(), kv_w);
+  mm(c, l.wv, xn, n, e, v.data(), kv_w);
   // per-head norms, then rope at each token's position
   parallel_items(n, c.threads, [&](int64_t t, int) {
     std::vector<float> cs, tmp(z(hd));
@@ -316,7 +322,7 @@ void full_attention(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, floa
     const float* gate = q + hd;
     for (int64_t i = 0; i < hd; ++i) o[i] *= sigmoid(gate[i]);
   });
-  matmul(l.wo, att.data(), n, hd * nh, out, e, c.threads, c.sc);
+  mm(c, l.wo, att.data(), n, hd * nh, out, e);
 }
 
 void delta_net(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* out) {
@@ -325,10 +331,10 @@ void delta_net(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* ou
   const int64_t ch = s.conv_channels(), d_inner = s.ssm_d_inner, ds = s.ssm_d_state, nk = s.ssm_n_group, nv = s.ssm_dt_rank;
   const int64_t taps = s.ssm_d_conv;
   std::vector<float> mixed(z(n * ch)), zg(z(n * d_inner)), beta(z(n * nv)), alpha(z(n * nv));
-  matmul(l.wqkv, xn, n, e, mixed.data(), ch, c.threads, c.sc);
-  matmul(l.wgate, xn, n, e, zg.data(), d_inner, c.threads, c.sc);
-  matmul(l.wbeta, xn, n, e, beta.data(), nv, c.threads, c.sc);
-  matmul(l.walpha, xn, n, e, alpha.data(), nv, c.threads, c.sc);
+  mm(c, l.wqkv, xn, n, e, mixed.data(), ch);
+  mm(c, l.wgate, xn, n, e, zg.data(), d_inner);
+  mm(c, l.wbeta, xn, n, e, beta.data(), nv);
+  mm(c, l.walpha, xn, n, e, alpha.data(), nv);
   // beta = sigmoid(.); g = softplus(alpha + dt) * A
   for (int64_t t = 0; t < n; ++t)
     for (int64_t h = 0; h < nv; ++h) {
@@ -394,7 +400,7 @@ void delta_net(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* ou
       rms_norm(o, l.ssm_norm.data(), tmp.data(), ds, s.rms_eps);
       for (int64_t i = 0; i < ds; ++i) o[i] = tmp[z(i)] * silu(zz[i]);
     }
-  matmul(l.ssm_out, core.data(), n, d_inner, out, e, c.threads, c.sc);
+  mm(c, l.ssm_out, core.data(), n, d_inner, out, e);
 }
 
 void moe(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* out) {
@@ -403,7 +409,7 @@ void moe(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* out) {
   // routing: softmax over every expert, the top n_expert_used by probability (ties: lower index first), their
   // probabilities renormalized to sum 1 (the sum clamped below at 2^-14)
   std::vector<float> probs(z(n * ne));
-  matmul(l.gate_inp, xn, n, e, probs.data(), ne, c.threads, c.sc);
+  mm(c, l.gate_inp, xn, n, e, probs.data(), ne);
   std::vector<int32_t> sel(z(n * nu));
   std::vector<float> wsel(z(n * nu));
   std::vector<int32_t> order(z(ne));
@@ -436,6 +442,17 @@ void moe(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* out) {
   for (int64_t t = 0; t < n; ++t)
     for (int64_t k = 0; k < nu; ++k) slots[z(sel[z(t * nu + k)])].push_back(t * nu + k);
   std::vector<float> ys(z(n * nu * e));  // each (token, slot)'s weighted expert output
+  // importance matrix of the experts, in the reference's order: slot by slot, then token by token
+  std::vector<float> hs(c.opt.imatrix ? z(n * nu * ff) : 0);
+  if (c.opt.imatrix) {
+    ImatrixEntry& eg = c.opt.imatrix->entry(l.gate_exps.name, e, ne);
+    ImatrixEntry& eu = c.opt.imatrix->entry(l.up_exps.name, e, ne);
+    for (int64_t k = 0; k < nu; ++k)
+      for (int64_t t = 0; t < n; ++t) {
+        ImatrixCollector::add_row(eg, sel[z(t * nu + k)], xn + t * e);
+        ImatrixCollector::add_row(eu, sel[z(t * nu + k)], xn + t * e);
+      }
+  }
   std::vector<int64_t> busy;
   for (int64_t x = 0; x < ne; ++x)
     if (!slots[z(x)].empty()) busy.push_back(x);
@@ -452,6 +469,8 @@ void moe(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* out) {
     matmul_rows(l.gate_exps, static_cast<uint64_t>(ex), 0, ff, sc.xe.data(), m, e, sc.ge.data(), ff, sc);
     matmul_rows(l.up_exps, static_cast<uint64_t>(ex), 0, ff, sc.xe.data(), m, e, sc.ue.data(), ff, sc);
     for (int64_t i = 0; i < m * ff; ++i) sc.ge[z(i)] = silu(sc.ge[z(i)]) * sc.ue[z(i)];
+    if (!hs.empty())
+      for (int64_t r = 0; r < m; ++r) std::memcpy(hs.data() + list[z(r)] * ff, sc.ge.data() + r * ff, z(ff) * sizeof(float));
     matmul_rows(l.down_exps, static_cast<uint64_t>(ex), 0, e, sc.ge.data(), m, ff, sc.ye.data(), e, sc);
     for (int64_t r = 0; r < m; ++r) {
       const int64_t slot = list[z(r)];
@@ -461,12 +480,18 @@ void moe(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* out) {
       for (int64_t i = 0; i < e; ++i) dst[i] = src[i] * wgt;
     }
   });
+  if (c.opt.imatrix) {
+    ImatrixEntry& ed = c.opt.imatrix->entry(l.down_exps.name, ff, ne);
+    for (int64_t k = 0; k < nu; ++k)
+      for (int64_t t = 0; t < n; ++t) ImatrixCollector::add_row(ed, sel[z(t * nu + k)], hs.data() + (t * nu + k) * ff);
+  }
   // shared expert, gated per token by sigmoid(gate_inp_shexp . x)
   std::vector<float> gs(z(n * ffs)), us(z(n * ffs)), sh(z(n * e));
-  matmul(l.gate_shexp, xn, n, e, gs.data(), ffs, c.threads, c.sc);
-  matmul(l.up_shexp, xn, n, e, us.data(), ffs, c.threads, c.sc);
+  mm(c, l.gate_shexp, xn, n, e, gs.data(), ffs);
+  mm(c, l.up_shexp, xn, n, e, us.data(), ffs);
   for (int64_t i = 0; i < n * ffs; ++i) gs[z(i)] = silu(gs[z(i)]) * us[z(i)];
-  matmul(l.down_shexp, gs.data(), n, ffs, sh.data(), e, c.threads, c.sc);
+  mm(c, l.down_shexp, gs.data(), n, ffs, sh.data(), e);
+  if (c.opt.imatrix) c.opt.imatrix->add_dense("blk." + std::to_string(c.il) + ".ffn_gate_inp_shexp.weight", xn, n, e, e);
   for (int64_t t = 0; t < n; ++t) {
     float g = 0.0f;
     for (int64_t i = 0; i < e; ++i) g += l.gate_inp_shexp[z(i)] * xn[t * e + i];
@@ -572,6 +597,7 @@ Status forward_reference(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, cons
     moe(c, l, xn.data(), y.data());
     for (int64_t i = 0; i < n * e; ++i) x[z(i)] += y[z(i)];
   }
+  if (!logits) return Status::good();  // the activations were all the caller wanted (importance matrix)
   const int64_t m = out_end - out_begin;
   for (int64_t t = 0; t < m; ++t) rms_norm(x.data() + (out_begin + t) * e, w.output_norm.data(), xn.data() + t * e, e, s.rms_eps);
   matmul(w.output, xn.data(), m, e, logits, s.n_vocab, threads, sc);

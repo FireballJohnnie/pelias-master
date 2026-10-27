@@ -138,6 +138,9 @@ void usage() {
       "                                  KL divergence of the model against a base file written by llama-perplexity\n"
       "                                  --kl-divergence-base, computed by Pelias's fp32 CPU reference forward pass;\n"
       "                                  --expert-stats: per layer and expert, how often it was picked and its routing weight\n"
+      "  imatrix --model FILE --file TEXT --out OUT.gguf [--ctx 512] [--chunks N] [--threads N] [--no-nfc]\n"
+      "                                  importance matrix from a calibration text, by the fp32 reference pass, in the\n"
+      "                                  reference's GGUF imatrix format (llama-quantize --imatrix reads it)\n"
       "  probe | train | export | serve | bench | web   not built yet (later steps)\n"
       "options: --log debug|info|warn|error (default info)");
 }
@@ -644,6 +647,85 @@ int cmd_kld(const Args& a) {
   return 0;
 }
 
+int cmd_imatrix(const Args& a) {
+  const std::string path = a.get("model"), text_path = a.get("file"), out = a.get("out");
+  if (path.empty() || text_path.empty() || out.empty()) {
+    usage();
+    return 1;
+  }
+  int threads = static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
+  int n_ctx = 512;
+  for (const char* k : {"threads", "ctx"}) {
+    if (!a.has(k)) continue;
+    const Result<std::uint64_t> r = io::parse_whole(a.get(k), 1u << 20);
+    if (!r.ok() || r.value == 0) {
+      std::fprintf(stderr, "pelias: --%s needs a whole number above 0\n", k);
+      return 1;
+    }
+    (std::string(k) == "threads" ? threads : n_ctx) = static_cast<int>(r.value);
+  }
+  os::FileMap m;
+  Status s = m.open(path);
+  if (!s) return fail_input(s);
+  io::GgufReader g;
+  s = g.parse(m);
+  if (!s) return fail_input(s);
+  const Result<model::Qwen35MoeSpec> spec = model::read_qwen35moe_spec(g);
+  if (!spec.ok()) return fail_input(spec.status);
+  const Result<model::Qwen35MoeWeights> w = model::bind_qwen35moe(g, m.data(), spec.value);
+  if (!w.ok()) return fail_input(w.status);
+  Result<tok::Tokenizer> tk = tok::Tokenizer::from_gguf(g);
+  if (!tk.ok()) return fail_input(tk.status);
+  Result<std::string> text = io::read_text_file(text_path);
+  if (!text.ok()) return fail_input(text.status);
+  tok::EncodeOptions eo;
+  eo.nfc = !a.has("no-nfc");
+  eo.parse_special = false;  // the reference tool's default: special-token text stays text
+  const std::vector<std::int32_t> ids = tk.value.encode(text.value, eo);
+  if (static_cast<std::int64_t>(ids.size()) < 2LL * n_ctx) {
+    std::fprintf(stderr, "pelias: the text gives %zu tokens; a context of %d needs at least %d\n", ids.size(), n_ctx, 2 * n_ctx);
+    return 2;
+  }
+  int n_chunk = static_cast<int>(ids.size() / static_cast<std::size_t>(n_ctx));
+  if (a.has("chunks")) {
+    const Result<std::uint64_t> r = io::parse_whole(a.get("chunks"), static_cast<std::uint64_t>(n_chunk));
+    if (!r.ok() || r.value == 0) {
+      std::fprintf(stderr, "pelias: --chunks needs a whole number from 1 to %d (what the text holds)\n", n_chunk);
+      return 1;
+    }
+    n_chunk = static_cast<int>(r.value);
+  }
+  bool found = false;
+  const bool add_bos = g.find("tokenizer.ggml.add_bos_token") && g.find("tokenizer.ggml.add_bos_token")->b;
+  const std::uint64_t bos = g.get_uint("tokenizer.ggml.bos_token_id", &found);
+  model::ImatrixCollector col;
+  model::ForwardOptions fo;
+  fo.threads = threads;
+  fo.imatrix = &col;
+  std::fprintf(stderr, "pelias imatrix: %d chunks of %d tokens (%zu in the text), %d threads, fp32 reference pass\n", n_chunk, n_ctx, ids.size(), threads);
+  Timer total;
+  for (int c = 0; c < n_chunk; ++c) {
+    Timer tc;
+    std::vector<std::int32_t> toks(ids.begin() + static_cast<std::ptrdiff_t>(c) * n_ctx, ids.begin() + static_cast<std::ptrdiff_t>(c + 1) * n_ctx);
+    if (add_bos && found) toks[0] = static_cast<std::int32_t>(bos);
+    s = model::forward_reference(spec.value, w.value, toks.data(), n_ctx, 0, n_ctx, nullptr, fo);
+    if (!s) return fail_input(s);
+    col.finish_chunk();
+    if (c == 0) std::fprintf(stderr, "pelias imatrix: %.2f seconds per chunk - ETA %.1f minutes\n", tc.seconds(), tc.seconds() * (n_chunk - 1) / 60.0);
+    else std::fprintf(stderr, "pelias imatrix: chunk %d of %d\n", c + 1, n_chunk);
+  }
+  // the dataset is named by its file name only (rule 7: no paths in outputs)
+  const std::size_t cut = text_path.find_last_of("/\\");
+  const std::string dataset = cut == std::string::npos ? text_path : text_path.substr(cut + 1);
+  s = col.write(out, {dataset}, static_cast<std::uint32_t>(n_ctx));
+  if (!s) {
+    std::fprintf(stderr, "pelias: %s\n", s.text().c_str());
+    return 6;
+  }
+  std::fprintf(stderr, "pelias imatrix: %zu entries over %u chunks written in %.1f s\n", col.entries().size(), col.chunks(), total.seconds());
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -665,6 +747,7 @@ int main(int argc, char** argv) {
   if (cmd == "verify") return cmd_verify(a);
   if (cmd == "tokenize") return cmd_tokenize(a);
   if (cmd == "kld") return cmd_kld(a);
+  if (cmd == "imatrix") return cmd_imatrix(a);
   for (const char* later : {"probe", "train", "export", "serve", "bench", "web"})
     if (cmd == later) {
       std::fprintf(stderr, "pelias: '%s' is not built yet (a later step of the order of operations)\n", later);

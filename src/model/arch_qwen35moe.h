@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "io/gguf_reader.h"
+#include "model/imatrix.h"
 #include "model/spec.h"
 #include "pelias/status.h"
 
@@ -66,10 +67,12 @@ struct ForwardOptions {
   // how many times each expert was among a token's chosen experts, and the sum of the routing weights it got.
   std::uint64_t* expert_picks = nullptr;
   double* expert_weight = nullptr;
+  // Optional importance-matrix collection (model/imatrix.h); the caller calls finish_chunk() after each call.
+  ImatrixCollector* imatrix = nullptr;
 };
 
 // Runs tokens[0..n_tokens) and writes the logits of positions [out_begin, out_end) to `logits`
-// ((out_end - out_begin) rows of spec.n_vocab floats).
+// ((out_end - out_begin) rows of spec.n_vocab floats). With `logits` null the output layer is skipped.
 Status forward_reference(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, const std::int32_t* tokens, int n_tokens, int out_begin,
                          int out_end, float* logits, const ForwardOptions& opt = {});
 

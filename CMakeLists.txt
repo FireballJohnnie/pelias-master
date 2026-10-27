@@ -72,7 +72,7 @@ pelias_add_module(pelias_plan
   SOURCES src/plan/memory_plan.cpp
   DEPENDS pelias_hal pelias_io)
 pelias_add_module(pelias_model
-  SOURCES src/model/spec.cpp src/model/arch_qwen35moe.cpp
+  SOURCES src/model/spec.cpp src/model/arch_qwen35moe.cpp src/model/imatrix.cpp
   DEPENDS pelias_io pelias_quant pelias_hal)
 if(NOT WIN32)
   find_package(Threads REQUIRED)
