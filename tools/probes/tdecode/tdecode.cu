@@ -11,6 +11,7 @@
 //                f of input blocks chosen once per token by activation energy (shared by every row), the rest filled
 //                with 0.5 through the activation block sum; f = 0, 0.25, 1
 //   tdecode prep   : activation quantization per 32 + the 8 bit planes by warp ballot, checked against the host
+//   tdecode gemv2  : version 2 kernels (lanes split each row), cold L2 (64 MiB written between launches), median of 50
 // Device layouts are the engine's (repacked at load from the GGUF blocks): headers and H bits in their own arrays.
 // Build (WSL): nvcc -std=c++17 -O3 -arch=sm_89 tdecode.cu -o tdecode
 #include <cuda_fp16.h>
@@ -312,7 +313,123 @@ __global__ void gemv_zh(const uint8_t* __restrict__ base, const uint64_t* __rest
   y[r] = acc;
 }
 
+// ------------------------------------------------------------------------------------------------ v2: lanes split K
+// Version 2 (2026-10-28 17:3x). The first run gave one thread per output row (~1.4 warps per scheduler, a latency-bound
+// chain; Fable's read-only review agreed) and timed L2-warm. Here each lane takes 4 consecutive 32-blocks (128 values)
+// of one row, K / 128 lanes per row, shuffle reduction; activations read straight from global (shared through L1 by
+// every row on the SM). Same arrays as version 1, the ZH H plane kept block-major (hp[block][row]: a 32-byte sector
+// holds one block for 8 rows, so a gate fetches exactly the selected sectors). Identity:
+// sum (2b - 127) x = 2 dp4a(b, x) - 127 sum(x); b <= 127 fits a signed byte.
+// ROUTE 0: Q8_Z. 1: Q7_ZT, H as bytes into dp4a (int8 route). 2: Q7_ZT, H by AND + popcount (T-decode).
+// 3: ZH arrays, H read where sel[block] (1-bit), else the 0.5 fill.
+template <int K, int ROUTE>
+__global__ void gemv_w(const int8_t* __restrict__ v8, const uint8_t* __restrict__ base, const uint64_t* __restrict__ hdr,
+                       const uint8_t* __restrict__ mask, const uint32_t* __restrict__ hb, const uint32_t* __restrict__ hp,
+                       const uint8_t* __restrict__ sel, int n, const int8_t* __restrict__ q, const float* __restrict__ sc,
+                       const int* __restrict__ sm, const uint32_t* __restrict__ pl, float* __restrict__ y) {
+  constexpr int LPR = K / 128;
+  static_assert(LPR >= 1 && LPR <= 32 && (32 % LPR) == 0, "K / 128 lanes per row must divide a warp");
+  const int gt = blockIdx.x * blockDim.x + threadIdx.x;
+  const int r = gt / LPR, part = gt % LPR;
+  float acc = 0.f;
+  if (r < n) {
+    const int j0 = part * 4;  // first 32-block of this lane (row-global index)
+    int xw[32];
+    {
+      const int4* x4 = reinterpret_cast<const int4*>(q + j0 * 32);
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const int4 t = __ldg(x4 + i);
+        xw[4 * i] = t.x; xw[4 * i + 1] = t.y; xw[4 * i + 2] = t.z; xw[4 * i + 3] = t.w;
+      }
+    }
+    if (ROUTE == 0) {
+      const int4* w4 = reinterpret_cast<const int4*>(v8 + static_cast<size_t>(r) * K + j0 * 32);
+      int4 w[8];
+#pragma unroll
+      for (int i = 0; i < 8; ++i) w[i] = w4[i];
+#pragma unroll
+      for (int jj = 0; jj < 4; ++jj) {
+        const int jg = j0 + jj;
+        int p = 0;
+        p = __dp4a(w[2 * jj].x, xw[8 * jj], p); p = __dp4a(w[2 * jj].y, xw[8 * jj + 1], p);
+        p = __dp4a(w[2 * jj].z, xw[8 * jj + 2], p); p = __dp4a(w[2 * jj].w, xw[8 * jj + 3], p);
+        p = __dp4a(w[2 * jj + 1].x, xw[8 * jj + 4], p); p = __dp4a(w[2 * jj + 1].y, xw[8 * jj + 5], p);
+        p = __dp4a(w[2 * jj + 1].z, xw[8 * jj + 6], p); p = __dp4a(w[2 * jj + 1].w, xw[8 * jj + 7], p);
+        acc += zscale(hdr[static_cast<size_t>(r) * (K / 256) + jg / 8], jg % 8) * __ldg(sc + jg) * static_cast<float>(p);
+      }
+    } else {
+      uint32_t wd[29];
+      {
+        const int4* b4 = reinterpret_cast<const int4*>(base + static_cast<size_t>(r) * (K / 256) * 224 + part * 112);
+#pragma unroll
+        for (int i = 0; i < 7; ++i) {
+          const int4 t = b4[i];
+          wd[4 * i] = static_cast<uint32_t>(t.x); wd[4 * i + 1] = static_cast<uint32_t>(t.y);
+          wd[4 * i + 2] = static_cast<uint32_t>(t.z); wd[4 * i + 3] = static_cast<uint32_t>(t.w);
+        }
+        wd[28] = 0u;
+      }
+#pragma unroll
+      for (int jj = 0; jj < 4; ++jj) {
+        const int jg = j0 + jj, B = jg / 8, j = jg % 8;
+        const size_t rb = static_cast<size_t>(r) * (K / 256) + B;
+        int pb = 0;
+#pragma unroll
+        for (int g = 0; g < 8; ++g) {
+          uint32_t packed = 0;
+#pragma unroll
+          for (int t = 0; t < 4; ++t) {
+            const int i = 32 * jj + 4 * g + t, bit = 7 * i;
+            const uint32_t v = __funnelshift_r(wd[bit >> 5], wd[(bit >> 5) + 1], bit & 31) & 127u;
+            packed |= v << (8 * t);
+          }
+          pb = __dp4a(static_cast<int>(packed), xw[8 * jj + g], pb);
+        }
+        const int sx = __ldg(sm + jg);
+        bool readH = false;
+        uint32_t H = 0;
+        if (ROUTE == 1 || ROUTE == 2) {
+          const unsigned m = mask[rb];
+          if ((m >> j) & 1u) {
+            readH = true;
+            H = hb[rb * 2 + __popc(m & ((1u << j) - 1u))];
+          }
+        } else if (__ldg(sel + jg)) {
+          readH = true;
+          H = hp[static_cast<size_t>(jg) * n + r];
+        }
+        int hx = 0;
+        if (readH) {
+          if (ROUTE == 1) {
+#pragma unroll
+            for (int g = 0; g < 8; ++g) {
+              const uint32_t nib = (H >> (4 * g)) & 0xfu;
+              hx = __dp4a(static_cast<int>((nib * 0x00204081u) & 0x01010101u), xw[8 * jj + g], hx);
+            }
+          } else {
+            const uint32_t* pp = pl + jg * 8;
+            hx = -128 * __popc(H);
+#pragma unroll
+            for (int k = 0; k < 8; ++k) hx += __popc(H & __ldg(pp + k)) << k;
+          }
+        }
+        const int P = 2 * pb - 127 * sx;
+        const int P2 = (ROUTE == 3 && !readH) ? 2 * P + sx : 2 * (P + hx);  // twice the partial sum; 0.5 fill when H is not read
+        acc += zscale(hdr[rb], j) * __ldg(sc + jg) * (0.5f * static_cast<float>(P2));
+      }
+    }
+  }
+#pragma unroll
+  for (int o = LPR / 2; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+  if (r < n && part == 0) y[r] = acc;
+}
+
 // ------------------------------------------------------------------------------------------------ host side
+static bool g_cold = false, g_v1 = true, g_v2 = false;
+static void* g_flush = nullptr;
+static const size_t kFlushBytes = 64ull << 20;
+
 static uint16_t f2h(float f) { return __half_as_ushort(__float2half(f)); }
 static float h2f(uint16_t b) { return __half2float(__ushort_as_half(b)); }
 
@@ -518,7 +635,35 @@ static int run_shape(int n, std::mt19937& rng) {
     }
     return y;
   };
+  auto check_cold = [&](const char* name, const std::vector<double>& yr, double bytes, auto launch) {
+    launch();
+    CK(cudaDeviceSynchronize());
+    std::vector<float> yg(static_cast<size_t>(n));
+    CK(cudaMemcpy(yg.data(), d_y, n * 4, cudaMemcpyDeviceToHost));
+    double worst = 0, scale = 0;
+    for (int r = 0; r < n; ++r) scale = std::max(scale, std::fabs(yr[static_cast<size_t>(r)]));
+    for (int r = 0; r < n; ++r) worst = std::max(worst, std::fabs(yg[static_cast<size_t>(r)] - yr[static_cast<size_t>(r)]));
+    cudaEvent_t e0, e1;
+    CK(cudaEventCreate(&e0));
+    CK(cudaEventCreate(&e1));
+    const int reps = 50;
+    std::vector<float> t(reps);
+    for (int i = 0; i < reps; ++i) {
+      CK(cudaMemsetAsync(g_flush, i & 0xff, kFlushBytes));  // 64 MiB written between launches: the 36 MB L2 holds none of the weights
+      CK(cudaEventRecord(e0));
+      launch();
+      CK(cudaEventRecord(e1));
+      CK(cudaEventSynchronize(e1));
+      CK(cudaEventElapsedTime(&t[static_cast<size_t>(i)], e0, e1));
+    }
+    std::sort(t.begin(), t.end());
+    const double us = t[reps / 2] * 1e3;  // median
+    std::printf("  %-30s %8.2f us cold  %7.1f GB/s  bytes %.2f MB (%.3f bits per weight)  max err %.2e of max |y| (%s)\n", name, us,
+                bytes / (us * 1e3), bytes / 1e6, bytes * 8.0 / (static_cast<double>(n) * K), worst / scale, worst / scale < 1e-5 ? "ok" : "FAIL");
+    return worst / scale < 1e-5 ? 0 : 1;
+  };
   auto check = [&](const char* name, const std::vector<double>& yr, double bytes, auto launch) {
+    if (g_cold) return check_cold(name, yr, bytes, launch);
     launch();
     CK(cudaDeviceSynchronize());
     std::vector<float> yg(static_cast<size_t>(n));
@@ -545,20 +690,38 @@ static int run_shape(int n, std::mt19937& rng) {
   std::printf("shape: %d outputs x %d inputs\n", n, K);
   int fails = 0;
   const double hdrB = static_cast<double>(n) * nB * 8;
+  const double ztB = static_cast<double>(n) * nB * (224 + 1 + 8) + hdrB;
+  const double zbB = static_cast<double>(n) * nB * 224 + hdrB;
   const std::vector<double> r8 = ref(0, nullptr), r7 = ref(1, nullptr), z0 = ref(2, &sel0), z25 = ref(2, &sel25), z100 = ref(2, &sel100);
+  if (g_v1) {
   fails += check("Q8_Z (int8, baseline)", r8, static_cast<double>(n) * K + hdrB,
                  [&] { gemv_q8z<K><<<G, T>>>(d_v8, d_hdr, n, dq, dsc, dsm, dpl, d_y); });
-  const double ztB = static_cast<double>(n) * nB * (224 + 1 + 8) + hdrB;
   fails += check("Q7_ZT fold (int8 route)", r7, ztB,
                  [&] { gemv_q7zt<K, false><<<G, T>>>(d_b7, d_hdr, d_mask, d_hb, n, dq, dsc, dsm, dpl, d_y); });
   fails += check("Q7_ZT 1-bit (T-decode)", r7, ztB,
                  [&] { gemv_q7zt<K, true><<<G, T>>>(d_b7, d_hdr, d_mask, d_hb, n, dq, dsc, dsm, dpl, d_y); });
-  const double zbB = static_cast<double>(n) * nB * 224 + hdrB;
   fails += check("ZH live, H on 0 %", z0, zbB, [&] { gemv_zh<K><<<G, T>>>(d_bz, d_hdr, d_hp, d_s0, n, dq, dsc, dsm, dpl, d_y); });
   fails += check("ZH live, H on 25 % (shared)", z25, zbB + static_cast<double>(n) * (nb / 4) * 4,
                  [&] { gemv_zh<K><<<G, T>>>(d_bz, d_hdr, d_hp, d_s25, n, dq, dsc, dsm, dpl, d_y); });
   fails += check("ZH live, H on 100 %", z100, zbB + static_cast<double>(n) * nb * 4,
                  [&] { gemv_zh<K><<<G, T>>>(d_bz, d_hdr, d_hp, d_s100, n, dq, dsc, dsm, dpl, d_y); });
+  }
+  if (g_v2) {
+    const int T2 = 128, G2 = (n * (K / 128) + T2 - 1) / T2;
+    std::printf("  -- version 2 (lanes split each row, %d lanes per row)\n", K / 128);
+    fails += check("v2 Q8_Z (int8, baseline)", r8, static_cast<double>(n) * K + hdrB,
+                   [&] { gemv_w<K, 0><<<G2, T2>>>(d_v8, nullptr, d_hdr, nullptr, nullptr, nullptr, nullptr, n, dq, dsc, dsm, dpl, d_y); });
+    fails += check("v2 Q7_ZT, H as int8 bytes", r7, ztB,
+                   [&] { gemv_w<K, 1><<<G2, T2>>>(nullptr, d_b7, d_hdr, d_mask, d_hb, nullptr, nullptr, n, dq, dsc, dsm, dpl, d_y); });
+    fails += check("v2 Q7_ZT, H by 1-bit decode", r7, ztB,
+                   [&] { gemv_w<K, 2><<<G2, T2>>>(nullptr, d_b7, d_hdr, d_mask, d_hb, nullptr, nullptr, n, dq, dsc, dsm, dpl, d_y); });
+    fails += check("v2 ZH arrays, H on 0 %", z0, zbB,
+                   [&] { gemv_w<K, 3><<<G2, T2>>>(nullptr, d_bz, d_hdr, nullptr, nullptr, d_hp, d_s0, n, dq, dsc, dsm, dpl, d_y); });
+    fails += check("v2 ZH arrays, H on 25 %", z25, zbB + static_cast<double>(n) * (nb / 4) * 4,
+                   [&] { gemv_w<K, 3><<<G2, T2>>>(nullptr, d_bz, d_hdr, nullptr, nullptr, d_hp, d_s25, n, dq, dsc, dsm, dpl, d_y); });
+    fails += check("v2 ZH arrays, H on 100 %", z100, zbB + static_cast<double>(n) * nb * 4,
+                   [&] { gemv_w<K, 3><<<G2, T2>>>(nullptr, d_bz, d_hdr, nullptr, nullptr, d_hp, d_s100, n, dq, dsc, dsm, dpl, d_y); });
+  }
   CK(cudaGetLastError());
   for (void* p : {static_cast<void*>(dx), static_cast<void*>(dq), static_cast<void*>(dsc), static_cast<void*>(dsm), static_cast<void*>(dpl),
                   static_cast<void*>(d_v8), static_cast<void*>(d_hdr), static_cast<void*>(d_b7), static_cast<void*>(d_bz), static_cast<void*>(d_mask),
@@ -571,7 +734,13 @@ static int run_shape(int n, std::mt19937& rng) {
 int main(int argc, char** argv) {
   const std::string cmd = argc > 1 ? argv[1] : "";
   if (cmd == "mma") return run_mma();
-  if (cmd == "gemv" || cmd == "prep") {
+  if (cmd == "gemv" || cmd == "prep" || cmd == "gemv2") {
+    if (cmd == "gemv2") {  // version 2 only, cold L2, median of 50
+      g_v1 = false;
+      g_v2 = true;
+      g_cold = true;
+      CK(cudaMalloc(&g_flush, kFlushBytes));
+    }
     std::mt19937 rng(12345);
     int fails = 0;
     fails += run_shape<2048>(8192, rng);  // attn_qkv-like: 2048 inputs, 8192 outputs
@@ -582,6 +751,6 @@ int main(int argc, char** argv) {
     std::printf("%s\n", fails ? "SOME ROUTES FAILED" : "all routes match the host reference");
     return fails ? 1 : 0;
   }
-  std::fprintf(stderr, "usage: tdecode mma | gemv\n");
+  std::fprintf(stderr, "usage: tdecode mma | gemv | gemv2\n");
   return 1;
 }

@@ -16,3 +16,11 @@ Checked before the first run (sandbox): the kernels compile to PTX for sm_89 wit
 Build and run (WSL, after any other run on the machine has finished):
 
     export PATH=/usr/local/cuda/bin:$PATH && nvcc -std=c++17 -O3 -arch=sm_89 tdecode.cu -o tdecode && ./tdecode mma && ./tdecode gemv
+
+## Version 2 (2026-10-28 17:4x, not yet run)
+
+The first run (log in `data/probe_results/tdecode/`) was exact on every route, measured the 1-bit tensor path at 8.00x the int8 bit-products and the popcount 8th bit at about 2 % over folding, but every 7-bit route ran 1.4-2.8x slower than Q8_Z: the kernels gave one thread per output row (about 1.4 warps per scheduler, a latency-bound chain), and the timing was L2-warm (Q8_Z at 895 GB/s, above the 504 GB/s of VRAM). Fable's read-only review agreed and weighed the author's array idea: it holds (separate arrays by role make "read H on f of the blocks" cost exactly f x 1 bit per weight), with H kept grouped by input block.
+
+`tdecode gemv2` runs the version 2 kernel (`gemv_w`): each lane takes 4 consecutive 32-blocks of one row (K / 128 lanes per row, shuffle reduction, 16-byte loads), activations read from global, the identity sum (2b - 127) x = 2 dp4a(b, x) - 127 sum x, H as spread bytes into dp4a or by AND + popcount, the ZH arrays with H block-major. Timing is cold: 64 MiB written between launches, median of 50. Checked before any run: device code compiles to PTX for sm_89 and the host code passes a clang syntax check; the integer paths emulated on 6,000 blocks, 0 mismatches (`tools/experiments/tdecode_kernel_emul_v2.py`).
+
+    nvcc -std=c++17 -O3 -arch=sm_89 tdecode.cu -o tdecode && ./tdecode gemv2
