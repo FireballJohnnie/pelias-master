@@ -1,0 +1,1 @@
+2026-10-28 05:57-07:04 | wsl bash /mnt/d/pelias-tests/gp/block_m.sh b | log D:\pelias-tests\gp\M\b_20261028_055721.log | dumps M\skip25.kld, M\skip40.kld, M\skip50.kld | about 22 min per 100-chunk run | all three re-verified from the dumps in Python (identical to kld-compare)

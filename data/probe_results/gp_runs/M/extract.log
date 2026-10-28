@@ -1,0 +1,3 @@
+blk.20.attn_qkv.weight [2048, 8192] type 30 -> 33554432 bytes
+blk.20.ffn_down_exps.weight [512, 2048, 4] type 30 -> 8388608 bytes
+blk.20.ffn_gate_exps.weight [2048, 512, 4] type 30 -> 8388608 bytes

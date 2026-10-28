@@ -1,0 +1,26 @@
+2026-10-27 16:36:54	GP1-01	stock (Pelias fp32 reference) 1280 s	Mean KLD: 0.039013 ± 0.000659	Same top p: 91.573 ± 0.174 %	/mnt/d/pelias-tests/gp/GP1-01/block_a_20261027_161528.log
+2026-10-27 16:59:15	GP1-02	stock, llama.cpp (--no-op-offload) 557 s	Mean KLD: 0.041468 ± 0.000717	Same top p: 91.114 ± 0.178 %	/mnt/d/pelias-tests/gp/GP1-02/stock_nooffload_20261027_164957.log
+2026-10-27 18:04:17	GP1-03	a_allcpu 1335 s	Mean KLD: 0.041397 ± 0.000710	Same top p: 91.282 ± 0.177 %	/mnt/d/pelias-tests/gp/GP1-03/a_allcpu_20261027_174202.log
+2026-10-27 18:48:19	GP1-03	b_allgpu 1432 s	Mean KLD: 0.039623 ± 0.000690	Same top p: 91.486 ± 0.175 %	/mnt/d/pelias-tests/gp/GP1-03/b_allgpu_20261027_182427.log
+2026-10-27 19:33:25	GP1-03	c_expsgpu 1293 s	Mean KLD: 0.038969 ± 0.000650	Same top p: 91.820 ± 0.172 %	/mnt/d/pelias-tests/gp/GP1-03/c_expsgpu_20261027_191152.log
+2026-10-27 20:18:02	GP1-03	d_densegpu 1414 s	Mean KLD: 0.039988 ± 0.000801	Same top p: 91.557 ± 0.174 %	/mnt/d/pelias-tests/gp/GP1-03/d_densegpu_20261027_195427.log
+2026-10-27 21:58:21	J	r1_dense_rot 1519 s	Mean KLD: 0.038802 ± 0.000640	Same top p: 91.580 ± 0.174 %	/mnt/d/pelias-tests/gp/J/r1_dense_rot_20261027_213258.log
+2026-10-27 22:52:35	J	r2_dense_fp32 1377 s	Mean KLD: 0.035564 ± 0.000641	Same top p: 91.859 ± 0.171 %	/mnt/d/pelias-tests/gp/J/r2_dense_20261027_222315.log
+2026-10-27 23:17:11	J	r2_dense_q81 1475 s	Mean KLD: 0.035297 ± 0.000583	Same top p: 91.741 ± 0.172 %	/mnt/d/pelias-tests/gp/J/r2_dense_20261027_222315.log
+2026-10-27 23:45:49	J	ctrl_fp32 1311 s	Mean KLD: 0.039018 ± 0.000659	Same top p: 91.561 ± 0.174 %	/mnt/d/pelias-tests/gp/J/ctrl_20261027_231742.log
+2026-10-28 00:13:45	J	r2b_exps_fp32 1319 s	Mean KLD: 0.039544 ± 0.000686	Same top p: 91.596 ± 0.174 %	/mnt/d/pelias-tests/gp/J/r2b_exps_20261027_234626.log
+2026-10-28 00:47:21	K	bf16_10 (floor of the base, GP1-07) 1161 s	Mean KLD: 0.002801 ± 0.000281	Same top p: 98.078 ± 0.272 %	/mnt/d/pelias-tests/gp/K/routes_20261028_002755.log
+2026-10-28 00:50:13	K	stock_10 172 s	Mean KLD: 0.041817 ± 0.002037	Same top p: 92.000 ± 0.537 %	/mnt/d/pelias-tests/gp/K/routes_20261028_002755.log
+2026-10-28 02:27:05	L	unsloth 1283 s	Mean KLD: 0.012095 ± 0.000346	Same top p: 95.153 ± 0.134 %	/mnt/d/pelias-tests/gp/L/c_20261028_020541.log
+2026-10-28 03:00:04	L	t8r 1372 s	Mean KLD: 0.012941 ± 0.000434	Same top p: 95.141 ± 0.135 %	/mnt/d/pelias-tests/gp/L/c_20261028_020541.log
+2026-10-28 03:35:38	L	t9r 1441 s	Mean KLD: 0.013479 ± 0.000416	Same top p: 95.161 ± 0.134 %	/mnt/d/pelias-tests/gp/L/c_20261028_020541.log
+2026-10-28 04:10:20	N	mtp_fp32 1246 s	Mean KLD: 0.012231 ± 0.000362	Same top p: 95.212 ± 0.134 %	/mnt/d/pelias-tests/gp/N/mtp_20261028_034928.log
+2026-10-28 04:33:54	N	mtp_a8 1414 s	Mean KLD: 0.012864 ± 0.000376	Same top p: 95.035 ± 0.136 %	/mnt/d/pelias-tests/gp/N/mtp_20261028_034928.log
+2026-10-28 05:02:30	M	defer1 1355 s	Mean KLD: 0.017154 ± 0.000441	Same top p: 94.180 ± 0.147 %	/mnt/d/pelias-tests/gp/M/a_20261028_043950.log
+2026-10-28 05:24:44	M	defer2 1334 s	Mean KLD: 0.023002 ± 0.000556	Same top p: 93.310 ± 0.156 %	/mnt/d/pelias-tests/gp/M/a_20261028_043950.log
+2026-10-28 05:47:01	M	swap001 1337 s	Mean KLD: 0.014606 ± 0.000519	Same top p: 94.718 ± 0.140 %	/mnt/d/pelias-tests/gp/M/a_20261028_043950.log
+2026-10-28 06:19:42	M	skip25 1341 s	Mean KLD: 0.013526 ± 0.000412	Same top p: 94.996 ± 0.137 %	/mnt/d/pelias-tests/gp/M/b_20261028_055721.log
+2026-10-28 06:42:09	M	skip40 1347 s	Mean KLD: 0.017611 ± 0.000623	Same top p: 94.259 ± 0.146 %	/mnt/d/pelias-tests/gp/M/b_20261028_055721.log
+2026-10-28 07:04:24	M	skip50 1335 s	Mean KLD: 0.024159 ± 0.000562	Same top p: 93.306 ± 0.157 %	/mnt/d/pelias-tests/gp/M/b_20261028_055721.log
+2026-10-28 07:43:42	M	a8all 1431 s	Mean KLD: 0.013106 ± 0.000406	Same top p: 95.212 ± 0.134 %	/mnt/d/pelias-tests/gp/M/c_20261028_071951.log
+2026-10-28 08:06:05	M	a4dense 1343 s	Mean KLD: 0.045766 ± 0.000637	Same top p: 89.788 ± 0.190 %	/mnt/d/pelias-tests/gp/M/c_20261028_071951.log

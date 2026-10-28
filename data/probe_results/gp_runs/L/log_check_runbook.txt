@@ -1,0 +1,1 @@
+- 2026-10-28 01:10-01:16: block_l check RAN: R2 rebuilt through --recipe is byte-identical to r2_dense.gguf (prediction met). NEXT: block_l imatrix (rotated matrix from the v2 calibration text), then block_l c (Unsloth, t8r, t9r).

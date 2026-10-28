@@ -1,0 +1,1 @@
+- 2026-10-27 23:18-23:45: ctrl RAN (exact unrotated twin). ctrl vs stock +0.000005 (the 13 ssm_a values are negligible). R2 vs ctrl -0.003454, t -6.06: the clean rotation gain. NEXT: R2b (experts rotated), started 23:4x.

@@ -1,0 +1,1 @@
+- 2026-10-28 01:20-02:05: block_l imatrix RAN: 510 entries, 310 rotated, 200 chunks, 2683 s. NEXT: Block M weight slice extraction (1 min, approved 02:01), then block_l c (Unsloth, t8r, t9r).

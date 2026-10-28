@@ -1,0 +1,16 @@
+{
+  "cpu_threads": 7,
+  "seconds_each": 30,
+  "cpu_alone_gb_s": 43.2653,
+  "gpu_zero_copy_alone_gb_s": 24.6299,
+  "h2d_copy_alone_gb_s": 26.1996,
+  "concurrent_all": {"cpu_gb_s": 24.3653, "zero_copy_gb_s": 11.4611, "h2d_gb_s": 11.4611, "combined_gb_s": 47.2875, "combined_vs_cpu_alone": 1.09297},
+  "concurrent_cpu_plus_h2d": {"cpu_gb_s": 22.8928, "h2d_gb_s": 25.8528, "combined_gb_s": 48.7456, "combined_vs_cpu_alone": 1.12667, "cpu_keeps_fraction": 0.529127},
+  "concurrent_cpu_plus_zero_copy": {"cpu_gb_s": 25.6, "zero_copy_gb_s": 20.5481, "combined_gb_s": 46.148, "combined_vs_cpu_alone": 1.06663, "cpu_keeps_fraction": 0.591698},
+  "ceiling_floors": {"config": "cpu_plus_zero_copy", "combined_ge_43": true, "combined_ge_40": true, "cpu_share_ge_17": true, "pcie_alone_ge_24": true},
+  "phase_7a_greenlight_needs_gb_s": 54.0816,
+  "combined_concurrent_gb_s": 47.2875,
+  "combined_vs_cpu_ratio": 1.09297,
+  "phase_7a_greenlight": false,
+  "checksum": 3182917
+}

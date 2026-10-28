@@ -1,0 +1,4 @@
+
+== GP1-03 c_expsgpu | Pelias KLD of the stock file, --act-int8 _exps --act-int8-path gpu | started 2026-10-27 19:10:44 | ETA about 22 min | log /mnt/d/pelias-tests/gp/GP1-03/c_expsgpu_20261027_191044.log
+2113955 bash -c setsid nohup bash /mnt/d/pelias-tests/gp/block_b.sh c > /dev/null 2>&1 < /dev/null & sleep 20; pgrep -af 'pelias kld' | cut -c1-80; tail -2 /mnt/d/pelias-tests/gp/live.log
+STOP: llama.cpp or pelias is already running in WSL

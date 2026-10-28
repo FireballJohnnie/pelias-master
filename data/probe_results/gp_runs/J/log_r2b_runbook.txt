@@ -1,0 +1,1 @@
+- 2026-10-27 23:46 - 2026-10-28 00:14: R2b RAN (experts rotated). 0.039544; vs stock +0.000530 (no difference), vs R2 +0.003979 (R2 better). Prediction MISSED. Decision: rotate dense weights only. NEXT (needs author OK): R2-256, R2-row, block_k routes.

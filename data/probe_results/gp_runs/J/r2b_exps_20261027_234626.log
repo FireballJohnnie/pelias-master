@@ -1,0 +1,259 @@
+
+== J r2b_exps | expert weights stored rotated: build from bf16, verify, fp32 run | started 2026-10-27 23:46:26 | ETA about 40-55 min | log /mnt/d/pelias-tests/gp/J/r2b_exps_20261027_234626.log
+From <backup>/2026-10-27/pelias-master_main_e15515f.bundle
+ * branch            main       -> FETCH_HEAD
+Already up to date.
+ninja: no work to do.
+build ok: pelias 0.2.0 (e15515f, Release) backends: none (host-only build)
+== R2b PREDICTION (written 10-27 22:4x): fp32 below stock 0.039013 with the interval below zero; the gain is at most about 0.0059 (DERIVED: the three expert groups' measured drops at Q8_0 summed: 0.002384 + 0.002127 + 0.001414); tiny model -0.1 %.
+free space at /mnt/d/pelias-tests/rot: 100 GB; this step writes about 22 GB
+quantizing 753 tensors to Q4_K_M
+   10 % (76 of 753 tensors)
+   20 % (151 of 753 tensors)
+   30 % (226 of 753 tensors)
+   40 % (302 of 753 tensors)
+   50 % (377 of 753 tensors)
+   60 % (452 of 753 tensors)
+   70 % (528 of 753 tensors)
+   80 % (603 of 753 tensors)
+   90 % (678 of 753 tensors)
+  100 % (753 of 753 tensors)
+rotated (Walsh-Hadamard per 32, recorded in pelias.rot32.tensors): 123 tensors
+done: 753 tensors (443 quantized, 310 copied unchanged), 66.18 GiB in, 20.21 GiB out, 310.3 s
+  F32    310 tensors
+  Q4_K   379 tensors
+  Q6_K   64 tensors
+built /mnt/d/pelias-tests/rot/r2b_exps.gguf (21713467648 bytes) in 315 s
+tensors: 753 / 753; identical 621; type differs 0; shape differs 0; data differs 132; only in one file 0 / 0
+metadata identical: no; tensor order identical: yes; files byte-identical: no
+  metadata entries: 53 / 51
+  blk.0.ffn_down_exps.weight: data differs from byte 0 (block 0)
+  blk.0.ffn_gate_exps.weight: data differs from byte 0 (block 0)
+  blk.0.ffn_up_exps.weight: data differs from byte 0 (block 0)
+  blk.1.ffn_down_exps.weight: data differs from byte 0 (block 0)
+  blk.1.ffn_gate_exps.weight: data differs from byte 0 (block 0)
+  blk.1.ffn_up_exps.weight: data differs from byte 0 (block 0)
+  blk.1.ssm_a: data differs from byte 84 (block 21); 1 of 32 values differ, by at most 1 units in the last place
+  blk.2.ffn_down_exps.weight: data differs from byte 0 (block 0)
+  blk.2.ffn_gate_exps.weight: data differs from byte 0 (block 0)
+  blk.2.ffn_up_exps.weight: data differs from byte 0 (block 0)
+  blk.3.ffn_down_exps.weight: data differs from byte 0 (block 0)
+  blk.3.ffn_gate_exps.weight: data differs from byte 0 (block 0)
+  blk.3.ffn_up_exps.weight: data differs from byte 0 (block 0)
+  blk.4.ffn_down_exps.weight: data differs from byte 0 (block 0)
+  blk.4.ffn_gate_exps.weight: data differs from byte 0 (block 0)
+  blk.4.ffn_up_exps.weight: data differs from byte 0 (block 0)
+  blk.4.ssm_a: data differs from byte 64 (block 16); 2 of 32 values differ, by at most 1 units in the last place
+  blk.5.ffn_down_exps.weight: data differs from byte 0 (block 0)
+  blk.5.ffn_gate_exps.weight: data differs from byte 0 (block 0)
+  blk.5.ffn_up_exps.weight: data differs from byte 0 (block 0)
+  blk.6.ffn_down_exps.weight: data differs from byte 0 (block 0)
+  blk.6.ffn_gate_exps.weight: data differs from byte 0 (block 0)
+  blk.6.ffn_up_exps.weight: data differs from byte 0 (block 0)
+  blk.6.ssm_a: data differs from byte 12 (block 3); 1 of 32 values differ, by at most 1 units in the last place
+  blk.7.ffn_down_exps.weight: data differs from byte 0 (block 0)
+  blk.7.ffn_gate_exps.weight: data differs from byte 0 (block 0)
+  blk.7.ffn_up_exps.weight: data differs from byte 0 (block 0)
+  blk.8.ffn_down_exps.weight: data differs from byte 0 (block 0)
+  blk.8.ffn_gate_exps.weight: data differs from byte 0 (block 0)
+  blk.8.ffn_up_exps.weight: data differs from byte 0 (block 0)
+  blk.9.ffn_down_exps.weight: data differs from byte 0 (block 0)
+  blk.9.ffn_gate_exps.weight: data differs from byte 0 (block 0)
+  blk.9.ffn_up_exps.weight: data differs from byte 0 (block 0)
+  blk.10.ffn_down_exps.weight: data differs from byte 0 (block 0)
+  blk.10.ffn_gate_exps.weight: data differs from byte 0 (block 0)
+  blk.10.ffn_up_exps.weight: data differs from byte 0 (block 0)
+  blk.11.ffn_down_exps.weight: data differs from byte 0 (block 0)
+  blk.11.ffn_gate_exps.weight: data differs from byte 0 (block 0)
+  blk.11.ffn_up_exps.weight: data differs from byte 0 (block 0)
+  blk.12.ffn_down_exps.weight: data differs from byte 0 (block 0)
+  blk.12.ffn_gate_exps.weight: data differs from byte 0 (block 0)
+  blk.12.ffn_up_exps.weight: data differs from byte 0 (block 0)
+  blk.13.ffn_down_exps.weight: data differs from byte 0 (block 0)
+  blk.13.ffn_gate_exps.weight: data differs from byte 0 (block 0)
+  blk.13.ffn_up_exps.weight: data differs from byte 0 (block 0)
+  blk.14.ffn_down_exps.weight: data differs from byte 0 (block 0)
+  blk.14.ffn_gate_exps.weight: data differs from byte 0 (block 0)
+  blk.14.ffn_up_exps.weight: data differs from byte 0 (block 0)
+  blk.15.ffn_down_exps.weight: data differs from byte 0 (block 0)
+  blk.15.ffn_gate_exps.weight: data differs from byte 0 (block 0)
+  blk.15.ffn_up_exps.weight: data differs from byte 0 (block 0)
+  blk.16.ffn_down_exps.weight: data differs from byte 0 (block 0)
+  blk.16.ffn_gate_exps.weight: data differs from byte 0 (block 0)
+  blk.16.ffn_up_exps.weight: data differs from byte 0 (block 0)
+  blk.17.ffn_down_exps.weight: data differs from byte 0 (block 0)
+  blk.17.ffn_gate_exps.weight: data differs from byte 0 (block 0)
+  blk.17.ffn_up_exps.weight: data differs from byte 0 (block 0)
+  blk.18.ffn_down_exps.weight: data differs from byte 0 (block 0)
+  blk.18.ffn_gate_exps.weight: data differs from byte 0 (block 0)
+  blk.18.ffn_up_exps.weight: data differs from byte 0 (block 0)
+  blk.19.ffn_down_exps.weight: data differs from byte 0 (block 0)
+  blk.19.ffn_gate_exps.weight: data differs from byte 0 (block 0)
+  blk.19.ffn_up_exps.weight: data differs from byte 0 (block 0)
+compared in 3.2 s
+verify against stock: tensors: 753 / 753; identical 621; type differs 0; shape differs 0; data differs 132; only in one file 0 / 0
+CONTROL NOT REPRODUCED: 132 tensors differ, 123 were rotated. Run block_j2.sh ctrl for an exact control before reading the result
+pelias: 120 weights are stored rotated (pelias.rot32.tensors); their inputs are rotated to match
+pelias kld: 100 chunks of 512 tokens, positions 256..510 scored, vocabulary 248320, 16 threads, fp32 reference pass
+chunk             PPL               ln(PPL(Q)/PPL(base))          KL Divergence              Δp RMS            Same top p
+   1       4.1443 ±    0.5703       0.01800 ±    0.01093       0.02115 ±    0.00387     4.477 ±  0.908 %    96.471 ±  1.158 %
+pelias kld: 47.48 seconds per chunk - ETA 78.3 minutes
+   2       5.8647 ±    0.6734       0.01069 ±    0.01046       0.02588 ±    0.00277     4.585 ±  0.564 %    93.725 ±  1.075 %
+   3       5.0755 ±    0.4606      -0.01079 ±    0.01378       0.04538 ±    0.00419     5.999 ±  0.518 %    92.680 ±  0.942 %
+   4       5.0466 ±    0.3796      -0.01746 ±    0.01296       0.04939 ±    0.00473     6.176 ±  0.485 %    92.255 ±  0.837 %
+   5       5.2041 ±    0.3441      -0.01308 ±    0.01116       0.04610 ±    0.00383     5.970 ±  0.407 %    92.314 ±  0.746 %
+   6       5.3981 ±    0.3253      -0.00852 ±    0.00977       0.04509 ±    0.00324     5.975 ±  0.354 %    92.026 ±  0.693 %
+   7       5.6557 ±    0.3180      -0.00575 ±    0.00888       0.04396 ±    0.00281     5.847 ±  0.317 %    91.933 ±  0.645 %
+   8       6.1622 ±    0.3343      -0.00353 ±    0.00817       0.04318 ±    0.00249     5.687 ±  0.289 %    91.863 ±  0.605 %
+   9       6.6285 ±    0.3440      -0.00435 ±    0.00762       0.04280 ±    0.00226     5.550 ±  0.269 %    91.895 ±  0.570 %
+  10       7.0250 ±    0.3481      -0.00237 ±    0.00710       0.04161 ±    0.00205     5.405 ±  0.251 %    92.078 ±  0.535 %
+  11       6.9863 ±    0.3268       0.00245 ±    0.00681       0.04142 ±    0.00197     5.413 ±  0.251 %    91.907 ±  0.515 %
+  12       7.0889 ±    0.3194       0.00059 ±    0.00643       0.04113 ±    0.00183     5.391 ±  0.234 %    91.863 ±  0.494 %
+  13       7.4983 ±    0.3313       0.00035 ±    0.00608       0.04081 ±    0.00174     5.303 ±  0.223 %    91.765 ±  0.478 %
+  14       7.0743 ±    0.2978      -0.00042 ±    0.00574       0.03964 ±    0.00163     5.272 ±  0.211 %    91.877 ±  0.457 %
+  15       7.0371 ±    0.2846       0.00050 ±    0.00544       0.03861 ±    0.00153     5.189 ±  0.201 %    91.974 ±  0.439 %
+  16       7.0627 ±    0.2772      -0.00040 ±    0.00520       0.03805 ±    0.00145     5.193 ±  0.193 %    92.010 ±  0.425 %
+  17       6.6792 ±    0.2512      -0.00079 ±    0.00495       0.03755 ±    0.00139     5.166 ±  0.187 %    91.995 ±  0.412 %
+  18       6.7564 ±    0.2475       0.00233 ±    0.00481       0.03708 ±    0.00132     5.155 ±  0.181 %    91.874 ±  0.403 %
+  19       6.6874 ±    0.2392       0.00252 ±    0.00463       0.03658 ±    0.00127     5.140 ±  0.173 %    91.889 ±  0.392 %
+  20       6.6104 ±    0.2287       0.00214 ±    0.00450       0.03696 ±    0.00123     5.168 ±  0.171 %    91.941 ±  0.381 %
+  21       6.4265 ±    0.2157       0.00097 ±    0.00446       0.03715 ±    0.00126     5.310 ±  0.176 %    91.970 ±  0.371 %
+  22       6.3746 ±    0.2091       0.00146 ±    0.00432       0.03692 ±    0.00121     5.283 ±  0.170 %    92.068 ±  0.361 %
+  23       6.1434 ±    0.1954       0.00107 ±    0.00427       0.03753 ±    0.00120     5.470 ±  0.171 %    92.089 ±  0.352 %
+  24       5.8866 ±    0.1817       0.00078 ±    0.00418       0.03749 ±    0.00122     5.545 ±  0.180 %    92.124 ±  0.344 %
+  25       5.7732 ±    0.1738       0.00228 ±    0.00414       0.03825 ±    0.00123     5.667 ±  0.182 %    92.141 ±  0.337 %
+  26       5.6490 ±    0.1655       0.00286 ±    0.00410       0.03861 ±    0.00122     5.724 ±  0.185 %    92.187 ±  0.330 %
+  27       5.5599 ±    0.1591       0.00337 ±    0.00401       0.03887 ±    0.00121     5.754 ±  0.182 %    92.186 ±  0.323 %
+  28       5.5028 ±    0.1542       0.00362 ±    0.00392       0.03855 ±    0.00118     5.706 ±  0.177 %    92.157 ±  0.318 %
+  29       5.5154 ±    0.1519       0.00387 ±    0.00384       0.03837 ±    0.00116     5.673 ±  0.173 %    92.184 ±  0.312 %
+  30       5.4833 ±    0.1481       0.00389 ±    0.00377       0.03832 ±    0.00114     5.639 ±  0.168 %    92.275 ±  0.305 %
+  31       5.4509 ±    0.1444       0.00370 ±    0.00369       0.03829 ±    0.00111     5.654 ±  0.166 %    92.245 ±  0.301 %
+  32       5.4755 ±    0.1433       0.00263 ±    0.00364       0.03833 ±    0.00108     5.661 ±  0.162 %    92.206 ±  0.297 %
+  33       5.4684 ±    0.1410       0.00279 ±    0.00358       0.03829 ±    0.00107     5.638 ±  0.158 %    92.216 ±  0.292 %
+  34       5.5156 ±    0.1407       0.00283 ±    0.00352       0.03821 ±    0.00104     5.633 ±  0.155 %    92.238 ±  0.287 %
+  35       5.5999 ±    0.1411       0.00373 ±    0.00347       0.03833 ±    0.00102     5.600 ±  0.152 %    92.134 ±  0.285 %
+  36       5.7241 ±    0.1427       0.00384 ±    0.00343       0.03857 ±    0.00101     5.571 ±  0.149 %    92.135 ±  0.281 %
+  37       5.7953 ±    0.1425       0.00425 ±    0.00339       0.03872 ±    0.00099     5.558 ±  0.146 %    92.051 ±  0.279 %
+  38       5.7810 ±    0.1402       0.00484 ±    0.00335       0.03872 ±    0.00098     5.531 ±  0.143 %    92.085 ±  0.274 %
+  39       5.8073 ±    0.1394       0.00558 ±    0.00330       0.03858 ±    0.00096     5.508 ±  0.140 %    92.036 ±  0.271 %
+  40       5.8556 ±    0.1396       0.00598 ±    0.00327       0.03912 ±    0.00126     5.560 ±  0.156 %    92.029 ±  0.268 %
+  41       5.8760 ±    0.1385       0.00641 ±    0.00322       0.03888 ±    0.00124     5.541 ±  0.154 %    92.042 ±  0.265 %
+  42       5.9234 ±    0.1381       0.00609 ±    0.00317       0.03884 ±    0.00121     5.539 ±  0.151 %    91.989 ±  0.262 %
+  43       5.9245 ±    0.1365       0.00653 ±    0.00313       0.03863 ±    0.00119     5.518 ±  0.148 %    91.938 ±  0.260 %
+  44       5.9094 ±    0.1343       0.00651 ±    0.00308       0.03858 ±    0.00116     5.528 ±  0.146 %    91.970 ±  0.257 %
+  45       5.9695 ±    0.1346       0.00663 ±    0.00304       0.03837 ±    0.00114     5.497 ±  0.144 %    92.000 ±  0.253 %
+  46       5.9376 ±    0.1321       0.00632 ±    0.00299       0.03828 ±    0.00112     5.498 ±  0.141 %    91.978 ±  0.251 %
+  47       6.0503 ±    0.1339       0.00703 ±    0.00295       0.03817 ±    0.00110     5.476 ±  0.139 %    91.907 ±  0.249 %
+  48       6.1018 ±    0.1337       0.00719 ±    0.00291       0.03786 ±    0.00108     5.440 ±  0.137 %    91.944 ±  0.246 %
+  49       6.0665 ±    0.1313       0.00674 ±    0.00287       0.03769 ±    0.00106     5.422 ±  0.135 %    91.997 ±  0.243 %
+  50       6.0842 ±    0.1303       0.00707 ±    0.00289       0.03872 ±    0.00109     5.510 ±  0.138 %    91.867 ±  0.242 %
+  51       6.0804 ±    0.1287       0.00735 ±    0.00286       0.03870 ±    0.00107     5.513 ±  0.136 %    91.834 ±  0.240 %
+  52       6.1276 ±    0.1288       0.00742 ±    0.00283       0.03864 ±    0.00105     5.502 ±  0.134 %    91.810 ±  0.238 %
+  53       6.1774 ±    0.1286       0.00748 ±    0.00279       0.03841 ±    0.00103     5.468 ±  0.133 %    91.750 ±  0.237 %
+  54       6.1969 ±    0.1278       0.00712 ±    0.00275       0.03830 ±    0.00102     5.463 ±  0.131 %    91.757 ±  0.234 %
+  55       6.2083 ±    0.1269       0.00665 ±    0.00273       0.03820 ±    0.00100     5.435 ±  0.129 %    91.758 ±  0.232 %
+  56       6.2321 ±    0.1264       0.00685 ±    0.00270       0.03812 ±    0.00099     5.433 ±  0.128 %    91.730 ±  0.230 %
+  57       6.2426 ±    0.1255       0.00681 ±    0.00268       0.03824 ±    0.00097     5.461 ±  0.125 %    91.689 ±  0.229 %
+  58       6.2547 ±    0.1245       0.00730 ±    0.00267       0.03869 ±    0.00098     5.524 ±  0.128 %    91.684 ±  0.227 %
+  59       6.2547 ±    0.1233       0.00704 ±    0.00265       0.03872 ±    0.00097     5.524 ±  0.126 %    91.652 ±  0.226 %
+  60       6.2872 ±    0.1231       0.00714 ±    0.00262       0.03887 ±    0.00096     5.531 ±  0.125 %    91.634 ±  0.224 %
+  61       6.3176 ±    0.1230       0.00694 ±    0.00261       0.03904 ±    0.00095     5.545 ±  0.124 %    91.610 ±  0.222 %
+  62       6.3748 ±    0.1232       0.00737 ±    0.00260       0.03903 ±    0.00094     5.546 ±  0.123 %    91.638 ±  0.220 %
+  63       6.4197 ±    0.1232       0.00707 ±    0.00258       0.03901 ±    0.00093     5.539 ±  0.122 %    91.640 ±  0.218 %
+  64       6.4670 ±    0.1232       0.00714 ±    0.00256       0.03894 ±    0.00091     5.519 ±  0.120 %    91.648 ±  0.217 %
+  65       6.5249 ±    0.1236       0.00686 ±    0.00254       0.03887 ±    0.00090     5.498 ±  0.119 %    91.644 ±  0.215 %
+  66       6.5542 ±    0.1233       0.00699 ±    0.00252       0.03888 ±    0.00089     5.514 ±  0.118 %    91.628 ±  0.214 %
+  67       6.6244 ±    0.1242       0.00764 ±    0.00251       0.03897 ±    0.00088     5.508 ±  0.117 %    91.618 ±  0.212 %
+  68       6.6576 ±    0.1240       0.00798 ±    0.00249       0.03899 ±    0.00087     5.508 ±  0.115 %    91.597 ±  0.211 %
+  69       6.6683 ±    0.1231       0.00753 ±    0.00247       0.03882 ±    0.00086     5.485 ±  0.114 %    91.611 ±  0.209 %
+  70       6.6394 ±    0.1216       0.00825 ±    0.00245       0.03885 ±    0.00085     5.504 ±  0.113 %    91.630 ±  0.207 %
+  71       6.6846 ±    0.1216       0.00805 ±    0.00242       0.03870 ±    0.00084     5.484 ±  0.112 %    91.638 ±  0.206 %
+  72       6.6992 ±    0.1208       0.00807 ±    0.00241       0.03859 ±    0.00083     5.466 ±  0.111 %    91.656 ±  0.204 %
+  73       6.7327 ±    0.1208       0.00842 ±    0.00239       0.03867 ±    0.00082     5.460 ±  0.109 %    91.620 ±  0.203 %
+  74       6.7301 ±    0.1200       0.00851 ±    0.00237       0.03851 ±    0.00081     5.460 ±  0.110 %    91.648 ±  0.201 %
+  75       6.7166 ±    0.1191       0.00822 ±    0.00235       0.03840 ±    0.00080     5.456 ±  0.109 %    91.660 ±  0.200 %
+  76       6.7106 ±    0.1183       0.00800 ±    0.00233       0.03826 ±    0.00079     5.444 ±  0.108 %    91.677 ±  0.198 %
+  77       6.7464 ±    0.1184       0.00774 ±    0.00231       0.03818 ±    0.00078     5.436 ±  0.107 %    91.653 ±  0.197 %
+  78       6.7579 ±    0.1184       0.00774 ±    0.00229       0.03796 ±    0.00077     5.419 ±  0.107 %    91.669 ±  0.196 %
+  79       6.6460 ±    0.1156       0.00822 ±    0.00230       0.03870 ±    0.00080     5.555 ±  0.111 %    91.700 ±  0.194 %
+  80       6.5889 ±    0.1136       0.00748 ±    0.00230       0.03946 ±    0.00080     5.630 ±  0.111 %    91.672 ±  0.193 %
+  81       6.5647 ±    0.1124       0.00706 ±    0.00230       0.03968 ±    0.00080     5.639 ±  0.110 %    91.673 ±  0.192 %
+  82       6.5786 ±    0.1120       0.00712 ±    0.00229       0.03990 ±    0.00080     5.662 ±  0.109 %    91.636 ±  0.191 %
+  83       6.5901 ±    0.1115       0.00722 ±    0.00228       0.03978 ±    0.00079     5.641 ±  0.109 %    91.637 ±  0.190 %
+  84       6.5846 ±    0.1106       0.00685 ±    0.00226       0.03975 ±    0.00078     5.630 ±  0.108 %    91.657 ±  0.189 %
+  85       6.6030 ±    0.1103       0.00687 ±    0.00224       0.03983 ±    0.00078     5.649 ±  0.109 %    91.668 ±  0.188 %
+  86       6.6389 ±    0.1104       0.00707 ±    0.00223       0.03980 ±    0.00077     5.637 ±  0.108 %    91.651 ±  0.187 %
+  87       6.6392 ±    0.1097       0.00669 ±    0.00221       0.03978 ±    0.00076     5.648 ±  0.110 %    91.643 ±  0.186 %
+  88       6.6485 ±    0.1094       0.00636 ±    0.00220       0.03983 ±    0.00076     5.652 ±  0.109 %    91.644 ±  0.185 %
+  89       6.6237 ±    0.1083       0.00664 ±    0.00219       0.03976 ±    0.00075     5.665 ±  0.108 %    91.628 ±  0.184 %
+  90       6.6114 ±    0.1074       0.00678 ±    0.00217       0.03969 ±    0.00074     5.657 ±  0.107 %    91.621 ±  0.183 %
+  91       6.6125 ±    0.1068       0.00694 ±    0.00215       0.03959 ±    0.00074     5.646 ±  0.106 %    91.627 ±  0.182 %
+  92       6.5974 ±    0.1058       0.00685 ±    0.00214       0.03946 ±    0.00073     5.638 ±  0.105 %    91.654 ±  0.181 %
+  93       6.6255 ±    0.1058       0.00698 ±    0.00213       0.03949 ±    0.00072     5.629 ±  0.104 %    91.638 ±  0.180 %
+  94       6.6371 ±    0.1054       0.00711 ±    0.00212       0.03951 ±    0.00072     5.617 ±  0.103 %    91.635 ±  0.179 %
+  95       6.6546 ±    0.1052       0.00731 ±    0.00211       0.03948 ±    0.00071     5.603 ±  0.103 %    91.649 ±  0.178 %
+  96       6.6508 ±    0.1045       0.00725 ±    0.00209       0.03945 ±    0.00070     5.589 ±  0.102 %    91.642 ±  0.177 %
+  97       6.6381 ±    0.1037       0.00752 ±    0.00208       0.03944 ±    0.00070     5.604 ±  0.102 %    91.668 ±  0.176 %
+  98       6.6314 ±    0.1029       0.00726 ±    0.00207       0.03947 ±    0.00069     5.593 ±  0.101 %    91.637 ±  0.175 %
+  99       6.6382 ±    0.1025       0.00762 ±    0.00206       0.03943 ±    0.00069     5.591 ±  0.101 %    91.590 ±  0.175 %
+ 100       6.6616 ±    0.1024       0.00723 ±    0.00205       0.03954 ±    0.00069     5.601 ±  0.102 %    91.596 ±  0.174 %
+pelias kld: 25500 per-token records written
+pelias kld: 100 chunks in 1317.6 s
+
+====== Perplexity statistics ======
+Mean PPL(Q)                   :   6.661647 ±   0.102434
+Mean PPL(base)                :   6.613646 ±   0.101611
+Cor(ln(PPL(Q)), ln(PPL(base))):  99.11%
+Mean ln(PPL(Q)/PPL(base))     :   0.007232 ±   0.002048
+Mean PPL(Q)/PPL(base)         :   1.007258 ±   0.002063
+Mean PPL(Q)-PPL(base)         :   0.048001 ±   0.013617
+
+====== KL divergence statistics ======
+Mean    KLD:   0.039544 ±   0.000686
+Maximum KLD:   8.659643
+99.9%   KLD:   1.164602
+99.0%   KLD:   0.354806
+95.0%   KLD:   0.136345
+90.0%   KLD:   0.085357
+Median  KLD:   0.017975
+10.0%   KLD:   0.000519
+ 5.0%   KLD:   0.000152
+ 1.0%   KLD:   0.000017
+ 0.1%   KLD:   0.000002
+Minimum KLD:  -0.000026
+
+====== Token probability statistics ======
+Mean    Δp: -0.223 ± 0.035 %
+Maximum Δp: 94.059%
+99.9%   Δp: 36.967%
+99.0%   Δp: 15.710%
+95.0%   Δp:  7.040%
+90.0%   Δp:  3.815%
+75.0%   Δp:  0.750%
+Median  Δp: -0.010%
+25.0%   Δp: -1.097%
+10.0%   Δp: -4.506%
+ 5.0%   Δp: -7.596%
+ 1.0%   Δp: -18.354%
+ 0.1%   Δp: -43.974%
+Minimum Δp: -78.865%
+RMS Δp    :  5.601 ± 0.102 %
+Same top p: 91.596 ± 0.174 %
+J r2b_exps_fp32 1319 s: Mean KLD: 0.039544 ± 0.000686 | Same top p: 91.596 ± 0.174 %
+paired on 25500 scored tokens (100 chunks of 255)
+mean KLD   r2b_exps_fp32 0.039544   stock_fp32 0.039013
+difference (A - B) +0.000530   SE per token 0.000388   SE per chunk (used) 0.000467   95% interval [-0.000396, +0.001457] (t 1.984, 99 df)   t-stat 1.14
+tokens where A has the lower KL: 50.09 %; mean ln(PPL) difference -0.004223
+top token: right only in A 696, only in B 690 (z 0.16)
+VERDICT: no difference this test can resolve (the 95 % interval contains zero)
+r2b_exps_fp32 vs stock_fp32: difference (A - B) +0.000530   SE per token 0.000388   SE per chunk (used) 0.000467   95% interval [-0.000396, +0.001457] (t 1.984, 99 df)   t-stat 1.14
+r2b_exps_fp32 vs stock_fp32: VERDICT: no difference this test can resolve (the 95 % interval contains zero)
+paired on 25500 scored tokens (100 chunks of 255)
+mean KLD   r2b_exps_fp32 0.039544   r2_dense_fp32 0.035564
+difference (A - B) +0.003979   SE per token 0.000622   SE per chunk (used) 0.000750   95% interval [+0.002492, +0.005467] (t 1.984, 99 df)   t-stat 5.31
+tokens where A has the lower KL: 44.90 %; mean ln(PPL) difference -0.008617
+top token: right only in A 1146, only in B 1213 (z -1.38)
+VERDICT: B has less drift than A (the 95 % interval is above zero)
+r2b_exps_fp32 vs r2_dense_fp32: difference (A - B) +0.003979   SE per token 0.000622   SE per chunk (used) 0.000750   95% interval [+0.002492, +0.005467] (t 1.984, 99 df)   t-stat 5.31
+r2b_exps_fp32 vs r2_dense_fp32: VERDICT: B has less drift than A (the 95 % interval is above zero)
+== J r2b done 2026-10-28 00:13:45. Log /mnt/d/pelias-tests/gp/J/r2b_exps_20261027_234626.log

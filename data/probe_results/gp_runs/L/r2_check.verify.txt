@@ -1,0 +1,3 @@
+tensors: 753 / 753; identical 753; type differs 0; shape differs 0; data differs 0; only in one file 0 / 0
+metadata identical: yes; tensor order identical: yes; files byte-identical: yes
+compared in 68.8 s

@@ -1,0 +1,1 @@
+2026-10-28 07:19-08:06 | wsl bash /mnt/d/pelias-tests/gp/block_m.sh c | log D:\pelias-tests\gp\M\c_20261028_071951.log | dumps M\a8all.kld, M\a4dense.kld | re-verified from the dumps in Python (identical to kld-compare), incl. t8r_a8all vs unsloth_mtp_a8

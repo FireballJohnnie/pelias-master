@@ -1,0 +1,5 @@
+
+== POWER dualbus | GPU power (nvidia-smi) during the dual-bus probe, phases of 30 s, idle 30 s before and after | started 2026-10-27 20:26:18 | ETA about 5 min | log /mnt/d/pelias-tests/gp/POWER/dualbus_20261027_202618.log
+NVIDIA GeForce RTX 4070, 200.00 W
+== 2026-10-27 20:26:20 idle baseline 30 s
+== 2026-10-27 20:26:50 probe: CPU alone, GPU zero-copy alone, copies alone, all three, CPU+copies, CPU+zero-copy (30 s each)

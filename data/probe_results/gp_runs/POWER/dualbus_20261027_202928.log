@@ -1,0 +1,34 @@
+
+== POWER dualbus | GPU power (nvidia-smi) during the dual-bus probe, phases of 30 s, idle 30 s before and after | started 2026-10-27 20:29:28 | ETA about 5 min | log /mnt/d/pelias-tests/gp/POWER/dualbus_20261027_202928.log
+NVIDIA GeForce RTX 4070, 200.00 W
+== 2026-10-27 20:29:30 idle baseline 30 s
+== 2026-10-27 20:30:00 probe: CPU alone, GPU zero-copy alone, copies alone, all three, CPU+copies, CPU+zero-copy (30 s each)
+[2d] CPU alone (7 threads)           43.27 GB/s
+[2d] GPU zero-copy alone              24.63 GB/s
+[2d] H2D copy alone                   26.20 GB/s
+[2d] all three at once               CPU  24.37 + zero-copy  11.46 + H2D  11.46 =  47.29 GB/s (1.09x CPU alone)
+[2d] CPU + H2D copies only           CPU  22.89 + H2D  25.85 =  48.75 GB/s (1.13x CPU alone; CPU keeps 53%)
+[2d] CPU + zero-copy only            CPU  25.60 + zero-copy  20.55 =  46.15 GB/s (1.07x CPU alone; CPU keeps 59%)
+[2d] ceiling floors (CPU + zero-copy): combined >= 43 GB/s: YES (>= 40: YES)   CPU share >= 17 GB/s: YES   PCIe alone >= 24 GB/s: YES
+[2d] note: phase_7a_greenlight asks for combined >= 1.25x CPU alone = 54.1 GB/s; dual-channel DDR4-3200 peaks at 51.2 GB/s, so that test can only pass if the CPU alone reads far below the memory limit
+[2d] wrote /mnt/d/pelias-tests/gp/POWER/dualbus_20261027_202928.json
+== 2026-10-27 20:33:04 idle after 30 s
+[2d] CPU alone (7 threads)           43.27 GB/s
+[2d] GPU zero-copy alone              24.63 GB/s
+[2d] H2D copy alone                   26.20 GB/s
+[2d] all three at once               CPU  24.37 + zero-copy  11.46 + H2D  11.46 =  47.29 GB/s (1.09x CPU alone)
+[2d] CPU + H2D copies only           CPU  22.89 + H2D  25.85 =  48.75 GB/s (1.13x CPU alone; CPU keeps 53%)
+[2d] CPU + zero-copy only            CPU  25.60 + zero-copy  20.55 =  46.15 GB/s (1.07x CPU alone; CPU keeps 59%)
+[2d] ceiling floors (CPU + zero-copy): combined >= 43 GB/s: YES (>= 40: YES)   CPU share >= 17 GB/s: YES   PCIe alone >= 24 GB/s: YES
+[2d] note: phase_7a_greenlight asks for combined >= 1.25x CPU alone = 54.1 GB/s; dual-channel DDR4-3200 peaks at 51.2 GB/s, so that test can only pass if the CPU alone reads far below the memory limit
+[2d] wrote /mnt/d/pelias-tests/gp/POWER/dualbus_20261027_202928.json
+idle before                GPU   37.2 W median ( 36.9- 38.1), SM 2490 MHz, 35 C, use   1 %, n=95
+CPU alone                  GPU   37.8 W median ( 36.6- 38.2), SM 2490 MHz, 34 C, use   3 %, n=91
+GPU zero-copy alone        GPU   47.1 W median ( 45.4- 48.5), SM 2775 MHz, 36 C, use 100 %, n=94
+H2D copies alone           GPU   45.2 W median ( 44.9- 46.0), SM 2775 MHz, 36 C, use 100 %, n=95
+all three                  GPU   45.3 W median ( 45.1- 45.5), SM 2775 MHz, 36 C, use  98 %, n=93
+CPU + copies               GPU   45.0 W median ( 44.8- 45.4), SM 2775 MHz, 36 C, use  99 %, n=93
+CPU + zero-copy            GPU   45.5 W median ( 45.1- 46.6), SM 2775 MHz, 37 C, use  98 %, n=93
+idle after                 GPU   36.6 W median ( 36.4- 37.3), SM 2490 MHz, 36 C, use   1 %, n=95
+phase windows (epoch): CPU alone 1793147404.2, GPU zero-copy alone 1793147434.2, H2D copies alone 1793147464.2, all three 1793147494.2, CPU + copies 1793147524.2, CPU + zero-copy 1793147554.2, end 1793147584.2
+== power test done 2026-10-27 20:33:34. Log /mnt/d/pelias-tests/gp/POWER/dualbus_20261027_202928.log; GPU samples /mnt/d/pelias-tests/gp/POWER/dualbus_gpu_20261027_202928.csv; stop HWiNFO logging now

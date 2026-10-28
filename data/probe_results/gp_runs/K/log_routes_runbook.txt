@@ -1,0 +1,1 @@
+- 2026-10-28 00:28-00:50: block_k routes RAN. Floor (bf16 through Pelias) 0.002801. Flips stock vs bf16 56.4 % of token-layers but mostly one rank-7/8 expert swapped, no link to KL (corr -0.004). Hot 120 per layer covers 93.5 % of picks; next-layer prediction 83.6 %. NEXT: pelias quantize --imatrix/--recipe (sandbox code), then Block C.

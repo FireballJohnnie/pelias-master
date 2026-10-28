@@ -1,0 +1,223 @@
+
+== K routes | GP1-06/07 and routing statistics: bf16 and stock, 10 chunks, routing records | started 2026-10-28 00:27:55 | ETA 25-45 min | log /mnt/d/pelias-tests/gp/K/routes_20261028_002755.log
+From <backup>/2026-10-27/pelias-master_main_0722912.bundle
+ * branch            main       -> FETCH_HEAD
+Updating e15515f..0722912
+Fast-forward
+ CMakeLists.txt                  |   1 +
+ docs/PELIAS_GAME_PLAN.md        |   2 +-
+ logs/BUILD_LOG.md               |   1 +
+ src/cli/main.cc                 |  43 +++++++-
+ src/model/arch_qwen35moe.cpp    |  34 +++++-
+ src/model/arch_qwen35moe.h      |  13 +++
+ tests/tools/test_route_stats.py |  76 ++++++++++++++
+ tools/route_stats.py            | 225 ++++++++++++++++++++++++++++++++++++++++
+ 8 files changed, 392 insertions(+), 3 deletions(-)
+ create mode 100644 tests/tools/test_route_stats.py
+ create mode 100644 tools/route_stats.py
+[1/6] Building CXX object CMakeFiles/pelias_unit.dir/tests/unit/test_model.cpp.o
+[2/6] Building CXX object CMakeFiles/pelias.dir/src/cli/main.cc.o
+[3/6] Building CXX object CMakeFiles/pelias_model.dir/src/model/arch_qwen35moe.cpp.o
+[4/6] Linking CXX static library libpelias_model.a
+[5/6] Linking CXX executable pelias
+[6/6] Linking CXX executable pelias_unit
+pelias: pelias 0.2.0 (0722912, Release) backends: none (host-only build)
+== PREDICTIONS (written 10-27 22:3x): floor of the base (bf16 through Pelias) 0.0005-0.003 (game plan GP1-07, ESTIMATE); routing flips stock vs bf16 in 2-8 % of token-layers, tokens with >= 1 change carrying over half the KL (GP1-06, ESTIMATE); next-layer prediction and cold-expert reuse unmeasured, no prediction.
+pelias kld: 10 chunks of 512 tokens, positions 256..510 scored, vocabulary 248320, 16 threads, fp32 reference pass
+chunk             PPL               ln(PPL(Q)/PPL(base))          KL Divergence              Δp RMS            Same top p
+   1       4.0603 ±    0.5550      -0.00247 ±    0.00228       0.00048 ±    0.00011     0.667 ±  0.140 %    100.000 ±  0.000 %
+pelias kld: 142.12 seconds per chunk - ETA 21.3 minutes
+   2       5.8057 ±    0.6703       0.00057 ±    0.00172       0.00068 ±    0.00010     0.605 ±  0.081 %    99.412 ±  0.339 %
+   3       5.1729 ±    0.4797       0.00821 ±    0.00437       0.00324 ±    0.00078     1.620 ±  0.369 %    99.085 ±  0.344 %
+   4       5.1675 ±    0.3962       0.00622 ±    0.00343       0.00285 ±    0.00059     1.523 ±  0.296 %    98.922 ±  0.324 %
+   5       5.2928 ±    0.3553       0.00383 ±    0.00292       0.00273 ±    0.00047     1.456 ±  0.249 %    98.510 ±  0.339 %
+   6       5.4653 ±    0.3335       0.00386 ±    0.00257       0.00288 ±    0.00040     1.468 ±  0.207 %    98.170 ±  0.343 %
+   7       5.7084 ±    0.3242       0.00354 ±    0.00250       0.00283 ±    0.00034     1.441 ±  0.182 %    98.039 ±  0.328 %
+   8       6.2169 ±    0.3394       0.00530 ±    0.00253       0.00295 ±    0.00035     1.403 ±  0.164 %    98.088 ±  0.303 %
+   9       6.6948 ±    0.3495       0.00561 ±    0.00230       0.00282 ±    0.00031     1.354 ±  0.151 %    98.083 ±  0.286 %
+  10       7.0791 ±    0.3519       0.00529 ±    0.00210       0.00280 ±    0.00028     1.327 ±  0.139 %    98.078 ±  0.272 %
+pelias kld: 2550 per-token records written
+pelias kld: routing record written (102000 token-layers)
+pelias kld: 10 chunks in 1145.8 s
+
+====== Perplexity statistics ======
+Mean PPL(Q)                   :   7.079056 ±   0.351925
+Mean PPL(base)                :   7.041686 ±   0.348345
+Cor(ln(PPL(Q)), ln(PPL(base))):  99.91%
+Mean ln(PPL(Q)/PPL(base))     :   0.005293 ±   0.002099
+Mean PPL(Q)/PPL(base)         :   1.005307 ±   0.002110
+Mean PPL(Q)-PPL(base)         :   0.037370 ±   0.015150
+
+====== KL divergence statistics ======
+Mean    KLD:   0.002801 ±   0.000281
+Maximum KLD:   0.464983
+99.9%   KLD:   0.195888
+99.0%   KLD:   0.028108
+95.0%   KLD:   0.010003
+90.0%   KLD:   0.005774
+Median  KLD:   0.000706
+10.0%   KLD:   0.000022
+ 5.0%   KLD:   0.000005
+ 1.0%   KLD:  -0.000000
+ 0.1%   KLD:  -0.000004
+Minimum KLD:  -0.000008
+
+====== Token probability statistics ======
+Mean    Δp: -0.023 ± 0.026 %
+Maximum Δp:  7.723%
+99.9%   Δp:  6.877%
+99.0%   Δp:  3.712%
+95.0%   Δp:  1.526%
+90.0%   Δp:  0.835%
+75.0%   Δp:  0.167%
+Median  Δp:  0.000%
+25.0%   Δp: -0.183%
+10.0%   Δp: -0.799%
+ 5.0%   Δp: -1.566%
+ 1.0%   Δp: -4.272%
+ 0.1%   Δp: -8.564%
+Minimum Δp: -29.926%
+RMS Δp    :  1.327 ± 0.139 %
+Same top p: 98.078 ± 0.272 %
+K bf16_10 (floor of the base, GP1-07) 1161 s: Mean KLD: 0.002801 ± 0.000281 | Same top p: 98.078 ± 0.272 %
+pelias kld: 10 chunks of 512 tokens, positions 256..510 scored, vocabulary 248320, 16 threads, fp32 reference pass
+chunk             PPL               ln(PPL(Q)/PPL(base))          KL Divergence              Δp RMS            Same top p
+   1       4.1236 ±    0.5655       0.01300 ±    0.01279       0.02015 ±    0.00304     4.166 ±  0.672 %    97.255 ±  1.025 %
+pelias kld: 47.96 seconds per chunk - ETA 7.2 minutes
+   2       5.8786 ±    0.6752       0.01306 ±    0.01065       0.02500 ±    0.00229     4.164 ±  0.385 %    95.098 ±  0.957 %
+   3       5.1354 ±    0.4670       0.00095 ±    0.01353       0.04869 ±    0.00547     5.635 ±  0.423 %    93.595 ±  0.886 %
+   4       5.0843 ±    0.3814      -0.01000 ±    0.01219       0.04919 ±    0.00468     5.631 ±  0.353 %    93.431 ±  0.776 %
+   5       5.2483 ±    0.3460      -0.00461 ±    0.01063       0.04686 ±    0.00380     5.572 ±  0.297 %    92.863 ±  0.721 %
+   6       5.4364 ±    0.3269      -0.00146 ±    0.00920       0.04479 ±    0.00320     5.436 ±  0.266 %    92.745 ±  0.663 %
+   7       5.6853 ±    0.3186      -0.00052 ±    0.00853       0.04429 ±    0.00278     5.378 ±  0.237 %    92.381 ±  0.628 %
+   8       6.1913 ±    0.3343       0.00118 ±    0.00779       0.04331 ±    0.00247     5.304 ±  0.218 %    92.108 ±  0.597 %
+   9       6.6656 ±    0.3448       0.00123 ±    0.00741       0.04277 ±    0.00224     5.184 ±  0.203 %    91.939 ±  0.568 %
+  10       7.0602 ±    0.3486       0.00263 ±    0.00694       0.04182 ±    0.00204     5.074 ±  0.190 %    92.000 ±  0.537 %
+pelias kld: 2550 per-token records written
+pelias kld: routing record written (102000 token-layers)
+pelias kld: 10 chunks in 169.3 s
+
+====== Perplexity statistics ======
+Mean PPL(Q)                   :   7.060222 ±   0.348649
+Mean PPL(base)                :   7.041686 ±   0.348345
+Cor(ln(PPL(Q)), ln(PPL(base))):  99.01%
+Mean ln(PPL(Q)/PPL(base))     :   0.002629 ±   0.006939
+Mean PPL(Q)/PPL(base)         :   1.002632 ±   0.006958
+Mean PPL(Q)-PPL(base)         :   0.018537 ±   0.048926
+
+====== KL divergence statistics ======
+Mean    KLD:   0.041817 ±   0.002037
+Maximum KLD:   2.496286
+99.9%   KLD:   1.297985
+99.0%   KLD:   0.376526
+95.0%   KLD:   0.143210
+90.0%   KLD:   0.086721
+Median  KLD:   0.018800
+10.0%   KLD:   0.000779
+ 5.0%   KLD:   0.000248
+ 1.0%   KLD:   0.000027
+ 0.1%   KLD:   0.000004
+Minimum KLD:   0.000003
+
+====== Token probability statistics ======
+Mean    Δp: -0.335 ± 0.100 %
+Maximum Δp: 43.316%
+99.9%   Δp: 32.171%
+99.0%   Δp: 14.560%
+95.0%   Δp:  6.917%
+90.0%   Δp:  3.522%
+75.0%   Δp:  0.719%
+Median  Δp: -0.021%
+25.0%   Δp: -1.298%
+10.0%   Δp: -4.873%
+ 5.0%   Δp: -8.031%
+ 1.0%   Δp: -17.828%
+ 0.1%   Δp: -30.473%
+Minimum Δp: -35.169%
+RMS Δp    :  5.074 ± 0.190 %
+Same top p: 92.000 ± 0.537 %
+K stock_10 172 s: Mean KLD: 0.041817 ± 0.002037 | Same top p: 92.000 ± 0.537 %
+routing record /mnt/d/pelias-tests/gp/K/stock_10.rt: 10 chunks x 255 scored tokens x 40 layers, 8 experts picked per token
+mean weight by rank: 1: 0.246  2: 0.169  3: 0.135  4: 0.113  5: 0.098  6: 0.087  7: 0.079  8: 0.073
+weight on the top 2: 41.5 %; on ranks 5-8: 33.8 %
+router margin (prob. of last picked minus first unpicked): median 0.00057, 10 % 0.00008, 1 % 0.00001; share under 0.001: 68.7 %
+cold picks (outside the 84 most-picked experts of each layer): 14.2 % of all picks
+previous 1 token(s): picks seen before 41.5 %; cold picks seen before 18.7 %; distinct cold experts in a 1-token window 45.5
+previous 2 token(s): picks seen before 50.0 %; cold picks seen before 23.9 %; distinct cold experts in a 2-token window 82.5
+previous 4 token(s): picks seen before 59.3 %; cold picks seen before 29.9 %; distinct cold experts in a 4-token window 150.0
+previous 8 token(s): picks seen before 68.3 %; cold picks seen before 36.5 %; distinct cold experts in a 8-token window 272.5
+next-layer prediction from this layer's output: 83.6 % of the next layer's picks; 72.2 % of its cold picks
+routing record /mnt/d/pelias-tests/gp/K/stock_10.rt: 10 chunks x 255 scored tokens x 40 layers, 8 experts picked per token
+mean weight by rank: 1: 0.246  2: 0.169  3: 0.135  4: 0.113  5: 0.098  6: 0.087  7: 0.079  8: 0.073
+weight on the top 2: 41.5 %; on ranks 5-8: 33.8 %
+router margin (prob. of last picked minus first unpicked): median 0.00057, 10 % 0.00008, 1 % 0.00001; share under 0.001: 68.7 %
+cold picks (outside the 120 most-picked experts of each layer): 6.5 % of all picks
+previous 1 token(s): picks seen before 41.5 %; cold picks seen before 13.6 %; distinct cold experts in a 1-token window 20.7
+previous 2 token(s): picks seen before 50.0 %; cold picks seen before 17.5 %; distinct cold experts in a 2-token window 38.5
+previous 4 token(s): picks seen before 59.3 %; cold picks seen before 22.1 %; distinct cold experts in a 4-token window 72.0
+previous 8 token(s): picks seen before 68.3 %; cold picks seen before 27.6 %; distinct cold experts in a 8-token window 134.2
+next-layer prediction from this layer's output: 83.6 % of the next layer's picks; 67.1 % of its cold picks
+routing record /mnt/d/pelias-tests/gp/K/stock_10.rt: 10 chunks x 255 scored tokens x 40 layers, 8 experts picked per token
+mean weight by rank: 1: 0.246  2: 0.169  3: 0.135  4: 0.113  5: 0.098  6: 0.087  7: 0.079  8: 0.073
+weight on the top 2: 41.5 %; on ranks 5-8: 33.8 %
+router margin (prob. of last picked minus first unpicked): median 0.00057, 10 % 0.00008, 1 % 0.00001; share under 0.001: 68.7 %
+cold picks (outside the 161 most-picked experts of each layer): 2.3 % of all picks
+previous 1 token(s): picks seen before 41.5 %; cold picks seen before 9.4 %; distinct cold experts in a 1-token window 7.3
+previous 2 token(s): picks seen before 50.0 %; cold picks seen before 12.1 %; distinct cold experts in a 2-token window 13.9
+previous 4 token(s): picks seen before 59.3 %; cold picks seen before 15.5 %; distinct cold experts in a 4-token window 26.6
+previous 8 token(s): picks seen before 68.3 %; cold picks seen before 20.1 %; distinct cold experts in a 8-token window 50.6
+next-layer prediction from this layer's output: 83.6 % of the next layer's picks; 60.6 % of its cold picks
+next-layer prediction from this layer's output: 83.6 % of the next layer's picks; 67.1 % of its cold picks
+previous 1 token(s): picks seen before 41.5 %; cold picks seen before 13.6 %; distinct cold experts in a 1-token window 20.7
+routing flips /mnt/d/pelias-tests/gp/K/stock_10.rt vs /mnt/d/pelias-tests/gp/K/bf16_10.rt on 2550 tokens x 40 layers
+layer  set differs  order only  weight on changed experts (mean per token-layer)
+    0      51.5 %      41.6 %  0.0409
+    1      60.0 %      33.8 %  0.0559
+    2      58.9 %      35.8 %  0.0445
+    3      68.0 %      28.7 %  0.0673
+    4      58.3 %      35.3 %  0.0514
+    5      53.6 %      37.0 %  0.0421
+    6      50.3 %      40.4 %  0.0411
+    7      57.2 %      35.6 %  0.0490
+    8      56.5 %      35.7 %  0.0461
+    9      50.5 %      38.8 %  0.0408
+   10      51.8 %      39.7 %  0.0438
+   11      52.2 %      38.2 %  0.0445
+   12      57.6 %      36.9 %  0.0547
+   13      53.7 %      37.6 %  0.0432
+   14      55.1 %      38.0 %  0.0516
+   15      58.5 %      35.8 %  0.0576
+   16      59.8 %      34.3 %  0.0577
+   17      56.6 %      36.7 %  0.0593
+   18      53.6 %      39.4 %  0.0532
+   19      60.9 %      33.6 %  0.0609
+   20      60.3 %      34.6 %  0.0534
+   21      59.4 %      34.8 %  0.0576
+   22      58.3 %      36.0 %  0.0597
+   23      59.2 %      34.6 %  0.0611
+   24      67.0 %      29.5 %  0.0778
+   25      60.9 %      34.1 %  0.0638
+   26      62.7 %      33.0 %  0.0678
+   27      63.1 %      33.4 %  0.0696
+   28      62.7 %      32.1 %  0.0689
+   29      61.9 %      32.7 %  0.0655
+   30      53.9 %      39.1 %  0.0586
+   31      58.7 %      34.4 %  0.0636
+   32      52.1 %      39.5 %  0.0494
+   33      48.6 %      38.5 %  0.0440
+   34      47.4 %      41.5 %  0.0446
+   35      57.1 %      35.4 %  0.0597
+   36      48.9 %      41.8 %  0.0502
+   37      55.9 %      35.2 %  0.0620
+   38      49.5 %      41.0 %  0.0546
+   39      44.5 %      43.5 %  0.0444
+all layers: set differs 56.4 % of token-layers
+tokens with 0 changed layers: 0.0 %
+tokens with 1 changed layers: 0.0 %
+tokens with 2-3 changed layers: 0.0 %
+tokens with >= 4 changed layers: 100.0 %
+mean KL of tokens with >= 4 changed layers: 0.041817 (2550 tokens)
+share of all KL carried by tokens with at least one changed layer: 100.0 %
+all layers: set differs 56.4 % of token-layers
+share of all KL carried by tokens with at least one changed layer: 100.0 %
+== K routes done 2026-10-28 00:50:19. Log /mnt/d/pelias-tests/gp/K/routes_20261028_002755.log

@@ -1,0 +1,10 @@
+routing record /mnt/d/pelias-tests/gp/K/stock_10.rt: 10 chunks x 255 scored tokens x 40 layers, 8 experts picked per token
+mean weight by rank: 1: 0.246  2: 0.169  3: 0.135  4: 0.113  5: 0.098  6: 0.087  7: 0.079  8: 0.073
+weight on the top 2: 41.5 %; on ranks 5-8: 33.8 %
+router margin (prob. of last picked minus first unpicked): median 0.00057, 10 % 0.00008, 1 % 0.00001; share under 0.001: 68.7 %
+cold picks (outside the 161 most-picked experts of each layer): 2.3 % of all picks
+previous 1 token(s): picks seen before 41.5 %; cold picks seen before 9.4 %; distinct cold experts in a 1-token window 7.3
+previous 2 token(s): picks seen before 50.0 %; cold picks seen before 12.1 %; distinct cold experts in a 2-token window 13.9
+previous 4 token(s): picks seen before 59.3 %; cold picks seen before 15.5 %; distinct cold experts in a 4-token window 26.6
+previous 8 token(s): picks seen before 68.3 %; cold picks seen before 20.1 %; distinct cold experts in a 8-token window 50.6
+next-layer prediction from this layer's output: 83.6 % of the next layer's picks; 60.6 % of its cold picks

@@ -1,0 +1,65 @@
+
+== L check | update + rebuild; R2 rebuilt through --recipe, byte-identical to r2_dense.gguf | started 2026-10-28 01:10:00 | ETA about 12 min | log /mnt/d/pelias-tests/gp/L/check_20261028_011000.log
+From <backup>/2026-10-27/pelias-master_main_d48b88d.bundle
+ * branch            main       -> FETCH_HEAD
+Updating 0722912..d48b88d
+Fast-forward
+ CMakeLists.txt                 |   2 +-
+ docs/PELIAS_GAME_PLAN.md       |  38 +++++++++++++
+ logs/BUILD_LOG.md              |   5 ++
+ src/cli/main.cc                |  33 ++++++++++-
+ src/io/imatrix_weights.cpp     |  92 ++++++++++++++++++++++++++++++
+ src/io/imatrix_weights.h       |  36 ++++++++++++
+ src/io/requantize.cpp          | 102 ++++++++++++++++++++++++++++++++-
+ src/io/requantize.h            |  16 ++++++
+ src/model/arch_qwen35moe.cpp   |  23 +++++---
+ src/model/imatrix.cpp          |  11 ++++
+ src/model/imatrix.h            |   8 ++-
+ tests/unit/test_model.cpp      |  12 ++++
+ tests/unit/test_requantize.cpp | 125 +++++++++++++++++++++++++++++++++++++++++
+ 13 files changed, 490 insertions(+), 13 deletions(-)
+ create mode 100644 src/io/imatrix_weights.cpp
+ create mode 100644 src/io/imatrix_weights.h
+[1/16] Building CXX object CMakeFiles/pelias_io.dir/src/io/imatrix_weights.cpp.o
+[2/16] Building CXX object CMakeFiles/pelias_model.dir/src/model/imatrix.cpp.o
+[3/16] Building CXX object CMakeFiles/pelias_unit.dir/tests/unit/test_model.cpp.o
+[4/16] Building CXX object CMakeFiles/pelias_unit.dir/tests/unit/test_requantize.cpp.o
+[5/16] Building CXX object CMakeFiles/pelias_unit.dir/tests/unit/test_ingest.cpp.o
+[6/16] Building CXX object CMakeFiles/pelias_ingest.dir/src/ingest/qwen35moe.cpp.o
+[7/16] Building CXX object CMakeFiles/pelias_io.dir/src/io/requantize.cpp.o
+[8/16] Linking CXX static library libpelias_io.a
+[9/16] Linking CXX executable pelias_mutate
+[10/16] Building CXX object CMakeFiles/pelias.dir/src/cli/main.cc.o
+[11/16] Building CXX object CMakeFiles/pelias_ingest.dir/src/ingest/stage_a.cpp.o
+[12/16] Linking CXX static library libpelias_ingest.a
+[13/16] Building CXX object CMakeFiles/pelias_model.dir/src/model/arch_qwen35moe.cpp.o
+[14/16] Linking CXX static library libpelias_model.a
+[15/16] Linking CXX executable pelias
+[16/16] Linking CXX executable pelias_unit
+build ok: pelias 0.2.0 (d48b88d, Release) backends: none (host-only build)
+== PREDICTION: r2_check.gguf is byte-identical to r2_dense.gguf (same quantizer, same types, no matrix)
+recipe: 753 tensors from /mnt/d/pelias-tests/rot/r2_dense.gguf
+free space at /mnt/d/pelias-tests/rot: 80 GB; this step writes about 22 GB
+recipe: 753 tensors named
+quantizing 753 tensors to Q4_K_M
+   10 % (76 of 753 tensors)
+   20 % (151 of 753 tensors)
+   30 % (226 of 753 tensors)
+   40 % (302 of 753 tensors)
+   50 % (377 of 753 tensors)
+   60 % (452 of 753 tensors)
+   70 % (528 of 753 tensors)
+   80 % (603 of 753 tensors)
+   90 % (678 of 753 tensors)
+  100 % (753 of 753 tensors)
+rotated (Walsh-Hadamard per 32, recorded in pelias.rot32.tensors): 318 tensors
+done: 753 tensors (443 quantized, 310 copied unchanged), 66.18 GiB in, 20.21 GiB out, 304.6 s
+  F32    310 tensors
+  Q4_K   379 tensors
+  Q6_K   64 tensors
+built /mnt/d/pelias-tests/rot/r2_check.gguf in 309 s
+tensors: 753 / 753; identical 753; type differs 0; shape differs 0; data differs 0; only in one file 0 / 0
+metadata identical: yes; tensor order identical: yes; files byte-identical: yes
+compared in 68.8 s
+CHECK OK: the recipe path rebuilds R2 byte for byte. r2_check.gguf is now a duplicate (21.7 GB) and can be removed by the author
+== L check done 2026-10-28 01:16:28. Log /mnt/d/pelias-tests/gp/L/check_20261028_011000.log
