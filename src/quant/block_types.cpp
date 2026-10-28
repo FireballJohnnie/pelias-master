@@ -43,7 +43,8 @@ TypeInfo type_info(std::uint32_t id) {
     case 40: return {"NVFP4", 64, 36, true};    // 64/16 + 64/2
     case 41: return {"Q1_0", 128, 18, true};    // 2 + 128/8
     case 42: return {"Q2_0", 64, 18, true};     // 2 + 64/4
-    case 200: return {"Q8_Z", 256, 264, true};  // Pelias-only: 2 (fp16 d) + 6 (eight 6-bit levels) + 256 (int8)
+    case 200: return {"Q8_Z", 256, 264, true};
+    case 201: return {"Q7_Z", 256, 232, true};  // Pelias-only: 2 (fp16 d) + 6 (levels) + 224 (7-bit values)  // Pelias-only: 2 (fp16 d) + 6 (eight 6-bit levels) + 256 (int8)
     default: return {"?", 0, 0, false};
   }
 }

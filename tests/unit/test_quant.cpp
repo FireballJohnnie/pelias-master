@@ -161,3 +161,57 @@ TEST(q8_z_layout_and_round_trip) {
   for (float v : back) CHECK(v == 0.0f);
   CHECK(zb[2] != 0);
 }
+
+TEST(q7_z_layout_and_round_trip) {
+  // Pelias-only id 201, 256 per block, 232 bytes (7.25 bits per weight): Q8_Z's header with tight 7-bit values
+  const q::TypeInfo ti = q::type_info(q::Type::q7_z);
+  CHECK(ti.known && std::string(ti.name) == "Q7_Z" && ti.block_elements == 256 && ti.block_bytes == 232);
+  CHECK(q::bits_per_weight(201) == 7.25);
+  std::vector<float> x(4096);
+  std::uint32_t s = 777;
+  for (float& v : x) {
+    s = s * 1664525u + 1013904223u;
+    const float u = (static_cast<float>(s >> 8) / 16777216.0f) - 0.5f;
+    v = 0.02f * u / (0.05f + std::fabs(u));
+  }
+  x[40] = 0.8f;
+  std::vector<std::uint8_t> z7(static_cast<std::size_t>(q::row_bytes(201, 4096))), z8(static_cast<std::size_t>(q::row_bytes(200, 4096)));
+  std::vector<float> b7(4096), b8(4096);
+  CHECK(q::quantize_row(q::Type::q7_z, x.data(), z7.data(), 4096).ok());
+  CHECK(q::dequantize_row(q::Type::q7_z, z7.data(), b7.data(), 4096).ok());
+  CHECK(q::quantize_row(q::Type::q8_z, x.data(), z8.data(), 4096).ok());
+  CHECK(q::dequantize_row(q::Type::q8_z, z8.data(), b8.data(), 4096).ok());
+  double e7 = 0, e8 = 0, ex = 0;
+  for (int i = 0; i < 4096; ++i) {
+    e7 += std::pow(b7[size_t(i)] - x[size_t(i)], 2);
+    e8 += std::pow(b8[size_t(i)] - x[size_t(i)], 2);
+    ex += std::pow(x[size_t(i)], 2);
+  }
+  std::printf("      Q7_Z relative error %.3g, Q8_Z %.3g\n", e7 / ex, e8 / ex);
+  CHECK(e7 > e8 && e7 / ex < 8.0 * e8 / ex);  // one value bit fewer: about 4x (the sandbox measured 4.0x on real weights)
+  // every value decodes from its 7-bit field on the block's grid
+  for (int b = 0; b < 16; ++b) {
+    const std::uint8_t* p = z7.data() + 232 * b;
+    std::uint16_t dh;
+    std::memcpy(&dh, p, 2);
+    const float d = q::fp16_to_fp32(dh);
+    std::uint64_t packed = 0;
+    for (int k = 0; k < 6; ++k) packed |= static_cast<std::uint64_t>(p[2 + k]) << (8 * k);
+    for (int g = 0; g < 32; ++g) {
+      std::uint64_t w = 0;
+      for (int k = 0; k < 7; ++k) w |= static_cast<std::uint64_t>(p[8 + 7 * g + k]) << (8 * k);
+      const int lv = static_cast<int>((packed >> (6 * (g / 4))) & 63u);
+      CHECK(lv >= 1 && lv <= 63);
+      for (int k = 0; k < 8; ++k) {
+        const int u = static_cast<int>((w >> (7 * k)) & 127u);
+        CHECK(u >= 1 && u <= 127);
+        CHECK(b7[size_t(256 * b + 8 * g + k)] == static_cast<float>(u - 64) * q::q7_z_scale(d, lv));
+      }
+    }
+  }
+  std::vector<float> zero(256, 0.0f), back(256, 1.0f);
+  std::vector<std::uint8_t> zb(232);
+  CHECK(q::quantize_row(q::Type::q7_z, zero.data(), zb.data(), 256).ok());
+  CHECK(q::dequantize_row(q::Type::q7_z, zb.data(), back.data(), 256).ok());
+  for (float v : back) CHECK(v == 0.0f);
+}

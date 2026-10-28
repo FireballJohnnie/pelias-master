@@ -58,6 +58,12 @@ void quantize_q8_0(const float* x, std::uint8_t* out, std::int64_t n);
 void quantize_q8_z(const float* x, std::uint8_t* out, std::int64_t n);
 void dequantize_q8_z(const std::uint8_t* in, float* y, std::int64_t n);
 float q8_z_scale(float d, int lv);
+// Q7_Z (Pelias-only, 256 per block, 232 bytes = 7.25 bits per weight): Q8_Z's header (fp16 d = top / 63, eight 6-bit
+// levels), then 32 groups of 7 bytes, each holding eight 7-bit values u = q + 64 (q in -63..63) little-endian, value k in
+// bits 7k..7k+6. Value = s_j * q with s_j = (d * lv_j) / 63 in fp32 (j = 32-block). Same level search as Q8_Z.
+void quantize_q7_z(const float* x, std::uint8_t* out, std::int64_t n);
+void dequantize_q7_z(const std::uint8_t* in, float* y, std::int64_t n);
+float q7_z_scale(float d, int lv);
 void quantize_q8_1(const float* x, std::uint8_t* out, std::int64_t n);
 void quantize_q4_k(const float* x, std::uint8_t* out, std::int64_t n);
 void quantize_q6_k(const float* x, std::uint8_t* out, std::int64_t n);
