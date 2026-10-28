@@ -1,0 +1,67 @@
+tensors: 753 / 733; identical 290; type differs 0; shape differs 0; data differs 443; only in one file 20 / 0
+metadata identical: no; tensor order identical: no; files byte-identical: no
+  metadata entries: 57 / 54
+  output.weight: data differs from byte 0 (block 0)
+  blk.0.attn_gate.weight: data differs from byte 0 (block 0)
+  blk.0.attn_qkv.weight: data differs from byte 0 (block 0)
+  blk.0.ffn_down_exps.weight: data differs from byte 178 (block 1)
+  blk.0.ffn_down_shexp.weight: data differs from byte 0 (block 0)
+  blk.0.ffn_gate_exps.weight: data differs from byte 1010 (block 7)
+  blk.0.ffn_gate_shexp.weight: data differs from byte 0 (block 0)
+  blk.0.ffn_up_exps.weight: data differs from byte 0 (block 0)
+  blk.0.ffn_up_shexp.weight: data differs from byte 0 (block 0)
+  blk.0.ssm_alpha.weight: data differs from byte 0 (block 0); 65536 of 65536 values differ, by at most 2068797380 units in the last place
+  blk.0.ssm_beta.weight: data differs from byte 0 (block 0); 65536 of 65536 values differ, by at most 2066669521 units in the last place
+  blk.0.ssm_out.weight: data differs from byte 0 (block 0)
+  blk.1.attn_gate.weight: data differs from byte 0 (block 0)
+  blk.1.attn_qkv.weight: data differs from byte 0 (block 0)
+  blk.1.ffn_down_exps.weight: data differs from byte 528 (block 3)
+  blk.1.ffn_down_shexp.weight: data differs from byte 0 (block 0)
+  blk.1.ffn_gate_exps.weight: data differs from byte 14114 (block 98)
+  blk.1.ffn_gate_shexp.weight: data differs from byte 0 (block 0)
+  blk.1.ffn_up_exps.weight: data differs from byte 3312 (block 23)
+  blk.1.ffn_up_shexp.weight: data differs from byte 0 (block 0)
+  blk.1.ssm_alpha.weight: data differs from byte 0 (block 0); 65536 of 65536 values differ, by at most 2075290775 units in the last place
+  blk.1.ssm_beta.weight: data differs from byte 0 (block 0); 65536 of 65536 values differ, by at most 2071044253 units in the last place
+  blk.1.ssm_out.weight: data differs from byte 0 (block 0)
+  blk.2.attn_gate.weight: data differs from byte 0 (block 0)
+  blk.2.attn_qkv.weight: data differs from byte 0 (block 0)
+  blk.2.ffn_down_exps.weight: data differs from byte 176 (block 1)
+  blk.2.ffn_down_shexp.weight: data differs from byte 0 (block 0)
+  blk.2.ffn_gate_exps.weight: data differs from byte 13682 (block 95)
+  blk.2.ffn_gate_shexp.weight: data differs from byte 0 (block 0)
+  blk.2.ffn_up_exps.weight: data differs from byte 16992 (block 118)
+  blk.2.ffn_up_shexp.weight: data differs from byte 0 (block 0)
+  blk.2.ssm_alpha.weight: data differs from byte 0 (block 0); 65536 of 65536 values differ, by at most 2075658909 units in the last place
+  blk.2.ssm_beta.weight: data differs from byte 0 (block 0); 65536 of 65536 values differ, by at most 2072313220 units in the last place
+  blk.2.ssm_out.weight: data differs from byte 0 (block 0)
+  blk.3.attn_k.weight: data differs from byte 0 (block 0)
+  blk.3.attn_output.weight: data differs from byte 0 (block 0)
+  blk.3.attn_q.weight: data differs from byte 0 (block 0)
+  blk.3.attn_v.weight: data differs from byte 0 (block 0)
+  blk.3.ffn_down_exps.weight: data differs from byte 2114 (block 12)
+  blk.3.ffn_down_shexp.weight: data differs from byte 0 (block 0)
+  blk.3.ffn_gate_exps.weight: data differs from byte 40464 (block 281)
+  blk.3.ffn_gate_shexp.weight: data differs from byte 0 (block 0)
+  blk.3.ffn_up_exps.weight: data differs from byte 3888 (block 27)
+  blk.3.ffn_up_shexp.weight: data differs from byte 0 (block 0)
+  blk.4.attn_gate.weight: data differs from byte 0 (block 0)
+  blk.4.attn_qkv.weight: data differs from byte 0 (block 0)
+  blk.4.ffn_down_exps.weight: data differs from byte 2 (block 0)
+  blk.4.ffn_down_shexp.weight: data differs from byte 0 (block 0)
+  blk.4.ffn_gate_exps.weight: data differs from byte 2016 (block 14)
+  blk.4.ffn_gate_shexp.weight: data differs from byte 0 (block 0)
+  blk.4.ffn_up_exps.weight: data differs from byte 1152 (block 8)
+  blk.4.ffn_up_shexp.weight: data differs from byte 0 (block 0)
+  blk.4.ssm_a: data differs from byte 64 (block 16); 1 of 32 values differ, by at most 1 units in the last place
+  blk.4.ssm_alpha.weight: data differs from byte 0 (block 0); 65536 of 65536 values differ, by at most 2078038101 units in the last place
+  blk.4.ssm_beta.weight: data differs from byte 0 (block 0); 65536 of 65536 values differ, by at most 2074650182 units in the last place
+  blk.4.ssm_out.weight: data differs from byte 0 (block 0)
+  blk.5.attn_gate.weight: data differs from byte 0 (block 0)
+  blk.5.attn_qkv.weight: data differs from byte 0 (block 0)
+  blk.5.ffn_down_exps.weight: data differs from byte 2642 (block 15)
+  blk.5.ffn_down_shexp.weight: data differs from byte 0 (block 0)
+  blk.5.ffn_gate_exps.weight: data differs from byte 1152 (block 8)
+  blk.5.ffn_gate_shexp.weight: data differs from byte 0 (block 0)
+  blk.5.ffn_up_exps.weight: data differs from byte 1584 (block 11)
+compared in 1.2 s
