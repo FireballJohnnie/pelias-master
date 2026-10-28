@@ -376,3 +376,33 @@ TEST(h_gate_live_drops_the_8th_bit_on_the_smallest_expected_loss) {
       CHECK(std::fabs(a0 - a1) > 1e-6);
     }
 }
+
+// Run D: the T-decode route (7-bit base as integers + the gated 8th bit by AND + popcount) equals the dequantized Q7_ZT
+// weights times the gpu256x8-rounded activations (the same integers in another summation order).
+TEST(t_decode_q7zt_equals_dequantized_product) {
+  const std::int64_t k = 512, n_out = 24, n_tok = 3;
+  std::vector<float> w(static_cast<std::size_t>(n_out * k)), x(static_cast<std::size_t>(n_tok * k));
+  std::uint32_t seed = 99u;
+  auto rnd = [&seed]() { seed = seed * 1664525u + 1013904223u; return (static_cast<float>(seed >> 8) / 16777216.0f) - 0.5f; };
+  for (float& v : w) v = 0.05f * rnd() / (0.05f + std::fabs(rnd()));
+  for (float& v : x) v = rnd() * (1.0f + 4.0f * std::fabs(rnd()));
+  const std::uint64_t rb = static_cast<std::uint64_t>(k / 256) * 241;
+  std::vector<std::uint8_t> q(static_cast<std::size_t>(n_out) * rb);
+  for (std::int64_t r = 0; r < n_out; ++r) pelias::quant::quantize_q7_zt(w.data() + r * k, q.data() + r * static_cast<std::int64_t>(rb), k);
+  std::vector<float> y(static_cast<std::size_t>(n_tok * n_out));
+  pelias::model::t_decode_q7zt(q.data(), rb, n_out, k, x.data(), n_tok, k, y.data(), n_out, 2);
+  std::vector<float> wd(static_cast<std::size_t>(k)), xr(x);
+  for (std::int64_t t = 0; t < n_tok; ++t) pelias::model::act_round_q8_256x8(xr.data() + t * k, k);
+  double worst = 0.0, scale = 0.0;
+  for (std::int64_t r = 0; r < n_out; ++r) {
+    pelias::quant::dequantize_q7_zt(q.data() + r * static_cast<std::int64_t>(rb), wd.data(), k);
+    for (std::int64_t t = 0; t < n_tok; ++t) {
+      double ref = 0.0;
+      for (std::int64_t i = 0; i < k; ++i) ref += static_cast<double>(wd[static_cast<std::size_t>(i)]) * xr[static_cast<std::size_t>(t * k + i)];
+      scale = std::max(scale, std::fabs(ref));
+      worst = std::max(worst, std::fabs(ref - static_cast<double>(y[static_cast<std::size_t>(t * n_out + r)])));
+    }
+  }
+  std::printf("      T-decode vs dequantized product: max error %.2e of max |y| %.3f\n", worst / scale, scale);
+  CHECK(worst / scale < 1e-5);
+}

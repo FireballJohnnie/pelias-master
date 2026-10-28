@@ -124,6 +124,11 @@ struct ForwardOptions {
   // the fraction f of each row's 32-blocks with the largest expected loss s^2 * sum(x^2) (the live gate, ZH: decided by
   // the token, not the calibration text); the other blocks use the base with H filled by 0.5. 0 = off (all H read).
   double h_gate = 0.0;
+  // T-decode proof (run D; docs/PELIAS_7_T_H_PLAN.md section 6 step 6): Q7_ZT weights with the eight-scales-per-256
+  // activation format (gpu256x8) are multiplied by the 1-bit route: the 7-bit base as integers, the 8th bit of each
+  // gated 32-block added by AND + popcount against the activation's bit planes (quant/tdecode.h). Off: the dequantized
+  // weights times the rounded activations (the same integers, summed in another order).
+  bool t_decode = false;
   // swap_margin m > 0 with hot (n_layer x n_expert, 1 = resident): when a token's last pick is not resident, the first
   // unpicked expert is, and their probabilities differ by less than m, the resident one is used instead.
   float swap_margin = 0.0f;
@@ -150,6 +155,11 @@ void act_round_q8_256(float* x, std::int64_t n);
 // y -= s_j * sum (h - 0.5) x over each dropped block. Blocks kept per row: round(f * blocks).
 void h_gate_correct_q8z(const std::uint8_t* data, std::uint64_t row_bytes, std::int64_t n_out, std::int64_t k, const float* x,
                         std::int64_t n_tok, std::int64_t ldx, float* y, std::int64_t ldy, double f, int threads);
+// T-decode (ForwardOptions::t_decode) on rows of a Q7_ZT matrix: x holds n_tok input rows (rotated if the weight is,
+// not yet rounded); they are rounded to the per-32 int8 format here; y[t][r] = sum over 32-blocks of s_j a_j P_j with the
+// gated blocks' 8th bit by AND + popcount.
+void t_decode_q7zt(const std::uint8_t* data, std::uint64_t row_bytes, std::int64_t n_out, std::int64_t k, const float* x, std::int64_t n_tok,
+                   std::int64_t ldx, float* y, std::int64_t ldy, int threads);
 // the same with eight scales per 256 (ForwardOptions::act_gpu256_sub 1) or a power-of-two exponent per 32 (sub 2)
 void act_round_q8_256x8(float* x, std::int64_t n);
 void act_round_q8_256e(float* x, std::int64_t n);

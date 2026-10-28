@@ -6,6 +6,7 @@
 #include "model/arch_qwen35moe.h"
 
 #include <algorithm>
+#include <bit>
 #include <atomic>
 #include <cmath>
 #include <cstring>
@@ -424,6 +425,60 @@ void h_gate_impl(const std::uint8_t* data, std::uint64_t row_bytes, int64_t n_ou
   });
 }
 
+void t_decode_impl(const std::uint8_t* data, std::uint64_t row_bytes, int64_t n_out, int64_t k, const float* x, int64_t n_tok, int64_t ldx,
+                   float* y, int64_t ldy, int threads) {
+  const int64_t nb = k / 32;
+  std::vector<quant::ActBlock32> act(z(n_tok * nb));
+  for (int64_t t = 0; t < n_tok; ++t) quant::act_quantize_32(x + t * ldx, k, act.data() + t * nb);
+  parallel_items(n_out, threads, [&](int64_t r, int) {
+    // the row as a kernel would hold it: the 7-bit base as integers b (0..127), the H word of each gated block, the scales
+    const std::uint8_t* row = data + static_cast<uint64_t>(r) * row_bytes;
+    std::vector<std::int8_t> bb(z(k));
+    std::vector<std::uint32_t> hw(z(nb), 0u);
+    std::vector<std::uint8_t> gated(z(nb), 0);
+    std::vector<float> s(z(nb));
+    for (int64_t i = 0; i < k / 256; ++i) {
+      const std::uint8_t* p = row + 241 * i;
+      const float d = quant::fp16_to_fp32(static_cast<std::uint16_t>(p[0] | (p[1] << 8)));
+      std::uint64_t lv = 0;
+      for (int b = 0; b < 6; ++b) lv |= static_cast<std::uint64_t>(p[2 + b]) << (8 * b);
+      const std::uint8_t mask = p[8];
+      int slot = 0;
+      for (int j = 0; j < 8; ++j) {
+        s[z(8 * i + j)] = quant::q8_z_scale(d, static_cast<int>((lv >> (6 * j)) & 63u));
+        if ((mask >> j) & 1u) {
+          const std::uint8_t* hp = p + 233 + 4 * slot++;
+          hw[z(8 * i + j)] = static_cast<std::uint32_t>(hp[0]) | (static_cast<std::uint32_t>(hp[1]) << 8) | (static_cast<std::uint32_t>(hp[2]) << 16) |
+                             (static_cast<std::uint32_t>(hp[3]) << 24);
+          gated[z(8 * i + j)] = 1;
+        }
+        for (int g = 0; g < 4; ++g) {
+          std::uint64_t wv = 0;
+          for (int b = 0; b < 7; ++b) wv |= static_cast<std::uint64_t>(p[9 + 7 * (4 * j + g) + b]) << (8 * b);
+          for (int kk = 0; kk < 8; ++kk) bb[z(256 * i + 32 * j + 8 * g + kk)] = static_cast<std::int8_t>((wv >> (7 * kk)) & 127u);
+        }
+      }
+    }
+    for (int64_t t = 0; t < n_tok; ++t) {
+      float acc = 0.0f;
+      for (int64_t j = 0; j < nb; ++j) {
+        const quant::ActBlock32& a = act[z(t * nb + j)];
+        std::int32_t pb = 0;
+        for (int i = 0; i < 32; ++i) pb += static_cast<std::int32_t>(bb[z(32 * j + i)]) * a.q[i];
+        std::int64_t P2 = 2 * (2 * static_cast<std::int64_t>(pb) - 127 * static_cast<std::int64_t>(a.sum));
+        if (gated[z(j)]) {
+          const std::uint32_t h = hw[z(j)];
+          std::int64_t hc = -128 * std::popcount(h);
+          for (int kk = 0; kk < 8; ++kk) hc += static_cast<std::int64_t>(std::popcount(h & a.plane[kk])) << kk;
+          P2 += 2 * hc;
+        }
+        acc += s[z(j)] * a.scale * (0.5f * static_cast<float>(P2));
+      }
+      y[t * ldy + r] = acc;
+    }
+  });
+}
+
 // matmul over the whole matrix, recording the activations for the importance matrix when asked
 void mm(const Ctx& c, const WeightView& w, const float* x, int64_t n_tok, int64_t ldx, float* y, int64_t ldy) {
   if (c.opt.imatrix && !w.rot32) c.opt.imatrix->add_dense(w.name, x, n_tok, ldx, static_cast<int64_t>(w.ne[0]));
@@ -440,6 +495,14 @@ void mm(const Ctx& c, const WeightView& w, const float* x, int64_t n_tok, int64_
   if (const ActFmt f = act_format(c.opt, w); f != ActFmt::none || w.rot32) {
     const int64_t k = static_cast<int64_t>(w.ne[0]);
     std::vector<float> xr(z(n_tok * k));
+    if (c.opt.t_decode && f == ActFmt::q8_256x8 && static_cast<quant::Type>(w.type) == quant::Type::q7_zt && !c.opt.act_rot32) {
+      for (int64_t t = 0; t < n_tok; ++t) {  // rotated as the weight is, rounded inside the T-decode (same rounding as gpu256x8)
+        std::memcpy(xr.data() + t * k, x + t * ldx, z(k) * sizeof(float));
+        if (w.rot32) act_rotate32(xr.data() + t * k, k);
+      }
+      t_decode_impl(w.data, w.row_bytes, static_cast<int64_t>(w.ne[1]), k, xr.data(), n_tok, k, y, ldy, c.threads);
+      return;
+    }
     for (int64_t t = 0; t < n_tok; ++t) {
       std::memcpy(xr.data() + t * k, x + t * ldx, z(k) * sizeof(float));
       prep_row(xr.data() + t * k, k, f, w.rot32, c.opt.act_rot32);
@@ -994,6 +1057,10 @@ void act_round_q8_256e(float* x, std::int64_t n) {
 void h_gate_correct_q8z(const std::uint8_t* data, std::uint64_t row_bytes, std::int64_t n_out, std::int64_t k, const float* x,
                         std::int64_t n_tok, std::int64_t ldx, float* y, std::int64_t ldy, double f, int threads) {
   h_gate_impl(data, row_bytes, n_out, k, x, n_tok, ldx, y, ldy, f, threads);
+}
+void t_decode_q7zt(const std::uint8_t* data, std::uint64_t row_bytes, std::int64_t n_out, std::int64_t k, const float* x, std::int64_t n_tok,
+                   std::int64_t ldx, float* y, std::int64_t ldy, int threads) {
+  t_decode_impl(data, row_bytes, n_out, k, x, n_tok, ldx, y, ldy, threads);
 }
 
 }  // namespace pelias::model

@@ -158,6 +158,7 @@ void usage() {
       "                                  comma-separated GROUPS (or 'all') to 8 bits first: cpu (default) = llama.cpp's CPU\n"
       "                                  format for each weight type (Q8_K / Q8_0 / Q8_1), gpu = q8_1\n"
       "                                  --act-rot h32: rotate each 32-value block (Walsh-Hadamard) before rounding, back after\n"      "      [--h-gate live:F]   (Q8_Z weights: the 8th bit read on the fraction F of 32-blocks with the largest expected loss per token)\n"
+      "      [--t-decode]        (Q7_ZT weights with --act-int8-path gpu256x8: the 1-bit route, 8th bit by AND + popcount)\n"
 "      [--act-bits 4] [--neuron-skip F] [--defer-experts D] [--swap-near-tie M --hot-set FILE] [--act-cold-path gpu256 --hot-set FILE]   (game plan Block M)\n"
       "                                  --act-bits 4: 4-bit activations per 32 (gpu path); --neuron-skip F: zero the smallest\n"
       "                                  F of each routed expert's hidden values (oracle); --defer-experts D: the D lowest\n"
@@ -741,6 +742,10 @@ int cmd_kld(const Args& a) {
     fo.h_gate = f.value;
     std::fprintf(stderr, "pelias kld: live H gate on Q8_Z weights: the 8th bit read on %.0f %% of each row's 32-blocks per token, the rest filled by 0.5\n",
                  100.0 * fo.h_gate);
+  }
+  if (a.has("t-decode")) {
+    fo.t_decode = true;
+    std::fprintf(stderr, "pelias kld: T-decode: Q7_ZT weights with gpu256x8 activations take the 1-bit route (8th bit by AND + popcount)\n");
   }
   if (a.has("defer-experts")) {
     const Result<std::uint64_t> d = io::parse_whole(a.get("defer-experts"), spec.value.n_expert_used > 0 ? spec.value.n_expert_used - 1 : 0);
