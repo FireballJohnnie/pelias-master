@@ -1,0 +1,68 @@
+
+== TD tdecode | T-decode GPU probe v2: mma rates and the gemv2 routes (cold L2) | started 2026-10-28 19:05:19 | ETA about 1-2 min | log /mnt/d/pelias-tests/gp/TD/tdecode_20261028_190518.log
+From /mnt/c/AI/cl-sndbx-bkp/stuart-creator/2026-10-28/pelias-master_main_e262b02-e596507.bundle
+ * branch            main       -> FETCH_HEAD
+Updating e262b02..e596507
+Fast-forward
+ .../tdecode/tdecode_20261028_171710.log            |  72 +++++++++
+ docs/PELIAS_GAME_PLAN.md                           |  14 ++
+ logs/BUILD_LOG.md                                  |   1 +
+ tools/experiments/tdecode_kernel_emul_v2.py        |  33 ++++
+ tools/probes/tdecode/README.md                     |   8 +
+ tools/probes/tdecode/tdecode.cu                    | 177 ++++++++++++++++++++-
+ 6 files changed, 301 insertions(+), 4 deletions(-)
+ create mode 100644 data/probe_results/tdecode/tdecode_20261028_171710.log
+ create mode 100644 tools/experiments/tdecode_kernel_emul_v2.py
+nvcc: Build cuda_13.0.r13.0/compiler.36424714_0
+== PREDICTIONS (written 10-28 19:0x, DERIVED): mma as before (MEASURED 8.00x). gemv2 is cold-L2 and memory-bound: Q8_Z near the 504 GB/s VRAM rate; Q7_ZT fold about 8-9 % faster than Q8_Z (fewer bytes); T-decode (1-bit route) within a few % of fold; ZH 25 % between Q7_ZT and Q8_Z by bytes; every route prints ok.
+device NVIDIA GeForce RTX 4070, 46 SMs, sm_89
+mma b1 m16n8k256 .and.popc: 3.37 ms, 937.4 T bit-MAC/s (28609 mma per us)
+mma s8 m16n8k32:            3.37 ms, 117.2 T int8-MAC/s (28610 mma per us)
+bit-MAC per int8-MAC: 8.00x (one 8-bit x 8-bit product = 64 bit-products, so the 1-bit path pays off above 64x... per weight plane x activation planes: 8 activation planes per weight plane -> 1.00x an int8 MAC per weight bit)
+  activation prep (warp ballot planes) vs host: identical
+shape: 8192 outputs x 2048 inputs
+  -- version 2 (lanes split each row, 16 lanes per row)
+  v2 Q8_Z (int8, baseline)          53.34 us cold    324.3 GB/s  bytes 17.30 MB (8.250 bits per weight)  max err 9.50e-08 of max |y| (ok)
+  v2 Q7_ZT, H as int8 bytes         50.18 us cold    314.8 GB/s  bytes 15.79 MB (7.531 bits per weight)  max err 8.01e-08 of max |y| (ok)
+  v2 Q7_ZT, H by 1-bit decode       51.20 us cold    308.5 GB/s  bytes 15.79 MB (7.531 bits per weight)  max err 8.01e-08 of max |y| (ok)
+  v2 ZH arrays, H on 0 %            47.10 us cold    322.8 GB/s  bytes 15.20 MB (7.250 bits per weight)  max err 8.23e-08 of max |y| (ok)
+  v2 ZH arrays, H on 25 %           52.22 us cold    301.2 GB/s  bytes 15.73 MB (7.500 bits per weight)  max err 8.55e-08 of max |y| (ok)
+  v2 ZH arrays, H on 100 %          62.46 us cold    277.0 GB/s  bytes 17.30 MB (8.250 bits per weight)  max err 9.50e-08 of max |y| (ok)
+  activation prep (warp ballot planes) vs host: identical
+shape: 2048 outputs x 4096 inputs
+  -- version 2 (lanes split each row, 32 lanes per row)
+  v2 Q8_Z (int8, baseline)          29.70 us cold    291.3 GB/s  bytes 8.65 MB (8.250 bits per weight)  max err 9.92e-08 of max |y| (ok)
+  v2 Q7_ZT, H as int8 bytes         27.65 us cold    285.6 GB/s  bytes 7.90 MB (7.531 bits per weight)  max err 7.54e-08 of max |y| (ok)
+  v2 Q7_ZT, H by 1-bit decode       29.70 us cold    265.9 GB/s  bytes 7.90 MB (7.531 bits per weight)  max err 7.54e-08 of max |y| (ok)
+  v2 ZH arrays, H on 0 %            26.62 us cold    285.5 GB/s  bytes 7.60 MB (7.250 bits per weight)  max err 8.42e-08 of max |y| (ok)
+  v2 ZH arrays, H on 25 %           30.88 us cold    254.7 GB/s  bytes 7.86 MB (7.500 bits per weight)  max err 7.39e-08 of max |y| (ok)
+  v2 ZH arrays, H on 100 %          45.06 us cold    192.0 GB/s  bytes 8.65 MB (8.250 bits per weight)  max err 9.92e-08 of max |y| (ok)
+  activation prep (warp ballot planes) vs host: identical
+shape: 4096 outputs x 2048 inputs
+  -- version 2 (lanes split each row, 16 lanes per row)
+  v2 Q8_Z (int8, baseline)          29.31 us cold    295.1 GB/s  bytes 8.65 MB (8.250 bits per weight)  max err 1.33e-07 of max |y| (ok)
+  v2 Q7_ZT, H as int8 bytes         27.65 us cold    285.6 GB/s  bytes 7.90 MB (7.531 bits per weight)  max err 1.03e-07 of max |y| (ok)
+  v2 Q7_ZT, H by 1-bit decode       29.54 us cold    267.4 GB/s  bytes 7.90 MB (7.531 bits per weight)  max err 1.03e-07 of max |y| (ok)
+  v2 ZH arrays, H on 0 %            26.62 us cold    285.5 GB/s  bytes 7.60 MB (7.250 bits per weight)  max err 1.16e-07 of max |y| (ok)
+  v2 ZH arrays, H on 25 %           30.72 us cold    256.0 GB/s  bytes 7.86 MB (7.500 bits per weight)  max err 9.34e-08 of max |y| (ok)
+  v2 ZH arrays, H on 100 %          35.84 us cold    241.4 GB/s  bytes 8.65 MB (8.250 bits per weight)  max err 1.33e-07 of max |y| (ok)
+  activation prep (warp ballot planes) vs host: identical
+shape: 512 outputs x 2048 inputs
+  -- version 2 (lanes split each row, 16 lanes per row)
+  v2 Q8_Z (int8, baseline)           8.19 us cold    132.0 GB/s  bytes 1.08 MB (8.250 bits per weight)  max err 7.47e-08 of max |y| (ok)
+  v2 Q7_ZT, H as int8 bytes          9.22 us cold    107.1 GB/s  bytes 0.99 MB (7.531 bits per weight)  max err 8.81e-08 of max |y| (ok)
+  v2 Q7_ZT, H by 1-bit decode        9.86 us cold    100.2 GB/s  bytes 0.99 MB (7.531 bits per weight)  max err 8.81e-08 of max |y| (ok)
+  v2 ZH arrays, H on 0 %             9.02 us cold    105.3 GB/s  bytes 0.95 MB (7.250 bits per weight)  max err 1.01e-07 of max |y| (ok)
+  v2 ZH arrays, H on 25 %           11.62 us cold     84.6 GB/s  bytes 0.98 MB (7.500 bits per weight)  max err 8.09e-08 of max |y| (ok)
+  v2 ZH arrays, H on 100 %          12.29 us cold     88.0 GB/s  bytes 1.08 MB (8.250 bits per weight)  max err 7.47e-08 of max |y| (ok)
+  activation prep (warp ballot planes) vs host: identical
+shape: 2048 outputs x 512 inputs
+  -- version 2 (lanes split each row, 4 lanes per row)
+  v2 Q8_Z (int8, baseline)           8.19 us cold    132.0 GB/s  bytes 1.08 MB (8.250 bits per weight)  max err 8.86e-08 of max |y| (ok)
+  v2 Q7_ZT, H as int8 bytes          9.22 us cold    107.1 GB/s  bytes 0.99 MB (7.531 bits per weight)  max err 7.78e-08 of max |y| (ok)
+  v2 Q7_ZT, H by 1-bit decode        9.22 us cold    107.1 GB/s  bytes 0.99 MB (7.531 bits per weight)  max err 7.78e-08 of max |y| (ok)
+  v2 ZH arrays, H on 0 %             8.19 us cold    116.0 GB/s  bytes 0.95 MB (7.250 bits per weight)  max err 6.74e-08 of max |y| (ok)
+  v2 ZH arrays, H on 25 %           10.24 us cold     96.0 GB/s  bytes 0.98 MB (7.500 bits per weight)  max err 1.01e-07 of max |y| (ok)
+  v2 ZH arrays, H on 100 %          11.26 us cold     96.0 GB/s  bytes 1.08 MB (8.250 bits per weight)  max err 8.86e-08 of max |y| (ok)
+all routes match the host reference
+== TD tdecode done 2026-10-28 19:05:29. Log /mnt/d/pelias-tests/gp/TD/tdecode_20261028_190518.log
