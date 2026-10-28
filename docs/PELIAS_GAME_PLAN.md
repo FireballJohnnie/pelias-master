@@ -1121,6 +1121,22 @@ Likeliest candidates first, then stop and decide (keep the best file or keep exp
 5. **C12 empty activation planes** (synthetic Gaussian and Laplace, per-32 int8 sign-magnitude): 0.000 empty planes per block at every bit. With one scale per 32 every plane carries bits. **Rejected.**
 6. **POPCNT on Zen 3** (uops.info, PUBLISHED/MEASURED there): r64 latency 1, throughput 0.25 measured (4 per cycle), 0.31 unrolled. Fable's assumption holds.
 
+### Q7_ZH and the binary gate (author 14:30-14:31: "H is like a gate", "the binary level", "what the Pelias variant is about"; sandbox MEASURED, real blk.20 attn_qkv, rotated, importance-weighted)
+
+- **Split:** Q8_Z's values as q = 2b + h (7-bit base plane, 1-bit H plane). Base only (reconstruct 2b + 0.5) 0.000116 vs native Q7_Z 0.000113: the split costs about 3 %, so one 8.25-bit file serves both 8-bit (H read, 0.000029) and 7-bit reads.
+- **Importance-weighted level search:** no change for Q8_Z or Q7_Z on this rotated tensor (0.000029 / 0.000113 either way); the rotation leaves importance nearly flat inside a 32-block.
+- **H as a per-block gate (one bit per 32 says "this block carries H"; blocks ranked by importance-weighted error removed):**
+
+| H on | Bits per weight | Weighted error | Straight line |
+|---|---|---|---|
+| 0 % | 7.28 | 0.000116 | 0.000116 |
+| 10 % | 7.38 | 0.000078 | 0.000108 |
+| 25 % | 7.53 | 0.000062 | 0.000094 |
+| 50 % | 7.78 | 0.000045 | 0.000072 |
+| 100 % | 8.28 | 0.000029 | 0.000029 |
+
+  The curve is strongly convex: the first 10 % of H bits remove a third of the gap. Stored as a format, this is a T (tag) bit used as a gate: **Q7_ZT** (7.25 + f + 1/32 bpw, H stored only where the gate is set); kept as a read rule on a full Q7_ZH file, the same ranking decides which H blocks to read. Next: the urm_Q7 result (all base) calibrates KLD per unit of error, then a C++ Q7_ZT at f = 10-25 % and one PC run.
+
 ### Idea register: the unified bus and the idle units (author + Claude + Fable, 2026-10-28 13:0x-13:5x)
 
 Every idea here held up on paper (math checked; Fable read-only where marked). All DERIVED, none MEASURED; each has its test. Details are in the sections below this one. Rejected ideas are listed at the end so they are not re-proposed.
