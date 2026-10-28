@@ -1037,7 +1037,9 @@ The exact pre-gating prediction gets 83.9 % of the next layer's picks with only 
 | Expert deferral 1 (`--defer-experts 1`) | 0.017154 | +0.004213 [+0.003624, +0.004802], t 14.2 | +0.0002 to +0.002: missed (about 2x the top) | ruled out as a default: one expert adds a third of t8r's drift |
 | Expert deferral 2 | 0.023002 | +0.010061 [+0.009218, +0.010904], t 23.7 | 2-3x defer 1: met (2.39x) | ruled out |
 | Near-tie swap, margin 0.001, 7.5 GiB hot set | 0.014606 | +0.001665 [+0.001102, +0.002228], t 5.9 | below +0.0005: missed | cheapest, still resolved; 302,248 swaps of 1,274,700 token-layers whose last pick was cold (23.7 %); a smaller margin is the only version worth a second look |
-| Neuron skip 25 / 40 / 50 % (step b) | pending | | | |
+| Neuron skip 25 % (oracle: smallest hidden values of each routed expert zeroed) | 0.013526 | +0.000585 [+0.000196, +0.000974], t 3.0 | +0.0003 to +0.002: met | the only cheap knob; an upper bound (a real predictor picks worse) |
+| Neuron skip 40 % | 0.017611 | +0.004670 [+0.004021, +0.005319], t 14.3 | +0.001 to +0.004: missed (just above) | as costly as one deferred expert |
+| Neuron skip 50 % | 0.024159 | +0.011218 [+0.009803, +0.012634], t 15.7 | +0.002 to +0.008: missed | ruled out |
 | 8-bit activations, every weight; 4-bit on rotated dense (step c) | pending | | | |
 
 - **Reading:** the routed experts are not interchangeable at the margin. The 8th pick carries about 7 % of the routed weight (block_k) but moving or swapping it costs 13-33 % of the whole file's drift. KTransformers' -0.5 % on LiveBench is a task score; per-token KLD is far more sensitive, and the speed knobs that touch routing must be judged on it.
