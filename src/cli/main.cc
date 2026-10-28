@@ -141,7 +141,9 @@ void usage() {
       "                                  KL divergence of the model against a base file written by llama-perplexity\n"
       "                                  --kl-divergence-base, computed by Pelias's fp32 CPU reference forward pass;\n"
       "                                  --expert-stats: per layer and expert, how often it was picked and its routing weight\n"
-      "      [--dump-kld OUT.bin] [--act-int8 GROUPS] [--act-int8-path cpu|gpu] [--act-rot h32]\n"
+      "      [--dump-kld OUT.bin] [--act-int8 GROUPS] [--act-int8-path cpu|gpu] [--act-rot h32] [--route-dump OUT.bin]\n"
+      "                                  --route-dump: per scored token and layer, the experts picked, their weights, the\n"
+      "                                  margin to the first unpicked one, and the next layer's pre-gating prediction\n"
       "                                  --dump-kld: every scored token's KL, NLLs, delta-p and top-token match (for kld-compare);\n"
       "                                  --act-int8: round the inputs of quantized weights whose names contain one of the\n"
       "                                  comma-separated GROUPS (or 'all') to 8 bits first: cpu (default) = llama.cpp's CPU\n"
@@ -682,6 +684,14 @@ int cmd_kld(const Args& a) {
     std::fprintf(stderr, "pelias kld: 8-bit activation rounding (%s path%s) on: %s\n", fo.act_int8_gpu ? "gpu" : "cpu",
                  fo.act_rot32 ? ", Walsh-Hadamard rotation per 32 values" : "", list.c_str());
   }
+  const std::string route_path = a.get("route-dump");
+  if (!route_path.empty() && std::ifstream(route_path, std::ios::binary)) {
+    std::fprintf(stderr, "pelias: %s already exists (nothing is overwritten)\n", route_path.c_str());
+    return 1;
+  }
+  std::vector<model::RouteRecord> route_chunk(route_path.empty() ? 0 : static_cast<std::size_t>(n_ctx) * spec.value.n_layer);
+  std::vector<model::RouteRecord> route_all;
+  if (!route_path.empty()) fo.route = route_chunk.data();
   const std::string stats_path = a.get("expert-stats");
   const std::size_t n_route = static_cast<std::size_t>(spec.value.n_layer) * spec.value.n_expert;
   std::vector<std::uint64_t> picks(stats_path.empty() ? 0 : n_route, 0);
@@ -713,6 +723,9 @@ int cmd_kld(const Args& a) {
     for (auto& th : pool) th.join();
     for (const verify::KlToken& t : per) stats.add(t);
     if (!dump_path.empty()) dump.tokens.insert(dump.tokens.end(), per.begin(), per.end());
+    if (!route_path.empty())  // the scored positions only, in the order of the KL records
+      route_all.insert(route_all.end(), route_chunk.begin() + static_cast<std::ptrdiff_t>(first) * spec.value.n_layer,
+                       route_chunk.begin() + static_cast<std::ptrdiff_t>(first + scored) * spec.value.n_layer);
     std::printf("%s", verify::kl_chunk_line(c + 1, stats).c_str());
     std::fflush(stdout);
     if (c == 0)
@@ -730,6 +743,34 @@ int cmd_kld(const Args& a) {
       return 6;
     }
     std::fprintf(stderr, "pelias kld: %zu per-token records written\n", dump.tokens.size());
+  }
+  if (!route_path.empty()) {
+    // PELROUT1: magic, u32 n_ctx, chunks, scored, n_layer, n_used, u64 token hash (as --dump-kld), then per scored
+    // token and layer: i16 sel[8], f32 w[8], f32 p_last, f32 p_next, i16 pred[8] (72 bytes), little-endian
+    std::FILE* f = std::fopen(route_path.c_str(), "wb");
+    bool okw = f != nullptr;
+    auto put = [&](const void* p, std::size_t nb) { okw = okw && std::fwrite(p, 1, nb, f) == nb; };
+    if (okw) {
+      put("PELROUT1", 8);
+      const std::uint32_t hdr[5] = {static_cast<std::uint32_t>(n_ctx), static_cast<std::uint32_t>(n_chunk), static_cast<std::uint32_t>(scored),
+                                    spec.value.n_layer, spec.value.n_expert_used};
+      put(hdr, sizeof hdr);
+      const std::uint64_t hash = verify::kl_token_hash(base.tokens().data(), static_cast<std::size_t>(n_chunk) * static_cast<std::size_t>(n_ctx));
+      put(&hash, 8);
+      for (const model::RouteRecord& r : route_all) {
+        put(r.sel, 16);
+        put(r.w, 32);
+        put(&r.p_last, 4);
+        put(&r.p_next, 4);
+        put(r.pred, 16);
+      }
+    }
+    if (f) okw = std::fclose(f) == 0 && okw;
+    if (!okw) {
+      std::fprintf(stderr, "pelias: the routing record could not be written\n");
+      return 6;
+    }
+    std::fprintf(stderr, "pelias kld: routing record written (%zu token-layers)\n", route_all.size());
   }
   if (!stats_path.empty()) {
     std::string csv = "layer,expert,picks,weight_sum\n";

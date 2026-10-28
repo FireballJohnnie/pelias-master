@@ -511,7 +511,14 @@ void moe(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* out) {
     float* p = probs.data() + t * ne;
     softmax(p, ne);
     for (int64_t i = 0; i < ne; ++i) order[z(i)] = static_cast<int32_t>(i);
-    std::partial_sort(order.begin(), order.begin() + nu, order.end(), [p](int32_t a, int32_t b) { return p[a] > p[b] || (p[a] == p[b] && a < b); });
+    // one more than picked, so the first unpicked expert is known (the picks themselves are the same)
+    const int64_t nsort = std::min<int64_t>(nu + 1, ne);
+    std::partial_sort(order.begin(), order.begin() + nsort, order.end(), [p](int32_t a, int32_t b) { return p[a] > p[b] || (p[a] == p[b] && a < b); });
+    if (c.opt.route) {
+      RouteRecord& rr = c.opt.route[z(t * static_cast<int64_t>(s.n_layer) + c.il)];
+      rr.p_last = p[order[z(nu - 1)]];
+      rr.p_next = nsort > nu ? p[order[z(nu)]] : 0.0f;
+    }
     float sum = 0.0f;
     for (int64_t k = 0; k < nu; ++k) {
       sel[z(t * nu + k)] = order[z(k)];
@@ -522,6 +529,13 @@ void moe(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* out) {
     for (int64_t k = 0; k < nu; ++k) {
       wsel[z(t * nu + k)] /= sum;
       if (s.expert_weights_scale != 0.0f && s.expert_weights_scale != 1.0f) wsel[z(t * nu + k)] *= s.expert_weights_scale;
+    }
+    if (c.opt.route) {
+      RouteRecord& rr = c.opt.route[z(t * static_cast<int64_t>(s.n_layer) + c.il)];
+      for (int64_t k = 0; k < nu; ++k) {
+        rr.sel[k] = static_cast<std::int16_t>(sel[z(t * nu + k)]);
+        rr.w[k] = wsel[z(t * nu + k)];
+      }
     }
   }
   if (c.opt.expert_picks || c.opt.expert_weight) {
@@ -707,6 +721,8 @@ Status forward_reference(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, cons
     return Status::fail(Code::invalid_argument, "the token count or the output range is empty or out of range");
   if (w.layers.size() != s.n_layer) return Status::fail(Code::invalid_argument, "the weights were bound for another spec");
   if (Status st = check_act_rounding(opt, w); !st) return st;
+  if (opt.route && (s.n_expert_used > 8 || s.n_expert > 32767))
+    return Status::fail(Code::unsupported, "the routing record holds at most 8 picked experts of at most 32767");
   if (opt.imatrix) {
     bool any_rot = w.output.rot32;
     for (const Qwen35MoeLayer& l : w.layers)
@@ -738,6 +754,22 @@ Status forward_reference(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, cons
     for (int64_t t = 0; t < n; ++t) rms_norm(x.data() + t * e, l.post_norm.data(), xn.data() + t * e, e, s.rms_eps);
     moe(c, l, xn.data(), y.data());
     for (int64_t i = 0; i < n * e; ++i) x[z(i)] += y[z(i)];
+    if (opt.route && il + 1 < s.n_layer) {
+      // pre-gating prediction: the next layer's router on this layer's output, through the next layer's norm
+      const Qwen35MoeLayer& nl = w.layers[il + 1];
+      const int64_t ne = s.n_expert, nu = s.n_expert_used;
+      for (int64_t t = 0; t < n; ++t) rms_norm(x.data() + t * e, nl.post_norm.data(), xn.data() + t * e, e, s.rms_eps);
+      std::vector<float> pr(z(n * ne));
+      mm(c, nl.gate_inp, xn.data(), n, e, pr.data(), ne);
+      std::vector<int32_t> ord(z(ne));
+      for (int64_t t = 0; t < n; ++t) {
+        const float* p = pr.data() + t * ne;
+        for (int64_t i = 0; i < ne; ++i) ord[z(i)] = static_cast<int32_t>(i);
+        std::partial_sort(ord.begin(), ord.begin() + nu, ord.end(), [p](int32_t a, int32_t b) { return p[a] > p[b] || (p[a] == p[b] && a < b); });
+        RouteRecord& rr = opt.route[z(t * static_cast<int64_t>(s.n_layer) + il)];
+        for (int64_t k = 0; k < nu; ++k) rr.pred[k] = static_cast<std::int16_t>(ord[z(k)]);
+      }
+    }
   }
   if (!logits) return Status::good();  // the activations were all the caller wanted (importance matrix)
   const int64_t m = out_end - out_begin;

@@ -27,6 +27,17 @@ namespace pelias::model {
 
 // A matrix (or a stack of matrices) inside the mapped file: rows of ne[0] elements, ne[1] rows per matrix, ne[2]
 // matrices (the experts). Never owns memory.
+// One position's routing at one layer (game plan D-T2, `pelias kld --route-dump`): the experts picked, best first, with
+// their renormalized weights; the router probabilities of the last picked and of the first unpicked expert (the
+// margin); and the experts the NEXT layer's router picks when it is fed this layer's output through the next layer's
+// post-attention norm (the pre-gating prediction; -1 at the last layer). For at most 8 experts per token.
+struct RouteRecord {
+  std::int16_t sel[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+  float w[8] = {};
+  float p_last = 0.0f, p_next = 0.0f;
+  std::int16_t pred[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+};
+
 struct WeightView {
   const std::uint8_t* data = nullptr;
   std::uint32_t type = 0;
@@ -87,6 +98,8 @@ struct ForwardOptions {
   // are rotated the same way, so this measures only what the rotation does to the activation rounding error (a
   // single large value is spread over the block's 32 values, which shrinks the block's scale).
   bool act_rot32 = false;
+  // Optional routing record (game plan D-T2): n_tokens x n_layer entries (position-major), filled by every layer.
+  RouteRecord* route = nullptr;
 };
 
 // The orthonormal Walsh-Hadamard transform of every 32-value block of x[0..n) in place (n a multiple of 32). It is its
