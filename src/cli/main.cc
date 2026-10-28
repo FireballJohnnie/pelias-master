@@ -146,7 +146,7 @@ void usage() {
       "                                  KL divergence of the model against a base file written by llama-perplexity\n"
       "                                  --kl-divergence-base, computed by Pelias's fp32 CPU reference forward pass;\n"
       "                                  --expert-stats: per layer and expert, how often it was picked and its routing weight\n"
-      "      [--dump-kld OUT.bin] [--act-int8 GROUPS] [--act-int8-path cpu|gpu] [--act-rot h32] [--route-dump OUT.bin]\n"
+      "      [--dump-kld OUT.bin] [--act-int8 GROUPS] [--act-int8-path cpu|gpu|gpu256] [--act-rot h32] [--route-dump OUT.bin]\n"
       "                                  --route-dump: per scored token and layer, the experts picked, their weights, the\n"
       "                                  margin to the first unpicked one, and the next layer's pre-gating prediction\n"
       "                                  --dump-kld: every scored token's KL, NLLs, delta-p and top-token match (for kld-compare);\n"
@@ -687,11 +687,12 @@ int cmd_kld(const Args& a) {
       std::fprintf(stderr, "pelias: --act-int8-path needs --act-int8\n");
       return 1;
     }
-    if (b != "cpu" && b != "gpu") {
-      std::fprintf(stderr, "pelias: --act-int8-path is cpu (llama.cpp's CPU formats per weight type) or gpu (q8_1)\n");
+    if (b != "cpu" && b != "gpu" && b != "gpu256") {
+      std::fprintf(stderr, "pelias: --act-int8-path is cpu (llama.cpp's CPU formats per weight type), gpu (q8_1) or gpu256 (the Pelias int8 kernel: one scale per 256)\n");
       return 1;
     }
-    fo.act_int8_gpu = b == "gpu";
+    fo.act_int8_gpu = b == "gpu" || b == "gpu256";
+    fo.act_gpu256 = b == "gpu256";
   }
   if (a.has("act-rot")) {
     const std::string r = a.get("act-rot");
@@ -710,7 +711,7 @@ int cmd_kld(const Args& a) {
   fo.m_stats = m_stats;
   if (a.has("act-bits")) {
     const std::string v = a.get("act-bits");
-    if ((v != "4" && v != "8") || !fo.act_int8_gpu) {
+    if ((v != "4" && v != "8") || !fo.act_int8_gpu || (v == "4" && fo.act_gpu256)) {
       std::fprintf(stderr, "pelias: --act-bits is 4 or 8 and needs --act-int8 ... --act-int8-path gpu\n");
       return 1;
     }
@@ -787,7 +788,7 @@ int cmd_kld(const Args& a) {
   if (!fo.act_int8.empty()) {
     std::string list;
     for (const std::string& x : fo.act_int8) list += (list.empty() ? "" : ",") + x;
-    std::fprintf(stderr, "pelias kld: 8-bit activation rounding (%s path%s) on: %s\n", fo.act_int8_gpu ? "gpu" : "cpu",
+    std::fprintf(stderr, "pelias kld: 8-bit activation rounding (%s path%s) on: %s\n", fo.act_gpu256 ? "gpu256" : (fo.act_int8_gpu ? "gpu" : "cpu"),
                  fo.act_rot32 ? ", Walsh-Hadamard rotation per 32 values" : "", list.c_str());
   }
   const std::string route_path = a.get("route-dump");

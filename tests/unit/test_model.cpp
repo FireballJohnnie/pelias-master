@@ -1,6 +1,7 @@
 // provenance: original (the base-record encoding used to build test input READ-SRC from llama.cpp
 //   tools/perplexity/perplexity.cpp log_softmax at commit 2ca15f5404760548c39e7b92bd43116a09414a1a)
 // Copyright (c) 2026 John Lipka and the Pelias contributors
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -230,4 +231,38 @@ TEST(imatrix_lists_weights_collected_rotated) {
   col.mark_rotated("blk.0.never_collected.weight");  // marked but no entry: not listed
   const std::vector<std::string> r = col.rotated();
   CHECK(r.size() == 1 && r[0] == "blk.0.attn_qkv.weight");
+}
+
+TEST(act_round_q8_256_matches_the_int8_kernel_format) {
+  // one scale per 256 = amax / 127; round half to even; clamp to -127..127 (q8k_warp, tools/probes/batch_c)
+  std::vector<float> x(512, 0.0f);
+  x[0] = 127.0f;  // block 0: amax 127, scale exactly 1
+  x[1] = 2.5f;    // ties go to even
+  x[2] = 3.5f;
+  x[3] = -2.5f;
+  x[4] = 0.4f;
+  x[5] = -126.6f;
+  // block 1 all zero: scale 1, everything stays 0
+  std::vector<float> y = x;
+  pelias::model::act_round_q8_256(y.data(), 512);
+  CHECK(y[0] == 127.0f);
+  CHECK(y[1] == 2.0f);
+  CHECK(y[2] == 4.0f);
+  CHECK(y[3] == -2.0f);
+  CHECK(y[4] == 0.0f);
+  CHECK(y[5] == -127.0f);
+  for (int i = 256; i < 512; ++i) CHECK(y[size_t(i)] == 0.0f);
+  // a general row: every value is a multiple of its block's scale, within half a step, and the largest is exact
+  std::vector<float> r(256);
+  for (int i = 0; i < 256; ++i) r[size_t(i)] = std::sin(0.11f * float(i)) * (1.0f + float(i % 13));
+  float amax = 0.0f;
+  for (float v : r) amax = std::max(amax, std::fabs(v));
+  const float scale = amax / 127.0f;
+  std::vector<float> q = r;
+  pelias::model::act_round_q8_256(q.data(), 256);
+  for (int i = 0; i < 256; ++i) {
+    CHECK(std::fabs(q[size_t(i)] - r[size_t(i)]) <= 0.5f * scale * 1.0001f);
+    const float k = q[size_t(i)] / scale;
+    CHECK(std::fabs(k - std::nearbyint(k)) < 1e-3f);
+  }
 }

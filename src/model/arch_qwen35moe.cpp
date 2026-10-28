@@ -267,7 +267,7 @@ struct Ctx {
 
 // the 8-bit activation format the inputs of `w` are rounded to (ForwardOptions::act_int8), or none; float weights never
 // are, as in the reference
-enum class ActFmt { none, q8_0, q8_1, q8_k, q4_32 };
+enum class ActFmt { none, q8_0, q8_1, q8_k, q4_32, q8_256 };
 
 ActFmt act_format(const ForwardOptions& o, const WeightView& w) {
   if (o.act_int8.empty() || !w.present()) return ActFmt::none;
@@ -277,7 +277,7 @@ ActFmt act_format(const ForwardOptions& o, const WeightView& w) {
   for (const std::string& g : o.act_int8)
     if (g == "all" || w.name.find(g) != std::string::npos) hit = true;
   if (!hit) return ActFmt::none;
-  if (o.act_int8_gpu) return o.act_bits == 4 ? ActFmt::q4_32 : ActFmt::q8_1;
+  if (o.act_int8_gpu) return o.act_bits == 4 ? ActFmt::q4_32 : (o.act_gpu256 ? ActFmt::q8_256 : ActFmt::q8_1);
   switch (t) {
     case quant::Type::q4_0: case quant::Type::q5_0: case quant::Type::q8_0: case quant::Type::iq4_nl: case quant::Type::mxfp4:
       return ActFmt::q8_0;
@@ -288,7 +288,7 @@ ActFmt act_format(const ForwardOptions& o, const WeightView& w) {
   }
 }
 
-int act_block(ActFmt f) { return f == ActFmt::q8_k ? 256 : 32; }
+int act_block(ActFmt f) { return f == ActFmt::q8_k || f == ActFmt::q8_256 ? 256 : 32; }
 
 // one row to the 8-bit format and back: Q8_0 (32: d fp16, qs int8), q8_1 (32: d fp16, s fp16, qs int8) or Q8_K
 // (256: d fp32, qs int8, sums). The row length is a multiple of the block (checked once by check_act_rounding).
@@ -303,6 +303,10 @@ void act_round_plain(float* x, int64_t n, ActFmt f) {
         x[i + j] = d * std::min(7.0f, std::max(-7.0f, q));
       }
     }
+    return;
+  }
+  if (f == ActFmt::q8_256) {  // the Pelias int8 kernel's format
+    act_round_q8_256(x, n);
     return;
   }
   if (f == ActFmt::q8_k) {
@@ -783,6 +787,8 @@ Status forward_reference(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, cons
     return Status::fail(Code::invalid_argument, "the token count or the output range is empty or out of range");
   if (w.layers.size() != s.n_layer) return Status::fail(Code::invalid_argument, "the weights were bound for another spec");
   if (Status st = check_act_rounding(opt, w); !st) return st;
+  if (opt.act_gpu256 && (!opt.act_int8_gpu || opt.act_bits != 8))
+    return Status::fail(Code::invalid_argument, "the 256-value int8 format is an 8-bit gpu-path format (--act-int8-path gpu256)");
   if (opt.act_bits != 8 && (opt.act_bits != 4 || !opt.act_int8_gpu))
     return Status::fail(Code::invalid_argument, "4-bit activations need the gpu path (--act-int8-path gpu); only 8 and 4 bits exist");
   if (opt.neuron_skip < 0.0 || opt.neuron_skip >= 1.0) return Status::fail(Code::invalid_argument, "neuron skipping takes a fraction in [0, 1)");
@@ -853,4 +859,20 @@ Status forward_reference(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, cons
   return Status::good();
 }
 
+}  // namespace pelias::model
+
+namespace pelias::model {
+// value for value what q8k_warp in tools/probes/batch_c/kernels_c.cu (int8 kernels v7-v12) gives the GEMM
+void act_round_q8_256(float* x, std::int64_t n) {
+  for (std::int64_t i = 0; i < n; i += 256) {
+    float amax = 0.0f;
+    for (int j = 0; j < 256; ++j) amax = std::max(amax, std::fabs(x[i + j]));
+    const float scale = amax > 0.0f ? amax / 127.0f : 1.0f;
+    const float inv = 1.0f / scale;
+    for (int j = 0; j < 256; ++j) {
+      const float q = std::min(127.0f, std::max(-127.0f, std::nearbyint(x[i + j] * inv)));
+      x[i + j] = scale * q;
+    }
+  }
+}
 }  // namespace pelias::model
