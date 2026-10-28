@@ -632,6 +632,15 @@ Run R1: `bash $R/block_j.sh r1` (updates the clone from the newest bundle, rebui
 - **Lower priority:** R2-256 and R2-row. R2 q8_1 already equals R2 exact, so a larger rotation can only lower the dense weights' own drift; R2b suggests per-32 blocks already capture most of it. Run them only if Block C lands close to Unsloth.
 - **Unchanged:** Block C (GP1-05), GP1-11, GP1-12, GP1-13, `block_k.sh routes`, R4.
 
+**block_k routes result (MEASURED 2026-10-28 00:28-00:50, 10 chunks, 2,550 scored tokens x 40 layers; re-computed from the record files):**
+- **GP1-07 floor:** the bf16 file through Pelias against llama.cpp's bf16 base: 0.002801 +/- 0.000281 (stock on the same 10 chunks 0.041817, so the floor is about 6.7 % of stock's drift). Prediction 0.0005-0.003: met, at the top edge.
+- **Routing flips (stock vs bf16):** the picked set differs in 56.4 % of token-layers (prediction 2-8 %: MISSED). 81.6 % of those swap exactly one expert; the expert bf16 picked and stock dropped is rank 7 or 8 in 80.3 % (rank 8 alone 54.6 %); the weight lost is 0.097 per flipped token-layer. Router margin between the 8th and 9th expert: median 0.00055, 69 % of token-layers under 0.001: the tail picks are near-ties.
+- **Flips do not drive the drift:** every token has 4 or more changed layers, so the planned "share of KL on changed tokens" cannot separate anything; per token, the weight lost to swaps has correlation -0.004 with KL, and KL by quartile of swapped weight is flat (0.037-0.046). Prediction "changed tokens carry over half the KL": NOT SUPPORTED. The drift comes from the weights' own error, not from routing.
+- **Weight spread:** rank 1-8 mean weights 0.246 / 0.169 / 0.135 / 0.113 / 0.098 / 0.087 / 0.079 / 0.073; top two 41.5 %, ranks 5-8 33.8 % (dropping to fewer experts would lose a third of the mass).
+- **Hot sets (stock):** picks outside the per-layer top 84 / 120 / 161: 14.2 / 6.5 / 2.3 %. Picks already made by the previous token: 41.5 % (2 tokens 50.0, 4: 59.3, 8: 68.3); cold picks only 13.6 % at top 120. Distinct cold experts in an 8-token window at top 120: 134 over 40 layers.
+- **Next-layer prediction** (this layer's output through the next layer's norm and router): 83.6 % of the next layer's picks, 67.1 % of its cold picks at top 120: usable as a prefetch hint one layer ahead.
+- **What it changes:** no protection of router ties is needed for accuracy (drift is in the weights; Block C and F stay the levers); the hot bank sizes in GP3 use the measured coverage (120 per layer = 93.5 % of picks); cold-expert prefetch can start one layer early from the prediction (67 % hit on cold picks). GP1-06's remaining question (does the floor matter) is answered: 0.0028 is small against the 0.0136 target, but not zero.
+
 **Building Block C's rotated candidates (2026-10-28 00:4x):**
 - Done: `pelias imatrix` collects rotated dense weights in the rotated basis (BUILD_LOG 00:3x).
 - Gap found: Block C's recipes (per-tensor types, `--imatrix`, IQ4_XS) are built with llama-quantize, which cannot rotate; `pelias quantize --rotate32` rotates but has no recipe or imatrix input.
