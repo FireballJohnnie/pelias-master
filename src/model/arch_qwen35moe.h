@@ -97,6 +97,11 @@ struct ForwardOptions {
   // values, scale = amax / 127 (1 when amax is 0), q = round-half-even(x * (1 / scale)) clamped to -127..127, for every
   // weight type ("--act-int8-path gpu256"). q8_1 (one fp16 scale per 32) when false.
   bool act_gpu256 = false;
+  // With act_gpu256, the per-32 refinements of the 256-value layout (candidates for the int8 kernel, game plan run list 1):
+  // 1 = eight fp32 scales per 256, one per 32 (amax32 / 127, same rounding as act_round_q8_256), "gpu256x8";
+  // 2 = one fp32 scale S per 256 and a power-of-two exponent e in 0..3 per 32 (scale S / 2^e, the largest e that still
+  //     covers the 32-block), "gpu256e". 0 = one scale per 256 (the v7-v12 kernels).
+  int act_gpu256_sub = 0;
   // With act_int8: rotate every 32-value block of a rounded input with the orthonormal Walsh-Hadamard transform
   // before the rounding and rotate it back after (game plan Block J, R1). Exact in real arithmetic when the weights
   // are rotated the same way, so this measures only what the rotation does to the activation rounding error (a
@@ -129,6 +134,9 @@ struct ForwardOptions {
 void act_rotate32(float* x, std::int64_t n);
 // one row to the Pelias int8 kernel's activation format and back (ForwardOptions::act_gpu256); n a multiple of 256
 void act_round_q8_256(float* x, std::int64_t n);
+// the same with eight scales per 256 (ForwardOptions::act_gpu256_sub 1) or a power-of-two exponent per 32 (sub 2)
+void act_round_q8_256x8(float* x, std::int64_t n);
+void act_round_q8_256e(float* x, std::int64_t n);
 
 // Runs tokens[0..n_tokens) and writes the logits of positions [out_begin, out_end) to `logits`
 // ((out_end - out_begin) rows of spec.n_vocab floats). With `logits` null the output layer is skipped.

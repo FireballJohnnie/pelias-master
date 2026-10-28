@@ -266,3 +266,39 @@ TEST(act_round_q8_256_matches_the_int8_kernel_format) {
     CHECK(std::fabs(k - std::nearbyint(k)) < 1e-3f);
   }
 }
+
+TEST(act_round_per32_refinements_of_the_256_layout) {
+  // two 32-blocks inside one 256-block: a large one (amax 127) and a small one (amax 10)
+  std::vector<float> x(256, 0.0f);
+  for (int j = 0; j < 32; ++j) x[size_t(j)] = 127.0f * std::sin(0.3f * float(j + 1));
+  x[0] = 127.0f;
+  for (int j = 0; j < 32; ++j) x[size_t(32 + j)] = 10.0f * std::cos(0.7f * float(j));
+  x[32] = 10.0f;
+  // eight scales: each block uses its own amax / 127, so the small block's largest value is exact and every value is
+  // within half of its own step
+  std::vector<float> a = x;
+  pelias::model::act_round_q8_256x8(a.data(), 256);
+  CHECK(a[0] == 127.0f);
+  CHECK(std::fabs(a[32] - 10.0f) < 1e-5f);
+  for (int j = 32; j < 64; ++j) CHECK(std::fabs(a[size_t(j)] - x[size_t(j)]) <= 0.5f * (10.0f / 127.0f) * 1.0001f);
+  // power-of-two exponent: the small block (127 / 10 = 12.7, so e = 3, scale 1/8) sits between the 256 and the 32 scale
+  std::vector<float> e = x;
+  pelias::model::act_round_q8_256e(e.data(), 256);
+  for (int j = 32; j < 64; ++j) {
+    CHECK(std::fabs(e[size_t(j)] - x[size_t(j)]) <= 0.5f * 0.125f * 1.0001f);
+    const float k = e[size_t(j)] * 8.0f;  // multiples of the 1/8 step
+    CHECK(std::fabs(k - std::nearbyint(k)) < 1e-4f);
+  }
+  // the large block keeps the 256 scale (e = 0) in both refinements: identical to one scale per 256 there
+  std::vector<float> o = x;
+  pelias::model::act_round_q8_256(o.data(), 256);
+  for (int j = 0; j < 32; ++j) CHECK(e[size_t(j)] == o[size_t(j)] && a[size_t(j)] == o[size_t(j)]);
+  // error ordering on the small block: eight scales <= exponent <= one scale per 256
+  double ea = 0, ee = 0, eo = 0;
+  for (int j = 32; j < 64; ++j) {
+    ea += std::pow(a[size_t(j)] - x[size_t(j)], 2);
+    ee += std::pow(e[size_t(j)] - x[size_t(j)], 2);
+    eo += std::pow(o[size_t(j)] - x[size_t(j)], 2);
+  }
+  CHECK(ea <= ee && ee <= eo);
+}

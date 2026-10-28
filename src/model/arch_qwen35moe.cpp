@@ -267,7 +267,7 @@ struct Ctx {
 
 // the 8-bit activation format the inputs of `w` are rounded to (ForwardOptions::act_int8), or none; float weights never
 // are, as in the reference
-enum class ActFmt { none, q8_0, q8_1, q8_k, q4_32, q8_256 };
+enum class ActFmt { none, q8_0, q8_1, q8_k, q4_32, q8_256, q8_256x8, q8_256e };
 
 ActFmt act_format(const ForwardOptions& o, const WeightView& w) {
   if (o.act_int8.empty() || !w.present()) return ActFmt::none;
@@ -277,7 +277,7 @@ ActFmt act_format(const ForwardOptions& o, const WeightView& w) {
   for (const std::string& g : o.act_int8)
     if (g == "all" || w.name.find(g) != std::string::npos) hit = true;
   if (!hit) return ActFmt::none;
-  if (o.act_int8_gpu) return o.act_bits == 4 ? ActFmt::q4_32 : (o.act_gpu256 ? ActFmt::q8_256 : ActFmt::q8_1);
+  if (o.act_int8_gpu) return o.act_bits == 4 ? ActFmt::q4_32 : (o.act_gpu256 ? (o.act_gpu256_sub == 1 ? ActFmt::q8_256x8 : o.act_gpu256_sub == 2 ? ActFmt::q8_256e : ActFmt::q8_256) : ActFmt::q8_1);
   switch (t) {
     case quant::Type::q4_0: case quant::Type::q5_0: case quant::Type::q8_0: case quant::Type::iq4_nl: case quant::Type::mxfp4:
       return ActFmt::q8_0;
@@ -288,7 +288,7 @@ ActFmt act_format(const ForwardOptions& o, const WeightView& w) {
   }
 }
 
-int act_block(ActFmt f) { return f == ActFmt::q8_k || f == ActFmt::q8_256 ? 256 : 32; }
+int act_block(ActFmt f) { return f == ActFmt::q8_k || f == ActFmt::q8_256 || f == ActFmt::q8_256x8 || f == ActFmt::q8_256e ? 256 : 32; }
 
 // one row to the 8-bit format and back: Q8_0 (32: d fp16, qs int8), q8_1 (32: d fp16, s fp16, qs int8) or Q8_K
 // (256: d fp32, qs int8, sums). The row length is a multiple of the block (checked once by check_act_rounding).
@@ -307,6 +307,14 @@ void act_round_plain(float* x, int64_t n, ActFmt f) {
   }
   if (f == ActFmt::q8_256) {  // the Pelias int8 kernel's format
     act_round_q8_256(x, n);
+    return;
+  }
+  if (f == ActFmt::q8_256x8) {
+    act_round_q8_256x8(x, n);
+    return;
+  }
+  if (f == ActFmt::q8_256e) {
+    act_round_q8_256e(x, n);
     return;
   }
   if (f == ActFmt::q8_k) {
@@ -787,6 +795,8 @@ Status forward_reference(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, cons
     return Status::fail(Code::invalid_argument, "the token count or the output range is empty or out of range");
   if (w.layers.size() != s.n_layer) return Status::fail(Code::invalid_argument, "the weights were bound for another spec");
   if (Status st = check_act_rounding(opt, w); !st) return st;
+  if (opt.act_gpu256_sub < 0 || opt.act_gpu256_sub > 2 || (opt.act_gpu256_sub != 0 && !opt.act_gpu256))
+    return Status::fail(Code::invalid_argument, "the per-32 refinement needs the 256-value int8 format");
   if (opt.act_gpu256 && (!opt.act_int8_gpu || opt.act_bits != 8))
     return Status::fail(Code::invalid_argument, "the 256-value int8 format is an 8-bit gpu-path format (--act-int8-path gpu256)");
   if (opt.act_bits != 8 && (opt.act_bits != 4 || !opt.act_int8_gpu))
@@ -872,6 +882,41 @@ void act_round_q8_256(float* x, std::int64_t n) {
     for (int j = 0; j < 256; ++j) {
       const float q = std::min(127.0f, std::max(-127.0f, std::nearbyint(x[i + j] * inv)));
       x[i + j] = scale * q;
+    }
+  }
+}
+
+namespace {
+// one 32-value block: amax / 127 as in act_round_q8_256, round half to even, clamp to -127..127
+void round32(float* x, float scale, float inv) {
+  for (int j = 0; j < 32; ++j) x[j] = scale * std::min(127.0f, std::max(-127.0f, std::nearbyint(x[j] * inv)));
+}
+float amax_of(const float* x, int n) {
+  float a = 0.0f;
+  for (int j = 0; j < n; ++j) a = std::max(a, std::fabs(x[j]));
+  return a;
+}
+}  // namespace
+
+void act_round_q8_256x8(float* x, std::int64_t n) {
+  for (std::int64_t i = 0; i < n; i += 32) {
+    const float a = amax_of(x + i, 32);
+    const float scale = a > 0.0f ? a / 127.0f : 1.0f;
+    round32(x + i, scale, 1.0f / scale);
+  }
+}
+
+void act_round_q8_256e(float* x, std::int64_t n) {
+  for (std::int64_t i = 0; i < n; i += 256) {
+    const float a256 = amax_of(x + i, 256);
+    const float s = a256 > 0.0f ? a256 / 127.0f : 1.0f;
+    const float inv = 1.0f / s;
+    for (int b = 0; b < 8; ++b) {
+      float* p = x + i + 32 * b;
+      const float a = amax_of(p, 32);
+      int e = 0;  // the largest e <= 3 whose scale s / 2^e still covers the block: a * 2^(e+1) <= a256
+      while (e < 3 && std::ldexp(a, e + 1) <= a256) ++e;
+      round32(p, std::ldexp(s, -e), std::ldexp(inv, e));
     }
   }
 }
