@@ -1092,7 +1092,7 @@ Likeliest candidates first, then stop and decide (keep the best file or keep exp
 
 ### Next steps (author, 2026-10-28 12:35)
 
-1. **Build Q8_Z (sandbox):** quantizer (zip scales with a scale search, int8 values), reference dequantizer, recipe name, Pelias-only type id, unit tests against the measured error (0.000031 rotated attn_qkv).
+1. **DONE 2026-10-28 12:4x: Q8_Z built** (type id 200, src/quant/quant_cpu.cpp; level search 70-100 % per 32-block; unit test). MEASURED on the real blk.20 attn_qkv (every row, C++ quantizer, tools/experiments/q8z_real_check.cpp): rotated 0.000029 vs Q8_0 0.000028 (ratio 1.017), plain 0.000036 vs 0.000035 (1.019), at 8.25 against 8.5 bits per weight. Was: quantizer (zip scales with a scale search, int8 values), reference dequantizer, recipe name, Pelias-only type id, unit tests against the measured error (0.000031 rotated attn_qkv).
 2. **Fable's check (a) (sandbox):** emulate fp16 partial sums per 256 flushed to fp32 in the reference's dense GEMM.
 3. **bench_gpu additions:** (b) fp16 vs fp32 accumulate mma rate (5 min); (c) texture-stream GB/s vs a plain read.
 4. **urm_Z (PC, author's OK first):** urm with every Q8_0 dense tensor as Q8_Z, engine format, paired against urm; plus check (a)'s paired run.

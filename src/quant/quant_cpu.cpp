@@ -27,7 +27,7 @@ constexpr float kGroupMaxEps = 1e-15f;
 // Q4_K: d (fp16) | dmin (fp16) | scales[12] | qs[128]                    144 bytes
 // Q6_K: ql[128] | qh[64] | scales[16] (int8) | d (fp16)                  210 bytes
 // Q8_K: d (fp32) | qs[256] (int8) | bsums[16] (int16)                    292 bytes
-constexpr std::size_t kQ8_0Bytes = 34, kQ8_1Bytes = 36, kQ4KBytes = 144, kQ6KBytes = 210, kQ8KBytes = 292;
+constexpr std::size_t kQ8_0Bytes = 34, kQ8_1Bytes = 36, kQ4KBytes = 144, kQ6KBytes = 210, kQ8KBytes = 292, kQ8ZBytes = 264;
 constexpr std::size_t kQ2KBytes = 84, kQ3KBytes = 110, kQ5KBytes = 176, kIQ4XSBytes = 136;
 // the IQ4_NL / IQ4_XS non-linear 4-bit levels (ggml-common.h kvalues_iq4nl)
 constexpr std::int8_t kValuesIq4nl[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
@@ -312,6 +312,68 @@ void quantize_q8_1(const float* x, std::uint8_t* out, std::int64_t n) {
       sum += q1;
     }
     put_u16(out + 2, fp32_to_fp16(static_cast<float>(sum) * d));
+  }
+}
+
+// ---- Q8_Z (Pelias-only; provenance: original)
+float q8_z_scale(float d, int lv) { return (d * static_cast<float>(lv)) / 63.0f; }
+
+void quantize_q8_z(const float* x, std::uint8_t* out, std::int64_t n) {
+  for (std::int64_t i = 0; i < n / 256; ++i, x += 256, out += kQ8ZBytes) {
+    float amax[8], top = 0.0f;
+    for (int j = 0; j < 8; ++j) {
+      amax[j] = 0.0f;
+      for (int k = 0; k < 32; ++k) amax[j] = std::max(amax[j], std::fabs(x[32 * j + k]));
+      top = std::max(top, amax[j]);
+    }
+    const std::uint16_t dh = fp32_to_fp16(top / 127.0f);
+    const float d = fp16_to_fp32(dh);
+    put_u16(out, dh);
+    std::uint64_t packed = 0;
+    for (int j = 0; j < 8; ++j) {
+      const float* xb = x + 32 * j;
+      int best = 63;
+      if (d > 0.0f && amax[j] > 0.0f) {
+        // the level that just covers the block's largest value, and every level down to 70 % of it
+        const float ideal = amax[j] / 127.0f / d * 63.0f;
+        const int hi = std::min(63, std::max(1, static_cast<int>(std::ceil(ideal))));
+        const int lo = std::max(1, static_cast<int>(std::floor(0.70f * ideal)));
+        float best_err = -1.0f;
+        for (int lv = hi; lv >= lo; --lv) {
+          const float s = q8_z_scale(d, lv), inv = 1.0f / s;
+          float err = 0.0f;
+          for (int k = 0; k < 32; ++k) {
+            const float q = std::min(127.0f, std::max(-127.0f, std::nearbyint(xb[k] * inv)));
+            const float e = xb[k] - q * s;
+            err += e * e;
+          }
+          if (best_err < 0.0f || err < best_err) { best_err = err; best = lv; }
+        }
+      }
+      packed |= static_cast<std::uint64_t>(best) << (6 * j);
+      const float s = q8_z_scale(d, best), inv = s > 0.0f ? 1.0f / s : 0.0f;
+      for (int k = 0; k < 32; ++k) {
+        const auto q = static_cast<std::int8_t>(std::min(127.0f, std::max(-127.0f, std::nearbyint(xb[k] * inv))));
+        std::memcpy(out + 8 + 32 * j + k, &q, 1);
+      }
+    }
+    for (int b = 0; b < 6; ++b) out[2 + b] = static_cast<std::uint8_t>(packed >> (8 * b));
+  }
+}
+
+void dequantize_q8_z(const std::uint8_t* in, float* y, std::int64_t n) {
+  for (std::int64_t i = 0; i < n / 256; ++i, in += kQ8ZBytes, y += 256) {
+    const float d = fp16_to_fp32(get_u16(in));
+    std::uint64_t packed = 0;
+    for (int b = 0; b < 6; ++b) packed |= static_cast<std::uint64_t>(in[2 + b]) << (8 * b);
+    for (int j = 0; j < 8; ++j) {
+      const float s = q8_z_scale(d, static_cast<int>((packed >> (6 * j)) & 63u));
+      for (int k = 0; k < 32; ++k) {
+        std::int8_t q;
+        std::memcpy(&q, in + 8 + 32 * j + k, 1);
+        y[32 * j + k] = static_cast<float>(q) * s;
+      }
+    }
   }
 }
 
@@ -660,7 +722,7 @@ void dequantize_iq4_xs(const std::uint8_t* in, float* y, std::int64_t n) {
 bool can_quantize(Type t) {
   switch (t) {
     case Type::f32: case Type::f16: case Type::bf16: case Type::q8_0: case Type::q8_1: case Type::q4_k: case Type::q6_k:
-    case Type::q8_k: case Type::q2_k: case Type::q3_k: case Type::q5_k: case Type::iq4_nl: case Type::iq4_xs:
+    case Type::q8_k: case Type::q2_k: case Type::q3_k: case Type::q5_k: case Type::iq4_nl: case Type::iq4_xs: case Type::q8_z:
       return true;
     default:
       return false;
@@ -673,7 +735,7 @@ bool can_dequantize(Type t) {
     case Type::q2_k: case Type::q3_k: case Type::q5_k: case Type::iq4_xs:
     case Type::q4_0: case Type::q4_1: case Type::q5_0: case Type::q5_1: case Type::iq4_nl: case Type::mxfp4:
     case Type::tq1_0: case Type::tq2_0: case Type::iq2_xxs: case Type::iq2_xs: case Type::iq2_s: case Type::iq3_xxs:
-    case Type::iq3_s: case Type::iq1_s: case Type::iq1_m:
+    case Type::iq3_s: case Type::iq1_s: case Type::iq1_m: case Type::q8_z:
       return true;
     default:
       return false;
@@ -727,6 +789,7 @@ Status quantize_row(Type t, const float* x, std::uint8_t* out, std::int64_t n) {
     case Type::q5_k: quantize_q5_k(x, out, n); break;
     case Type::iq4_nl: quantize_iq4_nl(x, out, n); break;
     case Type::iq4_xs: quantize_iq4_xs(x, out, n); break;
+    case Type::q8_z: quantize_q8_z(x, out, n); break;
     default: return Status::fail(Code::internal, "quantize dispatch");
   }
   return Status::good();
@@ -750,6 +813,7 @@ Status dequantize_row(Type t, const std::uint8_t* in, float* y, std::int64_t n) 
     case Type::q3_k: dequantize_q3_k(in, y, n); break;
     case Type::q5_k: dequantize_q5_k(in, y, n); break;
     case Type::iq4_xs: dequantize_iq4_xs(in, y, n); break;
+    case Type::q8_z: dequantize_q8_z(in, y, n); break;
     case Type::q4_0: dequantize_q4_0(in, y, n); break;
     case Type::q4_1: dequantize_q4_1(in, y, n); break;
     case Type::q5_0: dequantize_q5_0(in, y, n); break;

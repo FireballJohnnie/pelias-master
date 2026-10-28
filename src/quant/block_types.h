@@ -17,6 +17,8 @@ enum class Type : std::uint32_t {
   iq2_xxs = 16, iq2_xs = 17, iq3_xxs = 18, iq1_s = 19, iq4_nl = 20, iq3_s = 21, iq2_s = 22, iq4_xs = 23,
   i8 = 24, i16 = 25, i32 = 26, i64 = 27, f64 = 28, iq1_m = 29, bf16 = 30,
   tq1_0 = 34, tq2_0 = 35, mxfp4 = 39, nvfp4 = 40, q1_0 = 41, q2_0 = 42,
+  // Pelias-only ids, far above the reference library's range so it refuses such a file instead of misreading it
+  q8_z = 200,  // Q8_Z: the author's "zip code" scales with 8-bit values (game plan, Q7_PT review, 2026-10-28)
 };
 
 struct TypeInfo {

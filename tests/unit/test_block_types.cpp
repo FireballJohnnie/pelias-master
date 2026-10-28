@@ -22,6 +22,7 @@ TEST(block_types_sizes_match_the_reference_table) {
   CHECK(!pelias::quant::type_info(4).known);   // removed ids
   CHECK(!pelias::quant::type_info(31).known);
   CHECK(!pelias::quant::type_info(43).known);
+  CHECK(pelias::quant::type_info(200).known && pelias::quant::type_info(200).block_bytes == 264);  // Q8_Z, Pelias-only
   CHECK_EQ(row_bytes(12, 2048), 2048u / 256 * 144);
   CHECK_EQ(row_bytes(12, 100), 0u);  // not a whole number of blocks
   CHECK(bits_per_weight(12) > 4.49 && bits_per_weight(12) < 4.51);
