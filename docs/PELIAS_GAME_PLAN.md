@@ -1130,6 +1130,10 @@ GPU side and formats:
 - Rejected on the math: MTP draft on the CPU, AES/SHA/CLMUL, gather, 1 GB pages, L3 as a static bank.
 - Sent to Fable next: planes read by need (exact error bound per plane), both CPU schedulers on different experts, skipping empty activation planes (sign + magnitude).
 
+### Carry-over to dense (non-MoE) models that spill onto CPU/RAM (author, 2026-10-28 13:48)
+
+Every cluster is written for the MoE engine but is checked for what it gives a dense model too big for VRAM (layers spilled to system RAM, read every token). DERIVED differences: no hot/cold choice (every spilled byte is read every token), and the order of reads is fully known, so prefetch is 100 % predictable (no router guess). Carries over: U1 (both DRAM legs at once on the spilled layers, rows split CPU/GPU by the measured share), U2 (doorbells per spilled layer), J1 (CPU base plane + GPU 1-bit H plane of each spilled layer, both legs at once), U3/C11 (planes by need), U5 (Q8_Z, codebook, PT), U6 (MTP / speculative: the strongest lever when every token is bandwidth-bound), U8 (one graph per step), U11 (CRC32 prefix store; NVENC checkpoint grid for hybrid/recurrent models). Not applicable: the hot bank, expert prediction, expert skip. Test target when the engine runs: one dense model larger than 12 GB, spilled, against llama.cpp's -ngl split at the same file size.
+
 ### Run list before the engine build (updated 2026-10-28 09:4x, after Block M and M2 d)
 
 Each PC run first matches the reference to our code's exact format (docs/PELIAS_NEW_METHODS.md rule).
