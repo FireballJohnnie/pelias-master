@@ -112,6 +112,7 @@ if(PELIAS_BUILD_TESTS)
   if(Python3_Interpreter_FOUND)
     add_test(NAME recipe_tool COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/test_recipe.py)
     add_test(NAME route_stats_tool COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/test_route_stats.py)
+    add_test(NAME imatrix_merge_tool COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/test_imatrix_merge.py)
   endif()
 
   # Test-only oracle (masterwork 3.3): the reference library at llama.cpp commit 2ca15f5, built unchanged from a
