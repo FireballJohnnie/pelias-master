@@ -1,0 +1,72 @@
+
+== TD tdecode | T-decode GPU probe: mma rates and decode GEMV routes | started 2026-10-28 17:17:10 | ETA about 3-5 min | log /mnt/d/pelias-tests/gp/TD/tdecode_20261028_171710.log
+From <backup>/pelias-master_main_fd9cf9a-e262b02.bundle
+ * branch            main       -> FETCH_HEAD
+Updating fd9cf9a..e262b02
+Fast-forward
+ data/probe_results/gp_runs/U/hgate25_x8.kld        | Bin 0 -> 612036 bytes
+ .../gp_runs/U/hgate_20261028_155002.log            | 208 ++++++++
+ docs/PELIAS_GAME_PLAN.md                           |   3 +
+ docs/PELIAS_NEW_METHODS.md                         |   2 +-
+ docs/PELIAS_VS_EXISTING_FRAMEWORKS.md              | 138 +++++
+ logs/BUILD_LOG.md                                  |   2 +
+ tools/experiments/shared_gate_check.py             |  41 ++
+ tools/experiments/tdecode_kernel_emul.py           |  40 ++
+ tools/probes/tdecode/README.md                     |  18 +
+ tools/probes/tdecode/tdecode.cu                    | 587 +++++++++++++++++++++
+ 10 files changed, 1038 insertions(+), 1 deletion(-)
+ create mode 100644 data/probe_results/gp_runs/U/hgate25_x8.kld
+ create mode 100644 data/probe_results/gp_runs/U/hgate_20261028_155002.log
+ create mode 100644 docs/PELIAS_VS_EXISTING_FRAMEWORKS.md
+ create mode 100644 tools/experiments/shared_gate_check.py
+ create mode 100644 tools/experiments/tdecode_kernel_emul.py
+ create mode 100644 tools/probes/tdecode/README.md
+ create mode 100644 tools/probes/tdecode/tdecode.cu
+nvcc: Build cuda_13.0.r13.0/compiler.36424714_0
+== PREDICTIONS (written 10-28 17:1x, DERIVED): mma: the 1-bit path at about 8x the int8 rate in bit-products (sm_80-class ratio; unmeasured on sm_89). GEMV is memory-bound: Q7_ZT fold about 8-9 % faster than Q8_Z (7.88 vs 8.25 bits read incl. headers, mask and H), T-decode within a few % of fold (the popcount hides under the memory wait), ZH 25 % between Q7_ZT and Q8_Z by bytes; every route must print 'ok'.
+device NVIDIA GeForce RTX 4070, 46 SMs, sm_89
+mma b1 m16n8k256 .and.popc: 3.37 ms, 937.4 T bit-MAC/s (28609 mma per us)
+mma s8 m16n8k32:            3.37 ms, 117.2 T int8-MAC/s (28609 mma per us)
+bit-MAC per int8-MAC: 8.00x (one 8-bit x 8-bit product = 64 bit-products, so the 1-bit path pays off above 64x... per weight plane x activation planes: 8 activation planes per weight plane -> 1.00x an int8 MAC per weight bit)
+  activation prep (warp ballot planes) vs host: identical
+shape: 8192 outputs x 2048 inputs
+  Q8_Z (int8, baseline)         19.32 us    895.3 GB/s  bytes 17.30 MB (8.250 bits per weight)  max err 1.89e-07 of max |y| (ok)
+  Q7_ZT fold (int8 route)       53.88 us    293.1 GB/s  bytes 15.79 MB (7.531 bits per weight)  max err 1.99e-07 of max |y| (ok)
+  Q7_ZT 1-bit (T-decode)        54.88 us    287.8 GB/s  bytes 15.79 MB (7.531 bits per weight)  max err 1.99e-07 of max |y| (ok)
+  ZH live, H on 0 %             52.79 us    288.0 GB/s  bytes 15.20 MB (7.250 bits per weight)  max err 2.03e-07 of max |y| (ok)
+  ZH live, H on 25 % (shared)    53.38 us    294.6 GB/s  bytes 15.73 MB (7.500 bits per weight)  max err 1.95e-07 of max |y| (ok)
+  ZH live, H on 100 %           54.32 us    318.5 GB/s  bytes 17.30 MB (8.250 bits per weight)  max err 1.89e-07 of max |y| (ok)
+  activation prep (warp ballot planes) vs host: identical
+shape: 2048 outputs x 4096 inputs
+  Q8_Z (int8, baseline)         27.32 us    316.6 GB/s  bytes 8.65 MB (8.250 bits per weight)  max err 3.28e-07 of max |y| (ok)
+  Q7_ZT fold (int8 route)       59.80 us    132.1 GB/s  bytes 7.90 MB (7.531 bits per weight)  max err 3.41e-07 of max |y| (ok)
+  Q7_ZT 1-bit (T-decode)        61.42 us    128.6 GB/s  bytes 7.90 MB (7.531 bits per weight)  max err 3.41e-07 of max |y| (ok)
+  ZH live, H on 0 %             58.79 us    129.3 GB/s  bytes 7.60 MB (7.250 bits per weight)  max err 2.54e-07 of max |y| (ok)
+  ZH live, H on 25 % (shared)    63.26 us    124.3 GB/s  bytes 7.86 MB (7.500 bits per weight)  max err 2.94e-07 of max |y| (ok)
+  ZH live, H on 100 %           76.65 us    112.9 GB/s  bytes 8.65 MB (8.250 bits per weight)  max err 3.28e-07 of max |y| (ok)
+  activation prep (warp ballot planes) vs host: identical
+shape: 4096 outputs x 2048 inputs
+  Q8_Z (int8, baseline)         15.16 us    570.7 GB/s  bytes 8.65 MB (8.250 bits per weight)  max err 2.63e-07 of max |y| (ok)
+  Q7_ZT fold (int8 route)       32.16 us    245.6 GB/s  bytes 7.90 MB (7.531 bits per weight)  max err 1.99e-07 of max |y| (ok)
+  Q7_ZT 1-bit (T-decode)        33.14 us    238.3 GB/s  bytes 7.90 MB (7.531 bits per weight)  max err 1.99e-07 of max |y| (ok)
+  ZH live, H on 0 %             30.75 us    247.2 GB/s  bytes 7.60 MB (7.250 bits per weight)  max err 2.70e-07 of max |y| (ok)
+  ZH live, H on 25 % (shared)    33.05 us    237.9 GB/s  bytes 7.86 MB (7.500 bits per weight)  max err 2.79e-07 of max |y| (ok)
+  ZH live, H on 100 %           39.87 us    217.0 GB/s  bytes 8.65 MB (8.250 bits per weight)  max err 2.63e-07 of max |y| (ok)
+  activation prep (warp ballot planes) vs host: identical
+shape: 512 outputs x 2048 inputs
+  Q8_Z (int8, baseline)         14.94 us     72.4 GB/s  bytes 1.08 MB (8.250 bits per weight)  max err 2.11e-07 of max |y| (ok)
+  Q7_ZT fold (int8 route)       31.90 us     30.9 GB/s  bytes 0.99 MB (7.531 bits per weight)  max err 1.96e-07 of max |y| (ok)
+  Q7_ZT 1-bit (T-decode)        32.85 us     30.0 GB/s  bytes 0.99 MB (7.531 bits per weight)  max err 1.96e-07 of max |y| (ok)
+  ZH live, H on 0 %             30.56 us     31.1 GB/s  bytes 0.95 MB (7.250 bits per weight)  max err 1.49e-07 of max |y| (ok)
+  ZH live, H on 25 % (shared)    32.67 us     30.1 GB/s  bytes 0.98 MB (7.500 bits per weight)  max err 1.46e-07 of max |y| (ok)
+  ZH live, H on 100 %           39.47 us     27.4 GB/s  bytes 1.08 MB (8.250 bits per weight)  max err 2.11e-07 of max |y| (ok)
+  activation prep (warp ballot planes) vs host: identical
+shape: 2048 outputs x 512 inputs
+  Q8_Z (int8, baseline)          6.33 us    170.8 GB/s  bytes 1.08 MB (8.250 bits per weight)  max err 1.31e-07 of max |y| (ok)
+  Q7_ZT fold (int8 route)        9.14 us    107.9 GB/s  bytes 0.99 MB (7.531 bits per weight)  max err 1.13e-07 of max |y| (ok)
+  Q7_ZT 1-bit (T-decode)         9.38 us    105.3 GB/s  bytes 0.99 MB (7.531 bits per weight)  max err 1.13e-07 of max |y| (ok)
+  ZH live, H on 0 %              9.08 us    104.7 GB/s  bytes 0.95 MB (7.250 bits per weight)  max err 1.00e-07 of max |y| (ok)
+  ZH live, H on 25 % (shared)     9.78 us    100.5 GB/s  bytes 0.98 MB (7.500 bits per weight)  max err 1.12e-07 of max |y| (ok)
+  ZH live, H on 100 %           11.98 us     90.3 GB/s  bytes 1.08 MB (8.250 bits per weight)  max err 1.31e-07 of max |y| (ok)
+all routes match the host reference
+== TD tdecode done 2026-10-28 17:17:18. Log /mnt/d/pelias-tests/gp/TD/tdecode_20261028_171710.log
