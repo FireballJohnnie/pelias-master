@@ -1073,6 +1073,15 @@ The exact pre-gating prediction gets 83.9 % of the next layer's picks with only 
 - **Readers:** copy engines, tensor cores and regular CUDA cores (one shift-and-add per weight to merge). Not the RT cores: merging planes is arithmetic, not a search, and their tree costs about 9x the memory per number.
 - **Gate (one paired run on the reference):** worst case, every cold expert (outside the engine's 7.5 GiB hot set) at its base plane only (Q4_K -> 3-bit base), against the full file. A small paired cost makes split planes a speed lever with no VRAM cost; the reference option is not built yet.
 
+### Accuracy path agreed with the author (2026-10-28 10:48-10:58)
+
+Likeliest candidates first, then stop and decide (keep the best file or keep exploring):
+1. **urm** (running 10:54, block_urm2.sh): Unsloth's MTP types, dense rotated, merged matrix; fp32 and the engine format (gpu256x8).
+2. **urm_PT** (urm-plus, kept by the author): attention at Q7_PT, the split planes plus tag bits; needs the Q7_PT quantizer (sandbox, written while urm runs).
+3. **Hot/cold bits (author's idea, the "over/under" ledger):** hot experts full planes in VRAM, cold experts base plane only from RAM; a cold expert that turns hot gets its refinement plane added when it moves into the bank. Measured by the _P cold gate (reference option, sandbox) then GP3-02 per-expert types. Selection rule: accuracy gained per byte spent, per expert, filled to the VRAM and time budget.
+- Weighed on paper and set aside: rotation on/off by hot/cold (rotation costs under 1 % of a cold read and gains nothing at per-32; it helps coarse formats instead); shedding 2 bits from active experts into L2 (about 256 MB per token against a 36 MB L2, or about 10 ms per token over PCIe, and the cost lands on 93.5 % of picks); RT cores for tracking (a table does it, Block M RT test).
+- Build-readiness track unchanged: step 2 benches, R3 kernel with per-32 activation scales, MTP head, engine.
+
 ### Run list before the engine build (updated 2026-10-28 09:4x, after Block M and M2 d)
 
 Each PC run first matches the reference to our code's exact format (docs/PELIAS_NEW_METHODS.md rule).
