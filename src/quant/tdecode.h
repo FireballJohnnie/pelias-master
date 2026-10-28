@@ -36,4 +36,13 @@ enum class HRoute { fold, one_bit, missing };
 float q7_zt_dot(const std::uint8_t* base, const std::uint8_t* hbits, const ActBlock32* x, std::int64_t n, HRoute route,
                 std::int64_t* part2 = nullptr);
 
+// C6 accuracy-assisted miss map (author 2026-10-28 19:15-19:18): a state code of one hidden vector of n values (n a
+// multiple of 32). The values are multiplied by a fixed pseudo-random +/-1 diagonal and rotated by the Walsh-Hadamard
+// transform per 32 (Fable 19:1x: then each bit is the sign of a random hyperplane inside its block, SimHash), then
+// stored as n / 8 bytes of sign bits (value i in byte i / 8, bit i % 8; set = positive) followed by n / 32 energy bytes,
+// one per 32-block: round(16 log2(rms)) + 128 clamped to 1..255, 0 for an all-zero block (rms is unchanged by the
+// rotation). kStateCodeBytes(n) = n / 8 + n / 32.
+constexpr std::int64_t state_code_bytes(std::int64_t n) { return n / 8 + n / 32; }
+void state_code(const float* x, std::int64_t n, std::uint8_t* out);
+
 }  // namespace pelias::quant

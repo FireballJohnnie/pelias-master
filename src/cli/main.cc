@@ -40,6 +40,7 @@
 #include "plan/memory_plan.h"
 #include "plan/probe_constants.h"
 #include "quant/block_types.h"
+#include "quant/tdecode.h"
 #include "quant/type_rules.h"
 #include "io/text_file.h"
 #include "model/arch_qwen35moe.h"
@@ -146,7 +147,10 @@ void usage() {
       "                                  KL divergence of the model against a base file written by llama-perplexity\n"
       "                                  --kl-divergence-base, computed by Pelias's fp32 CPU reference forward pass;\n"
       "                                  --expert-stats: per layer and expert, how often it was picked and its routing weight\n"
-      "      [--dump-kld OUT.bin] [--act-int8 GROUPS] [--act-int8-path cpu|gpu|gpu256|gpu256x8|gpu256e] [--act-rot h32] [--route-dump OUT.bin]\n"
+      "      [--dump-kld OUT.bin] [--act-int8 GROUPS] [--act-int8-path cpu|gpu|gpu256|gpu256x8|gpu256e] [--act-rot h32] [--route-dump OUT.bin] [--dump-codes OUT.bin]\n"
+      "                                  --dump-codes: per scored token and layer, the state code of the layer's normed input\n"
+      "                                  (C6 miss map: sign bits after a fixed sign diagonal and Hadamard per 32, plus one\n"
+      "                                  log-energy byte per 32-block; quant::state_code)\n"
       "                                  --route-dump: per scored token and layer, the experts picked, their weights, the\n"
       "                                  margin to the first unpicked one, and the next layer's pre-gating prediction\n"
       "                                  --dump-kld: every scored token's KL, NLLs, delta-p and top-token match (for kld-compare);\n"
@@ -822,6 +826,16 @@ int cmd_kld(const Args& a) {
     std::fprintf(stderr, "pelias: %s already exists (nothing is overwritten)\n", route_path.c_str());
     return 1;
   }
+  const std::string codes_path = a.get("dump-codes");
+  if (!codes_path.empty() && std::ifstream(codes_path, std::ios::binary)) {
+    std::fprintf(stderr, "pelias: %s already exists (nothing is overwritten)\n", codes_path.c_str());
+    return 1;
+  }
+  const std::size_t code_bytes = static_cast<std::size_t>(quant::state_code_bytes(static_cast<std::int64_t>(spec.value.n_embd)));
+  const std::size_t code_row = code_bytes * spec.value.n_layer;  // one position, every layer
+  std::vector<std::uint8_t> codes_chunk(codes_path.empty() ? 0 : static_cast<std::size_t>(n_ctx) * code_row);
+  std::vector<std::uint8_t> codes_all;
+  if (!codes_path.empty()) fo.state_codes = codes_chunk.data();
   std::vector<model::RouteRecord> route_chunk(route_path.empty() ? 0 : static_cast<std::size_t>(n_ctx) * spec.value.n_layer);
   std::vector<model::RouteRecord> route_all;
   if (!route_path.empty()) fo.route = route_chunk.data();
@@ -859,6 +873,9 @@ int cmd_kld(const Args& a) {
     if (!route_path.empty())  // the scored positions only, in the order of the KL records
       route_all.insert(route_all.end(), route_chunk.begin() + static_cast<std::ptrdiff_t>(first) * spec.value.n_layer,
                        route_chunk.begin() + static_cast<std::ptrdiff_t>(first + scored) * spec.value.n_layer);
+    if (!codes_path.empty())  // the scored positions only, in the order of the KL records
+      codes_all.insert(codes_all.end(), codes_chunk.begin() + static_cast<std::ptrdiff_t>(first) * static_cast<std::ptrdiff_t>(code_row),
+                       codes_chunk.begin() + static_cast<std::ptrdiff_t>(first + scored) * static_cast<std::ptrdiff_t>(code_row));
     std::printf("%s", verify::kl_chunk_line(c + 1, stats).c_str());
     std::fflush(stdout);
     if (c == 0)
@@ -904,6 +921,28 @@ int cmd_kld(const Args& a) {
       return 6;
     }
     std::fprintf(stderr, "pelias kld: routing record written (%zu token-layers)\n", route_all.size());
+  }
+  if (!codes_path.empty()) {
+    // PELCODE1: magic, u32 n_ctx, chunks, scored, n_layer, n_embd, bytes per layer, u64 token hash (as --dump-kld), then
+    // per scored token and layer the state code (quant::state_code: n_embd / 8 sign bytes, n_embd / 32 energy bytes)
+    std::FILE* f = std::fopen(codes_path.c_str(), "wb");
+    bool okw = f != nullptr;
+    auto put = [&](const void* p, std::size_t nb) { okw = okw && std::fwrite(p, 1, nb, f) == nb; };
+    if (okw) {
+      put("PELCODE1", 8);
+      const std::uint32_t hdr[6] = {static_cast<std::uint32_t>(n_ctx), static_cast<std::uint32_t>(n_chunk), static_cast<std::uint32_t>(scored),
+                                    spec.value.n_layer, static_cast<std::uint32_t>(spec.value.n_embd), static_cast<std::uint32_t>(code_bytes)};
+      put(hdr, sizeof hdr);
+      const std::uint64_t hash = verify::kl_token_hash(base.tokens().data(), static_cast<std::size_t>(n_chunk) * static_cast<std::size_t>(n_ctx));
+      put(&hash, 8);
+      put(codes_all.data(), codes_all.size());
+    }
+    if (f) okw = std::fclose(f) == 0 && okw;
+    if (!okw) {
+      std::fprintf(stderr, "pelias: the state codes could not be written\n");
+      return 6;
+    }
+    std::fprintf(stderr, "pelias kld: state codes written (%zu bytes)\n", codes_all.size());
   }
   if (!stats_path.empty()) {
     std::string csv = "layer,expert,picks,weight_sum\n";

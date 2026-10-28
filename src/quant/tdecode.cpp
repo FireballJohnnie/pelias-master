@@ -133,4 +133,30 @@ float q7_zt_dot(const std::uint8_t* base, const std::uint8_t* hbits, const ActBl
   return acc;
 }
 
+void state_code(const float* x, std::int64_t n, std::uint8_t* out) {
+  std::uint8_t* sign = out;
+  std::uint8_t* energy = out + n / 8;
+  float v[32];
+  for (std::int64_t j = 0; j < n / 32; ++j) {
+    double ss = 0;
+    for (int k = 0; k < 32; ++k) {
+      std::uint64_t z = static_cast<std::uint64_t>(j * 32 + k) + 0x9E3779B97F4A7C15ull;  // splitmix64: the fixed diagonal
+      z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+      z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+      z ^= z >> 31;
+      v[k] = (z & 1u) ? -x[j * 32 + k] : x[j * 32 + k];
+      ss += static_cast<double>(x[j * 32 + k]) * x[j * 32 + k];
+    }
+    hadamard32(v, 32);
+    for (int k = 0; k < 32; ++k) {
+      const std::int64_t i = j * 32 + k;
+      if (k % 8 == 0) sign[i / 8] = 0;
+      if (v[k] > 0.0f) sign[i / 8] = static_cast<std::uint8_t>(sign[i / 8] | (1u << (i % 8)));
+    }
+    if (ss <= 0.0) { energy[j] = 0; continue; }
+    const double c = std::round(16.0 * std::log2(std::sqrt(ss / 32.0))) + 128.0;
+    energy[j] = static_cast<std::uint8_t>(std::clamp(c, 1.0, 255.0));
+  }
+}
+
 }  // namespace pelias::quant

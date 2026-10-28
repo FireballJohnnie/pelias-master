@@ -13,6 +13,7 @@
 
 #include "quant/block_types.h"
 #include "quant/quant_cpu.h"
+#include "quant/tdecode.h"
 
 namespace pelias::model {
 
@@ -897,6 +898,10 @@ Status forward_reference(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, cons
     const Qwen35MoeLayer& l = w.layers[il];
     c.il = il;
     for (int64_t t = 0; t < n; ++t) rms_norm(x.data() + t * e, l.attn_norm.data(), xn.data() + t * e, e, s.rms_eps);
+    if (opt.state_codes) {
+      const int64_t cb = quant::state_code_bytes(e);
+      for (int64_t t = 0; t < n; ++t) quant::state_code(xn.data() + t * e, e, opt.state_codes + (t * static_cast<int64_t>(s.n_layer) + il) * cb);
+    }
     if (l.recurrent) delta_net(c, l, xn.data(), y.data());
     else full_attention(c, l, xn.data(), y.data());
     for (int64_t i = 0; i < n * e; ++i) x[z(i)] += y[z(i)];

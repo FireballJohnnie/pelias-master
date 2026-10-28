@@ -90,3 +90,35 @@ TEST(tdecode_one_bit_route_equals_int8_fold_exactly) {
   std::printf("      T-decode: fold %.6f, 1-bit %.6f, H missing (0.5 fill) %.6f, double reference %.6f\n", static_cast<double>(yf),
               static_cast<double>(y1), refm, ref);
 }
+
+// C6 miss map: the state code keeps signs and log-energy; scaling the vector by 2 moves every energy byte by 16 and
+// keeps every sign; negating it flips every sign bit; an all-zero block codes energy 0.
+TEST(tdecode_state_code_signs_and_energy) {
+  const int n = 2048;
+  std::vector<float> x = rows(n, 7u, 1.0f);
+  for (int k = 0; k < 32; ++k) x[static_cast<std::size_t>(64 + k)] = 0.0f;  // block 2 all zero
+  const std::int64_t cb = q::state_code_bytes(n);
+  CHECK(cb == n / 8 + n / 32);
+  std::vector<std::uint8_t> a(static_cast<std::size_t>(cb)), b(static_cast<std::size_t>(cb)), c(static_cast<std::size_t>(cb));
+  q::state_code(x.data(), n, a.data());
+  std::vector<float> x2(x), xm(x);
+  for (float& v : x2) v *= 2.0f;
+  for (float& v : xm) v = -v;
+  q::state_code(x2.data(), n, b.data());
+  q::state_code(xm.data(), n, c.data());
+  int flips = 0, zero_bits = 0;
+  for (int i = 0; i < n / 8; ++i) {
+    CHECK(a[static_cast<std::size_t>(i)] == b[static_cast<std::size_t>(i)]);
+    if (i / 4 == 2) { zero_bits += __builtin_popcount(a[static_cast<std::size_t>(i)]) + __builtin_popcount(c[static_cast<std::size_t>(i)]); continue; }
+    flips += __builtin_popcount(static_cast<unsigned>(a[static_cast<std::size_t>(i)] ^ c[static_cast<std::size_t>(i)]));
+  }
+  CHECK(zero_bits == 0);                // an all-zero block has no positive value either way
+  CHECK(flips == n - 32);               // every other value flips sign (no exact zeros after the rotation here)
+  for (int j = 0; j < n / 32; ++j) {
+    const std::uint8_t ea = a[static_cast<std::size_t>(n / 8 + j)], eb = b[static_cast<std::size_t>(n / 8 + j)];
+    if (j == 2) { CHECK(ea == 0 && eb == 0); continue; }
+    CHECK(ea >= 1 && eb == ea + 16);
+  }
+  // the sign bits equal the signs of the rotated block (fixed diagonal, then Hadamard per 32)
+  std::printf("      state code: %lld bytes per vector of %d values (%d sign bytes, %d energy bytes)\n", static_cast<long long>(cb), n, n / 8, n / 32);
+}
