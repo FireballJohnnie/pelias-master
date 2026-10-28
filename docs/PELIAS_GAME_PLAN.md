@@ -1022,7 +1022,7 @@ The exact pre-gating prediction gets 83.9 % of the next layer's picks with only 
 | ROPs / raster pipeline for sums; optical flow unit | patents, old GPGPU | no modern ML use found | NONE |
 | GeForce 16-bit tensor math with 32-bit accumulate | NVIDIA forum (users, RTX 4090) | FP16/FP32-acc about 170 TFLOPS vs FP16/FP16-acc about 270; int8 about 560 TOPS; no NVIDIA statement | Consistent with our 4x int8/bf16 gap; our int8 path avoids it (correction: user-measured, not a whitepaper line) |
 
-**Order proposed for the engine phase (each with its own paired or timed test):** expert deferral in the reference (accuracy, now) -> one CUDA Graph per step -> MARLIN-style pipelining in the int8 kernel (R3) -> T-MAC-style CPU kernel -> MTP drafting with draft-driven prefetch and batch-per-expert on GPU and L3.
+**Order proposed for the engine phase (each with its own paired or timed test):** ~~expert deferral~~ (ruled out by Block M a, +0.004213 for one expert) -> one CUDA Graph per step -> MARLIN-style pipelining in the int8 kernel (R3) -> T-MAC-style CPU kernel -> MTP drafting with draft-driven prefetch and batch-per-expert on GPU and L3.
 
 ### Block M: side track, the author's "language" (codes written at build time) and speed ideas measured for accuracy (2026-10-28)
 
@@ -1040,7 +1040,8 @@ The exact pre-gating prediction gets 83.9 % of the next layer's picks with only 
 | Neuron skip 25 % (oracle: smallest hidden values of each routed expert zeroed) | 0.013526 | +0.000585 [+0.000196, +0.000974], t 3.0 | +0.0003 to +0.002: met | the only cheap knob; an upper bound (a real predictor picks worse) |
 | Neuron skip 40 % | 0.017611 | +0.004670 [+0.004021, +0.005319], t 14.3 | +0.001 to +0.004: missed (just above) | as costly as one deferred expert |
 | Neuron skip 50 % | 0.024159 | +0.011218 [+0.009803, +0.012634], t 15.7 | +0.002 to +0.008: missed | ruled out |
-| 8-bit activations, every weight; 4-bit on rotated dense (step c) | pending | | | |
+| 8-bit activations on every weight (gpu path) | 0.013106 | +0.000165 [-0.000148, +0.000478], t 1.1 | within about +0.0003: met | free; **vs Unsloth MTP 8-bit (0.012864): +0.000242 [-0.000198, +0.000682], a tie** (prediction "below Unsloth's 8-bit" missed) |
+| 4-bit activations on the rotated dense weights | 0.045766 | +0.032825 [+0.031543, +0.034107], t 50.8 | +0.002 to +0.01: missed (3x the top) | ruled out: no int4-activation kernel path |
 
 - **Reading:** the routed experts are not interchangeable at the margin. The 8th pick carries about 7 % of the routed weight (block_k) but moving or swapping it costs 13-33 % of the whole file's drift. KTransformers' -0.5 % on LiveBench is a task score; per-token KLD is far more sensitive, and the speed knobs that touch routing must be judged on it.
 
