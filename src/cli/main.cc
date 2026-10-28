@@ -18,6 +18,7 @@
 #include <fstream>
 #include <limits>
 #include <map>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -152,7 +153,11 @@ void usage() {
       "                                  --act-int8: round the inputs of quantized weights whose names contain one of the\n"
       "                                  comma-separated GROUPS (or 'all') to 8 bits first: cpu (default) = llama.cpp's CPU\n"
       "                                  format for each weight type (Q8_K / Q8_0 / Q8_1), gpu = q8_1\n"
-      "                                  --act-rot h32: rotate each 32-value block (Walsh-Hadamard) before rounding, back after\n"
+      "                                  --act-rot h32: rotate each 32-value block (Walsh-Hadamard) before rounding, back after\n"      "      [--act-bits 4] [--neuron-skip F] [--defer-experts D] [--swap-near-tie M --hot-set FILE]   (game plan Block M)\n"
+      "                                  --act-bits 4: 4-bit activations per 32 (gpu path); --neuron-skip F: zero the smallest\n"
+      "                                  F of each routed expert's hidden values (oracle); --defer-experts D: the D lowest\n"
+      "                                  experts added one layer later; --swap-near-tie M: use the first unpicked expert when\n"
+      "                                  the last pick is not in the hot set, it is, and their probabilities differ by < M\n"
       "  kld-compare --a A.bin --b B.bin [--name-a S] [--name-b S]\n"
       "                                  paired comparison of two --dump-kld files scored on the same base: mean difference,\n"
       "                                  chunk-clustered standard error, 95 % interval, top-token disagreements, verdict\n"
@@ -700,6 +705,79 @@ int cmd_kld(const Args& a) {
     }
     fo.act_rot32 = true;
   }
+  // Block M: speed ideas, each measured for its accuracy cost
+  std::uint64_t m_stats[4] = {0, 0, 0, 0};
+  fo.m_stats = m_stats;
+  if (a.has("act-bits")) {
+    const std::string v = a.get("act-bits");
+    if ((v != "4" && v != "8") || !fo.act_int8_gpu) {
+      std::fprintf(stderr, "pelias: --act-bits is 4 or 8 and needs --act-int8 ... --act-int8-path gpu\n");
+      return 1;
+    }
+    fo.act_bits = v == "4" ? 4 : 8;
+  }
+  if (a.has("neuron-skip")) {
+    const Result<double> f = io::parse_positive_decimal(a.get("neuron-skip"), 0.99);
+    if (!f.ok()) {
+      std::fprintf(stderr, "pelias: --neuron-skip takes a fraction above 0 and at most 0.99\n");
+      return 1;
+    }
+    fo.neuron_skip = f.value;
+  }
+  if (a.has("defer-experts")) {
+    const Result<std::uint64_t> d = io::parse_whole(a.get("defer-experts"), spec.value.n_expert_used > 0 ? spec.value.n_expert_used - 1 : 0);
+    if (!d.ok() || d.value == 0) {
+      std::fprintf(stderr, "pelias: --defer-experts takes 1 to n_expert_used - 1\n");
+      return 1;
+    }
+    fo.defer_experts = static_cast<int>(d.value);
+  }
+  if (a.has("swap-near-tie") != a.has("hot-set")) {
+    std::fprintf(stderr, "pelias: --swap-near-tie and --hot-set go together\n");
+    return 1;
+  }
+  if (a.has("swap-near-tie")) {
+    const Result<double> mg = io::parse_positive_decimal(a.get("swap-near-tie"), 1.0);
+    if (!mg.ok()) {
+      std::fprintf(stderr, "pelias: --swap-near-tie takes a probability margin above 0\n");
+      return 1;
+    }
+    fo.swap_margin = static_cast<float>(mg.value);
+    const Result<std::string> hs = io::read_text_file(a.get("hot-set"), std::uint64_t{16} << 20);
+    if (!hs.ok()) return fail_input(hs.status);
+    const std::uint32_t nl = spec.value.n_layer, nex = spec.value.n_expert;
+    fo.hot.assign(static_cast<std::size_t>(nl) * nex, 0);
+    std::istringstream in(hs.value);
+    std::string line;
+    std::uint32_t layers_seen = 0;
+    while (std::getline(in, line)) {
+      if (line.rfind("layer ", 0) != 0) continue;
+      std::istringstream ls(line.substr(6));
+      long long li = -1;
+      std::string colon;
+      ls >> li >> colon;
+      if (li < 0 || li >= static_cast<long long>(nl) || colon != ":") {
+        std::fprintf(stderr, "pelias: --hot-set: bad line '%s'\n", line.substr(0, 40).c_str());
+        return 1;
+      }
+      long long ex;
+      while (ls >> ex) {
+        if (ex < 0 || ex >= static_cast<long long>(nex)) {
+          std::fprintf(stderr, "pelias: --hot-set: expert %lld out of range\n", ex);
+          return 1;
+        }
+        fo.hot[static_cast<std::size_t>(li) * nex + static_cast<std::size_t>(ex)] = 1;
+      }
+      ++layers_seen;
+    }
+    if (layers_seen != nl) {
+      std::fprintf(stderr, "pelias: --hot-set names %u layers, the model has %u\n", layers_seen, nl);
+      return 1;
+    }
+  }
+  if (fo.act_bits == 4 || fo.neuron_skip > 0 || fo.defer_experts > 0 || fo.swap_margin > 0)
+    std::fprintf(stderr, "pelias kld: Block M options: act-bits %d, neuron-skip %.2f, defer-experts %d, swap-near-tie %.4g\n", fo.act_bits, fo.neuron_skip,
+                 fo.defer_experts, static_cast<double>(fo.swap_margin));
   const std::string dump_path = a.get("dump-kld");
   if (!dump_path.empty() && std::ifstream(dump_path, std::ios::binary)) {
     std::fprintf(stderr, "pelias: %s already exists (nothing is overwritten)\n", dump_path.c_str());
@@ -819,6 +897,12 @@ int cmd_kld(const Args& a) {
     std::fprintf(stderr, "pelias kld: expert statistics written (%u layers x %u experts)\n", spec.value.n_layer, spec.value.n_expert);
   }
   std::fprintf(stderr, "pelias kld: %d chunks in %.1f s\n", n_chunk, total.seconds());
+  if (fo.swap_margin > 0)
+    std::fprintf(stderr, "pelias kld: near-tie swap: %llu swaps of %llu token-layers whose last pick was not resident\n",
+                 static_cast<unsigned long long>(m_stats[0]), static_cast<unsigned long long>(m_stats[1]));
+  if (fo.neuron_skip > 0)
+    std::fprintf(stderr, "pelias kld: neuron skip: %llu of %llu expert hidden values zeroed\n", static_cast<unsigned long long>(m_stats[2]),
+                 static_cast<unsigned long long>(m_stats[3]));
   return 0;
 }
 

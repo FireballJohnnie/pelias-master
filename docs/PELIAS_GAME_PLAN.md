@@ -1002,6 +1002,27 @@ The exact pre-gating prediction gets 83.9 % of the next layer's picks with only 
 
 **Order proposed for the engine phase (each with its own paired or timed test):** expert deferral in the reference (accuracy, now) -> one CUDA Graph per step -> MARLIN-style pipelining in the int8 kernel (R3) -> T-MAC-style CPU kernel -> MTP drafting with draft-driven prefetch and batch-per-expert on GPU and L3.
 
+### Block M: side track, the author's "language" (codes written at build time) and speed ideas measured for accuracy (2026-10-28)
+
+**Rule:** sandbox-first, one cheap test per step, a gate decides build or park; never takes PC time from the main path.
+
+**Reference options built (sandbox, not yet run on the real model; tiny model: all off = bit-identical to before):** `kld --act-bits 4` (W4A4 with rotation), `--neuron-skip F` (oracle neuron skipping, the upper bound of TEAL/PowerInfer-style byte savings), `--defer-experts D` (KTransformers' expert deferral), `--swap-near-tie M --hot-set FILE` (cache-aware near-tie swap; hot set from the engine's 7.5 GiB file, 328 prompts). Tiny-model drift (random weights, direction only): base 5.43, skip 25 % 5.57, skip 50 % 5.69, defer 1 6.98, 8-bit rotated 5.54, 4-bit rotated 7.96, 4-bit plain 8.83.
+
+**Gate 1, the 3-weight code (MEASURED 02:1x, sandbox, real bf16 weights of blk.20 extracted read-only from the author's file: attn_qkv 2048x8192 sampled to 4096 rows, 4 gate and 4 down experts; relative squared error, no importance weights):**
+
+| Format | Bits per weight | attn_qkv rotated | attn_qkv plain | gate_exps | down_exps |
+|---|---|---|---|---|---|
+| Q4_K | 4.50 | 0.00502 | 0.00586 | 0.00515 | 0.00512 |
+| IQ4_XS | 4.25 | 0.00582 | 0.00668 | 0.00594 | 0.00591 |
+| 3-weight code, 4,096 words, fp16 scale per 32 | 4.50 | 0.00597 | 0.00632 | 0.00600 | 0.00588 |
+| 3-weight code, 4,096 words, "tags" (fp16 per 256 + 6-bit per 32) | 4.25 | 0.00598 | 0.00636 | 0.00599 | 0.00586 |
+| Triangle word + shade (256 triangles x 15 points) | 4.25 | 0.00902 | 0.00974 | 0.00920 | 0.00930 |
+| Q5_K (reference) | 5.50 | 0.00129 | 0.00150 | 0.00132 | 0.00131 |
+
+- **Verdict: gate 1 not passed.** A learned 3-weight code ties IQ4_XS at 4.25 bits (within -1 % to +3 %) and loses to Q4_K at 4.5; the triangle code loses by about 55 %. Three dimensions are too few for a codebook to pay (published gains come from 8 dimensions, QuIP#'s E8 lattice, and from importance-weighted fitting).
+- **Kept:** the author's "tags" (a label per 256 plus a smaller label per 32, the block's "zip code") give the same error as a full fp16 scale per 32 for 0.25 fewer bits per weight. K-quants already use exactly this two-level addressing, which is why they are hard to beat.
+- **Possible next step (parked unless the author asks):** an 8-weight code (E8-style) at 4.25 bits on the same slices, sandbox only, about 15 min; RT cores cannot serve 8 dimensions, so it would be a build-time tool on the CUDA cores.
+
 ### GP3-14 Masterwork step 10: the engine
 
 **Scope:**

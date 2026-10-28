@@ -100,6 +100,24 @@ struct ForwardOptions {
   bool act_rot32 = false;
   // Optional routing record (game plan D-T2): n_tokens x n_layer entries (position-major), filled by every layer.
   RouteRecord* route = nullptr;
+  // Speed ideas measured for their accuracy cost (game plan Block M). Each is off by default.
+  // act_bits 4: with act_int8 on the gpu path, round to 4 bits per 32 values (symmetric, -7..7, fp16 scale) instead of
+  // q8_1 (W4A4 with rotation, QuaRot-style).
+  int act_bits = 8;
+  // neuron_skip f in (0, 1): in every routed expert, the fraction f of its hidden values (silu(gate) * up) smallest in
+  // magnitude are set to zero for each token: the oracle upper bound of skipping neurons (their gate and up rows and
+  // their down column would not be read).
+  double neuron_skip = 0.0;
+  // swap_margin m > 0 with hot (n_layer x n_expert, 1 = resident): when a token's last pick is not resident, the first
+  // unpicked expert is, and their probabilities differ by less than m, the resident one is used instead.
+  float swap_margin = 0.0f;
+  std::vector<std::uint8_t> hot;
+  // defer_experts d: each token's d lowest-weight routed experts are added to the residual stream one layer later
+  // (after the next layer's MoE), as KTransformers' expert deferral; the last layer's are added before the output norm.
+  int defer_experts = 0;
+  // counters for the above (may be null): [0] swaps made, [1] token-layers whose last pick was not resident,
+  // [2] hidden values zeroed, [3] hidden values seen
+  std::uint64_t* m_stats = nullptr;
 };
 
 // The orthonormal Walsh-Hadamard transform of every 32-value block of x[0..n) in place (n a multiple of 32). It is its

@@ -267,7 +267,7 @@ struct Ctx {
 
 // the 8-bit activation format the inputs of `w` are rounded to (ForwardOptions::act_int8), or none; float weights never
 // are, as in the reference
-enum class ActFmt { none, q8_0, q8_1, q8_k };
+enum class ActFmt { none, q8_0, q8_1, q8_k, q4_32 };
 
 ActFmt act_format(const ForwardOptions& o, const WeightView& w) {
   if (o.act_int8.empty() || !w.present()) return ActFmt::none;
@@ -277,7 +277,7 @@ ActFmt act_format(const ForwardOptions& o, const WeightView& w) {
   for (const std::string& g : o.act_int8)
     if (g == "all" || w.name.find(g) != std::string::npos) hit = true;
   if (!hit) return ActFmt::none;
-  if (o.act_int8_gpu) return ActFmt::q8_1;
+  if (o.act_int8_gpu) return o.act_bits == 4 ? ActFmt::q4_32 : ActFmt::q8_1;
   switch (t) {
     case quant::Type::q4_0: case quant::Type::q5_0: case quant::Type::q8_0: case quant::Type::iq4_nl: case quant::Type::mxfp4:
       return ActFmt::q8_0;
@@ -293,6 +293,18 @@ int act_block(ActFmt f) { return f == ActFmt::q8_k ? 256 : 32; }
 // one row to the 8-bit format and back: Q8_0 (32: d fp16, qs int8), q8_1 (32: d fp16, s fp16, qs int8) or Q8_K
 // (256: d fp32, qs int8, sums). The row length is a multiple of the block (checked once by check_act_rounding).
 void act_round_plain(float* x, int64_t n, ActFmt f) {
+  if (f == ActFmt::q4_32) {  // 4 bits per value, -7..7, one fp16 scale per 32 (Block M, W4A4)
+    for (int64_t i = 0; i < n; i += 32) {
+      float amax = 0.0f;
+      for (int j = 0; j < 32; ++j) amax = std::max(amax, std::fabs(x[i + j]));
+      const float d = quant::fp16_to_fp32(quant::fp32_to_fp16(amax / 7.0f));
+      for (int j = 0; j < 32; ++j) {
+        const float q = d > 0.0f ? std::nearbyint(x[i + j] / d) : 0.0f;
+        x[i + j] = d * std::min(7.0f, std::max(-7.0f, q));
+      }
+    }
+    return;
+  }
   if (f == ActFmt::q8_k) {
     std::uint8_t b[292];
     for (int64_t i = 0; i < n; i += 256) {
@@ -507,7 +519,7 @@ void delta_net(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* ou
   mm(c, l.ssm_out, core.data(), n, d_inner, out, e);
 }
 
-void moe(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* out) {
+void moe(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* out, float* deferred = nullptr) {
   const Qwen35MoeSpec& s = c.s;
   const int64_t n = c.n, e = s.n_embd, ne = s.n_expert, nu = s.n_expert_used, ff = s.n_ff_exp, ffs = s.n_ff_shexp;
   // routing: softmax over every expert, the top n_expert_used by probability (ties: lower index first), their
@@ -528,6 +540,17 @@ void moe(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* out) {
       RouteRecord& rr = c.opt.route[z(t * static_cast<int64_t>(s.n_layer) + c.il)];
       rr.p_last = p[order[z(nu - 1)]];
       rr.p_next = nsort > nu ? p[order[z(nu)]] : 0.0f;
+    }
+    if (c.opt.swap_margin > 0.0f && nsort > nu && !c.opt.hot.empty()) {  // Block M: near-tie swap toward a resident expert
+      const std::uint8_t* hl = c.opt.hot.data() + static_cast<int64_t>(c.il) * ne;
+      const int32_t last = order[z(nu - 1)], next = order[z(nu)];
+      if (!hl[last]) {
+        if (c.opt.m_stats) ++c.opt.m_stats[1];
+        if (hl[next] && p[last] - p[next] < c.opt.swap_margin) {
+          std::swap(order[z(nu - 1)], order[z(nu)]);
+          if (c.opt.m_stats) ++c.opt.m_stats[0];
+        }
+      }
     }
     float sum = 0.0f;
     for (int64_t k = 0; k < nu; ++k) {
@@ -591,6 +614,25 @@ void moe(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* out) {
     matmul_rows(l.gate_exps, static_cast<uint64_t>(ex), 0, ff, sc.xe.data(), m, e, sc.ge.data(), ff, sc);
     matmul_rows(l.up_exps, static_cast<uint64_t>(ex), 0, ff, sc.xe.data(), m, e, sc.ue.data(), ff, sc);
     for (int64_t i = 0; i < m * ff; ++i) sc.ge[z(i)] = silu(sc.ge[z(i)]) * sc.ue[z(i)];
+    if (c.opt.neuron_skip > 0.0) {  // Block M: oracle neuron skipping, the smallest |h| per token set to zero
+      const auto kz = static_cast<int64_t>(c.opt.neuron_skip * static_cast<double>(ff));
+      if (kz > 0) {
+        std::vector<float> mag(z(ff));
+        for (int64_t r = 0; r < m; ++r) {
+          float* h = sc.ge.data() + r * ff;
+          for (int64_t i = 0; i < ff; ++i) mag[z(i)] = std::fabs(h[i]);
+          std::nth_element(mag.begin(), mag.begin() + (kz - 1), mag.end());
+          const float thr = mag[z(kz - 1)];
+          int64_t zeroed = 0;
+          for (int64_t i = 0; i < ff && zeroed < kz; ++i)
+            if (std::fabs(h[i]) <= thr) { h[i] = 0.0f; ++zeroed; }
+        }
+        if (c.opt.m_stats) {
+          std::atomic_ref<std::uint64_t>(c.opt.m_stats[2]).fetch_add(static_cast<std::uint64_t>(kz * m));
+          std::atomic_ref<std::uint64_t>(c.opt.m_stats[3]).fetch_add(static_cast<std::uint64_t>(ff * m));
+        }
+      }
+    }
     if (!hs.empty())
       for (int64_t r = 0; r < m; ++r) std::memcpy(hs.data() + list[z(r)] * ff, sc.ge.data() + r * ff, z(ff) * sizeof(float));
     if (const ActFmt fd = act_format(c.opt, l.down_exps); fd != ActFmt::none || l.down_exps.rot32)
@@ -622,10 +664,20 @@ void moe(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* out) {
     g = sigmoid(g);
     float* o = out + t * e;
     const float* y0 = ys.data() + (t * nu) * e;
+    // Block M expert deferral: the last d slots (lowest probability) go to `deferred`, added one layer later
+    const int64_t keep = deferred ? std::max<int64_t>(1, nu - c.opt.defer_experts) : nu;
     for (int64_t i = 0; i < e; ++i) o[i] = y0[i];
-    for (int64_t k = 1; k < nu; ++k) {
+    for (int64_t k = 1; k < keep; ++k) {
       const float* yk = ys.data() + (t * nu + k) * e;
       for (int64_t i = 0; i < e; ++i) o[i] += yk[i];
+    }
+    if (deferred) {
+      float* dd = deferred + t * e;
+      for (int64_t i = 0; i < e; ++i) dd[i] = 0.0f;
+      for (int64_t k = keep; k < nu; ++k) {
+        const float* yk = ys.data() + (t * nu + k) * e;
+        for (int64_t i = 0; i < e; ++i) dd[i] += yk[i];
+      }
     }
     const float* shr = sh.data() + t * e;
     for (int64_t i = 0; i < e; ++i) o[i] += shr[i] * g;
@@ -731,6 +783,13 @@ Status forward_reference(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, cons
     return Status::fail(Code::invalid_argument, "the token count or the output range is empty or out of range");
   if (w.layers.size() != s.n_layer) return Status::fail(Code::invalid_argument, "the weights were bound for another spec");
   if (Status st = check_act_rounding(opt, w); !st) return st;
+  if (opt.act_bits != 8 && (opt.act_bits != 4 || !opt.act_int8_gpu))
+    return Status::fail(Code::invalid_argument, "4-bit activations need the gpu path (--act-int8-path gpu); only 8 and 4 bits exist");
+  if (opt.neuron_skip < 0.0 || opt.neuron_skip >= 1.0) return Status::fail(Code::invalid_argument, "neuron skipping takes a fraction in [0, 1)");
+  if (opt.swap_margin > 0.0f && opt.hot.size() != static_cast<std::size_t>(s.n_layer) * s.n_expert)
+    return Status::fail(Code::invalid_argument, "the near-tie swap needs a hot set of n_layer x n_expert entries");
+  if (opt.defer_experts < 0 || opt.defer_experts >= static_cast<int>(s.n_expert_used))
+    return Status::fail(Code::invalid_argument, "expert deferral must keep at least one expert immediate");
   if (opt.route && (s.n_expert_used > 8 || s.n_expert > 32767))
     return Status::fail(Code::unsupported, "the routing record holds at most 8 picked experts of at most 32767");
   if (opt.imatrix) {  // rotated dense weights are collected in the rotated basis (mm); rotated routed experts are not built
@@ -745,6 +804,7 @@ Status forward_reference(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, cons
 
   // embedding rows
   std::vector<float> x(z(n * e)), xn(z(n * e)), y(z(n * e));
+  std::vector<float> ydef_now(opt.defer_experts > 0 ? z(n * e) : 0), ydef_prev(opt.defer_experts > 0 ? z(n * e) : 0);
   for (int64_t t = 0; t < n; ++t) {
     const std::int32_t tok = tokens[t];
     if (tok < 0 || static_cast<uint64_t>(tok) >= s.n_vocab) return Status::fail(Code::invalid_argument, "a token id is outside the vocabulary");
@@ -759,8 +819,14 @@ Status forward_reference(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, cons
     else full_attention(c, l, xn.data(), y.data());
     for (int64_t i = 0; i < n * e; ++i) x[z(i)] += y[z(i)];
     for (int64_t t = 0; t < n; ++t) rms_norm(x.data() + t * e, l.post_norm.data(), xn.data() + t * e, e, s.rms_eps);
-    moe(c, l, xn.data(), y.data());
-    for (int64_t i = 0; i < n * e; ++i) x[z(i)] += y[z(i)];
+    if (opt.defer_experts > 0) {  // Block M: this layer's deferred experts wait; the previous layer's arrive now
+      moe(c, l, xn.data(), y.data(), ydef_now.data());
+      for (int64_t i = 0; i < n * e; ++i) x[z(i)] += y[z(i)] + ydef_prev[z(i)];
+      std::swap(ydef_now, ydef_prev);
+    } else {
+      moe(c, l, xn.data(), y.data());
+      for (int64_t i = 0; i < n * e; ++i) x[z(i)] += y[z(i)];
+    }
     if (opt.route && il + 1 < s.n_layer) {
       // pre-gating prediction: the next layer's router on this layer's output, through the next layer's norm
       const Qwen35MoeLayer& nl = w.layers[il + 1];
@@ -778,6 +844,8 @@ Status forward_reference(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, cons
       }
     }
   }
+  if (opt.defer_experts > 0)  // the last layer's deferred experts arrive before the output norm
+    for (int64_t i = 0; i < n * e; ++i) x[z(i)] += ydef_prev[z(i)];
   if (!logits) return Status::good();  // the activations were all the caller wanted (importance matrix)
   const int64_t m = out_end - out_begin;
   for (int64_t t = 0; t < m; ++t) rms_norm(x.data() + (out_begin + t) * e, w.output_norm.data(), xn.data() + t * e, e, s.rms_eps);
