@@ -1030,6 +1030,18 @@ The exact pre-gating prediction gets 83.9 % of the next layer's picks with only 
 
 **Reference options built (sandbox, not yet run on the real model; tiny model: all off = bit-identical to before):** `kld --act-bits 4` (W4A4 with rotation), `--neuron-skip F` (oracle neuron skipping, the upper bound of TEAL/PowerInfer-style byte savings), `--defer-experts D` (KTransformers' expert deferral), `--swap-near-tie M --hot-set FILE` (cache-aware near-tie swap; hot set from the engine's 7.5 GiB file, 328 prompts). Tiny-model drift (random weights, direction only): base 5.43, skip 25 % 5.57, skip 50 % 5.69, defer 1 6.98, 8-bit rotated 5.54, 4-bit rotated 7.96, 4-bit plain 8.83.
 
+**Price list on the real model (block_m.sh, t8r = dense rotated, 100 chunks, each paired against t8r's fp32 run 0.012941; MEASURED, every result re-computed from the dumps in Python):**
+
+| Knob | KLD | vs t8r (95 % interval) | Prediction | Verdict |
+|---|---|---|---|---|
+| Expert deferral 1 (`--defer-experts 1`) | 0.017154 | +0.004213 [+0.003624, +0.004802], t 14.2 | +0.0002 to +0.002: missed (about 2x the top) | ruled out as a default: one expert adds a third of t8r's drift |
+| Expert deferral 2 | 0.023002 | +0.010061 [+0.009218, +0.010904], t 23.7 | 2-3x defer 1: met (2.39x) | ruled out |
+| Near-tie swap, margin 0.001, 7.5 GiB hot set | 0.014606 | +0.001665 [+0.001102, +0.002228], t 5.9 | below +0.0005: missed | cheapest, still resolved; 302,248 swaps of 1,274,700 token-layers whose last pick was cold (23.7 %); a smaller margin is the only version worth a second look |
+| Neuron skip 25 / 40 / 50 % (step b) | pending | | | |
+| 8-bit activations, every weight; 4-bit on rotated dense (step c) | pending | | | |
+
+- **Reading:** the routed experts are not interchangeable at the margin. The 8th pick carries about 7 % of the routed weight (block_k) but moving or swapping it costs 13-33 % of the whole file's drift. KTransformers' -0.5 % on LiveBench is a task score; per-token KLD is far more sensitive, and the speed knobs that touch routing must be judged on it.
+
 **Gate 1, the 3-weight code (MEASURED 02:1x, sandbox, real bf16 weights of blk.20 extracted read-only from the author's file: attn_qkv 2048x8192 sampled to 4096 rows, 4 gate and 4 down experts; relative squared error, no importance weights):**
 
 | Format | Bits per weight | attn_qkv rotated | attn_qkv plain | gate_exps | down_exps |
