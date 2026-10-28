@@ -1098,6 +1098,20 @@ Likeliest candidates first, then stop and decide (keep the best file or keep exp
 4. **DONE 2026-10-28 13:27: urm_Z (MEASURED, verified from the dumps with pair.py).** urm with all 259 Q8_0 tensors as Q8_Z: 22,602,383,584 bytes, **-61,003,840 bytes (-61.0 MB) vs Unsloth MTP** (predicted about -60 MB). Engine format (gpu256x8) 0.012402: vs urm -0.000098 [-0.000453, +0.000258], t -0.54, no difference (predicted +0.00002, no difference: met; Q8_Z costs nothing measurable); vs Unsloth on llama.cpp's GPU path (0.012864) -0.000462 [-0.001019, +0.000095], t -1.65, lower but not resolved (predicted about -0.00035). **7pH ladder gate 1 for Q8_Z passed on the whole model: accuracy equal to Q8_0, 61 MB fewer bytes** (speed: engine). urm_Z is now first on the GPU shortlist.
 5. **The engine handles P and H (author: "I want to see the engine handle P and H"):** in GP3-14 the engine reads _P files (a base plane plus refinement planes in their own arrays) and applies the H read rule (heat): hot experts in the GPU bank hold every plane; cold experts are read base plane first by the copy engines, the refinement plane queued second and applied if it arrives in time, skipped for that token if not; a cold expert promoted to the bank gets its refinement plane added as it moves. Dense tensors have no heat (read every token): Q8_Z through the texture path if checks (b) and (c) pass, else int8 v10. Engine gates for P/H: (i) with every plane read, logits identical to the unsplit file (KLD 0); (ii) base-only cold reads at the measured cold share, paired KLD against (i) (the _P cold gate, run on the reference first); (iii) tok/s and cold-path bytes per token, timed.
 
+### S1 sandbox results (2026-10-28 13:5x-14:0x, MEASURED, real blk.20 attn_qkv, rotated, all 8192 rows; tools/experiments/s1_rungs_check.py)
+
+| Format | bpw | Importance-weighted error | x Q8_0 |
+|---|---|---|---|
+| Q8_0 (C++) | 8.50 | 0.000028 | 1.00 |
+| Q8_Z (C++) | 8.25 | 0.000029 | 1.02 |
+| **Q7_Z (C++, new type id 201, commit 4a34c8d)** | **7.25** | **0.000113** | **4.0** |
+| 6-bit, same scales (numpy) | 6.25 | 0.000457 | 16.3 |
+| Q7_PT (7 + 7 + 2 tag bits, earlier) | 8.25 | 0.000040 plain | beaten by Q8_Z at the same bits; bit planes do not change values |
+
+- Exactness: J1 plane split (base nibble x 16 + low nibble) = whole dot, max difference 0; author's popcount H = plain dot, max difference 0.
+- fp16 partial sums per 256 (texture path, Fable check a): 0.22 % output error against Q8_Z's own 0.54 % on the same outputs (synthetic activations scaled by the importance matrix, rotated).
+- Whole-model test started 14:04 (author OK 13:59): block_urmq7.sh, urm_Z with all 259 Q8_Z tensors as Q7_Z; prediction about -305 MB vs Unsloth MTP and +0.0002 vs urm_Z.
+
 ### Idea register: the unified bus and the idle units (author + Claude + Fable, 2026-10-28 13:0x-13:5x)
 
 Every idea here held up on paper (math checked; Fable read-only where marked). All DERIVED, none MEASURED; each has its test. Details are in the sections below this one. Rejected ideas are listed at the end so they are not re-proposed.
