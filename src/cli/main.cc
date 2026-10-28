@@ -126,6 +126,10 @@ void usage() {
       "  plan --model FILE [--bank-gib N] [--ceiling-gib C] [--working-set-gib W] [--index N] [--header-only]\n"
       "                                  the device memory plan; refused above the ceiling (exit 3)\n"
       "  quantize --model IN.gguf --out OUT.gguf [--type Q4_K_M|Q6_K|Q8_0|BF16|F16|F32] [--threads N] [--rotate32 GROUPS]\n"
+      "           [--recipe RECIPE.tsv] [--imatrix IMATRIX.gguf]\n"
+      "                                  --recipe: exact type per tensor (tools/recipe.py), every tensor named; --imatrix:\n"
+      "                                  importance weights as llama-quantize --imatrix (rotated weights need a matrix\n"
+      "                                  collected rotated)\n"
       "                                  --rotate32: store the product weights whose names contain one of GROUPS (or 'all')\n"
       "                                  rotated per 32 values (Walsh-Hadamard); the reader rotates their inputs to match\n"
       "                                  a new GGUF in a stock mix (default Q4_K_M), identical to the reference's (exit 6 on a write failure)\n"
@@ -409,6 +413,24 @@ int cmd_quantize(const Args& a) {
       return 1;
     }
   }
+  if (a.has("recipe")) {
+    const Result<std::map<std::string, std::uint32_t>> rc = io::read_recipe(a.get("recipe"));
+    if (!rc.ok()) return fail_input(rc.status);
+    opt.recipe = rc.value;
+    std::printf("recipe: %zu tensors named\n", opt.recipe.size());
+  }
+  io::ImatrixWeights imw;
+  if (a.has("imatrix")) {
+    const std::string ip = a.get("imatrix");
+    Result<io::ImatrixWeights> im = io::read_imatrix_weights(ip);
+    if (!im.ok()) return fail_input(im.status);
+    imw = std::move(im.value);
+    opt.imatrix = &imw;
+    const std::size_t cut = ip.find_last_of("/\\");
+    opt.imatrix_name = cut == std::string::npos ? ip : ip.substr(cut + 1);  // rule 7: the file name, not its path
+    std::printf("importance matrix: %zu entries over %u chunks%s\n", imw.weights.size(), imw.chunk_count,
+                imw.has_rot32 ? (", " + std::to_string(imw.rot32.size()) + " collected rotated").c_str() : "");
+  }
   std::printf("quantizing %zu tensors to %s\n", r.tensors().size(), quant::file_type_name(ft.value));
   std::fflush(stdout);
   std::size_t last_pct = 0;
@@ -425,6 +447,11 @@ int cmd_quantize(const Args& a) {
     return res.status.code == Code::io_error ? 6 : 2;
   }
   const io::RequantReport& rep = res.value;
+  if (opt.imatrix) {
+    std::printf("importance weights used for %llu tensors; not in the matrix: %zu", static_cast<unsigned long long>(rep.with_imatrix), rep.imatrix_missing.size());
+    for (std::size_t i = 0; i < rep.imatrix_missing.size() && i < 5; ++i) std::printf("%s%s", i ? ", " : " (", rep.imatrix_missing[i].c_str());
+    std::printf("%s\n", rep.imatrix_missing.empty() ? "" : rep.imatrix_missing.size() > 5 ? ", ...)" : ")");
+  }
   if (rep.rotated) std::printf("rotated (Walsh-Hadamard per 32, recorded in pelias.rot32.tensors): %llu tensors\n", static_cast<unsigned long long>(rep.rotated));
   std::printf("done: %llu tensors (%llu quantized, %llu copied unchanged), %s in, %s out, %.1f s\n", static_cast<unsigned long long>(rep.tensors),
               static_cast<unsigned long long>(rep.quantized), static_cast<unsigned long long>(rep.copied), plan::format_bytes(rep.bytes_in).c_str(),

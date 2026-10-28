@@ -10,10 +10,12 @@
 
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <string>
 
 #include "io/gguf_reader.h"
 #include "io/gguf_writer.h"
+#include "io/imatrix_weights.h"
 #include "os/file_map.h"
 #include "pelias/status.h"
 #include "quant/type_rules.h"
@@ -29,13 +31,27 @@ struct RequantOptions {
   // product weights are eligible (attention and DeltaNet projections, routed and shared experts, the output layer);
   // embeddings, routers, norms and convolutions never are. Empty: nothing rotated, the file is the stock one.
   std::vector<std::string> rotate32;
+  // A PEL recipe (tools/recipe.py, `name<TAB>TYPE` per tensor): when not empty, every tensor of the source must be named
+  // and gets exactly that type instead of the mix's rule; a tensor the stock rule never quantizes (norms, routers, ...)
+  // must keep its source type. Like llama-quantize with a --tensor-type-file naming every tensor.
+  std::map<std::string, std::uint32_t> recipe;
+  // An importance matrix (read_imatrix_weights): each quantized tensor found in it is quantized with its column
+  // weights, one matrix per expert, as llama-quantize --imatrix does. Rotated tensors must have been collected rotated
+  // (the matrix's pelias.rot32.tensors) and the reverse. `imatrix_name` is written as quantize.imatrix.file.
+  const ImatrixWeights* imatrix = nullptr;
+  std::string imatrix_name;
 };
+
+// Reads a recipe file: one `name<TAB>TYPE` line per tensor (ggml type names, any case); blank lines are skipped.
+Result<std::map<std::string, std::uint32_t>> read_recipe(const std::string& path);
 
 // True when `name` is a product weight that may be stored rotated and one of `groups` selects it.
 bool rot32_selected(const std::string& name, const std::vector<std::string>& groups);
 
 struct RequantReport {
   std::uint64_t tensors = 0, quantized = 0, copied = 0, rotated = 0;
+  std::uint64_t with_imatrix = 0;            // quantized with importance weights (types that use them)
+  std::vector<std::string> imatrix_missing;  // quantized tensors the matrix has no entry for
   std::uint64_t bytes_in = 0, bytes_out = 0;
   double seconds = 0;
   std::uint64_t by_type[64] = {};  // output tensors per type id (ids below 64)

@@ -3,12 +3,15 @@
 #include "io/requantize.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstring>
+#include <set>
 #include <filesystem>
 #include <thread>
 #include <vector>
 
 #include "io/gguf_writer.h"
+#include "io/text_file.h"
 #include "pelias/timer.h"
 #include "quant/block_types.h"
 #include "quant/quant_cpu.h"
@@ -85,7 +88,51 @@ void parallel_rows(std::int64_t n, int threads, F fn) {
   for (auto& th : pool) th.join();
 }
 
+// gguf_set_val semantics: a key already present is replaced where it stands, a new key is added at the end
+void set_kv(std::vector<GgufKvBlob>& kv, GgufKvBlob b) {
+  const std::string key = gguf_kv_key(b);
+  for (GgufKvBlob& e : kv)
+    if (gguf_kv_key(e) == key) {
+      e = std::move(b);
+      return;
+    }
+  kv.push_back(std::move(b));
+}
+
 }  // namespace
+
+Result<std::map<std::string, std::uint32_t>> read_recipe(const std::string& path) {
+  using R = Result<std::map<std::string, std::uint32_t>>;
+  const Result<std::string> text = read_text_file(path, std::uint64_t{64} << 20);
+  if (!text.ok()) return R::fail(text.status);
+  std::map<std::string, std::uint32_t> out;
+  const std::string& t = text.value;
+  std::size_t line_no = 0;
+  for (std::size_t p = 0; p < t.size();) {
+    std::size_t q = t.find('\n', p);
+    if (q == std::string::npos) q = t.size();
+    std::string line = t.substr(p, q - p);
+    p = q + 1;
+    ++line_no;
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (line.find_first_not_of(" \t") == std::string::npos) continue;
+    const std::size_t tab = line.find('\t');
+    if (tab == std::string::npos || tab == 0 || line.find('\t', tab + 1) != std::string::npos)
+      return R::fail(Status::fail(Code::invalid_argument, "recipe line " + std::to_string(line_no) + " is not `name<TAB>TYPE`"));
+    const std::string name = line.substr(0, tab);
+    std::string ty = line.substr(tab + 1);
+    for (char& c : ty) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    std::uint32_t id = 64;
+    for (std::uint32_t k = 0; k < 64; ++k) {
+      const quant::TypeInfo ti = quant::type_info(k);
+      if (ti.known && ty == ti.name) id = k;
+    }
+    if (id == 64) return R::fail(Status::fail(Code::invalid_argument, "recipe line " + std::to_string(line_no) + ": unknown type '" + ty + "'", 0, name));
+    if (!out.emplace(name, id).second) return R::fail(Status::fail(Code::invalid_argument, "the recipe names a tensor twice", 0, name));
+  }
+  if (out.empty()) return R::fail(Status::fail(Code::invalid_argument, "the recipe is empty"));
+  return R::good(std::move(out));
+}
 
 bool rot32_selected(const std::string& name, const std::vector<std::string>& groups) {
   static const char* const kProducts[] = {"attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight", "attn_qkv.weight",
@@ -152,6 +199,12 @@ Result<RequantReport> quantize_source(const QuantSource& src, const std::string&
   }
   kv.push_back(gguf_kv_u32("general.quantization_version", kQuantizationVersion));
   kv.push_back(gguf_kv_u32("general.file_type", static_cast<std::uint32_t>(opt.ftype)));
+  if (opt.imatrix) {  // the keys llama-quantize adds as overrides (quantize.cpp), in its order; the file by name only (rule 7)
+    set_kv(kv, gguf_kv_str("quantize.imatrix.file", opt.imatrix_name.substr(0, 127)));
+    if (!opt.imatrix->datasets.empty()) set_kv(kv, gguf_kv_str("quantize.imatrix.dataset", opt.imatrix->datasets[0].substr(0, 127)));
+    set_kv(kv, gguf_kv_u32("quantize.imatrix.entries_count", static_cast<std::uint32_t>(opt.imatrix->weights.size())));
+    if (opt.imatrix->chunk_count > 0) set_kv(kv, gguf_kv_u32("quantize.imatrix.chunks_count", opt.imatrix->chunk_count));
+  }
 
   // ---- tensors in the reference's order, and their types by the mix's rule
   const auto& st = src.tensors;
@@ -171,8 +224,26 @@ Result<RequantReport> quantize_source(const QuantSource& src, const std::string&
     d.type = st[i].type;
     descs.push_back(d);
   }
-  const Result<std::vector<std::uint32_t>> types = quant::choose_types(descs, src.facts, opt.ftype);
+  Result<std::vector<std::uint32_t>> types = quant::choose_types(descs, src.facts, opt.ftype);
   if (!types.ok()) return R::fail(types.status);
+  if (!opt.recipe.empty()) {  // the recipe decides every type
+    std::set<std::string> seen;
+    for (std::size_t j = 0; j < order.size(); ++j) {
+      const SourceTensor& t = st[order[j]];
+      const auto it = opt.recipe.find(t.name);
+      if (it == opt.recipe.end()) return R::fail(Status::fail(Code::invalid_argument, "the recipe does not name this tensor", 0, t.name));
+      seen.insert(t.name);
+      const std::uint32_t want = it->second;
+      if (!quant::tensor_allows_quantization(descs[j], src.facts.arch) && want != t.type)
+        return R::fail(Status::fail(Code::unsupported, std::string("the recipe asks for ") + quant::type_info(want).name +
+                                                           " but the reference never quantizes this tensor (it keeps " + quant::type_info(t.type).name + ")", 0, t.name));
+      if (want != t.type && quant::row_bytes(want, t.ne[0]) == 0)
+        return R::fail(Status::fail(Code::unsupported, std::string("the row length is not a whole number of ") + quant::type_info(want).name + " blocks", 0, t.name));
+      types.value[j] = want;
+    }
+    for (const auto& [name, ty] : opt.recipe)
+      if (seen.count(name) == 0) return R::fail(Status::fail(Code::invalid_argument, "the recipe names a tensor the source does not have", 0, name));
+  }
 
   std::vector<GgufOutTensor> out;
   std::vector<char> rotate(order.size(), 0);
@@ -203,6 +274,28 @@ Result<RequantReport> quantize_source(const QuantSource& src, const std::string&
     o.type = to;
     o.bytes = to == t.type ? t.bytes : quant::row_bytes(to, t.ne[0]) * t.ne[1] * t.ne[2] * t.ne[3];
     out.push_back(o);
+  }
+  // importance matrix: which tensors it weighs, and whether its rotation matches this file's
+  std::vector<const std::vector<float>*> imat(order.size(), nullptr);
+  if (opt.imatrix) {
+    const std::set<std::string> im_rot(opt.imatrix->rot32.begin(), opt.imatrix->rot32.end());
+    for (std::size_t j = 0; j < order.size(); ++j) {
+      const SourceTensor& t = st[order[j]];
+      const auto it = opt.imatrix->weights.find(t.name);
+      if (it == opt.imatrix->weights.end()) continue;
+      if (rotate[j] && im_rot.count(t.name) == 0)
+        return R::fail(Status::fail(Code::invalid_argument, "this tensor is stored rotated but the importance matrix was collected on unrotated inputs "
+                                                            "(collect it with `pelias imatrix` on a file whose weights are rotated the same way)", 0, t.name));
+      if (!rotate[j] && im_rot.count(t.name) != 0)
+        return R::fail(Status::fail(Code::invalid_argument, "the importance matrix was collected on rotated inputs but this tensor is not rotated here", 0, t.name));
+      if (out[j].type == t.type) continue;  // copied: the reference uses no matrix
+      if (it->second.size() != t.ne[0] * t.ne[2]) {
+        if (t.name == "token_embd.weight") continue;  // the reference ignores this one mismatch
+        return R::fail(Status::fail(Code::invalid_argument, "the importance matrix has " + std::to_string(it->second.size()) + " values for a tensor of " +
+                                                                std::to_string(t.ne[0] * t.ne[2]), 0, t.name));
+      }
+      imat[j] = &it->second;
+    }
   }
   if (!opt.rotate32.empty()) {
     if (rotated_names.empty()) return R::fail(Status::fail(Code::invalid_argument, "--rotate32 selected no product weight"));
@@ -237,6 +330,8 @@ Result<RequantReport> quantize_source(const QuantSource& src, const std::string&
       qbuf.resize(static_cast<std::size_t>(nr * out_row));
       const std::uint32_t tin = t.type, tout = o.type;
       const bool rot = rotate[j] != 0;
+      const float* im = imat[j] ? imat[j]->data() : nullptr;
+      const std::uint64_t rows_per_matrix = t.ne[1];
       parallel_rows(static_cast<std::int64_t>(nr), threads, [&](std::int64_t b, std::int64_t e) {
         for (std::int64_t r = b; r < e; ++r) {
           float* row = f32.data() + r * ne0;
@@ -246,6 +341,7 @@ Result<RequantReport> quantize_source(const QuantSource& src, const std::string&
           if (rot) quant::hadamard32(row, ne0);
           std::uint8_t* qo = qbuf.data() + static_cast<std::uint64_t>(r) * out_row;
           if (tout == static_cast<std::uint32_t>(quant::Type::f32)) std::memcpy(qo, row, static_cast<std::size_t>(ne0) * 4);
+          else if (im) (void)quant::quantize_rows(static_cast<quant::Type>(tout), row, qo, 1, ne0, im + ((r0 + static_cast<std::uint64_t>(r)) / rows_per_matrix) * t.ne[0]);
           else (void)quant::quantize_row(static_cast<quant::Type>(tout), row, qo, ne0);
         }
       });
@@ -257,6 +353,10 @@ Result<RequantReport> quantize_source(const QuantSource& src, const std::string&
     if (o.type == t.type && !rotate[j]) ++rep.copied;
     else ++rep.quantized;
     if (rotate[j]) ++rep.rotated;
+    if (opt.imatrix && o.type != t.type) {
+      if (imat[j] && quant::uses_importance(static_cast<quant::Type>(o.type))) ++rep.with_imatrix;
+      else if (!imat[j] && opt.imatrix->weights.count(t.name) == 0) rep.imatrix_missing.push_back(t.name);
+    }
     ++rep.tensors;
     rep.bytes_in += t.bytes;
     rep.bytes_out += o.bytes;

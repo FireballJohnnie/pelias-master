@@ -1,15 +1,20 @@
 // provenance: original (the expected hashes MEASURED in the sandbox 2026-10-26: the reference llama-quantize at commit
 //   2ca15f5, built unchanged, run on the same synthetic file with Q4_K_M)
 // Copyright (c) 2026 John Lipka and the Pelias contributors
+#include <cstdio>
 #include <filesystem>
 #include <string>
+#include <vector>
 
 #include "io/gguf_compare.h"
 #include "io/gguf_reader.h"
+#include "io/imatrix_weights.h"
 #include "io/requantize.h"
 #include "io/sha256.h"
+#include "model/imatrix.h"
 #include "os/file_map.h"
 #include "pelias_test.h"
+#include "quant/block_types.h"
 #include "unit/synth_model.h"
 
 using namespace pelias;
@@ -94,4 +99,124 @@ TEST(rot32_selects_product_weights_only) {
   CHECK(!rot32_selected("blk.0.ffn_gate_inp_shexp.weight", all));
   CHECK(rot32_selected("blk.0.attn_gate.weight", all));
   CHECK(!rot32_selected("blk.0.attn_gate.weight", {}));
+}
+
+namespace {
+// Writes `text` to `path` (test files only).
+bool write_text(const std::string& path, const std::string& text) {
+  std::FILE* f = std::fopen(path.c_str(), "wb");
+  if (!f) return false;
+  const bool ok = std::fwrite(text.data(), 1, text.size(), f) == text.size();
+  return std::fclose(f) == 0 && ok;
+}
+// SHA-256 of the reference quantizer's output (llama-quantize at 2ca15f5, built unchanged, run in the data directory as
+// `llama-quantize --imatrix synth_imatrix.gguf --tensor-type-file synth_mix.txt synth_qwen35moe.gguf OUT Q4_K_M`, the
+// pattern file made by `tools/recipe.py llama-file` from synth_mix.tsv), MEASURED in the sandbox 2026-10-28
+const char* kReferenceRecipeImatrixSha = "bbab87c816b9fd1f3c6fd92c8314368f5b05902312df229b12bedcd3ae9caf4d";
+}  // namespace
+
+TEST(recipe_file_is_read_and_checked) {
+  const std::string d = ptest::data_dir();
+  CHECK(write_text(d + "/recipe_ok.tsv", "a.weight\tq8_0\r\n\nb.weight\tIQ4_XS\n"));
+  const auto ok = io::read_recipe(d + "/recipe_ok.tsv");
+  CHECK(ok.ok() && ok.value.size() == 2 && ok.value.at("a.weight") == 8u && ok.value.at("b.weight") == 23u);
+  CHECK(write_text(d + "/recipe_dup.tsv", "a.weight\tQ8_0\na.weight\tQ4_K\n"));
+  CHECK(!io::read_recipe(d + "/recipe_dup.tsv").ok());
+  CHECK(write_text(d + "/recipe_type.tsv", "a.weight\tQ9_X\n"));
+  CHECK(!io::read_recipe(d + "/recipe_type.tsv").ok());
+  CHECK(write_text(d + "/recipe_form.tsv", "a.weight Q8_0\n"));
+  CHECK(!io::read_recipe(d + "/recipe_form.tsv").ok());
+}
+
+TEST(quantize_with_recipe_and_imatrix_matches_the_reference) {
+  const std::string d = ptest::data_dir();
+  const std::string header = d + "/unsloth_header_16MiB.bin";
+  if (!std::filesystem::exists(header)) {
+    ptest::skip("unsloth_header_16MiB.bin not in the data directory (kept on the author's drive)");
+    return;
+  }
+  const std::string in_path = d + "/synth_qwen35moe.gguf";
+  std::error_code ec;
+  if (!std::filesystem::exists(in_path)) CHECK(ptest::write_synthetic_qwen35moe(header, in_path).ok());
+  CHECK_EQ(file_sha(in_path), std::string(kSynthInputSha));
+  os::FileMap m;
+  CHECK(m.open(in_path).ok());
+  io::GgufReader r;
+  CHECK(r.parse(m).ok());
+
+  // the stock types, then a mixed recipe from them (every tensor named)
+  const std::string stock = d + "/synth_stock_for_recipe.gguf";
+  std::filesystem::remove(stock, ec);
+  io::RequantOptions o0;
+  o0.threads = 3;
+  CHECK(io::requantize(m, r, stock, o0).ok());
+  os::FileMap ms;
+  CHECK(ms.open(stock).ok());
+  io::GgufReader rs;
+  CHECK(rs.parse(ms).ok());
+  std::string tsv;
+  for (const io::GgufTensor& t : rs.tensors()) {
+    std::string ty = quant::type_info(t.type).name;
+    if (t.name.find("ffn_gate_exps") != std::string::npos || t.name.find("ffn_up_exps") != std::string::npos) ty = "IQ4_XS";
+    else if (t.name.find("ffn_down_exps") != std::string::npos) ty = "Q5_K";
+    else if (t.name.find("attn_qkv.weight") != std::string::npos) ty = "Q8_0";
+    else if (t.name.find("ssm_out.weight") != std::string::npos) ty = "Q6_K";
+    tsv += t.name + "\t" + ty + "\n";
+  }
+  CHECK(write_text(d + "/synth_mix.tsv", tsv));
+
+  // a deterministic importance matrix over the experts and some dense weights; expert 1 of each stack sees no token
+  model::ImatrixCollector col;
+  for (const io::GgufTensor& t : r.tensors()) {
+    const bool exps = t.name.find("_exps.weight") != std::string::npos;
+    const bool dense = t.name.find("attn_qkv.weight") != std::string::npos || t.name.find("ssm_out.weight") != std::string::npos ||
+                       t.name.find("attn_output.weight") != std::string::npos;
+    if (!exps && !dense) continue;
+    const auto cols = static_cast<std::int64_t>(t.ne[0]), mats = exps ? static_cast<std::int64_t>(t.ne[2]) : 1;
+    model::ImatrixEntry& e = col.entry(t.name, cols, mats);
+    std::vector<float> row(static_cast<std::size_t>(cols));
+    for (std::int64_t k = 0; k < mats; ++k) {
+      if (exps && k == 1) continue;
+      for (int rep = 0; rep < 3; ++rep) {
+        for (std::int64_t j = 0; j < cols; ++j)
+          row[static_cast<std::size_t>(j)] = 0.05f + static_cast<float>((j * 37 + k * 11 + rep * 5 + static_cast<std::int64_t>(t.name.size())) % 97) / 16.0f;
+        model::ImatrixCollector::add_row(e, k, row.data());
+      }
+    }
+  }
+  col.finish_chunk();
+  const std::string imat = d + "/synth_imatrix.gguf";
+  std::filesystem::remove(imat, ec);
+  CHECK(col.write(imat, {"synthetic"}, 512).ok());
+  const auto iw = io::read_imatrix_weights(imat);
+  CHECK(iw.ok());
+  if (!iw.ok()) return;
+  // weights are sum2 / count; a matrix with no token weighs every column 1
+  for (const auto& [name, e] : col.entries()) {
+    const std::vector<float>& w = iw.value.weights.at(name);
+    CHECK(w.size() == e.sum2.size());
+    if (e.counts.size() > 1) CHECK(w[static_cast<std::size_t>(e.columns)] == 1.0f);
+    CHECK(w[0] == e.sum2[0] / static_cast<float>(e.counts[0]));
+    break;
+  }
+
+  const auto rc = io::read_recipe(d + "/synth_mix.tsv");
+  CHECK(rc.ok());
+  io::RequantOptions opt;
+  opt.threads = 3;
+  opt.recipe = rc.value;
+  opt.imatrix = &iw.value;
+  opt.imatrix_name = "synth_imatrix.gguf";
+  const std::string out = d + "/synth_mix_imatrix.pelias.gguf";
+  std::filesystem::remove(out, ec);
+  const auto rep = io::requantize(m, r, out, opt);
+  CHECK(rep.ok());
+  if (!rep.ok()) {
+    std::printf("      %s\n", rep.status.text().c_str());
+    return;
+  }
+  CHECK(rep.value.with_imatrix > 0);
+  const std::string sha = file_sha(out);
+  CHECK_EQ(sha, std::string(kReferenceRecipeImatrixSha));
+  if (sha != kReferenceRecipeImatrixSha) std::printf("      output sha %s\n", sha.c_str());
 }
