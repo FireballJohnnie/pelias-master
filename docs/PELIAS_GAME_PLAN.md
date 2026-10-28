@@ -641,6 +641,13 @@ Run R1: `bash $R/block_j.sh r1` (updates the clone from the newest bundle, rebui
 - **Next-layer prediction** (this layer's output through the next layer's norm and router): 83.6 % of the next layer's picks, 67.1 % of its cold picks at top 120: usable as a prefetch hint one layer ahead.
 - **What it changes:** no protection of router ties is needed for accuracy (drift is in the weights; Block C and F stay the levers); the hot bank sizes in GP3 use the measured coverage (120 per layer = 93.5 % of picks); cold-expert prefetch can start one layer early from the prediction (67 % hit on cold picks). GP1-06's remaining question (does the floor matter) is answered: 0.0028 is small against the 0.0136 target, but not zero.
 
+**Block L: rotated candidates against Unsloth (authorized by the author 2026-10-28 00:59; script `$R/block_l.sh`, dry-run end to end on the tiny model):**
+- `check` (about 12 min): R2 rebuilt from bf16 through `--recipe` (recipe read from `r2_dense.gguf`); prediction: byte-identical to `r2_dense.gguf`. Writes 21.7 GB to D: (a duplicate the author can remove after).
+- `imatrix` (about 45 min): `pelias imatrix` on `r2_dense.gguf` (dense collected rotated, experts unrotated), from the v2 calibration text (local only, never published; read through a link named `calib.txt` so only that neutral name is recorded), up to 200 chunks of 512.
+- `c` (about 85 min): Unsloth through Pelias; t8r = T8 recipe (from the sweep log) + dense rotated + the matrix; t9r = t8r with gate/up experts IQ4_XS; all paired. Candidates on C: ($M).
+- **Predictions (written before the runs, Pelias scale, DERIVED from the llama.cpp sweep with the stock offset 0.039013 vs 0.040965):** Unsloth 0.0117-0.0130; t8r 0.0113-0.0135 (T8 0.0129-0.0141, minus about 0.0006 for the matrix, minus 0-0.001 for rotating mostly-Q8_0 dense weights); t8r vs Unsloth a tie or a t8r win; t9r 0.0003-0.0010 above t8r at 21.81 GB.
+- **Decision:** a resolved t8r win against Unsloth meets O20 on WikiText (Block E's second text still to confirm); a tie sends the work to Block F (per-layer allocation) with rotation kept.
+
 **Building Block C's rotated candidates (2026-10-28 00:4x):**
 - Done: `pelias imatrix` collects rotated dense weights in the rotated basis (BUILD_LOG 00:3x).
 - Gap found: Block C's recipes (per-tensor types, `--imatrix`, IQ4_XS) are built with llama-quantize, which cannot rotate; `pelias quantize --rotate32` rotates but has no recipe or imatrix input.
