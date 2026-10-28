@@ -58,19 +58,61 @@ Author's request, 2026-10-28 14:48. Every number is labelled: **MEASURED** (sand
 | 1 | Reference T-decode (fold, 1-bit, missing) | Sandbox | **Done**: integer-exact, tested |
 | 2 | Activation bit planes (CPU pmovmskb; GPU warp ballot) | Sandbox (CPU) / PC (GPU) | **CPU done** |
 | 3 | CPU kernel (popcount on the integer units, beside the vector base) | Sandbox correctness / PC timing | Correctness done (reference); speed kernel next |
-| 4 | GPU kernels: CUDA-core AND + popc for decode (M = 1); 1-bit mma for batched MTP verify (M = 5-8) | PC | To build |
-| 5 | 1-bit mma rate probe on sm_89 | PC, 5 min | To run (S2) |
+| 4 | GPU kernels: CUDA-core AND + popc for decode (M = 1); 1-bit mma for batched MTP verify (M = 5-8) | PC | **Probe v2 done** (19:05): exact; fold 5.7-6.9 % faster than Q8_Z cold; 1-bit route tie to +7 % vs fold |
+| 5 | 1-bit mma rate probe on sm_89 | PC, 5 min | **Done**: 937.4 T bit-MAC/s, 8.00x int8 (MEASURED) |
 | 6 | `--t-decode` option in `pelias kld` (whole-model proof on urm_ZT) | Sandbox build, PC run | To build |
 | 7 | Split storage (base 233 bytes + H 8 bytes per 256, separate arrays) | Sandbox | **Done** (split / join, tested) |
-| 8 | Timing: T-decode vs the plain int8 route | PC | To run |
+| 8 | Timing: T-decode vs the plain int8 route | PC | **Probe done**; kernel v3 (bytes in flight, Q8_Z at 64 % of 504 GB/s) next |
 
 **Why the 1-bit decoder:**
 - **It switches on idle units.** The H bits are added by AND + popcount: on the CPU's scalar integer units (POPCNT, 4 per cycle on Zen 3, which sit idle while the vector units do the base), on the GPU's CUDA cores (popc) or its 1-bit tensor path (idle during decode), and the activation planes come from pmovmskb on the CPU and the warp ballot on the GPU. The 0.5 fill is plain math (derived), not a unit.
 - **It lets the base and the H bits live in different places** (H is 3 % of Q7_ZT's bytes): base in VRAM, H streamed from RAM; CPU base + GPU H (J1); dense models spilling onto RAM.
 - **The int8 kernel still "sees 8".** The fold route rebuilds exact int8 values (-127..127) for the existing v10 kernel, so nothing chokes; the 1-bit route gives the same integers.
 
-## 7. Order from here
+## 7. Order from here (updated 2026-10-28 19:1x)
 
-1. urm_ZT result (check-ins 18:59Z, 19:08Z, 19:17Z).
-2. If it holds: the T curve (k = 1, 4) and the `--t-decode` whole-model proof.
-3. PC bench session (S2): 1-bit mma rate, CPU popcount kernel timing, then the GPU T-decode kernel.
+1. Sandbox: C4 (grid tags + H on real blk.20 expert slices vs Q3_K 0.0230) and C3 (fragile tokens in the per-token dumps).
+2. Kernel v3: gate 3 (speed) for Q7_ZT.
+3. `--t-decode` whole-model proof.
+4. R3 kernel.
+5. GP3-08 MTP head, with the C4 type.
+6. Engine: U1/U2, then C3, C1, C5.
+7. Server: C2.
+
+## 8. Where everything lands (author + Claude + Fable, 2026-10-28 19:1x)
+
+The 7-bit / T / H / 1-bit decoder work is the spine; each newer idea plugs into one layer. Full tables and sources: the "Idle Units List (Unified Bus)" doc and the game plan section "The web, version 2".
+
+### 8.1 Quantizer and file format (build time)
+
+| Idea | Lands as | Status | Next |
+|---|---|---|---|
+| T gate, dense (Q7_ZT) | Dense tensors at 7.53 bpw | Gates 1 and 2 passed (MEASURED) | Gate 3, speed, via kernel v3 |
+| C4 grid tags + H (author's bit-tag matrix) | New 3-bit type: 3 bit planes + 1 tag byte per 32-block (3.5 bpw; 3.75 with the H gate) for the MTP block and expert gate/up; replaces the planned MTP Q3_PH | Paper only | Sandbox on real blk.20 slices; must reach <= 0.0211 at 3.5 bpw or <= 0.0148 at 3.75 |
+| C3 fragility tags | Per-tensor sensitivity from calibration (fit on chunks 0-49, scored on 50-99); tagged experts get refinement planes | Idea | Chunk-24 diagnosis: do the experts or the dense tensors flip it |
+
+### 8.2 Kernels
+
+| Idea | Lands as | Status |
+|---|---|---|
+| Fold route | Default decode (M = 1) for Q7_ZT | MEASURED: 5.7-6.9 % faster than Q8_Z |
+| 1-bit decoder (T-decode) | The route when base and H live apart (J1, spill-over) and for batched verify | Exact on GPU; tie to +7 % vs fold |
+| Kernel v3 | More bytes in flight, several rows per warp: 64 % toward 85-90 % of 504 GB/s | Next |
+| C1 KV codes | Same bit-plane family: scaled 1-bit dot on q and k codes (own warp ballot, random sign diagonal folded into W_q and W_k, page bound first) | Paper; needs a one-chunk q, k dump |
+
+### 8.3 Engine runtime (decode loop)
+
+| Idea | Lands as |
+|---|---|
+| H read rule | Dense: fixed gate (live gate optional). Experts: planes by need. MTP: H by draft depth |
+| C3 flag (author's ROP idea) | Attention near-tie -> `red.global.or` flag, shared with the U2 doorbell -> cold-expert refinement planes pulled in 0.2-0.4 ms |
+| C1 KV page selector | 10 attention layers; at 128K, KV reads 2.83 -> 0.26-0.52 ms per token |
+| C5 three drafters + batched verify | One chain (exact n-gram > MTP > fuzzy); after GP3-08 and U1/U2; 1.64x at rung 1 |
+| U1 / U2 / U8 bus fixes | Before C5 pays anything |
+
+### 8.4 Server and context
+
+| Idea | Lands as |
+|---|---|
+| C2 tiered context | Raw tiers VRAM -> pinned RAM -> NVMe with CRC32 keys (U11), restored on a low-priority stream |
+| DeltaNet checkpoint grid | U11: int8 or rotated int4 + rANS |
