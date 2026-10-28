@@ -142,7 +142,7 @@ Until question 1 is settled, all the llama.cpp drift numbers count as rankings, 
 7. **Size check.** The output's byte size must equal the expected byte size where one is MEASURED or DERIVED (to ±32 bytes for DERIVED sizes, exact for MEASURED rebuilds). Expected size = `recipe.py data-bytes RECIPE SOURCE` + 10,991,136. That offset is MEASURED identical for PEL-6, T5 and T8 (data start plus trailing padding, same metadata). It stays constant only while the metadata and the last tensor's padded size are unchanged; the type check, not the size, is the proof.
 8. **Summary line.** One line is appended to `$R/summary.tsv` with these columns: date-time, test ID, file (and route), the tool's `Mean    KLD` line, its `Same top p:` line, wall seconds, log path. The file's byte size goes in the quantize step's own log.
 9. **Results first.** Claude reads the summary lines (and the log where needed), labels each number MEASURED and checks the prediction before anything else is decided.
-10. **How a block runs (from 10-27).** The blocks are script files in `$R` (`common.sh`, `block_a.sh`, `block_b.sh`, later blocks alike; a copy of each sits in the git-ignored `profiles/local_only/gp/` and in the backup folder). Claude runs them on the author's machine through the host command tool as `wsl bash $R/<block>.sh [step]`, one call per run, and only after the author's OK. Before asking, Claude states what the run is for, its log path, and its ETA. No single call may exceed the tool's 7,200 s window, so Block B and later blocks take a step argument and run one test per call. Every script was dry-run end to end in the sandbox on the tiny model (paths overridden, `GP_TEST=1` skipping only the real-file size checks) before it was copied over; its SHA-256 on the author's drive is checked against the tested copy.
+10. **How a block runs (from 10-27).** The blocks are script files in `$R` (`common.sh`, `block_a.sh`, `block_b.sh`, later blocks alike; a copy of each sits in the git-ignored `profiles/local_only/gp/` and in the backup folder). Claude runs them on the author's machine through the host command tool as `wsl bash $R/<block>.sh [step]`, one call per run, and only after the author's OK. Before asking, Claude states what the run is for, its log path, and its ETA. No single call may exceed the tool's 7,200 s window, so Block B and later blocks take a step argument and run one test per call. Every script was dry-run end to end in the sandbox on the tiny model (paths overridden, `GP_TEST=1` skipping only the real-file size checks) before it was copied over; its SHA-256 on the author's drive is checked against the tested copy. **While a run is active, no other host command is started**: a second command stops the first (MEASURED 10-27: step c killed at chunk 35). Progress is read from `live.log` with the read-only file tool; scheduled check-ins at a third and two thirds of the ETA and at the ETA.
 11. **No deletions.** No script deletes anything. If a file must go, Claude prints the command for the author to review and run by hand.
 
 ### 0.3 Fixed inputs (MEASURED sizes; a script stops if a size differs)
@@ -434,6 +434,8 @@ Routine for each tool: unit tests, gcc/clang/asan, oracle where one exists, priv
 
 #### GP1-08 Grid idempotence (P-E7) and the fine-tune size (ΔW ≈ 3 % σ) (A+C)
 
+**Moved to the trainer phase (2026-10-27):** it decides the trainer's Mode Q only; the engine never re-quantizes. Run it when the trainer build starts.
+
 **Run 1: re-quantization on the served weights.**
 ```
 $PELIAS requant-check --model $T/qwen36-Q4_K_M.pelias.gguf
@@ -590,6 +592,16 @@ $PELIAS imatrix --model $T/qwen36-Q4_K_M.pelias.gguf --file <calibration text> -
 | R4 | VRAM bandwidth with and without locked memory clocks (admin) | No | At most +2 % (CUDA lowered the memory clock 11,501 to 11,251 MHz in the 10-27 power test) | 5 min |
 
 Run R1: `bash $R/block_j.sh r1` (updates the clone from the newest bundle, rebuilds build/m1, runs R1, compares against GP1-01 and GP1-03 d).
+
+**R1 RESULT (MEASURED 2026-10-27 21:58, 25,500 tokens, 1517 s):** 0.038802. Against d (same rounding, no rotation): -0.001186 [-0.001913, -0.000458], t -3.23, rotation wins. Against fp32: -0.000211 [-0.000586, +0.000163], no difference. The rotation removes the whole dense-layer 8-bit rounding cost on the real model (the tiny random model said the opposite: its activations have no large values). Prediction (0.039013-0.039988) landed 0.0002 below, within noise: best case.
+
+**What R1 changes (DECISION proposed, 10-27 22:0x):**
+- **R2 moves first and becomes required** for deployment: R1 assumes exactly rotated weights; a real file holds rotated weights quantized again. R2: rotate the dense weights per 32-wide input block from the bf16 original, quantize to Q8_0 (Pelias quantizer), score with Pelias with the same activation rotation, against GP1-01 and R1.
+- **R2b (new): rotated expert weights.** Rotation is known to help low-bit weight quantization too (QuaRot, PUBLISHED). Rotate `ffn_gate_exps`/`ffn_up_exps` (input 2048) and `ffn_down_exps` (input 512) per 32 before Q4_K/Q5_K, with the importance matrix collected in the rotated basis (`pelias imatrix` with the rotation). If it lowers the file's own drift, it is a direct O20 lever, so it runs before Block C, whose candidates would then be built rotated. Files are Pelias-only (decision B2).
+- **Dropped for the dense layers:** selective rotation, adaptive quasi and the outlier map (R1 already reaches fp32 with every block rotated). Two-limb quasi becomes the fallback, run only if R2 loses much to re-quantization.
+- **Unchanged:** routing statistics (router weight spread, cold-expert reuse between tokens, next-layer prediction, routing flips), recorded in R2's run; the cold-step breakdown; T6 as a Pelias Q5_P; R3 (simpler: one int8 pass, the rotation is 5 shuffles in the fused RMSNorm); Blocks D-G; GP1-08 moves to the trainer phase (it decides Mode Q only).
+
+**Fable review of the author's 5-mechanism proposal (read-only, 2026-10-27 21:3x), adopted:** Q5_K's `qh` is the most significant bit, so dropping it is not a 4-bit approximation (the working form is a Pelias Q5_P with a top-4-bit base plane; hot-bank gain 0.52 GiB, not 1.24); the 256->32 transcoder makes data 1.89x larger and gains nothing; RT cores cannot rank 2048-wide routers; the memory clock lock is worth at most 2.2 %; Q7_P on attn_qkv/attn_q saves 168 MB; the trainer's optimizer state is 323 MiB and does not fit in L3. The E0 cold step (10.1 ms) is about 4.3 ms of kernel time and about 5.8 ms of per-step overhead (DERIVED from llama.cpp's CPU-only 16.28 tok/s), so the step structure must change, not only the kernel. Non-temporal loads act only on write-combining memory: on cached RAM the tool is `prefetchnta`.
 
 ## Part 2. What gets fixed after the tests
 
@@ -1125,7 +1137,7 @@ The bf16 model is zero drift. The bar to beat is Unsloth UD-Q4_K_M.
 | C Unsloth (GP1-05) | about 92 min | +about 44 GB on C: (T8+imat, T9) |
 | D | tools first (Claude), then GP1-06 about 30–60 min, GP1-08 about 30–45 min | +about 0.2 GB |
 | E | GP1-09 about 2 h base + 3 × 45–60 min; GP1-10 57 min base + 4 × 26 min; GP1-11 about 30 min | +25.4 GB (4096 base) + 12.7 GB (domain base) on D: |
-| F | GP1-12 about 2 h 30 min; GP1-13 about 70 min | +22–45 GB on C: (screening files are overwritten one by one) |
+| F | GP1-12 about 2 h 30 min; GP1-13 about 70 min | +22–45 GB on C: (each screening file gets a new name; nothing is overwritten; the author decides deletions between steps) |
 
 Free space after Part 1, if nothing is deleted: C: about 191 − 62 − 44 − 45 ≈ 40 GB, under the 50 GB warning line. **Before Block F, the author decides which candidate files to delete** (only on the author's word).
 
