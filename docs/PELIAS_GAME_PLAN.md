@@ -1098,6 +1098,40 @@ Likeliest candidates first, then stop and decide (keep the best file or keep exp
 4. **DONE 2026-10-28 13:27: urm_Z (MEASURED, verified from the dumps with pair.py).** urm with all 259 Q8_0 tensors as Q8_Z: 22,602,383,584 bytes, **-61,003,840 bytes (-61.0 MB) vs Unsloth MTP** (predicted about -60 MB). Engine format (gpu256x8) 0.012402: vs urm -0.000098 [-0.000453, +0.000258], t -0.54, no difference (predicted +0.00002, no difference: met; Q8_Z costs nothing measurable); vs Unsloth on llama.cpp's GPU path (0.012864) -0.000462 [-0.001019, +0.000095], t -1.65, lower but not resolved (predicted about -0.00035). **7pH ladder gate 1 for Q8_Z passed on the whole model: accuracy equal to Q8_0, 61 MB fewer bytes** (speed: engine). urm_Z is now first on the GPU shortlist.
 5. **The engine handles P and H (author: "I want to see the engine handle P and H"):** in GP3-14 the engine reads _P files (a base plane plus refinement planes in their own arrays) and applies the H read rule (heat): hot experts in the GPU bank hold every plane; cold experts are read base plane first by the copy engines, the refinement plane queued second and applied if it arrives in time, skipped for that token if not; a cold expert promoted to the bank gets its refinement plane added as it moves. Dense tensors have no heat (read every token): Q8_Z through the texture path if checks (b) and (c) pass, else int8 v10. Engine gates for P/H: (i) with every plane read, logits identical to the unsplit file (KLD 0); (ii) base-only cold reads at the measured cold share, paired KLD against (i) (the _P cold gate, run on the reference first); (iii) tok/s and cold-path bytes per token, timed.
 
+### Idea register: the unified bus and the idle units (author + Claude + Fable, 2026-10-28 13:0x-13:5x)
+
+Every idea here held up on paper (math checked; Fable read-only where marked). All DERIVED, none MEASURED; each has its test. Details are in the sections below this one. Rejected ideas are listed at the end so they are not re-proposed.
+
+**Clusters on the unified bus (author 13:29: test in groups of 2-3 that depend on one another; each measured as the bus, into one per-token ledger so no gain is counted twice):**
+
+| Cluster | Bus leg | Members | Gain (paper) | Test | Status |
+|---|---|---|---|---|---|
+| U1 | Both DRAM legs | 2 MB pages + 8 pinned streams (CPU), copy engines / GPU zero-copy, PMU counters | Cold reads 3.0 -> 0.9 ms | Dual-bus bench rerun with large pages: combined GB/s and the new split (0.44 today) | Fable checked; first |
+| U2 | Handoffs | Spinning SMT doorbells, BAR1 write-combining into VRAM (Windows build only), idle-time promotion | Handoffs 5.6 -> 0.4 ms; BAR1 -0.2 ms | Handoff round trip vs 13.34 us measured | Fable checked; U1 + U2 = 9.7 ms, 103 tok/s |
+| U3 | What the bus carries | Author's rule (predicted cold experts get all planes into L3 during the GPU step), rest one layer late (A2), planes by need | Exposed cold 0.19 ms; 8.65 ms, 116 tok/s | Prediction hit rate from the K route files, paired KLD for A2, cold-step timer + L3 hit rate | Fable checked (planes by need: not yet) |
+| U4 | Compute at the ends | GPU: texture units, fp16 accumulate, 1-bit path. CPU: author's popcount H, both schedulers | Decode about 0; prefill CPU +20 %, GPU 0.64 -> 1.28x v10 | Compute per layer against U1's read time per layer | Fable checked popcount H (exact) |
+| U5 | One format for both ends | Codebook (E8 residual) for all experts vs PT on bit planes; Q8_Z | Codebook -0.2 ms (0.57 -> 0.47 GB); Q8_Z -0.12 ms; about 8.33 ms, 120 tok/s | 8-weight sandbox test; Q7_PT vs Q8_Z at matched bytes | Q8_Z MEASURED (urm_Z); rest open |
+| U6 | The draft leg | MTP draft on GPU slack, draft-driven prefetch, one read per expert for the verified batch | Bytes per token fall with each accepted draft (headless: 17 -> about 32 tok/s) | After GP3-08: acceptance rate | Waits on GP3-08 |
+| U7 | The skip leg | 1-bit peek, empty activation planes skipped, neuron skip 25 % on cold experts only | Cold-only skip -9.5 % cold bytes for about +0.00004; peek pays only above 40 % skippable | Offline from the block_k record, then paired KLD | Fable checked (conditional) |
+| U8 | The spine | One CUDA Graph per step with the doorbell waits inside, L2 persistence (router, norms, activations), R3 kernel | Up to -3.2 ms: about 120 -> toward the 193 tok/s floor | Engine timers (the 3.2 ms split is unmeasured) | The largest remaining gain |
+| U9 | Idle memory as space | VRAM for context and MTP instead of more experts (one more expert saves about 0.6 us once cold is hidden), MTP block at Q3, preloaded prefix KV | MTP Q3 -140 MB; time to first token on repeats | With U6 and U11 | Fable checked |
+| U10 | Build-time units | RT cores for codebook search, codebook building, hot-bank re-profiling | Faster builds only | n/a | Build time only |
+| U11 | Prefix store | CRC32 page keys (one 32-bit key + exact token compare), DeltaNet checkpoint grid every 256 tokens stored as int8 or rotated int4 + rANS on idle CPU cores, copy engine restore | Full hit: 4K-token prefix skips about 1.83 s; partial hit: about -400 ms | Sandbox: quantize one DeltaNet checkpoint, restore, continue 512 tokens, paired KLD | Fable checked; NVENC loses to rANS |
+
+**J1, split-plane cold expert (CPU base plane over DDR4 + GPU H plane by zero-copy, merged at the doorbell):** exact (Fable). Full-file accuracy on the unpredicted tail for about +0.1 ms; a time gain only if the CPU leg stays under about 35 GB/s after U1. Tests: split dot = whole dot bit-exact (unit test), U1's CPU-leg rate.
+
+**Formats and planes:**
+- Q8_Z: whole-model gate 1 passed (MEASURED: equal accuracy, -61 MB); the bar every 7-bit rung now has to beat.
+- Q7_P / Q7_PT / Q7_PH: open. PT's 315 > 127 overflow is gone on bit planes (popcount sums exact in int32, scale after), but 8-bit values beat 7 + tags at the same bits, so Q7_PT must beat Q8_Z at matched bytes (sandbox).
+- 1-bit tensor path (mma .b1 AND + popcount, sm_89): for batched MTP verification (M = 5-8); at M = 1 CUDA cores do it in 0.7 us. Rate on the 4070: 5-minute probe.
+- MTP block as Q3_PH, H read by draft depth: draft 1 reads base + H (its acceptance multiplies every later draft), deeper drafts read base only. After GP3-08.
+- Planes by need: after k planes the remaining error is bounded exactly (2^(planes left) x sum |x|); read more planes only where router weight x bound matters. Not yet checked by Fable.
+- Both CPU schedulers on different experts at once; activation planes as sign + magnitude so empty planes are skipped. Not yet checked by Fable.
+
+**Carries over to dense models spilling onto CPU/RAM:** U1, U2, J1, planes by need, U5, U6 (strongest), U8, U11. Not: hot bank, expert prediction, expert skip. Prefetch is 100 % predictable there.
+
+**Rejected on the math (do not re-propose):** MTP draft on the CPU (critical path, 1.4 ms from DRAM); AES / SHA / CLMUL; vector gather; 1 GB pages (2 us); L3 as a static bank (0.13 % of picks); NVENC/NVDEC for the live KV cache (1.3 s per token) or the prefix store (rANS on CPU cores is 10x faster at equal size); GPU L2 to keep bytes off DDR4 (it caches VRAM); RT cores at run time; optical flow, display engine, GSP, FP64, x87, NVMe for decode.
+
 ### The DDR4 cold path, outside the box (Fable, read-only, 2026-10-28 13:0x; author: "the CPU is blindingly fast, DDR4 is the wall")
 
 Arithmetic is not the problem (66 M MAC per token, 0.03-0.11 ms); the cold step is reads and handoffs. Per token: 21 cold experts x 1.90 MB = 40 MB through DDR4 (13.31 GB/s today = 3.0 ms; ceiling 51.2, about 45 practical on one Zen 3 CCD), plus 80 OS wake-ups x about 70 us = 5.6 ms of handoffs. DERIVED ledger, each item its own test:
