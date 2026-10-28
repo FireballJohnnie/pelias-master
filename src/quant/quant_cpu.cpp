@@ -480,14 +480,23 @@ void q7_zt_block(const float* x, std::uint8_t* out, const float* qw) {
     const float ideal = amax[j] / 127.0f / d * 63.0f;
     const int lo = std::max(1, static_cast<int>(std::floor(0.70f * ideal)));
     const int hi = std::min(63, std::max(1, static_cast<int>(std::ceil(1.05f * ideal))));
+    // levels by plain error (as Q8_Z and Q7_Z): a level search weighted by the importance matrix over-fits the
+    // calibration text (urm_ZT, 2026-10-28: chunks 23-24 at 2-3x Q7_Z's KL); the importance only ranks the gates,
+    // tempered to its square root so no input column is starved
     float bf = -1.0f, bo = -1.0f;
     for (int lv = hi; lv >= lo; --lv) {
       const float s = q8_z_scale(d, lv);
-      const float ef = q7zt_err(xb, wb, s, true, nullptr), eo = q7zt_err(xb, wb, s, false, nullptr);
+      const float ef = q7zt_err(xb, nullptr, s, true, nullptr), eo = q7zt_err(xb, nullptr, s, false, nullptr);
       if (bf < 0.0f || ef < bf) { bf = ef; lv_full[j] = lv; }
       if (bo < 0.0f || eo < bo) { bo = eo; lv_odd[j] = lv; }
     }
-    gain[j] = bo - bf;
+    if (wb) {
+      float tw[32];
+      for (int k = 0; k < 32; ++k) tw[k] = std::sqrt(std::max(0.0f, wb[k]));
+      gain[j] = q7zt_err(xb, tw, q8_z_scale(d, lv_odd[j]), false, nullptr) - q7zt_err(xb, tw, q8_z_scale(d, lv_full[j]), true, nullptr);
+    } else {
+      gain[j] = bo - bf;
+    }
   }
   int g1 = 0;
   for (int j = 1; j < 8; ++j) if (gain[j] > gain[g1]) g1 = j;
