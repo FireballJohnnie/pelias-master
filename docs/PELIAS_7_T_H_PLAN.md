@@ -109,7 +109,7 @@ The 7-bit / T / H / 1-bit decoder work is the spine; each newer idea plugs into 
 | C1 KV page selector | 10 attention layers; at 128K, KV reads 2.83 -> 0.26-0.52 ms per token |
 | C5 three drafters + batched verify | One chain (exact n-gram > MTP > fuzzy); after GP3-08 and U1/U2; 1.64x at rung 1 |
 | U1 / U2 / U8 bus fixes | Before C5 pays anything |
-| C6 miss map (author) | Log every stuck place (fragile token, prefetch miss, rejected draft) with its state code; a hit takes the expensive path. First check MEASURED: stuck places repeat across files (47-66 % vs 1 % random), come in runs (11x), and hold 23-26 % of the KL |
+| C6 accuracy-assisted miss map (author) | Log every stuck place (fragile token, prefetch miss, rejected draft) with its state code; a hit takes the expensive path. First check MEASURED: stuck places repeat across files (47-66 % vs 1 % random), come in runs (11x), and hold 23-26 % of the KL |
 
 ### 8.4 Server and context
 
