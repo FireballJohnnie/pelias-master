@@ -1115,7 +1115,7 @@ Arithmetic is not the problem (66 M MAC per token, 0.03-0.11 ms); the cold step 
 
 Case A order (cold experts on the CPU), all DERIVED, each with its test:
 1. 2 MB pages + 8 pinned streams (13.31 -> 40-45 GB/s).
-2. Doorbells: SMT siblings spin all the time (power is free); results written straight into VRAM through BAR1 write-combining, the GPU spins on a flag there (-0.2-0.4 ms of copy launches; needs ReBAR). Test: handoff timer.
+2. Doorbells: SMT siblings spin all the time (power is free); results written straight into VRAM through BAR1 write-combining, the GPU spins on a flag there (-0.2-0.4 ms of copy launches; needs ReBAR). Test: handoff timer. **Tabled for the Windows-native build (author 13:22):** WSL2 does not expose BAR1 mapping, so A3 is tested only on the Windows build on the reference machine.
 3. Author's rule: predicted cold experts get all planes into L3 during the GPU step (0.67 MB per layer vs 0.21 ms of GPU time: fits 14x; L3 is a victim cache, so the SMT sibling pulls them through L2 with dummy loads); they then run from L3 in about 0.02 ms. Test: cold-step timer + L3 hit rate from the PMU.
 4. Unpredicted cold experts (about 7): base plane now, refinement plane one layer late (Fable A2: about +0.00005 on paper, against deferral 1's +0.0042 for a whole expert). Exposed DDR4: 8.75 MB = 0.19 ms. Test: `--defer-refinement` reference option, paired KLD.
 5. Idle-time promotion: a cold expert turning hot is merged and DMA'd to the bank behind the GPU step.
