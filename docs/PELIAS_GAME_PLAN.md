@@ -1111,6 +1111,25 @@ Arithmetic is not the problem (66 M MAC per token, 0.03-0.11 ms); the cold step 
 - **VRAM's marginal value (Fable):** once the cold tier runs at bus speed and hidden, one more expert in the bank saves about 0.6 us per token; spend VRAM on what has no slow tier (context, batches, the MTP block) rather than hoarding experts.
 - Small or no: vpshufb LUT, vpmaddubsw/vpsignb (use them; compute is not the limit), pdep (Q4_K scale fields, 0.07 ms), F16C, L3 as a static bank (0.13 % of picks), attention/KV on the CPU (no).
 
+### Idle units, outside the box (Fable read-only pass 2, 2026-10-28 13:1x; author: power is not a limit, turn everything on)
+
+Case A order (cold experts on the CPU), all DERIVED, each with its test:
+1. 2 MB pages + 8 pinned streams (13.31 -> 40-45 GB/s).
+2. Doorbells: SMT siblings spin all the time (power is free); results written straight into VRAM through BAR1 write-combining, the GPU spins on a flag there (-0.2-0.4 ms of copy launches; needs ReBAR). Test: handoff timer.
+3. Author's rule: predicted cold experts get all planes into L3 during the GPU step (0.67 MB per layer vs 0.21 ms of GPU time: fits 14x; L3 is a victim cache, so the SMT sibling pulls them through L2 with dummy loads); they then run from L3 in about 0.02 ms. Test: cold-step timer + L3 hit rate from the PMU.
+4. Unpredicted cold experts (about 7): base plane now, refinement plane one layer late (Fable A2: about +0.00005 on paper, against deferral 1's +0.0042 for a whole expert). Exposed DDR4: 8.75 MB = 0.19 ms. Test: `--defer-refinement` reference option, paired KLD.
+5. Idle-time promotion: a cold expert turning hot is merged and DMA'd to the bank behind the GPU step.
+- After 1-5 the CPU side is about 0.2 ms exposed; the rest of the gap to the 193 tok/s floor is GPU-side (3.2 ms overhead: one CUDA Graph per step, R3).
+
+GPU side and formats:
+- **Codebook (residual E8-lattice) for all experts, not cold only:** 4.0 vs 4.83 bpw (-17 %); hot experts 0.57 -> 0.47 GB in VRAM = -0.2 ms per token; 2 KB table in shared memory / L1. Stage 1 alone is about Q3-class (coarser than Q5_PH's base): measure. Gate: the parked 8-weight sandbox test (line 1065).
+- **_PT back on paper (author 13:19, "the PT is back"):** bit-plane products on the GPU's 1-bit tensor path (PTX mma .b1 with AND + popcount, sm_80 and up; the 4070 is sm_89). Each plane's popcount is exact in int32 and the tag scale is applied after, so Q7_PT's blocker (tag x level 315 > 127 cannot feed the int8 mma) disappears. Cost: 8 activation planes x k weight planes of 1-bit mma; decode is memory-bound, so it may hide. Still open: b1 mma throughput on sm_89 (unmeasured: bench_gpu), and the second reason Q7_PT lost (8-bit zip is better at the same bits) is an accuracy result this does not change; Q7_PT must beat Q8_Z at matched bytes in the sandbox.
+- **Author's popcount H on the CPU integer side (Fable: exact):** sum H x = sum_b 2^b popcount(H AND x_b) - 128 popcount(H); about +20 % compute throughput; matters for CPU prefill (2.7 -> 2.2 s per 2048 tokens headless), not decode. Verify POPCNT 4 per cycle on Zen 3 (Agner Fog) first.
+- **1-bit peek (Fable):** correlation sqrt(2/pi) right; pays only if more than 40 % of peeked experts can be skipped KLD-neutral, and the top bit must be its own plane. Test offline from the block_k record.
+- Case B (whole model on the CPU): MTP verify is the lever (about 32 vs 17 tok/s, hinging on GP3-08's acceptance rate); dense is 77 % of the bytes.
+- Rejected on the math: MTP draft on the CPU, AES/SHA/CLMUL, gather, 1 GB pages, L3 as a static bank.
+- Sent to Fable next: planes read by need (exact error bound per plane), both CPU schedulers on different experts, skipping empty activation planes (sign + magnitude).
+
 ### Run list before the engine build (updated 2026-10-28 09:4x, after Block M and M2 d)
 
 Each PC run first matches the reference to our code's exact format (docs/PELIAS_NEW_METHODS.md rule).
