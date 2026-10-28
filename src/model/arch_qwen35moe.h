@@ -124,8 +124,12 @@ struct ForwardOptions {
   // defer_experts d: each token's d lowest-weight routed experts are added to the residual stream one layer later
   // (after the next layer's MoE), as KTransformers' expert deferral; the last layer's are added before the output norm.
   int defer_experts = 0;
-  // counters for the above (may be null): [0] swaps made, [1] token-layers whose last pick was not resident,
-  // [2] hidden values zeroed, [3] hidden values seen
+  // cold_gpu256 with hot (the engine's split: hot experts on the GPU, cold on the CPU): the routed experts NOT in the hot
+  // set round their inputs to one scale per 256 (act_round_q8_256, the format the CPU cold kernel must use), the rest keep
+  // the gpu-path format chosen above. Needs act_int8 on the gpu path.
+  bool cold_gpu256 = false;
+  // counters for the above (may be null, 6 entries): [0] swaps made, [1] token-layers whose last pick was not resident,
+  // [2] hidden values zeroed, [3] hidden values seen, [4] expert rows (token, expert) computed cold, [5] all expert rows
   std::uint64_t* m_stats = nullptr;
 };
 

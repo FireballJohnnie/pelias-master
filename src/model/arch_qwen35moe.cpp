@@ -620,7 +620,14 @@ void moe(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* out, flo
     sc.ye.resize(z(m * e));
     for (int64_t r = 0; r < m; ++r) std::memcpy(sc.xe.data() + r * e, xn + (list[z(r)] / nu) * e, z(e) * sizeof(float));
     // one input feeds both gate and up, rounded once (in llama.cpp both are the same type, so the same format)
-    const ActFmt fgu = act_format(c.opt, l.gate_exps) != ActFmt::none ? act_format(c.opt, l.gate_exps) : act_format(c.opt, l.up_exps);
+    ActFmt fgu = act_format(c.opt, l.gate_exps) != ActFmt::none ? act_format(c.opt, l.gate_exps) : act_format(c.opt, l.up_exps);
+    // the engine's split: a cold expert runs on the CPU, whose kernel takes one scale per 256
+    const bool cold = c.opt.cold_gpu256 && !c.opt.hot.empty() && c.opt.hot[z(static_cast<int64_t>(c.il) * ne + ex)] == 0;
+    if (cold && fgu != ActFmt::none) fgu = ActFmt::q8_256;
+    if (c.opt.cold_gpu256 && c.opt.m_stats) {
+      if (cold) std::atomic_ref<std::uint64_t>(c.opt.m_stats[4]).fetch_add(static_cast<std::uint64_t>(m));
+      std::atomic_ref<std::uint64_t>(c.opt.m_stats[5]).fetch_add(static_cast<std::uint64_t>(m));
+    }
     if (fgu != ActFmt::none || l.gate_exps.rot32)
       for (int64_t r = 0; r < m; ++r) prep_row(sc.xe.data() + r * e, e, fgu, l.gate_exps.rot32, c.opt.act_rot32);
     matmul_rows(l.gate_exps, static_cast<uint64_t>(ex), 0, ff, sc.xe.data(), m, e, sc.ge.data(), ff, sc);
@@ -647,7 +654,9 @@ void moe(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* out, flo
     }
     if (!hs.empty())
       for (int64_t r = 0; r < m; ++r) std::memcpy(hs.data() + list[z(r)] * ff, sc.ge.data() + r * ff, z(ff) * sizeof(float));
-    if (const ActFmt fd = act_format(c.opt, l.down_exps); fd != ActFmt::none || l.down_exps.rot32)
+    ActFmt fd = act_format(c.opt, l.down_exps);
+    if (cold && fd != ActFmt::none) fd = ActFmt::q8_256;
+    if (fd != ActFmt::none || l.down_exps.rot32)
       for (int64_t r = 0; r < m; ++r) prep_row(sc.ge.data() + r * ff, ff, fd, l.down_exps.rot32, c.opt.act_rot32);
     matmul_rows(l.down_exps, static_cast<uint64_t>(ex), 0, e, sc.ge.data(), m, ff, sc.ye.data(), e, sc);
     for (int64_t r = 0; r < m; ++r) {
@@ -802,6 +811,8 @@ Status forward_reference(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, cons
   if (opt.act_bits != 8 && (opt.act_bits != 4 || !opt.act_int8_gpu))
     return Status::fail(Code::invalid_argument, "4-bit activations need the gpu path (--act-int8-path gpu); only 8 and 4 bits exist");
   if (opt.neuron_skip < 0.0 || opt.neuron_skip >= 1.0) return Status::fail(Code::invalid_argument, "neuron skipping takes a fraction in [0, 1)");
+  if (opt.cold_gpu256 && (!opt.act_int8_gpu || opt.act_bits != 8 || opt.hot.size() != static_cast<std::size_t>(s.n_layer) * s.n_expert))
+    return Status::fail(Code::invalid_argument, "the cold-expert format needs 8-bit activations on the gpu path and a hot set of n_layer x n_expert entries");
   if (opt.swap_margin > 0.0f && opt.hot.size() != static_cast<std::size_t>(s.n_layer) * s.n_expert)
     return Status::fail(Code::invalid_argument, "the near-tie swap needs a hot set of n_layer x n_expert entries");
   if (opt.defer_experts < 0 || opt.defer_experts >= static_cast<int>(s.n_expert_used))

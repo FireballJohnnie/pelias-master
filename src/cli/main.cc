@@ -153,7 +153,7 @@ void usage() {
       "                                  --act-int8: round the inputs of quantized weights whose names contain one of the\n"
       "                                  comma-separated GROUPS (or 'all') to 8 bits first: cpu (default) = llama.cpp's CPU\n"
       "                                  format for each weight type (Q8_K / Q8_0 / Q8_1), gpu = q8_1\n"
-      "                                  --act-rot h32: rotate each 32-value block (Walsh-Hadamard) before rounding, back after\n"      "      [--act-bits 4] [--neuron-skip F] [--defer-experts D] [--swap-near-tie M --hot-set FILE]   (game plan Block M)\n"
+      "                                  --act-rot h32: rotate each 32-value block (Walsh-Hadamard) before rounding, back after\n"      "      [--act-bits 4] [--neuron-skip F] [--defer-experts D] [--swap-near-tie M --hot-set FILE] [--act-cold-path gpu256 --hot-set FILE]   (game plan Block M)\n"
       "                                  --act-bits 4: 4-bit activations per 32 (gpu path); --neuron-skip F: zero the smallest\n"
       "                                  F of each routed expert's hidden values (oracle); --defer-experts D: the D lowest\n"
       "                                  experts added one layer later; --swap-near-tie M: use the first unpicked expert when\n"
@@ -708,7 +708,7 @@ int cmd_kld(const Args& a) {
     fo.act_rot32 = true;
   }
   // Block M: speed ideas, each measured for its accuracy cost
-  std::uint64_t m_stats[4] = {0, 0, 0, 0};
+  std::uint64_t m_stats[6] = {0, 0, 0, 0, 0, 0};
   fo.m_stats = m_stats;
   if (a.has("act-bits")) {
     const std::string v = a.get("act-bits");
@@ -734,7 +734,18 @@ int cmd_kld(const Args& a) {
     }
     fo.defer_experts = static_cast<int>(d.value);
   }
-  if (a.has("swap-near-tie") != a.has("hot-set")) {
+  if (a.has("act-cold-path")) {
+    if (a.get("act-cold-path") != "gpu256" || !fo.act_int8_gpu || !a.has("hot-set")) {
+      std::fprintf(stderr, "pelias: --act-cold-path gpu256 needs --act-int8 ... --act-int8-path gpu|gpu256* and --hot-set FILE\n");
+      return 1;
+    }
+    fo.cold_gpu256 = true;
+  }
+  if (a.has("hot-set") && !a.has("swap-near-tie") && !fo.cold_gpu256) {
+    std::fprintf(stderr, "pelias: --hot-set goes with --swap-near-tie or --act-cold-path\n");
+    return 1;
+  }
+  if (a.has("swap-near-tie") && !a.has("hot-set")) {
     std::fprintf(stderr, "pelias: --swap-near-tie and --hot-set go together\n");
     return 1;
   }
@@ -745,6 +756,8 @@ int cmd_kld(const Args& a) {
       return 1;
     }
     fo.swap_margin = static_cast<float>(mg.value);
+  }
+  if (a.has("hot-set")) {
     const Result<std::string> hs = io::read_text_file(a.get("hot-set"), std::uint64_t{16} << 20);
     if (!hs.ok()) return fail_input(hs.status);
     const std::uint32_t nl = spec.value.n_layer, nex = spec.value.n_expert;
@@ -905,6 +918,10 @@ int cmd_kld(const Args& a) {
   if (fo.neuron_skip > 0)
     std::fprintf(stderr, "pelias kld: neuron skip: %llu of %llu expert hidden values zeroed\n", static_cast<unsigned long long>(m_stats[2]),
                  static_cast<unsigned long long>(m_stats[3]));
+  if (fo.cold_gpu256)
+    std::fprintf(stderr, "pelias kld: cold experts (CPU format, one scale per 256): %llu of %llu expert rows (%.2f %%)\n",
+                 static_cast<unsigned long long>(m_stats[4]), static_cast<unsigned long long>(m_stats[5]),
+                 m_stats[5] ? 100.0 * static_cast<double>(m_stats[4]) / static_cast<double>(m_stats[5]) : 0.0);
   return 0;
 }
 
