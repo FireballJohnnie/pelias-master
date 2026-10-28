@@ -36,6 +36,10 @@ int nearest_int(float x);
 bool can_quantize(Type t);    // this step's quantizers
 bool can_dequantize(Type t);  // this step's dequantizers (the activation types Q8_1 and Q8_K are not dequantized)
 Status quantize_row(Type t, const float* x, std::uint8_t* out, std::int64_t n);
+// The orthonormal Walsh-Hadamard transform of every 32-value block of x[0..n) in place (n a multiple of 32; a tail
+// shorter than 32 is left as it is). Symmetric and its own inverse. A weight row rotated with it and an input rotated
+// with it give the same product: (W H)(H x) = W x.
+void hadamard32(float* x, std::int64_t n);
 Status dequantize_row(Type t, const std::uint8_t* in, float* y, std::int64_t n);
 
 // ---- with an importance matrix (quant_weighted.cpp): nrow rows of n_per_row values, as the reference's

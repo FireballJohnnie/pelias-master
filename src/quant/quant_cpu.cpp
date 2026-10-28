@@ -691,6 +691,21 @@ Status check_row(Type t, std::int64_t n, bool quantize) {
 }
 }  // namespace
 
+void hadamard32(float* x, std::int64_t n) {
+  const float norm = 1.0f / std::sqrt(32.0f);
+  for (std::int64_t b = 0; b + 32 <= n; b += 32) {
+    float* v = x + b;
+    for (int h = 1; h < 32; h *= 2)
+      for (int i = 0; i < 32; i += 2 * h)
+        for (int j = i; j < i + h; ++j) {
+          const float a = v[j], d = v[j + h];
+          v[j] = a + d;
+          v[j + h] = a - d;
+        }
+    for (int j = 0; j < 32; ++j) v[j] *= norm;
+  }
+}
+
 Status quantize_row(Type t, const float* x, std::uint8_t* out, std::int64_t n) {
   const Status s = check_row(t, n, true);
   if (!s) return s;

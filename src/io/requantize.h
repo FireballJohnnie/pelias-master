@@ -23,10 +23,19 @@ namespace pelias::io {
 struct RequantOptions {
   quant::FileType ftype = quant::FileType::q4_k_m;
   int threads = 0;  // 0 = all hardware threads
+  // Weights to store rotated (game plan Block J, R2): the product weights whose names contain one of these strings
+  // ("all": every product weight) have every row multiplied by the 32-value Walsh-Hadamard transform before they are
+  // quantized; their names are recorded in pelias.rot32.tensors so the reader rotates their inputs the same way. Only
+  // product weights are eligible (attention and DeltaNet projections, routed and shared experts, the output layer);
+  // embeddings, routers, norms and convolutions never are. Empty: nothing rotated, the file is the stock one.
+  std::vector<std::string> rotate32;
 };
 
+// True when `name` is a product weight that may be stored rotated and one of `groups` selects it.
+bool rot32_selected(const std::string& name, const std::vector<std::string>& groups);
+
 struct RequantReport {
-  std::uint64_t tensors = 0, quantized = 0, copied = 0;
+  std::uint64_t tensors = 0, quantized = 0, copied = 0, rotated = 0;
   std::uint64_t bytes_in = 0, bytes_out = 0;
   double seconds = 0;
   std::uint64_t by_type[64] = {};  // output tensors per type id (ids below 64)

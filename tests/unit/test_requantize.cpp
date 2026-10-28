@@ -72,3 +72,26 @@ TEST(quantize_matches_the_reference_end_to_end) {
   // nothing is overwritten
   CHECK(io::requantize(m, r, out1, opt).status.code == Code::invalid_argument);
 }
+
+TEST(rot32_selects_product_weights_only) {
+  using pelias::io::rot32_selected;
+  const std::vector<std::string> dense{"attn", "ssm_", "shexp", "output"}, exps{"_exps"}, all{"all"};
+  CHECK(rot32_selected("blk.0.attn_qkv.weight", dense));
+  CHECK(rot32_selected("blk.3.attn_output.weight", dense));
+  CHECK(rot32_selected("blk.0.ssm_out.weight", dense));
+  CHECK(rot32_selected("blk.0.ssm_alpha.weight", dense));
+  CHECK(rot32_selected("blk.7.ffn_down_shexp.weight", dense));
+  CHECK(rot32_selected("output.weight", dense));
+  CHECK(!rot32_selected("blk.0.ssm_conv1d.weight", dense));      // a convolution, not a product
+  CHECK(!rot32_selected("blk.0.ssm_norm.weight", dense));
+  CHECK(!rot32_selected("output_norm.weight", dense));
+  CHECK(!rot32_selected("blk.0.attn_norm.weight", dense));
+  CHECK(!rot32_selected("blk.0.ffn_gate_exps.weight", dense));
+  CHECK(rot32_selected("blk.0.ffn_gate_exps.weight", exps));
+  CHECK(rot32_selected("blk.39.ffn_down_exps.weight", exps));
+  CHECK(!rot32_selected("blk.0.ffn_gate_inp.weight", all));      // the router stays as it is
+  CHECK(!rot32_selected("token_embd.weight", all));              // a lookup table
+  CHECK(!rot32_selected("blk.0.ffn_gate_inp_shexp.weight", all));
+  CHECK(rot32_selected("blk.0.attn_gate.weight", all));
+  CHECK(!rot32_selected("blk.0.attn_gate.weight", {}));
+}

@@ -87,6 +87,24 @@ void parallel_rows(std::int64_t n, int threads, F fn) {
 
 }  // namespace
 
+bool rot32_selected(const std::string& name, const std::vector<std::string>& groups) {
+  static const char* const kProducts[] = {"attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight", "attn_qkv.weight",
+                                          "attn_gate.weight", "ssm_alpha.weight", "ssm_beta.weight", "ssm_out.weight", "ffn_up_exps.weight",
+                                          "ffn_gate_exps.weight", "ffn_down_exps.weight", "ffn_up_shexp.weight", "ffn_gate_shexp.weight",
+                                          "ffn_down_shexp.weight"};
+  bool product = name == "output.weight";
+  if (name.rfind("blk.", 0) == 0) {
+    const std::size_t dot = name.find('.', 4);
+    if (dot != std::string::npos)
+      for (const char* p : kProducts)
+        if (name.compare(dot + 1, std::string::npos, p) == 0) product = true;
+  }
+  if (!product) return false;
+  for (const std::string& g : groups)
+    if (g == "all" || name.find(g) != std::string::npos) return true;
+  return false;
+}
+
 Status write_gguf_file(const std::string& out_path, const std::vector<GgufKvBlob>& kv, const std::vector<GgufOutTensor>& out,
                        const std::function<Status(std::size_t j, GgufFileWriter& w)>& fill) {
   const std::uint64_t total = gguf_file_bytes(kv, out, 32);
@@ -157,9 +175,20 @@ Result<RequantReport> quantize_source(const QuantSource& src, const std::string&
   if (!types.ok()) return R::fail(types.status);
 
   std::vector<GgufOutTensor> out;
+  std::vector<char> rotate(order.size(), 0);
+  std::vector<std::string> rotated_names;
   for (std::size_t j = 0; j < order.size(); ++j) {
     const SourceTensor& t = st[order[j]];
     const std::uint32_t to = types.value[j];
+    if (!opt.rotate32.empty() && rot32_selected(t.name, opt.rotate32)) {
+      if (t.ne[0] % 32 != 0) return R::fail(Status::fail(Code::unsupported, "a rotated tensor needs a row length that is a multiple of 32", 0, t.name));
+      if (to == t.type && t.type != static_cast<std::uint32_t>(quant::Type::f32))
+        return R::fail(Status::fail(Code::unsupported, "rotating a tensor that would be copied unchanged is built for F32 only", 0, t.name));
+      if (!is_float_type(t.type) && !quant::can_dequantize(static_cast<quant::Type>(t.type)))
+        return R::fail(Status::fail(Code::unsupported, "reading this type to rotate it is not built yet", 0, t.name));
+      rotate[j] = 1;
+      rotated_names.push_back(t.name);
+    }
     if (to != t.type) {
       const quant::TypeInfo ti_in = quant::type_info(t.type), ti_out = quant::type_info(to);
       if (!is_float_type(t.type) && !quant::can_dequantize(static_cast<quant::Type>(t.type)))
@@ -174,6 +203,11 @@ Result<RequantReport> quantize_source(const QuantSource& src, const std::string&
     o.type = to;
     o.bytes = to == t.type ? t.bytes : quant::row_bytes(to, t.ne[0]) * t.ne[1] * t.ne[2] * t.ne[3];
     out.push_back(o);
+  }
+  if (!opt.rotate32.empty()) {
+    if (rotated_names.empty()) return R::fail(Status::fail(Code::invalid_argument, "--rotate32 selected no product weight"));
+    kv.push_back(gguf_kv_str("pelias.rot32.kind", "walsh-hadamard-32-orthonormal-row-blocks"));
+    kv.push_back(gguf_kv_arr_str("pelias.rot32.tensors", rotated_names));
   }
 
   const int threads = opt.threads > 0 ? opt.threads : static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
@@ -192,7 +226,7 @@ Result<RequantReport> quantize_source(const QuantSource& src, const std::string&
       raw.resize(static_cast<std::size_t>(nr * in_row));
       Status s = src.read(order[j], r0, nr, raw.data());
       if (!s) return s;
-      if (o.type == t.type) {
+      if (o.type == t.type && !rotate[j]) {
         s = w.write(raw.data(), raw.size());
         if (!s) return s;
         continue;
@@ -202,13 +236,17 @@ Result<RequantReport> quantize_source(const QuantSource& src, const std::string&
       f32.resize(static_cast<std::size_t>(nr * t.ne[0]));
       qbuf.resize(static_cast<std::size_t>(nr * out_row));
       const std::uint32_t tin = t.type, tout = o.type;
+      const bool rot = rotate[j] != 0;
       parallel_rows(static_cast<std::int64_t>(nr), threads, [&](std::int64_t b, std::int64_t e) {
         for (std::int64_t r = b; r < e; ++r) {
           float* row = f32.data() + r * ne0;
           const std::uint8_t* rin = raw.data() + static_cast<std::uint64_t>(r) * in_row;
           if (tin == static_cast<std::uint32_t>(quant::Type::f32)) std::memcpy(row, rin, static_cast<std::size_t>(ne0) * 4);
           else to_f32(tin, rin, row, ne0);
-          (void)quant::quantize_row(static_cast<quant::Type>(tout), row, qbuf.data() + static_cast<std::uint64_t>(r) * out_row, ne0);
+          if (rot) quant::hadamard32(row, ne0);
+          std::uint8_t* qo = qbuf.data() + static_cast<std::uint64_t>(r) * out_row;
+          if (tout == static_cast<std::uint32_t>(quant::Type::f32)) std::memcpy(qo, row, static_cast<std::size_t>(ne0) * 4);
+          else (void)quant::quantize_row(static_cast<quant::Type>(tout), row, qo, ne0);
         }
       });
       if (!row_data_finite(o.type, qbuf.data(), qbuf.size()))
@@ -216,8 +254,9 @@ Result<RequantReport> quantize_source(const QuantSource& src, const std::string&
       s = w.write(qbuf.data(), qbuf.size());
       if (!s) return s;
     }
-    if (o.type == t.type) ++rep.copied;
+    if (o.type == t.type && !rotate[j]) ++rep.copied;
     else ++rep.quantized;
+    if (rotate[j]) ++rep.rotated;
     ++rep.tensors;
     rep.bytes_in += t.bytes;
     rep.bytes_out += o.bytes;

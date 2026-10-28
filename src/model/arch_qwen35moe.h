@@ -33,6 +33,9 @@ struct WeightView {
   std::uint64_t ne[3] = {1, 1, 1};
   std::uint64_t row_bytes = 0;
   std::string name;
+  // The file stores this weight rotated (pelias.rot32.tensors): every row was multiplied by the 32-value Walsh-Hadamard
+  // transform before quantization, so each input row is rotated the same way before the product.
+  bool rot32 = false;
   [[nodiscard]] bool present() const { return data != nullptr; }
 };
 

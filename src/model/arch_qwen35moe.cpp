@@ -322,6 +322,17 @@ void act_round_row(float* x, int64_t n, ActFmt f, bool rot) {
   if (rot) act_rotate32(x, n);
 }
 
+// one input row of a product with `w`: rotated when the file stores `w` rotated (then rounded in the rotated basis, and
+// not rotated back), else rounded with the optional simulated rotation around it
+void prep_row(float* x, int64_t n, ActFmt f, bool w_rot, bool sim_rot) {
+  if (w_rot) {
+    act_rotate32(x, n);
+    if (f != ActFmt::none) act_round_plain(x, n, f);
+  } else if (f != ActFmt::none) {
+    act_round_row(x, n, f, sim_rot);
+  }
+}
+
 // every rounded input row must be a whole number of blocks (the reference's own requirement for these products)
 Status check_act_rounding(const ForwardOptions& o, const Qwen35MoeWeights& w) {
   if (o.act_int8.empty()) return Status::good();
@@ -341,12 +352,12 @@ Status check_act_rounding(const ForwardOptions& o, const Qwen35MoeWeights& w) {
 // matmul over the whole matrix, recording the activations for the importance matrix when asked
 void mm(const Ctx& c, const WeightView& w, const float* x, int64_t n_tok, int64_t ldx, float* y, int64_t ldy) {
   if (c.opt.imatrix) c.opt.imatrix->add_dense(w.name, x, n_tok, ldx, static_cast<int64_t>(w.ne[0]));
-  if (const ActFmt f = act_format(c.opt, w); f != ActFmt::none) {
+  if (const ActFmt f = act_format(c.opt, w); f != ActFmt::none || w.rot32) {
     const int64_t k = static_cast<int64_t>(w.ne[0]);
     std::vector<float> xr(z(n_tok * k));
     for (int64_t t = 0; t < n_tok; ++t) {
       std::memcpy(xr.data() + t * k, x + t * ldx, z(k) * sizeof(float));
-      act_round_row(xr.data() + t * k, k, f, c.opt.act_rot32);
+      prep_row(xr.data() + t * k, k, f, w.rot32, c.opt.act_rot32);
     }
     matmul(w, xr.data(), n_tok, k, y, ldy, c.threads, c.sc);
     return;
@@ -551,15 +562,15 @@ void moe(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* out) {
     for (int64_t r = 0; r < m; ++r) std::memcpy(sc.xe.data() + r * e, xn + (list[z(r)] / nu) * e, z(e) * sizeof(float));
     // one input feeds both gate and up, rounded once (in llama.cpp both are the same type, so the same format)
     const ActFmt fgu = act_format(c.opt, l.gate_exps) != ActFmt::none ? act_format(c.opt, l.gate_exps) : act_format(c.opt, l.up_exps);
-    if (fgu != ActFmt::none)
-      for (int64_t r = 0; r < m; ++r) act_round_row(sc.xe.data() + r * e, e, fgu, c.opt.act_rot32);
+    if (fgu != ActFmt::none || l.gate_exps.rot32)
+      for (int64_t r = 0; r < m; ++r) prep_row(sc.xe.data() + r * e, e, fgu, l.gate_exps.rot32, c.opt.act_rot32);
     matmul_rows(l.gate_exps, static_cast<uint64_t>(ex), 0, ff, sc.xe.data(), m, e, sc.ge.data(), ff, sc);
     matmul_rows(l.up_exps, static_cast<uint64_t>(ex), 0, ff, sc.xe.data(), m, e, sc.ue.data(), ff, sc);
     for (int64_t i = 0; i < m * ff; ++i) sc.ge[z(i)] = silu(sc.ge[z(i)]) * sc.ue[z(i)];
     if (!hs.empty())
       for (int64_t r = 0; r < m; ++r) std::memcpy(hs.data() + list[z(r)] * ff, sc.ge.data() + r * ff, z(ff) * sizeof(float));
-    if (const ActFmt fd = act_format(c.opt, l.down_exps); fd != ActFmt::none)
-      for (int64_t r = 0; r < m; ++r) act_round_row(sc.ge.data() + r * ff, ff, fd, c.opt.act_rot32);
+    if (const ActFmt fd = act_format(c.opt, l.down_exps); fd != ActFmt::none || l.down_exps.rot32)
+      for (int64_t r = 0; r < m; ++r) prep_row(sc.ge.data() + r * ff, ff, fd, l.down_exps.rot32, c.opt.act_rot32);
     matmul_rows(l.down_exps, static_cast<uint64_t>(ex), 0, e, sc.ge.data(), m, ff, sc.ye.data(), e, sc);
     for (int64_t r = 0; r < m; ++r) {
       const int64_t slot = list[z(r)];
@@ -599,20 +610,7 @@ void moe(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* out) {
 
 }  // namespace
 
-void act_rotate32(float* x, std::int64_t n) {
-  const float norm = 1.0f / std::sqrt(32.0f);
-  for (std::int64_t b = 0; b + 32 <= n; b += 32) {
-    float* v = x + b;
-    for (int h = 1; h < 32; h *= 2)
-      for (int i = 0; i < 32; i += 2 * h)
-        for (int j = i; j < i + h; ++j) {
-          const float a = v[j], d = v[j + h];
-          v[j] = a + d;
-          v[j + h] = a - d;
-        }
-    for (int j = 0; j < 32; ++j) v[j] *= norm;
-  }
-}
+void act_rotate32(float* x, std::int64_t n) { quant::hadamard32(x, n); }
 
 Result<Qwen35MoeWeights> bind_qwen35moe(const io::GgufReader& r, const std::uint8_t* base, const Qwen35MoeSpec& s) {
   using R = Result<Qwen35MoeWeights>;
@@ -669,6 +667,37 @@ Result<Qwen35MoeWeights> bind_qwen35moe(const io::GgufReader& r, const std::uint
     for (const Status& x : all)
       if (!x) return R::fail(x);
   }
+  // weights the file stores rotated (pelias.rot32.tensors, written by `pelias quantize --rotate32`)
+  for (const io::GgufKv& kv : r.kv()) {
+    if (kv.key != "pelias.rot32.tensors") continue;
+    if (kv.value.type != io::GgufValueType::array || kv.value.array_type != io::GgufValueType::string)
+      return R::fail(Status::fail(Code::corrupt, "pelias.rot32.tensors is not a list of tensor names"));
+    std::vector<std::string> names;
+    if (Status as = r.array_strings(kv.value, names); !as) return R::fail(as);
+    std::vector<WeightView*> views{&w.output};
+    for (Qwen35MoeLayer& l : w.layers)
+      for (WeightView* p : {&l.wq, &l.wk, &l.wv, &l.wo, &l.wqkv, &l.wgate, &l.wbeta, &l.walpha, &l.ssm_out, &l.up_exps, &l.gate_exps, &l.down_exps,
+                            &l.up_shexp, &l.gate_shexp, &l.down_shexp})
+        views.push_back(p);
+    for (const std::string& nm : names) {
+      WeightView* hit = nullptr;
+      for (WeightView* p : views)
+        if (p->present() && p->name == nm) hit = p;
+      if (!hit) {
+        // a block the reference does not run (the MTP block) may be stored rotated; anything else must be a product here
+        const bool mtp = nm.rfind("blk." + std::to_string(s.n_layer) + ".", 0) == 0;
+        if (mtp) continue;
+        return R::fail(Status::fail(Code::unsupported, "the file marks a tensor as rotated that is not a product weight of this model", 0, nm));
+      }
+      if (hit == &w.output && w.output.data == w.tok_embd.data)
+        return R::fail(Status::fail(Code::unsupported, "a rotated output layer tied to the embedding table", 0, nm));
+      if (hit->ne[0] % 32 != 0) return R::fail(Status::fail(Code::corrupt, "a rotated tensor's row length is not a multiple of 32", 0, nm));
+      hit->rot32 = true;
+    }
+    for (const Qwen35MoeLayer& l : w.layers)
+      if (l.gate_exps.rot32 != l.up_exps.rot32)
+        return R::fail(Status::fail(Code::unsupported, "expert gate and up share one input, so both or neither must be rotated", 0, l.gate_exps.name));
+  }
   return R::good(std::move(w));
 }
 
@@ -678,6 +707,14 @@ Status forward_reference(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, cons
     return Status::fail(Code::invalid_argument, "the token count or the output range is empty or out of range");
   if (w.layers.size() != s.n_layer) return Status::fail(Code::invalid_argument, "the weights were bound for another spec");
   if (Status st = check_act_rounding(opt, w); !st) return st;
+  if (opt.imatrix) {
+    bool any_rot = w.output.rot32;
+    for (const Qwen35MoeLayer& l : w.layers)
+      for (const WeightView* p : {&l.wq, &l.wk, &l.wv, &l.wo, &l.wqkv, &l.wgate, &l.wbeta, &l.walpha, &l.ssm_out, &l.up_exps, &l.gate_exps, &l.down_exps,
+                                  &l.up_shexp, &l.gate_shexp, &l.down_shexp})
+        any_rot = any_rot || p->rot32;
+    if (any_rot) return Status::fail(Code::unsupported, "collecting an importance matrix on a file with rotated weights is not built yet");
+  }
   const int threads = opt.threads > 0 ? opt.threads : static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
   const int64_t n = n_tokens, e = s.n_embd;
   std::vector<Scratch> sc(z(threads));

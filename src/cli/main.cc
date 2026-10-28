@@ -125,7 +125,9 @@ void usage() {
       "  key --model FILE                SHA-256 of the file (the model key)\n"
       "  plan --model FILE [--bank-gib N] [--ceiling-gib C] [--working-set-gib W] [--index N] [--header-only]\n"
       "                                  the device memory plan; refused above the ceiling (exit 3)\n"
-      "  quantize --model IN.gguf --out OUT.gguf [--type Q4_K_M|Q6_K|Q8_0|BF16|F16|F32] [--threads N]\n"
+      "  quantize --model IN.gguf --out OUT.gguf [--type Q4_K_M|Q6_K|Q8_0|BF16|F16|F32] [--threads N] [--rotate32 GROUPS]\n"
+      "                                  --rotate32: store the product weights whose names contain one of GROUPS (or 'all')\n"
+      "                                  rotated per 32 values (Walsh-Hadamard); the reader rotates their inputs to match\n"
       "                                  a new GGUF in a stock mix (default Q4_K_M), identical to the reference's (exit 6 on a write failure)\n"
       "  convert --model FOLDER --out OUT.gguf [--type BF16|Q4_K_M|Q6_K|Q8_0] [--threads N]\n"
       "                                  a Hugging Face folder (safetensors) to a GGUF: BF16 as the reference converter writes it,\n"
@@ -388,6 +390,22 @@ int cmd_quantize(const Args& a) {
   io::RequantOptions opt;
   opt.ftype = ft.value;
   opt.threads = threads;
+  if (a.has("rotate32")) {
+    const std::string groups = a.get("rotate32");
+    if (groups == "1") {
+      std::fprintf(stderr, "pelias: --rotate32 needs 'all' or comma-separated parts of tensor names\n");
+      return 1;
+    }
+    for (std::size_t p = 0; p <= groups.size();) {
+      const std::size_t q = std::min(groups.find(',', p), groups.size());
+      if (q > p) opt.rotate32.push_back(groups.substr(p, q - p));
+      p = q + 1;
+    }
+    if (opt.rotate32.empty()) {
+      std::fprintf(stderr, "pelias: --rotate32 needs 'all' or comma-separated parts of tensor names\n");
+      return 1;
+    }
+  }
   std::printf("quantizing %zu tensors to %s\n", r.tensors().size(), quant::file_type_name(ft.value));
   std::fflush(stdout);
   std::size_t last_pct = 0;
@@ -404,6 +422,7 @@ int cmd_quantize(const Args& a) {
     return res.status.code == Code::io_error ? 6 : 2;
   }
   const io::RequantReport& rep = res.value;
+  if (rep.rotated) std::printf("rotated (Walsh-Hadamard per 32, recorded in pelias.rot32.tensors): %llu tensors\n", static_cast<unsigned long long>(rep.rotated));
   std::printf("done: %llu tensors (%llu quantized, %llu copied unchanged), %s in, %s out, %.1f s\n", static_cast<unsigned long long>(rep.tensors),
               static_cast<unsigned long long>(rep.quantized), static_cast<unsigned long long>(rep.copied), plan::format_bytes(rep.bytes_in).c_str(),
               plan::format_bytes(rep.bytes_out).c_str(), rep.seconds);
@@ -565,6 +584,14 @@ int cmd_kld(const Args& a) {
   if (!spec.ok()) return fail_input(spec.status);
   const Result<model::Qwen35MoeWeights> w = model::bind_qwen35moe(g, m.data(), spec.value);
   if (!w.ok()) return fail_input(w.status);
+  {
+    std::size_t nrot = w.value.output.rot32 ? 1 : 0;
+    for (const model::Qwen35MoeLayer& l : w.value.layers)
+      for (const model::WeightView* p : {&l.wq, &l.wk, &l.wv, &l.wo, &l.wqkv, &l.wgate, &l.wbeta, &l.walpha, &l.ssm_out, &l.up_exps, &l.gate_exps,
+                                         &l.down_exps, &l.up_shexp, &l.gate_shexp, &l.down_shexp})
+        nrot += p->rot32 ? 1 : 0;
+    if (nrot) std::fprintf(stderr, "pelias: %zu weights are stored rotated (pelias.rot32.tensors); their inputs are rotated to match\n", nrot);
+  }
   verify::KlBaseFile base;
   s = base.open(base_path);
   if (!s) return fail_input(s);
