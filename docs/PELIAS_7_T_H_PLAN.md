@@ -89,7 +89,7 @@ The 7-bit / T / H / 1-bit decoder work is the spine; each newer idea plugs into 
 |---|---|---|---|
 | T gate, dense (Q7_ZT) | Dense tensors at 7.53 bpw | Gates 1 and 2 passed (MEASURED) | Gate 3, speed, via kernel v3 |
 | C4 grid tags + H (author's bit-tag matrix) | New 3-bit type: 3 bit planes + 1 tag byte per 32-block (3.5 bpw; 3.75 with the H gate) for the MTP block and expert gate/up; replaces the planned MTP Q3_PH | Paper only | Sandbox on real blk.20 slices; must reach <= 0.0211 at 3.5 bpw or <= 0.0148 at 3.75 |
-| C3 fragility tags | Per-tensor sensitivity from calibration (fit on chunks 0-49, scored on 50-99); tagged experts get refinement planes | Idea | Chunk-24 diagnosis: do the experts or the dense tensors flip it |
+| C3 fragility tags | Per-tensor sensitivity from calibration (fit on chunks 0-49, scored on 50-99); tagged experts get refinement planes | Idea | Knife-edge view (author 19:12): no separate chunk-24 diagnosis; the near-tie flag treats fragile tokens as a class. Revisit only if the own-text check shows rotated files losing fragile tokens Unsloth keeps |
 
 ### 8.2 Kernels
 
