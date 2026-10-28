@@ -800,6 +800,8 @@ The steady routine applies to every step:
 1. T8 built by Pelias equals T8 built by llama-quantize from the same recipe, byte for byte (`pelias verify`, exit 0), with and without Unsloth's imatrix. The first run is by the author: 2 × ~4 min.
 2. The imatrix name map handles the expert slices (READ-SRC: imatrix + (row / rows-per-expert) × n_per_row).
 
+**Status (2026-10-28 00:5x, d48b88d): BUILT.** `--recipe` and `--imatrix` are in; byte-identical to llama-quantize at 2ca15f5 on the tiny model and the 753-tensor synthetic model with a mixed recipe and an imatrix (unit test pins the hash); the expert slices use imatrix + (row / ne1) × ne0; rotated tensors require a matrix collected rotated. Gate 1 on the real model: the R2 rebuild through `--recipe` was byte-identical (Block L check, 01:16); the T8 comparison against llama-quantize remains for the author's next machine slot.
+
 ### GP3-02 Per-expert types, "cold experts" (task 3)
 
 **Inputs:** `--expert-stats` from stock and T8 on both evaluation texts. Each Pelias run already writes this CSV when asked. Add `--expert-stats` to the GP1-04/05 runs at no time cost.
@@ -855,6 +857,8 @@ The steady routine applies to every step:
 The imatrix or the GPTQ objective adds weight to the router's input space and to the experts whose margins are small.
 
 **Gate:** a paired win plus a measured drop in the flip share (route-compare).
+
+**Status (2026-10-28): NOT TRIGGERED.** block_k showed flips do not carry the drift (swapped weight vs KL correlation -0.004); this step stays parked.
 
 ### GP3-07 Decode loop and sampling on the CPU reference (task 4)
 
@@ -942,6 +946,33 @@ The gates are the ladder rungs 2–7 (masterwork 16.1), with the K-gates of GP2-
 - A paired win against the untrained PEL file on both evaluation texts (never the calibration text).
 - No regression on the domain text.
 - P-X1 hash proof on every frozen tensor.
+
+### GP3-13b Idle units and the idle-work scheduler (author's idea, 2026-10-28 01:1x-01:25)
+
+**Background (MEASURED):** during the dual-bus power test the GPU drew 45-47 W while reading RAM and at most 107 W in the soak (limit 200 W); the CPU stayed at or under about 58 W (PPT 142 W). The int8 kernel is issue-bound (13.4 instructions per mma, tensor busy 37.7 %). The power and the units are there; they wait on data.
+
+**Idle units and the measured bottleneck each could relieve (each is tested alone, tokens/s with and without, paired):**
+
+| Unit | Job | Bottleneck it attacks | How measured |
+|---|---|---|---|
+| Copy engines (DMA) | Prefetch next-layer cold experts from the pre-gating prediction (83.6 % of picks, 67.1 % of cold picks, block_k) | PCIe wait in the cold step | Nsight Systems: copy/compute overlap; cold-step time |
+| Regular CUDA cores (warp specialization) | Unpacking warps feed the tensor-core warps in a producer/consumer pipeline (FlashAttention-3's pattern, PUBLISHED) | 13.4 instructions per mma | ncu: instructions per mma, tensor busy % (R3) |
+| Texture units | Hardware format conversion of 8-bit data on the read path | Same unpack cost (alternative) | ncu, same metrics |
+| L2 (36 MB on the 4070) persistence | Pin router, norms and the current activations (cudaAccessPolicyWindow) | Repeated VRAM reads | ncu: L2 hit rate, DRAM bytes |
+| CPU cores (headroom about 84 W) | Cold experts computed on the CPU at the same time as the GPU (dual bus) | Cold-step serial wait | Cold-step time, tokens/s |
+| CPU L3 (96 MB) | One expert is about 1.8 MB at ~4.5 bpw (3 x 2048 x 512, DERIVED), so L3 holds about 50: read a cold expert from DDR4 once and use it for every token of a speculative / MTP batch | DDR4 bandwidth per token | Timed CPU kernel: GB/s effective vs batch size |
+| Idle RAM / VRAM / L3 | Hold preloaded text: the KV cache of a known prefix (system prompt, documents in use), computed in idle time | Prefill time on repeated context | Time to first token with and without |
+| GPU slack between steps | Draft tokens with the MTP block (blk.40, kept) for speculative decoding | One token per weight read | Accepted tokens per step, tokens/s |
+| RT cores, optical flow, video units | No fitting job found (RT cores are 3-D only; Fable 10-27) | n/a | Kept as an idea: a naturally low-dimensional job (scheduling, a coarse prefilter); vector quantization with RT-core nearest-codeword search at build time only |
+
+**The idle-work scheduler:**
+1. Inventory at startup (the plan module already measures the machine): the units above and their sizes.
+2. Live load per token: GPU timers, copy-engine queues, CPU core load.
+3. A queue of optional jobs from the table, each with its measured payoff on this machine.
+4. Hard rule: an optional job runs only on an idle unit and is always cancellable; it never delays the token being made.
+5. Each job is kept only if its own paired test shows a gain on that machine (universal engine: other hardware fills its own idle units).
+
+**Also noted (MEASURED):** int8 259.5 TOPS against bf16 65.2 TFLOPS is a 4x gap, where 2x would be expected; GeForce Ada runs 16-bit tensor math with 32-bit accumulation at half rate (NVIDIA Ada whitepaper, to be cited exactly before use). The int8 path, made free in accuracy by rotation (R1, R2), avoids that limit. Test: the same 16-bit GEMM with 16- and 32-bit accumulation, about 5 min.
 
 ### GP3-14 Masterwork step 10: the engine
 
