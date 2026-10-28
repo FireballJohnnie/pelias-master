@@ -965,6 +965,17 @@ The gates are the ladder rungs 2–7 (masterwork 16.1), with the K-gates of GP2-
 | GPU slack between steps | Draft tokens with the MTP block (blk.40, kept) for speculative decoding | One token per weight read | Accepted tokens per step, tokens/s |
 | RT cores, optical flow, video units | No fitting job found (RT cores are 3-D only; Fable 10-27) | n/a | Kept as an idea: a naturally low-dimensional job (scheduling, a coarse prefilter); vector quantization with RT-core nearest-codeword search at build time only |
 
+**RT-core prefetch map, tested 2026-10-28 01:3x (MEASURED offline on block_k's stock routing record, train on chunks 0-4, test on 5-9; 16 candidates per token-layer; script in the sandbox, `rt3d.py`):** experts placed in 3-D by a joint spectral embedding of their pick transitions (the data an RT-core nearest-neighbour search could serve) against the same transitions kept in full and against "the most popular 16".
+
+| Task | Full transition map | 3-D map | Most popular |
+|---|---|---|---|
+| Next token, same layer | 53.1 % of picks (cold 1.9 %) | 32.6 % (cold 9.0 %) | 36.8 % (cold 0 %) |
+| Next layer, same token | 63.7 % (cold 3.2 %) | 31.9 % (cold 14.7 %) | 37.2 % |
+| Two layers ahead | 62.2 % (cold 2.5 %) | 29.3 % (cold 13.3 %) | 37.6 % |
+| Next token, next layer | 50.3 % (cold 0.8 %) | 24.9 % (cold 7.6 %) | 37.2 % |
+
+The exact pre-gating prediction gets 83.9 % of the next layer's picks with only 8 candidates (67.1 % of cold picks, block_k). Squeezing the routing into 3-D loses about half of what the full map knows and does worse than "most popular"; it reaches more cold picks than the full map but far fewer than pre-gating. **Verdict: the RT-core prefetch map is not worth building**; pre-gating on the tensor cores (one 2048x256 product per layer) stays the prefetch hint. Caveat: 1,275 training tokens and one embedding method; a larger record would not close a gap this size.
+
 **The idle-work scheduler:**
 1. Inventory at startup (the plan module already measures the machine): the units above and their sizes.
 2. Live load per token: GPU timers, copy-engine queues, CPU core load.
