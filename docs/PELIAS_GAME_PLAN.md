@@ -985,6 +985,23 @@ The exact pre-gating prediction gets 83.9 % of the next layer's picks with only 
 
 **Also noted (MEASURED):** int8 259.5 TOPS against bf16 65.2 TFLOPS is a 4x gap, where 2x would be expected; GeForce Ada runs 16-bit tensor math with 32-bit accumulation at half rate (NVIDIA Ada whitepaper, to be cited exactly before use). The int8 path, made free in accuracy by rotation (R1, R2), avoids that limit. Test: the same 16-bit GEMM with 16- and 32-bit accumulation, about 5 min.
 
+**Research sweep on idle units (2026-10-28 01:4x; PUBLISHED unless marked; numbers are the authors', not ours):**
+
+| Idea | Source | What they measured | Fit for this machine |
+|---|---|---|---|
+| Draft-driven expert prefetch: an INT4 draft of the model runs ahead and its router picks drive prefetch | MoE-SpeQ (arXiv 2511.14102) | Draft matches the full model's top-4 experts 90.9 % (vs 84.7 % for one-layer-ahead prediction); 2.5-3.3x vs Mixtral-Offloading, A100 + PCIe 4 | HIGH: our weak spot is the next token's cold experts (13.6 % repeat); MTP draft = our version |
+| Speculative decoding to give each transferred expert more tokens, transfers overlapped with compute | SpecMoEOff (arXiv 2508.21706); SP-MoE (2510.10302) | 1.45-1.53x from speculation alone; 2.1x avg vs MoE-Lightning; tested on a 4090D | HIGH: the batch-per-expert idea, GPU side and the L3 side |
+| Expert deferral: some experts' outputs merged two layers later (residual tolerates it) so CPU and GPU never wait on each other | KTransformers (SOSP 2025) | CPU use 74 -> 100 %, up to +45 % throughput, -0.5 % LiveBench | HIGH and testable now: a reference option, paired KLD tells the accuracy cost |
+| Whole decode step in one CUDA Graph, CPU hooks via cudaLaunchHostFunc | KTransformers | up to 1.23x decode | HIGH: attacks the 5.8 ms per-step overhead of the E0 cold step |
+| cp.async pipelining, `evict_first` L2 hint for single-use weights, loads several stages ahead | MARLIN (arXiv 2408.11743) | about 3.9x over FP16 at batch <= 16-32 (A10) | HIGH for R3: the in-SM copy units overlapping tensor-core math; the L2 hint is the "L2 for the right things" idea |
+| Table lookup instead of multiply on the CPU (vpshufb, 16-entry tables) | T-MAC (arXiv 2407.00088) | 4-bit GEMV up to 3.1x vs llama.cpp single-thread; multi-thread limited by bandwidth | HIGH: our CPU kernel is at 13.31 of 51.2 GB/s, the regime T-MAC targets |
+| Video codecs (NVENC/NVDEC) as tensor codecs | LLM.265 (MICRO 2025); torch-nvenc-compress; arXiv 2602.09725 | weights ~3 bits near FP16 accuracy, KV 2.9 bits; NVDEC about 1.3 GB/s; loses on PCIe Gen4, wins on slow links (Ethernet, Thunderbolt); training: activations 3.5 bits, gradients 10.1 bits in pipeline training | LOW here: the codec is slower than our PCIe bus; note for multi-machine training later |
+| RT cores for MoE routing (experts as boxes, tokens as rays) | Spectral-AI (independent, OLMoE, RTX 5070 Ti) | router 48-89x faster but routing is 2.8 % of the step; HellaSwag 53.1 -> 52.0; needs a distilled router | LOW: our own 3-D test (above) agrees; RT review (arXiv 2603.28771): memory x9, FP32 only, switching overhead |
+| ROPs / raster pipeline for sums; optical flow unit | patents, old GPGPU | no modern ML use found | NONE |
+| GeForce 16-bit tensor math with 32-bit accumulate | NVIDIA forum (users, RTX 4090) | FP16/FP32-acc about 170 TFLOPS vs FP16/FP16-acc about 270; int8 about 560 TOPS; no NVIDIA statement | Consistent with our 4x int8/bf16 gap; our int8 path avoids it (correction: user-measured, not a whitepaper line) |
+
+**Order proposed for the engine phase (each with its own paired or timed test):** expert deferral in the reference (accuracy, now) -> one CUDA Graph per step -> MARLIN-style pipelining in the int8 kernel (R3) -> T-MAC-style CPU kernel -> MTP drafting with draft-driven prefetch and batch-per-expert on GPU and L3.
+
 ### GP3-14 Masterwork step 10: the engine
 
 **Scope:**
