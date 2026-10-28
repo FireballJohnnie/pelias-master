@@ -608,6 +608,24 @@ Run R1: `bash $R/block_j.sh r1` (updates the clone from the newest bundle, rebui
 - **Predictions (written before the runs):** R2 fp32 below the stock 0.039013 with the paired interval below zero (rotation helps 4-bit weights, PUBLISHED QuaRot; tiny model -1.1 %), the gain at most about 0.0216 (DERIVED: the dense groups' drops at Q8_0, summed). R2 dense q8_1: no difference from R2 fp32 (R1). R2b fp32 below 0.039013, the gain at most about 0.0059 (DERIVED: 0.002384 + 0.002127 + 0.001414); tiny model -0.1 %.
 - **Decision:** a resolved gain in R2b makes rotation part of the PEL recipes, so Block C's candidates are built rotated, which needs importance-matrix collection in the rotated basis (accumulate (Hx)^2 instead of x^2 for rotated tensors; not built yet).
 
+**R2, ctrl and R2b results (2026-10-27 22:23 to 2026-10-28 00:14, MEASURED, 25,500 scored tokens, paired, 99 df; every number re-computed from the per-token dumps):**
+
+| Run | Mean KLD vs bf16 | Paired against | Difference [95 % interval] | t | Verdict |
+|---|---|---|---|---|---|
+| R2 dense rotated, fp32 | 0.035564 | stock 0.039013 | -0.003449 (from the means) | | less drift |
+| R2 dense rotated, dense q8_1 | 0.035297 | R2 fp32 | -0.000267 [-0.000793, +0.000258] | -1.01 | no difference |
+| R2 dense rotated, dense q8_1 | 0.035297 | stock fp32 | -0.003716 [-0.004934, -0.002498] | -6.05 | less drift |
+| ctrl (unrotated twin, same build path) | 0.039018 | stock | +0.000005 [-0.000018, +0.000028] | | no difference |
+| R2 fp32 | 0.035564 | ctrl | -0.003454 [-0.004585, -0.002323] | -6.06 | less drift (-8.9 %) |
+| R2b experts rotated, fp32 | 0.039544 | stock | +0.000530 [-0.000396, +0.001457] | 1.14 | no difference |
+| R2b | 0.039544 | ctrl | +0.000526 [-0.000402, +0.001454] | 1.12 | no difference |
+| R2b | 0.039544 | R2 fp32 | +0.003979 [+0.002492, +0.005467] | 5.31 | R2 less drift |
+
+- **Predictions:** R2 met (below stock, interval below zero, gain within the 0.0216 ceiling); R2 q8_1 met (no difference from fp32); **R2b missed** (predicted below stock; no resolvable change).
+- **Reading:** rotating the dense weights (Q8_0/Q6_K/Q4_K dense groups in the stock mix) lowers the file's own drift by 8.9 % and removes the activation-rounding cost. Rotating the K-quant experts does nothing measurable. Likely cause (THEORY, not tested): K-quants already give each 32-value sub-block its own scale, so the experts' outliers were absorbed before rotation; the tiny model showed the same (-0.1 %).
+- **Decision:** PEL recipes rotate the dense product weights only (`--rotate32` on the R2 groups); routed and shared expert weights stay unrotated, so the expert reader path needs no rotation. Block C's candidates are built dense-rotated; importance-matrix collection in the rotated basis is needed for the dense tensors only. `r2b_exps.gguf` has no further use (the author decides on removal).
+- **Waiting for the author's OK:** R2-256 and R2-row (larger rotations, dense only), `block_k.sh routes` (GP1-06/07 and routing statistics).
+
 **Fable review of the author's 5-mechanism proposal (read-only, 2026-10-27 21:3x), adopted:** Q5_K's `qh` is the most significant bit, so dropping it is not a 4-bit approximation (the working form is a Pelias Q5_P with a top-4-bit base plane; hot-bank gain 0.52 GiB, not 1.24); the 256->32 transcoder makes data 1.89x larger and gains nothing; RT cores cannot rank 2048-wide routers; the memory clock lock is worth at most 2.2 %; Q7_P on attn_qkv/attn_q saves 168 MB; the trainer's optimizer state is 323 MiB and does not fit in L3. The E0 cold step (10.1 ms) is about 4.3 ms of kernel time and about 5.8 ms of per-step overhead (DERIVED from llama.cpp's CPU-only 16.28 tok/s), so the step structure must change, not only the kernel. Non-temporal loads act only on write-combining memory: on cached RAM the tool is `prefetchnta`.
 
 ## Part 2. What gets fixed after the tests
