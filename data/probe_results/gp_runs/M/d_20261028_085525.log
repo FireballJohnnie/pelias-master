@@ -1,0 +1,533 @@
+
+== M d | 8-bit activations in the int8 kernel's format (one scale per 256): t8r and Unsloth MTP | started 2026-10-28 08:55:25 | ETA about 50 min | log /mnt/d/pelias-tests/gp/M/d_20261028_085525.log
+From <backup>/2026-10-28/pelias-master_main_bfbbff2-e74a52a.bundle
+ * branch            main       -> FETCH_HEAD
+Updating bfbbff2..e74a52a
+Fast-forward
+ .../gp_runs/GP1-01/block_a_20261027_161528.log     |   232 +
+ data/probe_results/gp_runs/GP1-01/stock.kld        |   Bin 0 -> 612036 bytes
+ .../probe_results/gp_runs/GP1-01/stock_experts.csv | 10241 +++++++++++++++++++
+ .../GP1-02/stock_nooffload_20261027_164957.log     |   173 +
+ data/probe_results/gp_runs/GP1-03/a_allcpu.kld     |   Bin 0 -> 612036 bytes
+ .../gp_runs/GP1-03/a_allcpu_20261027_174202.log    |   159 +
+ data/probe_results/gp_runs/GP1-03/b_allgpu.kld     |   Bin 0 -> 612036 bytes
+ .../gp_runs/GP1-03/b_allgpu_20261027_182427.log    |   159 +
+ data/probe_results/gp_runs/GP1-03/c_expsgpu.kld    |   Bin 0 -> 612036 bytes
+ .../gp_runs/GP1-03/c_expsgpu_20261027_185008.log   |    42 +
+ .../gp_runs/GP1-03/c_expsgpu_20261027_191044.log   |     4 +
+ .../gp_runs/GP1-03/c_expsgpu_20261027_191152.log   |   159 +
+ data/probe_results/gp_runs/GP1-03/d_densegpu.kld   |   Bin 0 -> 612036 bytes
+ .../gp_runs/GP1-03/d_densegpu_20261027_195427.log  |   167 +
+ .../gp_runs/J/ctrl_20261027_231742.log             |   201 +
+ data/probe_results/gp_runs/J/ctrl_fp32.kld         |   Bin 0 -> 612036 bytes
+ data/probe_results/gp_runs/J/log_ctrl_runbook.txt  |     1 +
+ data/probe_results/gp_runs/J/log_ctrl_tally.txt    |     1 +
+ data/probe_results/gp_runs/J/log_r2b_runbook.txt   |     1 +
+ data/probe_results/gp_runs/J/log_r2b_tally.txt     |     1 +
+ data/probe_results/gp_runs/J/r1_dense_rot.kld      |   Bin 0 -> 612036 bytes
+ .../gp_runs/J/r1_dense_rot_20261027_213258.log     |   185 +
+ .../gp_runs/J/r2_dense_20261027_222315.log         |   453 +
+ data/probe_results/gp_runs/J/r2_dense_fp32.kld     |   Bin 0 -> 612036 bytes
+ data/probe_results/gp_runs/J/r2_dense_q81.kld      |   Bin 0 -> 612036 bytes
+ .../gp_runs/J/r2b_exps_20261027_234626.log         |   259 +
+ data/probe_results/gp_runs/J/r2b_exps_fp32.kld     |   Bin 0 -> 612036 bytes
+ data/probe_results/gp_runs/K/bf16_10.kld           |   Bin 0 -> 61236 bytes
+ .../gp_runs/K/flips_stock_vs_bf16.txt              |    49 +
+ .../probe_results/gp_runs/K/log_routes_runbook.txt |     1 +
+ data/probe_results/gp_runs/K/log_routes_tally.txt  |     1 +
+ .../gp_runs/K/routes_20261028_002755.log           |   223 +
+ data/probe_results/gp_runs/K/stock_10.kld          |   Bin 0 -> 61236 bytes
+ .../gp_runs/K/stock_10_stats_hot120.txt            |    10 +
+ .../gp_runs/K/stock_10_stats_hot161.txt            |    10 +
+ .../gp_runs/K/stock_10_stats_hot84.txt             |    10 +
+ data/probe_results/gp_runs/L/c_20261028_020541.log |   556 +
+ .../gp_runs/L/check_20261028_011000.log            |    65 +
+ .../gp_runs/L/download_mtp_20261028_034136.log     |    11 +
+ .../gp_runs/L/imatrix_20261028_012022.log          |   209 +
+ data/probe_results/gp_runs/L/log_c_t9r_tally.txt   |     1 +
+ .../gp_runs/L/log_c_unsloth_t8r_tally.txt          |     2 +
+ data/probe_results/gp_runs/L/log_check_runbook.txt |     1 +
+ data/probe_results/gp_runs/L/log_check_tally.txt   |     1 +
+ .../gp_runs/L/log_imatrix_runbook.txt              |     1 +
+ data/probe_results/gp_runs/L/log_imatrix_tally.txt |     1 +
+ data/probe_results/gp_runs/L/mix_A.tsv             |   753 ++
+ data/probe_results/gp_runs/L/mix_B.tsv             |   753 ++
+ data/probe_results/gp_runs/L/r2_check.verify.txt   |     3 +
+ data/probe_results/gp_runs/L/r2_recipe.tsv         |   753 ++
+ data/probe_results/gp_runs/L/t8.tsv                |   753 ++
+ data/probe_results/gp_runs/L/t8r.kld               |   Bin 0 -> 612036 bytes
+ data/probe_results/gp_runs/L/t9.tsv                |   753 ++
+ data/probe_results/gp_runs/L/t9r.kld               |   Bin 0 -> 612036 bytes
+ data/probe_results/gp_runs/L/unsloth.kld           |   Bin 0 -> 612036 bytes
+ data/probe_results/gp_runs/M/a4dense.kld           |   Bin 0 -> 612036 bytes
+ data/probe_results/gp_runs/M/a8all.kld             |   Bin 0 -> 612036 bytes
+ data/probe_results/gp_runs/M/a_20261028_043950.log |   506 +
+ data/probe_results/gp_runs/M/b_20261028_055721.log |   477 +
+ data/probe_results/gp_runs/M/c_20261028_071951.log |   326 +
+ data/probe_results/gp_runs/M/defer1.kld            |   Bin 0 -> 612036 bytes
+ data/probe_results/gp_runs/M/defer2.kld            |   Bin 0 -> 612036 bytes
+ data/probe_results/gp_runs/M/extract.log           |     3 +
+ data/probe_results/gp_runs/M/log_m_a_runbook.txt   |     1 +
+ data/probe_results/gp_runs/M/log_m_a_tally.txt     |     3 +
+ data/probe_results/gp_runs/M/log_m_b_runbook.txt   |     1 +
+ data/probe_results/gp_runs/M/log_m_b_tally.txt     |     3 +
+ data/probe_results/gp_runs/M/log_m_c_runbook.txt   |     1 +
+ data/probe_results/gp_runs/M/log_m_c_tally.txt     |     2 +
+ data/probe_results/gp_runs/M/skip25.kld            |   Bin 0 -> 612036 bytes
+ data/probe_results/gp_runs/M/skip40.kld            |   Bin 0 -> 612036 bytes
+ data/probe_results/gp_runs/M/skip50.kld            |   Bin 0 -> 612036 bytes
+ data/probe_results/gp_runs/M/swap001.kld           |   Bin 0 -> 612036 bytes
+ data/probe_results/gp_runs/N/log_n_tally.txt       |     1 +
+ .../gp_runs/N/mtp_20261028_034928.log              |   407 +
+ data/probe_results/gp_runs/N/mtp_a8.kld            |   Bin 0 -> 612036 bytes
+ data/probe_results/gp_runs/N/mtp_fp32.kld          |   Bin 0 -> 612036 bytes
+ .../gp_runs/N/mtp_vs_nonmtp.verify.txt             |    67 +
+ .../gp_runs/POWER/dualbus_20261027_202618.log      |     5 +
+ .../gp_runs/POWER/dualbus_20261027_202928.json     |    16 +
+ .../gp_runs/POWER/dualbus_20261027_202928.log      |    34 +
+ .../gp_runs/POWER/dualbus_gpu_20261027_202618.csv  |   737 ++
+ .../gp_runs/POWER/dualbus_gpu_20261027_202928.csv  |   959 ++
+ .../POWER/dualbus_times_20261027_202618.txt        |     3 +
+ .../POWER/dualbus_times_20261027_202928.txt        |     5 +
+ data/probe_results/gp_runs/README.md               |    17 +
+ data/probe_results/gp_runs/summary.tsv             |    26 +
+ docs/PELIAS_GAME_PLAN.md                           |    22 +-
+ docs/PELIAS_NEW_METHODS.md                         |    14 +
+ logs/BUILD_LOG.md                                  |     4 +
+ src/cli/main.cc                                    |    13 +-
+ src/model/arch_qwen35moe.cpp                       |    28 +-
+ src/model/arch_qwen35moe.h                         |     6 +
+ tests/unit/test_model.cpp                          |    35 +
+ 94 files changed, 21070 insertions(+), 10 deletions(-)
+ create mode 100644 data/probe_results/gp_runs/GP1-01/block_a_20261027_161528.log
+ create mode 100644 data/probe_results/gp_runs/GP1-01/stock.kld
+ create mode 100644 data/probe_results/gp_runs/GP1-01/stock_experts.csv
+ create mode 100644 data/probe_results/gp_runs/GP1-02/stock_nooffload_20261027_164957.log
+ create mode 100644 data/probe_results/gp_runs/GP1-03/a_allcpu.kld
+ create mode 100644 data/probe_results/gp_runs/GP1-03/a_allcpu_20261027_174202.log
+ create mode 100644 data/probe_results/gp_runs/GP1-03/b_allgpu.kld
+ create mode 100644 data/probe_results/gp_runs/GP1-03/b_allgpu_20261027_182427.log
+ create mode 100644 data/probe_results/gp_runs/GP1-03/c_expsgpu.kld
+ create mode 100644 data/probe_results/gp_runs/GP1-03/c_expsgpu_20261027_185008.log
+ create mode 100644 data/probe_results/gp_runs/GP1-03/c_expsgpu_20261027_191044.log
+ create mode 100644 data/probe_results/gp_runs/GP1-03/c_expsgpu_20261027_191152.log
+ create mode 100644 data/probe_results/gp_runs/GP1-03/d_densegpu.kld
+ create mode 100644 data/probe_results/gp_runs/GP1-03/d_densegpu_20261027_195427.log
+ create mode 100644 data/probe_results/gp_runs/J/ctrl_20261027_231742.log
+ create mode 100644 data/probe_results/gp_runs/J/ctrl_fp32.kld
+ create mode 100644 data/probe_results/gp_runs/J/log_ctrl_runbook.txt
+ create mode 100644 data/probe_results/gp_runs/J/log_ctrl_tally.txt
+ create mode 100644 data/probe_results/gp_runs/J/log_r2b_runbook.txt
+ create mode 100644 data/probe_results/gp_runs/J/log_r2b_tally.txt
+ create mode 100644 data/probe_results/gp_runs/J/r1_dense_rot.kld
+ create mode 100644 data/probe_results/gp_runs/J/r1_dense_rot_20261027_213258.log
+ create mode 100644 data/probe_results/gp_runs/J/r2_dense_20261027_222315.log
+ create mode 100644 data/probe_results/gp_runs/J/r2_dense_fp32.kld
+ create mode 100644 data/probe_results/gp_runs/J/r2_dense_q81.kld
+ create mode 100644 data/probe_results/gp_runs/J/r2b_exps_20261027_234626.log
+ create mode 100644 data/probe_results/gp_runs/J/r2b_exps_fp32.kld
+ create mode 100644 data/probe_results/gp_runs/K/bf16_10.kld
+ create mode 100644 data/probe_results/gp_runs/K/flips_stock_vs_bf16.txt
+ create mode 100644 data/probe_results/gp_runs/K/log_routes_runbook.txt
+ create mode 100644 data/probe_results/gp_runs/K/log_routes_tally.txt
+ create mode 100644 data/probe_results/gp_runs/K/routes_20261028_002755.log
+ create mode 100644 data/probe_results/gp_runs/K/stock_10.kld
+ create mode 100644 data/probe_results/gp_runs/K/stock_10_stats_hot120.txt
+ create mode 100644 data/probe_results/gp_runs/K/stock_10_stats_hot161.txt
+ create mode 100644 data/probe_results/gp_runs/K/stock_10_stats_hot84.txt
+ create mode 100644 data/probe_results/gp_runs/L/c_20261028_020541.log
+ create mode 100644 data/probe_results/gp_runs/L/check_20261028_011000.log
+ create mode 100644 data/probe_results/gp_runs/L/download_mtp_20261028_034136.log
+ create mode 100644 data/probe_results/gp_runs/L/imatrix_20261028_012022.log
+ create mode 100644 data/probe_results/gp_runs/L/log_c_t9r_tally.txt
+ create mode 100644 data/probe_results/gp_runs/L/log_c_unsloth_t8r_tally.txt
+ create mode 100644 data/probe_results/gp_runs/L/log_check_runbook.txt
+ create mode 100644 data/probe_results/gp_runs/L/log_check_tally.txt
+ create mode 100644 data/probe_results/gp_runs/L/log_imatrix_runbook.txt
+ create mode 100644 data/probe_results/gp_runs/L/log_imatrix_tally.txt
+ create mode 100644 data/probe_results/gp_runs/L/mix_A.tsv
+ create mode 100644 data/probe_results/gp_runs/L/mix_B.tsv
+ create mode 100644 data/probe_results/gp_runs/L/r2_check.verify.txt
+ create mode 100644 data/probe_results/gp_runs/L/r2_recipe.tsv
+ create mode 100644 data/probe_results/gp_runs/L/t8.tsv
+ create mode 100644 data/probe_results/gp_runs/L/t8r.kld
+ create mode 100644 data/probe_results/gp_runs/L/t9.tsv
+ create mode 100644 data/probe_results/gp_runs/L/t9r.kld
+ create mode 100644 data/probe_results/gp_runs/L/unsloth.kld
+ create mode 100644 data/probe_results/gp_runs/M/a4dense.kld
+ create mode 100644 data/probe_results/gp_runs/M/a8all.kld
+ create mode 100644 data/probe_results/gp_runs/M/a_20261028_043950.log
+ create mode 100644 data/probe_results/gp_runs/M/b_20261028_055721.log
+ create mode 100644 data/probe_results/gp_runs/M/c_20261028_071951.log
+ create mode 100644 data/probe_results/gp_runs/M/defer1.kld
+ create mode 100644 data/probe_results/gp_runs/M/defer2.kld
+ create mode 100644 data/probe_results/gp_runs/M/extract.log
+ create mode 100644 data/probe_results/gp_runs/M/log_m_a_runbook.txt
+ create mode 100644 data/probe_results/gp_runs/M/log_m_a_tally.txt
+ create mode 100644 data/probe_results/gp_runs/M/log_m_b_runbook.txt
+ create mode 100644 data/probe_results/gp_runs/M/log_m_b_tally.txt
+ create mode 100644 data/probe_results/gp_runs/M/log_m_c_runbook.txt
+ create mode 100644 data/probe_results/gp_runs/M/log_m_c_tally.txt
+ create mode 100644 data/probe_results/gp_runs/M/skip25.kld
+ create mode 100644 data/probe_results/gp_runs/M/skip40.kld
+ create mode 100644 data/probe_results/gp_runs/M/skip50.kld
+ create mode 100644 data/probe_results/gp_runs/M/swap001.kld
+ create mode 100644 data/probe_results/gp_runs/N/log_n_tally.txt
+ create mode 100644 data/probe_results/gp_runs/N/mtp_20261028_034928.log
+ create mode 100644 data/probe_results/gp_runs/N/mtp_a8.kld
+ create mode 100644 data/probe_results/gp_runs/N/mtp_fp32.kld
+ create mode 100644 data/probe_results/gp_runs/N/mtp_vs_nonmtp.verify.txt
+ create mode 100644 data/probe_results/gp_runs/POWER/dualbus_20261027_202618.log
+ create mode 100644 data/probe_results/gp_runs/POWER/dualbus_20261027_202928.json
+ create mode 100644 data/probe_results/gp_runs/POWER/dualbus_20261027_202928.log
+ create mode 100644 data/probe_results/gp_runs/POWER/dualbus_gpu_20261027_202618.csv
+ create mode 100644 data/probe_results/gp_runs/POWER/dualbus_gpu_20261027_202928.csv
+ create mode 100644 data/probe_results/gp_runs/POWER/dualbus_times_20261027_202618.txt
+ create mode 100644 data/probe_results/gp_runs/POWER/dualbus_times_20261027_202928.txt
+ create mode 100644 data/probe_results/gp_runs/README.md
+ create mode 100644 data/probe_results/gp_runs/summary.tsv
+ create mode 100644 docs/PELIAS_NEW_METHODS.md
+[1/6] Building CXX object CMakeFiles/pelias_unit.dir/tests/unit/test_model.cpp.o
+[2/6] Building CXX object CMakeFiles/pelias.dir/src/cli/main.cc.o
+[3/6] Building CXX object CMakeFiles/pelias_model.dir/src/model/arch_qwen35moe.cpp.o
+[4/6] Linking CXX static library libpelias_model.a
+[5/6] Linking CXX executable pelias
+[6/6] Linking CXX executable pelias_unit
+build ok: pelias 0.2.0 (e74a52a, Release) backends: none (host-only build)
+== PREDICTIONS (written 10-28 08:5x, DERIVED): t8r gpu256 vs its fp32 +0.0003 to +0.0024 (lower: its per-32 cost +0.000165; upper: stock at one scale per 256, llama.cpp Q8_K, +0.002383 with no rotation). Unsloth MTP gpu256 vs its fp32 about +0.0024 (unrotated like stock). t8r_g256 vs unsloth_mtp_g256 = fp32 gap +0.000710 plus the cost difference: -0.0014 to +0.0007, t8r ahead unless the rotation saves little at 256.
+pelias: 311 weights are stored rotated (pelias.rot32.tensors); their inputs are rotated to match
+pelias kld: 100 chunks of 512 tokens, positions 256..510 scored, vocabulary 248320, 16 threads, fp32 reference pass
+pelias kld: 8-bit activation rounding (gpu256 path) on: all
+chunk             PPL               ln(PPL(Q)/PPL(base))          KL Divergence              Δp RMS            Same top p
+   1       4.0992 ±    0.5627       0.00706 ±    0.00859       0.00648 ±    0.00091     2.293 ±  0.259 %    97.647 ±  0.951 %
+pelias kld: 18.70 seconds per chunk - ETA 30.9 minutes
+   2       5.7579 ±    0.6617      -0.00769 ±    0.00628       0.00822 ±    0.00120     2.106 ±  0.163 %    96.667 ±  0.796 %
+   3       5.2197 ±    0.4861       0.01722 ±    0.01034       0.01846 ±    0.00231     3.581 ±  0.387 %    96.471 ±  0.668 %
+   4       5.2200 ±    0.4019       0.01634 ±    0.00834       0.01752 ±    0.00179     3.644 ±  0.355 %    95.294 ±  0.663 %
+   5       5.3526 ±    0.3607       0.01507 ±    0.00746       0.01707 ±    0.00147     3.558 ±  0.295 %    95.216 ±  0.598 %
+   6       5.5233 ±    0.3378       0.01440 ±    0.00643       0.01643 ±    0.00124     3.469 ±  0.256 %    95.098 ±  0.552 %
+   7       5.7709 ±    0.3284       0.01442 ±    0.00589       0.01607 ±    0.00107     3.402 ±  0.226 %    95.182 ±  0.507 %
+   8       6.2822 ±    0.3437       0.01576 ±    0.00542       0.01570 ±    0.00097     3.320 ±  0.205 %    95.049 ±  0.480 %
+   9       6.7362 ±    0.3519       0.01178 ±    0.00495       0.01509 ±    0.00087     3.242 ±  0.190 %    95.033 ±  0.454 %
+  10       7.1193 ±    0.3540       0.01096 ±    0.00458       0.01464 ±    0.00079     3.139 ±  0.177 %    95.216 ±  0.423 %
+  11       7.0418 ±    0.3298       0.01036 ±    0.00427       0.01409 ±    0.00072     3.073 ±  0.165 %    95.187 ±  0.404 %
+  12       7.1664 ±    0.3240       0.01146 ±    0.00400       0.01399 ±    0.00070     3.168 ±  0.190 %    95.294 ±  0.383 %
+  13       7.5857 ±    0.3360       0.01194 ±    0.00382       0.01417 ±    0.00068     3.146 ±  0.180 %    95.324 ±  0.367 %
+  14       7.1596 ±    0.3021       0.01157 ±    0.00360       0.01376 ±    0.00063     3.112 ±  0.170 %    95.350 ±  0.352 %
+  15       7.1110 ±    0.2881       0.01095 ±    0.00342       0.01341 ±    0.00060     3.087 ±  0.165 %    95.529 ±  0.334 %
+  16       7.1392 ±    0.2808       0.01036 ±    0.00327       0.01316 ±    0.00057     3.098 ±  0.158 %    95.588 ±  0.322 %
+  17       6.7496 ±    0.2542       0.00969 ±    0.00311       0.01275 ±    0.00054     3.076 ±  0.150 %    95.663 ±  0.309 %
+  18       6.8083 ±    0.2495       0.00998 ±    0.00301       0.01263 ±    0.00051     3.049 ±  0.144 %    95.664 ±  0.301 %
+  19       6.7350 ±    0.2407       0.00962 ±    0.00291       0.01248 ±    0.00049     3.045 ±  0.138 %    95.666 ±  0.293 %
+  20       6.6620 ±    0.2304       0.00991 ±    0.00282       0.01261 ±    0.00047     3.051 ±  0.132 %    95.686 ±  0.285 %
+  21       6.4821 ±    0.2178       0.00958 ±    0.00274       0.01257 ±    0.00046     3.103 ±  0.130 %    95.649 ±  0.279 %
+  22       6.4183 ±    0.2107       0.00830 ±    0.00266       0.01272 ±    0.00046     3.137 ±  0.126 %    95.633 ±  0.273 %
+  23       6.1844 ±    0.1970       0.00773 ±    0.00260       0.01299 ±    0.00046     3.222 ±  0.124 %    95.601 ±  0.268 %
+  24       5.9287 ±    0.1834       0.00791 ±    0.00259       0.01336 ±    0.00069     3.345 ±  0.156 %    95.539 ±  0.264 %
+  25       5.8086 ±    0.1752       0.00839 ±    0.00255       0.01348 ±    0.00067     3.421 ±  0.155 %    95.529 ±  0.259 %
+  26       5.6815 ±    0.1667       0.00859 ±    0.00251       0.01342 ±    0.00065     3.428 ±  0.149 %    95.535 ±  0.254 %
+  27       5.5892 ±    0.1602       0.00863 ±    0.00245       0.01344 ±    0.00063     3.441 ±  0.144 %    95.527 ±  0.249 %
+  28       5.5302 ±    0.1552       0.00858 ±    0.00239       0.01335 ±    0.00061     3.418 ±  0.140 %    95.518 ±  0.245 %
+  29       5.5389 ±    0.1528       0.00813 ±    0.00233       0.01325 ±    0.00059     3.395 ±  0.137 %    95.483 ±  0.242 %
+  30       5.5031 ±    0.1489       0.00749 ±    0.00232       0.01334 ±    0.00057     3.377 ±  0.133 %    95.516 ±  0.237 %
+  31       5.4679 ±    0.1451       0.00681 ±    0.00227       0.01329 ±    0.00056     3.370 ±  0.129 %    95.522 ±  0.233 %
+  32       5.4931 ±    0.1440       0.00584 ±    0.00225       0.01359 ±    0.00060     3.458 ±  0.153 %    95.490 ±  0.230 %
+  33       5.4891 ±    0.1418       0.00657 ±    0.00221       0.01354 ±    0.00058     3.448 ±  0.149 %    95.460 ±  0.227 %
+  34       5.5376 ±    0.1416       0.00681 ±    0.00217       0.01355 ±    0.00057     3.444 ±  0.145 %    95.467 ±  0.223 %
+  35       5.6181 ±    0.1417       0.00697 ±    0.00213       0.01365 ±    0.00056     3.419 ±  0.142 %    95.283 ±  0.224 %
+  36       5.7405 ±    0.1433       0.00670 ±    0.00210       0.01370 ±    0.00055     3.397 ±  0.139 %    95.218 ±  0.223 %
+  37       5.8072 ±    0.1429       0.00629 ±    0.00207       0.01369 ±    0.00053     3.371 ±  0.136 %    95.103 ±  0.222 %
+  38       5.7912 ±    0.1404       0.00661 ±    0.00204       0.01366 ±    0.00052     3.362 ±  0.133 %    95.088 ±  0.220 %
+  39       5.8094 ±    0.1394       0.00594 ±    0.00201       0.01356 ±    0.00051     3.351 ±  0.131 %    95.053 ±  0.217 %
+  40       5.8554 ±    0.1396       0.00594 ±    0.00200       0.01432 ±    0.00098     3.462 ±  0.176 %    95.098 ±  0.214 %
+  41       5.8736 ±    0.1384       0.00600 ±    0.00196       0.01416 ±    0.00096     3.444 ±  0.172 %    95.093 ±  0.211 %
+  42       5.9217 ±    0.1380       0.00580 ±    0.00193       0.01410 ±    0.00093     3.439 ±  0.169 %    95.042 ±  0.210 %
+  43       5.9213 ±    0.1365       0.00598 ±    0.00191       0.01396 ±    0.00091     3.430 ±  0.166 %    95.057 ±  0.207 %
+  44       5.9062 ±    0.1343       0.00598 ±    0.00188       0.01392 ±    0.00089     3.419 ±  0.163 %    95.018 ±  0.205 %
+  45       5.9657 ±    0.1346       0.00598 ±    0.00185       0.01387 ±    0.00087     3.401 ±  0.160 %    95.041 ±  0.203 %
+  46       5.9365 ±    0.1322       0.00612 ±    0.00183       0.01385 ±    0.00085     3.412 ±  0.157 %    95.072 ±  0.200 %
+  47       6.0467 ±    0.1339       0.00643 ±    0.00180       0.01381 ±    0.00084     3.395 ±  0.154 %    95.019 ±  0.199 %
+  48       6.0992 ±    0.1337       0.00675 ±    0.00177       0.01368 ±    0.00082     3.381 ±  0.152 %    95.065 ±  0.196 %
+  49       6.0661 ±    0.1314       0.00666 ±    0.00175       0.01362 ±    0.00081     3.393 ±  0.151 %    95.086 ±  0.193 %
+  50       6.0839 ±    0.1305       0.00702 ±    0.00175       0.01386 ±    0.00079     3.413 ±  0.147 %    95.067 ±  0.192 %
+  51       6.0802 ±    0.1289       0.00731 ±    0.00173       0.01377 ±    0.00078     3.402 ±  0.145 %    95.079 ±  0.190 %
+  52       6.1245 ±    0.1290       0.00691 ±    0.00171       0.01377 ±    0.00076     3.395 ±  0.143 %    95.045 ±  0.188 %
+  53       6.1756 ±    0.1288       0.00719 ±    0.00168       0.01366 ±    0.00075     3.373 ±  0.141 %    95.050 ±  0.187 %
+  54       6.1948 ±    0.1280       0.00679 ±    0.00167       0.01359 ±    0.00073     3.369 ±  0.139 %    95.062 ±  0.185 %
+  55       6.2088 ±    0.1272       0.00673 ±    0.00164       0.01352 ±    0.00072     3.350 ±  0.137 %    95.066 ±  0.183 %
+  56       6.2336 ±    0.1267       0.00710 ±    0.00163       0.01351 ±    0.00071     3.367 ±  0.135 %    95.077 ±  0.181 %
+  57       6.2434 ±    0.1258       0.00693 ±    0.00162       0.01365 ±    0.00071     3.431 ±  0.145 %    95.081 ±  0.179 %
+  58       6.2533 ±    0.1247       0.00707 ±    0.00160       0.01362 ±    0.00070     3.440 ±  0.143 %    95.091 ±  0.178 %
+  59       6.2548 ±    0.1236       0.00706 ±    0.00159       0.01362 ±    0.00068     3.432 ±  0.141 %    95.115 ±  0.176 %
+  60       6.2861 ±    0.1234       0.00698 ±    0.00157       0.01364 ±    0.00067     3.436 ±  0.140 %    95.124 ±  0.174 %
+  61       6.3167 ±    0.1233       0.00680 ±    0.00157       0.01376 ±    0.00067     3.454 ±  0.138 %    95.121 ±  0.173 %
+  62       6.3719 ±    0.1235       0.00692 ±    0.00156       0.01370 ±    0.00066     3.440 ±  0.136 %    95.104 ±  0.172 %
+  63       6.4172 ±    0.1235       0.00667 ±    0.00154       0.01366 ±    0.00065     3.438 ±  0.134 %    95.120 ±  0.170 %
+  64       6.4631 ±    0.1234       0.00653 ±    0.00153       0.01362 ±    0.00064     3.425 ±  0.133 %    95.074 ±  0.169 %
+  65       6.5228 ±    0.1238       0.00654 ±    0.00151       0.01358 ±    0.00063     3.409 ±  0.131 %    95.071 ±  0.168 %
+  66       6.5501 ±    0.1235       0.00637 ±    0.00150       0.01353 ±    0.00062     3.404 ±  0.130 %    95.080 ±  0.167 %
+  67       6.6179 ±    0.1243       0.00664 ±    0.00149       0.01356 ±    0.00061     3.411 ±  0.128 %    95.072 ±  0.166 %
+  68       6.6474 ±    0.1240       0.00644 ±    0.00148       0.01352 ±    0.00060     3.396 ±  0.127 %    95.081 ±  0.164 %
+  69       6.6606 ±    0.1232       0.00638 ±    0.00146       0.01343 ±    0.00059     3.379 ±  0.125 %    95.095 ±  0.163 %
+  70       6.6286 ±    0.1216       0.00662 ±    0.00146       0.01347 ±    0.00058     3.404 ±  0.123 %    95.120 ±  0.161 %
+  71       6.6738 ±    0.1216       0.00643 ±    0.00146       0.01348 ±    0.00058     3.391 ±  0.122 %    95.106 ±  0.160 %
+  72       6.6884 ±    0.1208       0.00646 ±    0.00145       0.01344 ±    0.00057     3.383 ±  0.121 %    95.125 ±  0.159 %
+  73       6.7181 ±    0.1207       0.00624 ±    0.00144       0.01346 ±    0.00056     3.385 ±  0.119 %    95.074 ±  0.159 %
+  74       6.7146 ±    0.1198       0.00620 ±    0.00143       0.01340 ±    0.00055     3.380 ±  0.118 %    95.098 ±  0.157 %
+  75       6.7013 ±    0.1189       0.00594 ±    0.00141       0.01344 ±    0.00055     3.384 ±  0.118 %    95.111 ±  0.156 %
+  76       6.6964 ±    0.1182       0.00588 ±    0.00140       0.01338 ±    0.00055     3.373 ±  0.117 %    95.119 ±  0.155 %
+  77       6.7346 ±    0.1184       0.00598 ±    0.00138       0.01334 ±    0.00054     3.359 ±  0.116 %    95.090 ±  0.154 %
+  78       6.7469 ±    0.1184       0.00610 ±    0.00137       0.01328 ±    0.00053     3.348 ±  0.115 %    95.103 ±  0.153 %
+  79       6.6349 ±    0.1156       0.00656 ±    0.00139       0.01403 ±    0.00057     3.606 ±  0.126 %    95.096 ±  0.152 %
+  80       6.5841 ±    0.1137       0.00675 ±    0.00139       0.01434 ±    0.00057     3.675 ±  0.124 %    95.069 ±  0.152 %
+  81       6.5623 ±    0.1125       0.00671 ±    0.00139       0.01435 ±    0.00056     3.673 ±  0.123 %    95.033 ±  0.151 %
+  82       6.5735 ±    0.1121       0.00635 ±    0.00138       0.01437 ±    0.00055     3.678 ±  0.122 %    95.012 ±  0.151 %
+  83       6.5843 ±    0.1115       0.00634 ±    0.00137       0.01434 ±    0.00055     3.666 ±  0.121 %    95.001 ±  0.150 %
+  84       6.5805 ±    0.1107       0.00623 ±    0.00136       0.01432 ±    0.00054     3.659 ±  0.120 %    95.014 ±  0.149 %
+  85       6.5985 ±    0.1103       0.00619 ±    0.00135       0.01430 ±    0.00053     3.654 ±  0.119 %    95.022 ±  0.148 %
+  86       6.6332 ±    0.1104       0.00622 ±    0.00134       0.01426 ±    0.00053     3.642 ±  0.118 %    95.021 ±  0.147 %
+  87       6.6354 ±    0.1098       0.00611 ±    0.00133       0.01422 ±    0.00052     3.630 ±  0.117 %    95.019 ±  0.146 %
+  88       6.6463 ±    0.1095       0.00603 ±    0.00132       0.01421 ±    0.00052     3.623 ±  0.116 %    95.031 ±  0.145 %
+  89       6.6199 ±    0.1084       0.00606 ±    0.00131       0.01418 ±    0.00051     3.625 ±  0.115 %    95.030 ±  0.144 %
+  90       6.6062 ±    0.1074       0.00600 ±    0.00130       0.01417 ±    0.00051     3.634 ±  0.113 %    95.037 ±  0.143 %
+  91       6.6057 ±    0.1067       0.00592 ±    0.00129       0.01411 ±    0.00050     3.622 ±  0.113 %    95.048 ±  0.142 %
+  92       6.5908 ±    0.1058       0.00585 ±    0.00128       0.01407 ±    0.00050     3.616 ±  0.112 %    95.072 ±  0.141 %
+  93       6.6185 ±    0.1058       0.00593 ±    0.00127       0.01405 ±    0.00049     3.605 ±  0.111 %    95.075 ±  0.141 %
+  94       6.6300 ±    0.1054       0.00605 ±    0.00126       0.01403 ±    0.00049     3.597 ±  0.110 %    95.056 ±  0.140 %
+  95       6.6467 ±    0.1052       0.00612 ±    0.00125       0.01400 ±    0.00048     3.584 ±  0.109 %    95.059 ±  0.139 %
+  96       6.6430 ±    0.1044       0.00608 ±    0.00125       0.01400 ±    0.00048     3.573 ±  0.108 %    95.037 ±  0.139 %
+  97       6.6285 ±    0.1036       0.00607 ±    0.00124       0.01397 ±    0.00047     3.567 ±  0.107 %    95.027 ±  0.138 %
+  98       6.6222 ±    0.1029       0.00587 ±    0.00123       0.01393 ±    0.00047     3.556 ±  0.107 %    95.030 ±  0.137 %
+  99       6.6265 ±    0.1024       0.00586 ±    0.00123       0.01397 ±    0.00046     3.566 ±  0.107 %    95.013 ±  0.137 %
+ 100       6.6518 ±    0.1024       0.00575 ±    0.00122       0.01394 ±    0.00046     3.555 ±  0.106 %    95.016 ±  0.136 %
+pelias kld: 25500 per-token records written
+pelias kld: 100 chunks in 1336.5 s
+
+====== Perplexity statistics ======
+Mean PPL(Q)                   :   6.651752 ±   0.102363
+Mean PPL(base)                :   6.613646 ±   0.101611
+Cor(ln(PPL(Q)), ln(PPL(base))):  99.69%
+Mean ln(PPL(Q)/PPL(base))     :   0.005745 ±   0.001218
+Mean PPL(Q)/PPL(base)         :   1.005762 ±   0.001225
+Mean PPL(Q)-PPL(base)         :   0.038106 ±   0.008111
+
+====== KL divergence statistics ======
+Mean    KLD:   0.013939 ±   0.000459
+Maximum KLD:   8.606965
+99.9%   KLD:   0.486023
+99.0%   KLD:   0.137766
+95.0%   KLD:   0.045754
+90.0%   KLD:   0.027664
+Median  KLD:   0.005505
+10.0%   KLD:   0.000149
+ 5.0%   KLD:   0.000041
+ 1.0%   KLD:   0.000004
+ 0.1%   KLD:  -0.000002
+Minimum KLD:  -0.000020
+
+====== Token probability statistics ======
+Mean    Δp: -0.093 ± 0.022 %
+Maximum Δp: 94.028%
+99.9%   Δp: 27.445%
+99.0%   Δp:  9.315%
+95.0%   Δp:  3.884%
+90.0%   Δp:  2.264%
+75.0%   Δp:  0.434%
+Median  Δp: -0.002%
+25.0%   Δp: -0.586%
+10.0%   Δp: -2.466%
+ 5.0%   Δp: -4.260%
+ 1.0%   Δp: -10.040%
+ 0.1%   Δp: -29.078%
+Minimum Δp: -80.170%
+RMS Δp    :  3.555 ± 0.106 %
+Same top p: 95.016 ± 0.136 %
+M t8r_g256 1339 s: Mean KLD: 0.013939 ± 0.000459 | Same top p: 95.016 ± 0.136 %
+paired on 25500 scored tokens (100 chunks of 255)
+mean KLD   t8r_g256 0.013939   t8r_fp32 0.012941
+difference (A - B) +0.000999   SE per token 0.000158   SE per chunk (used) 0.000148   95% interval [+0.000705, +0.001293] (t 1.984, 99 df)   t-stat 6.74
+tokens where A has the lower KL: 43.02 %; mean ln(PPL) difference +0.000475
+top token: right only in A 328, only in B 360 (z -1.22)
+VERDICT: B has less drift than A (the 95 % interval is above zero)
+t8r_g256 vs t8r_fp32: difference (A - B) +0.000999   SE per token 0.000158   SE per chunk (used) 0.000148   95% interval [+0.000705, +0.001293] (t 1.984, 99 df)   t-stat 6.74
+t8r_g256 vs t8r_fp32: VERDICT: B has less drift than A (the 95 % interval is above zero)
+paired on 25500 scored tokens (100 chunks of 255)
+mean KLD   t8r_g256 0.013939   t8r_q81 0.013106
+difference (A - B) +0.000834   SE per token 0.000205   SE per chunk (used) 0.000207   95% interval [+0.000422, +0.001245] (t 1.984, 99 df)   t-stat 4.02
+tokens where A has the lower KL: 45.39 %; mean ln(PPL) difference +0.000141
+top token: right only in A 315, only in B 365 (z -1.92)
+VERDICT: B has less drift than A (the 95 % interval is above zero)
+t8r_g256 vs t8r_q81: difference (A - B) +0.000834   SE per token 0.000205   SE per chunk (used) 0.000207   95% interval [+0.000422, +0.001245] (t 1.984, 99 df)   t-stat 4.02
+t8r_g256 vs t8r_q81: VERDICT: B has less drift than A (the 95 % interval is above zero)
+pelias kld: 100 chunks of 512 tokens, positions 256..510 scored, vocabulary 248320, 16 threads, fp32 reference pass
+pelias kld: 8-bit activation rounding (gpu256 path) on: all
+chunk             PPL               ln(PPL(Q)/PPL(base))          KL Divergence              Δp RMS            Same top p
+   1       4.1060 ±    0.5641       0.00872 ±    0.00702       0.00773 ±    0.00118     2.932 ±  0.549 %    97.647 ±  0.951 %
+pelias kld: 50.03 seconds per chunk - ETA 82.5 minutes
+   2       5.8185 ±    0.6695       0.00278 ±    0.00607       0.00877 ±    0.00084     2.507 ±  0.332 %    95.882 ±  0.881 %
+   3       5.1768 ±    0.4786       0.00897 ±    0.00909       0.02231 ±    0.00373     3.748 ±  0.353 %    94.510 ±  0.824 %
+   4       5.1565 ±    0.3925       0.00410 ±    0.00792       0.02017 ±    0.00281     3.662 ±  0.279 %    93.725 ±  0.760 %
+   5       5.2885 ±    0.3522       0.00303 ±    0.00686       0.01970 ±    0.00228     3.684 ±  0.232 %    93.333 ±  0.699 %
+   6       5.4545 ±    0.3303       0.00186 ±    0.00599       0.01868 ±    0.00191     3.583 ±  0.202 %    93.725 ±  0.620 %
+   7       5.7183 ±    0.3231       0.00527 ±    0.00558       0.01850 ±    0.00165     3.570 ±  0.180 %    93.277 ±  0.593 %
+   8       6.2162 ±    0.3377       0.00520 ±    0.00499       0.01765 ±    0.00145     3.439 ±  0.165 %    93.627 ±  0.541 %
+   9       6.6771 ±    0.3468       0.00296 ±    0.00461       0.01716 ±    0.00130     3.391 ±  0.156 %    93.682 ±  0.508 %
+  10       7.0723 ±    0.3502       0.00434 ±    0.00429       0.01678 ±    0.00117     3.305 ±  0.147 %    93.804 ±  0.478 %
+  11       7.0008 ±    0.3266       0.00452 ±    0.00403       0.01631 ±    0.00107     3.247 ±  0.137 %    93.868 ±  0.453 %
+  12       7.1169 ±    0.3207       0.00453 ±    0.00387       0.01607 ±    0.00100     3.234 ±  0.135 %    93.954 ±  0.431 %
+  13       7.5262 ±    0.3324       0.00406 ±    0.00370       0.01633 ±    0.00096     3.235 ±  0.133 %    93.967 ±  0.414 %
+  14       7.1092 ±    0.2989       0.00451 ±    0.00349       0.01595 ±    0.00089     3.249 ±  0.137 %    94.146 ±  0.393 %
+  15       7.0640 ±    0.2854       0.00431 ±    0.00331       0.01562 ±    0.00084     3.266 ±  0.141 %    94.275 ±  0.376 %
+  16       7.0953 ±    0.2782       0.00419 ±    0.00316       0.01521 ±    0.00079     3.251 ±  0.135 %    94.387 ±  0.360 %
+  17       6.7059 ±    0.2518       0.00318 ±    0.00307       0.01500 ±    0.00075     3.258 ±  0.129 %    94.348 ±  0.351 %
+  18       6.7604 ±    0.2471       0.00292 ±    0.00298       0.01475 ±    0.00071     3.205 ±  0.124 %    94.336 ±  0.341 %
+  19       6.6924 ±    0.2385       0.00327 ±    0.00287       0.01449 ±    0.00068     3.171 ±  0.119 %    94.427 ±  0.330 %
+  20       6.6183 ±    0.2283       0.00333 ±    0.00282       0.01459 ±    0.00065     3.173 ±  0.115 %    94.353 ±  0.323 %
+  21       6.4419 ±    0.2157       0.00336 ±    0.00281       0.01461 ±    0.00063     3.219 ±  0.113 %    94.416 ±  0.314 %
+  22       6.3802 ±    0.2087       0.00234 ±    0.00273       0.01454 ±    0.00060     3.232 ±  0.111 %    94.456 ±  0.306 %
+  23       6.1536 ±    0.1955       0.00272 ±    0.00265       0.01466 ±    0.00059     3.275 ±  0.107 %    94.544 ±  0.297 %
+  24       5.8984 ±    0.1820       0.00278 ±    0.00260       0.01461 ±    0.00058     3.306 ±  0.111 %    94.542 ±  0.290 %
+  25       5.7785 ±    0.1739       0.00320 ±    0.00254       0.01477 ±    0.00057     3.358 ±  0.107 %    94.573 ±  0.284 %
+  26       5.6477 ±    0.1652       0.00262 ±    0.00249       0.01474 ±    0.00055     3.386 ±  0.106 %    94.555 ±  0.279 %
+  27       5.5497 ±    0.1585       0.00153 ±    0.00243       0.01479 ±    0.00054     3.405 ±  0.102 %    94.568 ±  0.273 %
+  28       5.4851 ±    0.1533       0.00039 ±    0.00240       0.01486 ±    0.00053     3.397 ±  0.099 %    94.636 ±  0.267 %
+  29       5.4944 ±    0.1510       0.00006 ±    0.00233       0.01472 ±    0.00051     3.373 ±  0.097 %    94.672 ±  0.261 %
+  30       5.4648 ±    0.1473       0.00051 ±    0.00228       0.01461 ±    0.00050     3.351 ±  0.094 %    94.784 ±  0.254 %
+  31       5.4317 ±    0.1436       0.00017 ±    0.00224       0.01459 ±    0.00049     3.338 ±  0.092 %    94.725 ±  0.251 %
+  32       5.4620 ±    0.1428       0.00016 ±    0.00222       0.01483 ±    0.00053     3.340 ±  0.090 %    94.657 ±  0.249 %
+  33       5.4561 ±    0.1405       0.00054 ±    0.00219       0.01484 ±    0.00052     3.341 ±  0.088 %    94.605 ±  0.246 %
+  34       5.5028 ±    0.1402       0.00050 ±    0.00215       0.01486 ±    0.00051     3.347 ±  0.087 %    94.614 ±  0.242 %
+  35       5.5829 ±    0.1404       0.00069 ±    0.00212       0.01497 ±    0.00050     3.342 ±  0.086 %    94.510 ±  0.241 %
+  36       5.7067 ±    0.1421       0.00080 ±    0.00209       0.01506 ±    0.00049     3.328 ±  0.085 %    94.423 ±  0.240 %
+  37       5.7786 ±    0.1419       0.00136 ±    0.00206       0.01511 ±    0.00048     3.324 ±  0.083 %    94.319 ±  0.238 %
+  38       5.7606 ±    0.1393       0.00131 ±    0.00202       0.01498 ±    0.00047     3.305 ±  0.082 %    94.345 ±  0.235 %
+  39       5.7810 ±    0.1384       0.00105 ±    0.00199       0.01487 ±    0.00046     3.292 ±  0.080 %    94.339 ±  0.232 %
+  40       5.8251 ±    0.1385       0.00075 ±    0.00199       0.01563 ±    0.00095     3.430 ±  0.148 %    94.392 ±  0.228 %
+  41       5.8440 ±    0.1374       0.00094 ±    0.00195       0.01549 ±    0.00093     3.414 ±  0.145 %    94.376 ±  0.225 %
+  42       5.8922 ±    0.1370       0.00081 ±    0.00193       0.01543 ±    0.00090     3.410 ±  0.142 %    94.379 ±  0.223 %
+  43       5.8941 ±    0.1355       0.00137 ±    0.00189       0.01527 ±    0.00088     3.389 ±  0.140 %    94.327 ±  0.221 %
+  44       5.8793 ±    0.1333       0.00141 ±    0.00187       0.01524 ±    0.00087     3.384 ±  0.137 %    94.296 ±  0.219 %
+  45       5.9366 ±    0.1335       0.00109 ±    0.00185       0.01518 ±    0.00085     3.368 ±  0.134 %    94.292 ±  0.217 %
+  46       5.9085 ±    0.1311       0.00141 ±    0.00184       0.01525 ±    0.00083     3.415 ±  0.133 %    94.280 ±  0.214 %
+  47       6.0185 ±    0.1329       0.00176 ±    0.00182       0.01522 ±    0.00081     3.400 ±  0.131 %    94.243 ±  0.213 %
+  48       6.0715 ±    0.1327       0.00221 ±    0.00179       0.01509 ±    0.00080     3.384 ±  0.129 %    94.297 ±  0.210 %
+  49       6.0381 ±    0.1304       0.00204 ±    0.00176       0.01499 ±    0.00078     3.379 ±  0.127 %    94.334 ±  0.207 %
+  50       6.0586 ±    0.1296       0.00285 ±    0.00177       0.01527 ±    0.00077     3.407 ±  0.124 %    94.314 ±  0.205 %
+  51       6.0522 ±    0.1279       0.00270 ±    0.00175       0.01524 ±    0.00075     3.411 ±  0.122 %    94.295 ±  0.203 %
+  52       6.1015 ±    0.1282       0.00315 ±    0.00174       0.01521 ±    0.00074     3.405 ±  0.120 %    94.276 ±  0.202 %
+  53       6.1508 ±    0.1279       0.00316 ±    0.00171       0.01510 ±    0.00073     3.384 ±  0.119 %    94.280 ±  0.200 %
+  54       6.1707 ±    0.1271       0.00289 ±    0.00169       0.01505 ±    0.00071     3.385 ±  0.117 %    94.321 ±  0.197 %
+  55       6.1857 ±    0.1263       0.00301 ±    0.00167       0.01499 ±    0.00070     3.370 ±  0.115 %    94.317 ±  0.195 %
+  56       6.2121 ±    0.1259       0.00365 ±    0.00166       0.01498 ±    0.00069     3.388 ±  0.113 %    94.328 ±  0.194 %
+  57       6.2199 ±    0.1250       0.00317 ±    0.00164       0.01505 ±    0.00068     3.396 ±  0.111 %    94.303 ±  0.192 %
+  58       6.2278 ±    0.1238       0.00298 ±    0.00163       0.01522 ±    0.00068     3.452 ±  0.114 %    94.293 ±  0.191 %
+  59       6.2294 ±    0.1227       0.00297 ±    0.00161       0.01522 ±    0.00067     3.452 ±  0.112 %    94.324 ±  0.189 %
+  60       6.2608 ±    0.1225       0.00294 ±    0.00160       0.01531 ±    0.00066     3.474 ±  0.113 %    94.294 ±  0.188 %
+  61       6.2902 ±    0.1224       0.00261 ±    0.00160       0.01538 ±    0.00065     3.471 ±  0.112 %    94.266 ±  0.186 %
+  62       6.3453 ±    0.1226       0.00274 ±    0.00158       0.01534 ±    0.00064     3.461 ±  0.110 %    94.276 ±  0.185 %
+  63       6.3917 ±    0.1227       0.00269 ±    0.00157       0.01534 ±    0.00063     3.453 ±  0.109 %    94.255 ±  0.184 %
+  64       6.4384 ±    0.1226       0.00270 ±    0.00156       0.01529 ±    0.00062     3.443 ±  0.108 %    94.252 ±  0.182 %
+  65       6.4968 ±    0.1230       0.00254 ±    0.00155       0.01527 ±    0.00062     3.433 ±  0.106 %    94.250 ±  0.181 %
+  66       6.5265 ±    0.1227       0.00276 ±    0.00154       0.01522 ±    0.00061     3.424 ±  0.105 %    94.272 ±  0.179 %
+  67       6.5966 ±    0.1236       0.00342 ±    0.00154       0.01536 ±    0.00060     3.455 ±  0.106 %    94.258 ±  0.178 %
+  68       6.6292 ±    0.1234       0.00369 ±    0.00153       0.01532 ±    0.00060     3.449 ±  0.105 %    94.250 ±  0.177 %
+  69       6.6429 ±    0.1226       0.00370 ±    0.00152       0.01522 ±    0.00059     3.431 ±  0.104 %    94.265 ±  0.175 %
+  70       6.6126 ±    0.1210       0.00420 ±    0.00151       0.01533 ±    0.00058     3.474 ±  0.103 %    94.246 ±  0.174 %
+  71       6.6600 ±    0.1211       0.00436 ±    0.00149       0.01531 ±    0.00057     3.470 ±  0.102 %    94.250 ±  0.173 %
+  72       6.6757 ±    0.1204       0.00456 ±    0.00148       0.01525 ±    0.00057     3.455 ±  0.101 %    94.286 ±  0.171 %
+  73       6.7054 ±    0.1202       0.00436 ±    0.00147       0.01526 ±    0.00056     3.449 ±  0.100 %    94.268 ±  0.170 %
+  74       6.7015 ±    0.1194       0.00424 ±    0.00145       0.01519 ±    0.00055     3.446 ±  0.099 %    94.308 ±  0.169 %
+  75       6.6875 ±    0.1185       0.00389 ±    0.00144       0.01522 ±    0.00055     3.454 ±  0.099 %    94.316 ±  0.167 %
+  76       6.6836 ±    0.1178       0.00397 ±    0.00142       0.01516 ±    0.00054     3.440 ±  0.098 %    94.340 ±  0.166 %
+  77       6.7208 ±    0.1179       0.00393 ±    0.00142       0.01516 ±    0.00054     3.448 ±  0.099 %    94.321 ±  0.165 %
+  78       6.7319 ±    0.1179       0.00388 ±    0.00141       0.01511 ±    0.00053     3.446 ±  0.098 %    94.359 ±  0.164 %
+  79       6.6204 ±    0.1151       0.00436 ±    0.00141       0.01566 ±    0.00054     3.621 ±  0.107 %    94.361 ±  0.163 %
+  80       6.5689 ±    0.1132       0.00443 ±    0.00141       0.01592 ±    0.00054     3.674 ±  0.105 %    94.358 ±  0.162 %
+  81       6.5482 ±    0.1120       0.00455 ±    0.00140       0.01596 ±    0.00053     3.683 ±  0.104 %    94.340 ±  0.161 %
+  82       6.5601 ±    0.1116       0.00431 ±    0.00139       0.01599 ±    0.00053     3.690 ±  0.103 %    94.333 ±  0.160 %
+  83       6.5724 ±    0.1111       0.00454 ±    0.00139       0.01596 ±    0.00052     3.676 ±  0.102 %    94.316 ±  0.159 %
+  84       6.5689 ±    0.1103       0.00446 ±    0.00137       0.01592 ±    0.00052     3.669 ±  0.102 %    94.328 ±  0.158 %
+  85       6.5872 ±    0.1099       0.00447 ±    0.00136       0.01593 ±    0.00051     3.663 ±  0.101 %    94.330 ±  0.157 %
+  86       6.6216 ±    0.1101       0.00448 ±    0.00135       0.01590 ±    0.00050     3.652 ±  0.100 %    94.337 ±  0.156 %
+  87       6.6226 ±    0.1094       0.00419 ±    0.00135       0.01589 ±    0.00050     3.654 ±  0.099 %    94.343 ±  0.155 %
+  88       6.6328 ±    0.1091       0.00400 ±    0.00134       0.01589 ±    0.00049     3.647 ±  0.098 %    94.354 ±  0.154 %
+  89       6.6072 ±    0.1080       0.00414 ±    0.00133       0.01589 ±    0.00049     3.654 ±  0.097 %    94.356 ±  0.153 %
+  90       6.5933 ±    0.1070       0.00405 ±    0.00132       0.01589 ±    0.00048     3.670 ±  0.096 %    94.357 ±  0.152 %
+  91       6.5935 ±    0.1064       0.00408 ±    0.00131       0.01582 ±    0.00048     3.657 ±  0.096 %    94.359 ±  0.151 %
+  92       6.5789 ±    0.1054       0.00405 ±    0.00130       0.01577 ±    0.00047     3.654 ±  0.095 %    94.378 ±  0.150 %
+  93       6.6057 ±    0.1054       0.00398 ±    0.00130       0.01574 ±    0.00047     3.644 ±  0.094 %    94.366 ±  0.150 %
+  94       6.6182 ±    0.1050       0.00426 ±    0.00129       0.01573 ±    0.00046     3.635 ±  0.093 %    94.368 ±  0.149 %
+  95       6.6342 ±    0.1048       0.00424 ±    0.00128       0.01568 ±    0.00046     3.622 ±  0.093 %    94.374 ±  0.148 %
+  96       6.6311 ±    0.1040       0.00429 ±    0.00127       0.01568 ±    0.00046     3.613 ±  0.092 %    94.359 ±  0.147 %
+  97       6.6174 ±    0.1032       0.00440 ±    0.00126       0.01567 ±    0.00045     3.612 ±  0.091 %    94.368 ±  0.147 %
+  98       6.6112 ±    0.1025       0.00420 ±    0.00126       0.01565 ±    0.00045     3.603 ±  0.091 %    94.342 ±  0.146 %
+  99       6.6157 ±    0.1021       0.00423 ±    0.00125       0.01568 ±    0.00044     3.620 ±  0.092 %    94.343 ±  0.145 %
+ 100       6.6396 ±    0.1020       0.00392 ±    0.00125       0.01567 ±    0.00044     3.611 ±  0.091 %    94.349 ±  0.145 %
+pelias kld: 25500 per-token records written
+pelias kld: 100 chunks in 1316.0 s
+
+====== Perplexity statistics ======
+Mean PPL(Q)                   :   6.639596 ±   0.101977
+Mean PPL(base)                :   6.613646 ±   0.101611
+Cor(ln(PPL(Q)), ln(PPL(base))):  99.67%
+Mean ln(PPL(Q)/PPL(base))     :   0.003916 ±   0.001246
+Mean PPL(Q)/PPL(base)         :   1.003924 ±   0.001250
+Mean PPL(Q)-PPL(base)         :   0.025950 ±   0.008262
+
+====== KL divergence statistics ======
+Mean    KLD:   0.015665 ±   0.000440
+Maximum KLD:   8.558176
+99.9%   KLD:   0.561802
+99.0%   KLD:   0.149277
+95.0%   KLD:   0.052022
+90.0%   KLD:   0.031937
+Median  KLD:   0.006522
+10.0%   KLD:   0.000182
+ 5.0%   KLD:   0.000050
+ 1.0%   KLD:   0.000006
+ 0.1%   KLD:  -0.000000
+Minimum KLD:  -0.000023
+
+====== Token probability statistics ======
+Mean    Δp: -0.139 ± 0.023 %
+Maximum Δp: 93.987%
+99.9%   Δp: 23.629%
+99.0%   Δp:  9.651%
+95.0%   Δp:  4.216%
+90.0%   Δp:  2.326%
+75.0%   Δp:  0.447%
+Median  Δp: -0.002%
+25.0%   Δp: -0.644%
+10.0%   Δp: -2.741%
+ 5.0%   Δp: -4.654%
+ 1.0%   Δp: -11.027%
+ 0.1%   Δp: -29.886%
+Minimum Δp: -75.178%
+RMS Δp    :  3.611 ± 0.091 %
+Same top p: 94.349 ± 0.145 %
+M unsloth_mtp_g256 1318 s: Mean KLD: 0.015665 ± 0.000440 | Same top p: 94.349 ± 0.145 %
+paired on 25500 scored tokens (100 chunks of 255)
+mean KLD   unsloth_mtp_g256 0.015665   unsloth_mtp_fp32 0.012231
+difference (A - B) +0.003434   SE per token 0.000201   SE per chunk (used) 0.000238   95% interval [+0.002963, +0.003906] (t 1.984, 99 df)   t-stat 14.45
+tokens where A has the lower KL: 31.80 %; mean ln(PPL) difference +0.000446
+top token: right only in A 346, only in B 566 (z -7.28)
+VERDICT: B has less drift than A (the 95 % interval is above zero)
+unsloth_mtp_g256 vs unsloth_mtp_fp32: difference (A - B) +0.003434   SE per token 0.000201   SE per chunk (used) 0.000238   95% interval [+0.002963, +0.003906] (t 1.984, 99 df)   t-stat 14.45
+unsloth_mtp_g256 vs unsloth_mtp_fp32: VERDICT: B has less drift than A (the 95 % interval is above zero)
+paired on 25500 scored tokens (100 chunks of 255)
+mean KLD   unsloth_mtp_g256 0.015665   unsloth_mtp_q81 0.012864
+difference (A - B) +0.002801   SE per token 0.000215   SE per chunk (used) 0.000256   95% interval [+0.002292, +0.003310] (t 1.984, 99 df)   t-stat 10.93
+tokens where A has the lower KL: 36.28 %; mean ln(PPL) difference +0.001160
+top token: right only in A 384, only in B 559 (z -5.70)
+VERDICT: B has less drift than A (the 95 % interval is above zero)
+unsloth_mtp_g256 vs unsloth_mtp_q81: difference (A - B) +0.002801   SE per token 0.000215   SE per chunk (used) 0.000256   95% interval [+0.002292, +0.003310] (t 1.984, 99 df)   t-stat 10.93
+unsloth_mtp_g256 vs unsloth_mtp_q81: VERDICT: B has less drift than A (the 95 % interval is above zero)
+paired on 25500 scored tokens (100 chunks of 255)
+mean KLD   t8r_g256 0.013939   unsloth_mtp_g256 0.015665
+difference (A - B) -0.001726   SE per token 0.000281   SE per chunk (used) 0.000319   95% interval [-0.002359, -0.001092] (t 1.984, 99 df)   t-stat -5.40
+tokens where A has the lower KL: 57.76 %; mean ln(PPL) difference +0.001829
+top token: right only in A 757, only in B 587 (z 4.64)
+VERDICT: A has less drift than B (the 95 % interval is below zero)
+t8r_g256 vs unsloth_mtp_g256: difference (A - B) -0.001726   SE per token 0.000281   SE per chunk (used) 0.000319   95% interval [-0.002359, -0.001092] (t 1.984, 99 df)   t-stat -5.40
+t8r_g256 vs unsloth_mtp_g256: VERDICT: A has less drift than B (the 95 % interval is below zero)
+== M d done 2026-10-28 09:39:48. Log /mnt/d/pelias-tests/gp/M/d_20261028_085525.log
