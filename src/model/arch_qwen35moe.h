@@ -117,6 +117,10 @@ struct ForwardOptions {
   // magnitude are set to zero for each token: the oracle upper bound of skipping neurons (their gate and up rows and
   // their down column would not be read).
   double neuron_skip = 0.0;
+  // h_gate f in (0, 1]: on every Q8_Z weight, each token reads the 8th bit (H, the low bit of u = q + 127 = 2b + h) only on
+  // the fraction f of each row's 32-blocks with the largest expected loss s^2 * sum(x^2) (the live gate, ZH: decided by
+  // the token, not the calibration text); the other blocks use the base with H filled by 0.5. 0 = off (all H read).
+  double h_gate = 0.0;
   // swap_margin m > 0 with hot (n_layer x n_expert, 1 = resident): when a token's last pick is not resident, the first
   // unpicked expert is, and their probabilities differ by less than m, the resident one is used instead.
   float swap_margin = 0.0f;
@@ -138,6 +142,11 @@ struct ForwardOptions {
 void act_rotate32(float* x, std::int64_t n);
 // one row to the Pelias int8 kernel's activation format and back (ForwardOptions::act_gpu256); n a multiple of 256
 void act_round_q8_256(float* x, std::int64_t n);
+// The live H gate (ForwardOptions::h_gate) on rows of a Q8_Z matrix: y[t][r] holds the full dot products on entry; on
+// return, for each token t and row r, the 32-blocks outside the kept fraction have their 8th bit replaced by 0.5, i.e.
+// y -= s_j * sum (h - 0.5) x over each dropped block. Blocks kept per row: round(f * blocks).
+void h_gate_correct_q8z(const std::uint8_t* data, std::uint64_t row_bytes, std::int64_t n_out, std::int64_t k, const float* x,
+                        std::int64_t n_tok, std::int64_t ldx, float* y, std::int64_t ldy, double f, int threads);
 // the same with eight scales per 256 (ForwardOptions::act_gpu256_sub 1) or a power-of-two exponent per 32 (sub 2)
 void act_round_q8_256x8(float* x, std::int64_t n);
 void act_round_q8_256e(float* x, std::int64_t n);

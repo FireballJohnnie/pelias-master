@@ -373,6 +373,56 @@ Status check_act_rounding(const ForwardOptions& o, const Qwen35MoeWeights& w) {
   return Status::good();
 }
 
+void h_gate_impl(const std::uint8_t* data, std::uint64_t row_bytes, int64_t n_out, int64_t k, const float* x, int64_t n_tok,
+                 int64_t ldx, float* y, int64_t ldy, double f, int threads) {
+  const int64_t nb = k / 32;
+  const int64_t keep = std::min<int64_t>(nb, std::max<int64_t>(0, static_cast<int64_t>(std::llround(f * static_cast<double>(nb)))));
+  if (keep == nb) return;
+  std::vector<float> X(z(n_tok * nb));  // sum of x^2 per token and 32-block
+  for (int64_t t = 0; t < n_tok; ++t)
+    for (int64_t j = 0; j < nb; ++j) {
+      float s2 = 0.0f;
+      for (int i = 0; i < 32; ++i) s2 += x[t * ldx + 32 * j + i] * x[t * ldx + 32 * j + i];
+      X[z(t * nb + j)] = s2;
+    }
+  parallel_items(n_out, threads, [&](int64_t r, int) {
+    const std::uint8_t* row = data + static_cast<uint64_t>(r) * row_bytes;
+    std::vector<float> s(z(nb)), hm(z(k)), score(z(nb));
+    std::vector<int64_t> idx(z(nb));
+    for (int64_t b = 0; b < k / 256; ++b) {
+      const std::uint8_t* p = row + 264 * b;
+      const float d = quant::fp16_to_fp32(static_cast<std::uint16_t>(p[0] | (p[1] << 8)));
+      std::uint64_t lv = 0;
+      for (int i = 0; i < 6; ++i) lv |= static_cast<std::uint64_t>(p[2 + i]) << (8 * i);
+      for (int j = 0; j < 8; ++j) {
+        s[z(8 * b + j)] = quant::q8_z_scale(d, static_cast<int>((lv >> (6 * j)) & 63u));
+        for (int i = 0; i < 32; ++i) {
+          const int q = static_cast<int>(static_cast<std::int8_t>(p[8 + 32 * j + i]));
+          hm[z(256 * b + 32 * j + i)] = static_cast<float>((q + 127) & 1) - 0.5f;
+        }
+      }
+    }
+    for (int64_t t = 0; t < n_tok; ++t) {
+      for (int64_t j = 0; j < nb; ++j) {
+        score[z(j)] = s[z(j)] * s[z(j)] * X[z(t * nb + j)];
+        idx[z(j)] = j;
+      }
+      // the nb - keep blocks with the smallest expected loss drop their 8th bit
+      std::nth_element(idx.begin(), idx.begin() + (nb - keep), idx.end(), [&](int64_t a, int64_t b2) {
+        return score[z(a)] < score[z(b2)] || (score[z(a)] == score[z(b2)] && a < b2);
+      });
+      float corr = 0.0f;
+      for (int64_t q = 0; q < nb - keep; ++q) {
+        const int64_t j = idx[z(q)];
+        float acc = 0.0f;
+        for (int i = 0; i < 32; ++i) acc += hm[z(32 * j + i)] * x[t * ldx + 32 * j + i];
+        corr += s[z(j)] * acc;
+      }
+      y[t * ldy + r] -= corr;
+    }
+  });
+}
+
 // matmul over the whole matrix, recording the activations for the importance matrix when asked
 void mm(const Ctx& c, const WeightView& w, const float* x, int64_t n_tok, int64_t ldx, float* y, int64_t ldy) {
   if (c.opt.imatrix && !w.rot32) c.opt.imatrix->add_dense(w.name, x, n_tok, ldx, static_cast<int64_t>(w.ne[0]));
@@ -394,9 +444,13 @@ void mm(const Ctx& c, const WeightView& w, const float* x, int64_t n_tok, int64_
       prep_row(xr.data() + t * k, k, f, w.rot32, c.opt.act_rot32);
     }
     matmul(w, xr.data(), n_tok, k, y, ldy, c.threads, c.sc);
+    if (c.opt.h_gate > 0.0 && static_cast<quant::Type>(w.type) == quant::Type::q8_z)
+      h_gate_impl(w.data, w.row_bytes, static_cast<int64_t>(w.ne[1]), k, xr.data(), n_tok, k, y, ldy, c.opt.h_gate, c.threads);
     return;
   }
   matmul(w, x, n_tok, ldx, y, ldy, c.threads, c.sc);
+  if (c.opt.h_gate > 0.0 && static_cast<quant::Type>(w.type) == quant::Type::q8_z)
+    h_gate_impl(w.data, w.row_bytes, static_cast<int64_t>(w.ne[1]), static_cast<int64_t>(w.ne[0]), x, n_tok, ldx, y, ldy, c.opt.h_gate, c.threads);
 }
 
 void full_attention(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* out) {
@@ -811,6 +865,7 @@ Status forward_reference(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, cons
   if (opt.act_bits != 8 && (opt.act_bits != 4 || !opt.act_int8_gpu))
     return Status::fail(Code::invalid_argument, "4-bit activations need the gpu path (--act-int8-path gpu); only 8 and 4 bits exist");
   if (opt.neuron_skip < 0.0 || opt.neuron_skip >= 1.0) return Status::fail(Code::invalid_argument, "neuron skipping takes a fraction in [0, 1)");
+  if (opt.h_gate < 0.0 || opt.h_gate > 1.0) return Status::fail(Code::invalid_argument, "the live H gate takes a fraction in (0, 1]");
   if (opt.cold_gpu256 && (!opt.act_int8_gpu || opt.act_bits != 8 || opt.hot.size() != static_cast<std::size_t>(s.n_layer) * s.n_expert))
     return Status::fail(Code::invalid_argument, "the cold-expert format needs 8-bit activations on the gpu path and a hot set of n_layer x n_expert entries");
   if (opt.swap_margin > 0.0f && opt.hot.size() != static_cast<std::size_t>(s.n_layer) * s.n_expert)
@@ -931,4 +986,9 @@ void act_round_q8_256e(float* x, std::int64_t n) {
     }
   }
 }
+void h_gate_correct_q8z(const std::uint8_t* data, std::uint64_t row_bytes, std::int64_t n_out, std::int64_t k, const float* x,
+                        std::int64_t n_tok, std::int64_t ldx, float* y, std::int64_t ldy, double f, int threads) {
+  h_gate_impl(data, row_bytes, n_out, k, x, n_tok, ldx, y, ldy, f, threads);
+}
+
 }  // namespace pelias::model

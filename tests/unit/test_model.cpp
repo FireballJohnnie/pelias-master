@@ -11,6 +11,8 @@
 #include "gguf_builder.h"
 #include "io/gguf_reader.h"
 #include "model/arch_qwen35moe.h"
+#include "quant/block_types.h"
+#include "quant/quant_cpu.h"
 #include "model/imatrix.h"
 #include "model/spec.h"
 #include "pelias_test.h"
@@ -301,4 +303,76 @@ TEST(act_round_per32_refinements_of_the_256_layout) {
     eo += std::pow(o[size_t(j)] - x[size_t(j)], 2);
   }
   CHECK(ea <= ee && ee <= eo);
+}
+
+TEST(h_gate_live_drops_the_8th_bit_on_the_smallest_expected_loss) {
+  // 3 rows x 512 inputs of Q8_Z, 2 tokens: f = 1 changes nothing; f = 0 is the base with H = 0.5 everywhere; f = 0.5
+  // keeps the 8th bit on the 8 of 16 blocks with the largest s^2 * sum(x^2) per row and token
+  const int64_t k = 512, n_out = 3, n_tok = 2, nb = k / 32;
+  std::vector<float> w(static_cast<size_t>(n_out * k)), x(static_cast<size_t>(n_tok * k));
+  std::uint32_t s = 5;
+  auto rnd = [&]() { s = s * 1664525u + 1013904223u; return (static_cast<float>(s >> 8) / 16777216.0f) - 0.5f; };
+  for (float& v : w) v = 0.05f * rnd();
+  for (int64_t i = 0; i < n_tok * k; ++i) x[static_cast<size_t>(i)] = rnd() * (i % 97 == 0 ? 8.0f : 1.0f);
+  const std::uint64_t rb = pelias::quant::row_bytes(200, static_cast<std::uint64_t>(k));
+  std::vector<std::uint8_t> q(static_cast<size_t>(rb * static_cast<std::uint64_t>(n_out)));
+  for (int64_t r = 0; r < n_out; ++r)
+    CHECK(pelias::quant::quantize_row(pelias::quant::Type::q8_z, w.data() + r * k, q.data() + static_cast<std::uint64_t>(r) * rb, k).ok());
+  // reference values per element: full, and base with H = 0.5
+  std::vector<double> full(static_cast<size_t>(n_out * k)), half(full.size()), sc(static_cast<size_t>(n_out * nb));
+  for (int64_t r = 0; r < n_out; ++r)
+    for (int64_t b = 0; b < k / 256; ++b) {
+      const std::uint8_t* p = q.data() + static_cast<std::uint64_t>(r) * rb + static_cast<std::uint64_t>(264 * b);
+      const float d = pelias::quant::fp16_to_fp32(static_cast<std::uint16_t>(p[0] | (p[1] << 8)));
+      std::uint64_t lv = 0;
+      for (int i = 0; i < 6; ++i) lv |= static_cast<std::uint64_t>(p[2 + i]) << (8 * i);
+      for (int j = 0; j < 8; ++j) {
+        const double sj = pelias::quant::q8_z_scale(d, static_cast<int>((lv >> (6 * j)) & 63u));
+        sc[static_cast<size_t>(r * nb + 8 * b + j)] = sj;
+        for (int i = 0; i < 32; ++i) {
+          const int qv = static_cast<std::int8_t>(p[8 + 32 * j + i]);
+          const size_t at = static_cast<size_t>(r * k + 256 * b + 32 * j + i);
+          full[at] = sj * qv;
+          half[at] = sj * (qv - ((qv + 127) & 1) + 0.5);
+        }
+      }
+    }
+  auto run = [&](double f) {
+    std::vector<float> y(static_cast<size_t>(n_tok * n_out));
+    for (int64_t t = 0; t < n_tok; ++t)
+      for (int64_t r = 0; r < n_out; ++r) {
+        double a = 0;
+        for (int64_t i = 0; i < k; ++i) a += full[static_cast<size_t>(r * k + i)] * x[static_cast<size_t>(t * k + i)];
+        y[static_cast<size_t>(t * n_out + r)] = static_cast<float>(a);
+      }
+    pelias::model::h_gate_correct_q8z(q.data(), rb, n_out, k, x.data(), n_tok, k, y.data(), n_out, f, 2);
+    return y;
+  };
+  const std::vector<float> y1 = run(1.0), y0 = run(0.0), yh = run(0.5);
+  for (int64_t t = 0; t < n_tok; ++t)
+    for (int64_t r = 0; r < n_out; ++r) {
+      double a1 = 0, a0 = 0;
+      std::vector<std::pair<double, int64_t>> sco;
+      for (int64_t j = 0; j < nb; ++j) {
+        double x2 = 0;
+        for (int i = 0; i < 32; ++i) x2 += double(x[static_cast<size_t>(t * k + 32 * j + i)]) * x[static_cast<size_t>(t * k + 32 * j + i)];
+        sco.push_back({sc[static_cast<size_t>(r * nb + j)] * sc[static_cast<size_t>(r * nb + j)] * x2, j});
+      }
+      std::sort(sco.begin(), sco.end());
+      std::vector<bool> kept(static_cast<size_t>(nb), false);
+      for (int64_t q2 = nb / 2; q2 < nb; ++q2) kept[static_cast<size_t>(sco[static_cast<size_t>(q2)].second)] = true;
+      double ah = 0;
+      for (int64_t i = 0; i < k; ++i) {
+        const size_t at = static_cast<size_t>(r * k + i);
+        const double xv = x[static_cast<size_t>(t * k + i)];
+        a1 += full[at] * xv;
+        a0 += half[at] * xv;
+        ah += (kept[static_cast<size_t>(i / 32)] ? full[at] : half[at]) * xv;
+      }
+      const size_t o = static_cast<size_t>(t * n_out + r);
+      CHECK(std::fabs(y1[o] - a1) < 1e-4 * (1 + std::fabs(a1)));
+      CHECK(std::fabs(y0[o] - a0) < 1e-4 * (1 + std::fabs(a0)));
+      CHECK(std::fabs(yh[o] - ah) < 1e-4 * (1 + std::fabs(ah)));
+      CHECK(std::fabs(a0 - a1) > 1e-6);
+    }
 }
