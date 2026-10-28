@@ -12,6 +12,7 @@
 //                with 0.5 through the activation block sum; f = 0, 0.25, 1
 //   tdecode prep   : activation quantization per 32 + the 8 bit planes by warp ballot, checked against the host
 //   tdecode gemv2  : version 2 kernels (lanes split each row), cold L2 (64 MiB written between launches), median of 50
+//   tdecode gemv3  : versions 2 and 3 (v3: 2 or 4 rows per lane, every load issued before any arithmetic), cold L2
 // Device layouts are the engine's (repacked at load from the GGUF blocks): headers and H bits in their own arrays.
 // Build (WSL): nvcc -std=c++17 -O3 -arch=sm_89 tdecode.cu -o tdecode
 #include <cuda_fp16.h>
@@ -425,8 +426,152 @@ __global__ void gemv_w(const int8_t* __restrict__ v8, const uint8_t* __restrict_
   if (r < n && part == 0) y[r] = acc;
 }
 
+// ---- version 3 (run A, 2026-10-28 19:4x): v2's lane split, but each lane takes RPL rows and issues every row's loads
+// before any arithmetic (RPL x the bytes in flight per lane, the activation slice loaded once for RPL rows). v2 reached
+// 324 GB/s cold on 8192 x 2048 (64 % of 504): the loads of one lane were serialized behind its own arithmetic.
+// streaming 16-byte load (cache-streaming hint: the weights are read once, keep them from evicting the activations)
+__device__ __forceinline__ int4 ld_cs4(const int4* p) {
+  int4 r;
+  asm("ld.global.cs.v4.s32 {%0, %1, %2, %3}, [%4];" : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "l"(p));
+  return r;
+}
+
+template <int ROUTE>
+struct RowRegs;
+template <>
+struct RowRegs<0> { int4 w[8]; };
+template <>
+struct RowRegs<1> { uint32_t wd[29]; };
+template <>
+struct RowRegs<2> { uint32_t wd[29]; };
+template <>
+struct RowRegs<3> { uint32_t wd[29]; };
+
+template <int K, int ROUTE>
+__device__ __forceinline__ void load_row(RowRegs<ROUTE>& R, int r, int part, const int8_t* __restrict__ v8, const uint8_t* __restrict__ base) {
+  if constexpr (ROUTE == 0) {
+    const int4* w4 = reinterpret_cast<const int4*>(v8 + static_cast<size_t>(r) * K + part * 128);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) R.w[i] = ld_cs4(w4 + i);
+  } else {
+    const int4* b4 = reinterpret_cast<const int4*>(base + static_cast<size_t>(r) * (K / 256) * 224 + part * 112);
+#pragma unroll
+    for (int i = 0; i < 7; ++i) {
+      const int4 t = ld_cs4(b4 + i);
+      R.wd[4 * i] = static_cast<uint32_t>(t.x); R.wd[4 * i + 1] = static_cast<uint32_t>(t.y);
+      R.wd[4 * i + 2] = static_cast<uint32_t>(t.z); R.wd[4 * i + 3] = static_cast<uint32_t>(t.w);
+    }
+    R.wd[28] = 0u;
+  }
+}
+
+template <int K, int ROUTE>
+__device__ __forceinline__ float compute_row(const RowRegs<ROUTE>& R, const int* xw, int r, int part, int n, const uint64_t* __restrict__ hdr,
+                                             const uint8_t* __restrict__ mask, const uint32_t* __restrict__ hb, const uint32_t* __restrict__ hp,
+                                             const uint8_t* __restrict__ sel, const float* __restrict__ sc, const int* __restrict__ sm,
+                                             const uint32_t* __restrict__ pl) {
+  const int j0 = part * 4;
+  float acc = 0.f;
+  if constexpr (ROUTE == 0) {
+#pragma unroll
+    for (int jj = 0; jj < 4; ++jj) {
+      const int jg = j0 + jj;
+      int p = 0;
+      p = __dp4a(R.w[2 * jj].x, xw[8 * jj], p); p = __dp4a(R.w[2 * jj].y, xw[8 * jj + 1], p);
+      p = __dp4a(R.w[2 * jj].z, xw[8 * jj + 2], p); p = __dp4a(R.w[2 * jj].w, xw[8 * jj + 3], p);
+      p = __dp4a(R.w[2 * jj + 1].x, xw[8 * jj + 4], p); p = __dp4a(R.w[2 * jj + 1].y, xw[8 * jj + 5], p);
+      p = __dp4a(R.w[2 * jj + 1].z, xw[8 * jj + 6], p); p = __dp4a(R.w[2 * jj + 1].w, xw[8 * jj + 7], p);
+      acc += zscale(hdr[static_cast<size_t>(r) * (K / 256) + jg / 8], jg % 8) * __ldg(sc + jg) * static_cast<float>(p);
+    }
+  } else {
+#pragma unroll
+    for (int jj = 0; jj < 4; ++jj) {
+      const int jg = j0 + jj, B = jg / 8, j = jg % 8;
+      const size_t rb = static_cast<size_t>(r) * (K / 256) + B;
+      int pb = 0;
+#pragma unroll
+      for (int g = 0; g < 8; ++g) {
+        uint32_t packed = 0;
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+          const int i = 32 * jj + 4 * g + t, bit = 7 * i;
+          const uint32_t v = __funnelshift_r(R.wd[bit >> 5], R.wd[(bit >> 5) + 1], bit & 31) & 127u;
+          packed |= v << (8 * t);
+        }
+        pb = __dp4a(static_cast<int>(packed), xw[8 * jj + g], pb);
+      }
+      const int sx = __ldg(sm + jg);
+      bool readH = false;
+      uint32_t H = 0;
+      if (ROUTE == 1 || ROUTE == 2) {
+        const unsigned m = mask[rb];
+        if ((m >> j) & 1u) {
+          readH = true;
+          H = hb[rb * 2 + __popc(m & ((1u << j) - 1u))];
+        }
+      } else if (__ldg(sel + jg)) {
+        readH = true;
+        H = hp[static_cast<size_t>(jg) * n + r];
+      }
+      int hx = 0;
+      if (readH) {
+        if (ROUTE == 1) {
+#pragma unroll
+          for (int g = 0; g < 8; ++g) {
+            const uint32_t nib = (H >> (4 * g)) & 0xfu;
+            hx = __dp4a(static_cast<int>((nib * 0x00204081u) & 0x01010101u), xw[8 * jj + g], hx);
+          }
+        } else {
+          const uint32_t* pp = pl + jg * 8;
+          hx = -128 * __popc(H);
+#pragma unroll
+          for (int k = 0; k < 8; ++k) hx += __popc(H & __ldg(pp + k)) << k;
+        }
+      }
+      const int P = 2 * pb - 127 * sx;
+      const int P2 = (ROUTE == 3 && !readH) ? 2 * P + sx : 2 * (P + hx);
+      acc += zscale(hdr[rb], j) * __ldg(sc + jg) * (0.5f * static_cast<float>(P2));
+    }
+  }
+  return acc;
+}
+
+template <int K, int ROUTE, int RPL>
+__global__ void gemv_w3(const int8_t* __restrict__ v8, const uint8_t* __restrict__ base, const uint64_t* __restrict__ hdr,
+                        const uint8_t* __restrict__ mask, const uint32_t* __restrict__ hb, const uint32_t* __restrict__ hp,
+                        const uint8_t* __restrict__ sel, int n, const int8_t* __restrict__ q, const float* __restrict__ sc,
+                        const int* __restrict__ sm, const uint32_t* __restrict__ pl, float* __restrict__ y) {
+  constexpr int LPR = K / 128;
+  static_assert(LPR >= 1 && LPR <= 32 && (32 % LPR) == 0, "K / 128 lanes per row must divide a warp");
+  const int gt = blockIdx.x * blockDim.x + threadIdx.x;
+  const int g = gt / LPR, part = gt % LPR;
+  RowRegs<ROUTE> R[RPL];
+#pragma unroll
+  for (int k = 0; k < RPL; ++k) {
+    const int r = g * RPL + k;
+    if (r < n) load_row<K, ROUTE>(R[k], r, part, v8, base);
+  }
+  int xw[32];
+  {
+    const int4* x4 = reinterpret_cast<const int4*>(q + part * 128);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int4 t = __ldg(x4 + i);
+      xw[4 * i] = t.x; xw[4 * i + 1] = t.y; xw[4 * i + 2] = t.z; xw[4 * i + 3] = t.w;
+    }
+  }
+#pragma unroll
+  for (int k = 0; k < RPL; ++k) {
+    const int r = g * RPL + k;
+    float acc = r < n ? compute_row<K, ROUTE>(R[k], xw, r, part, n, hdr, mask, hb, hp, sel, sc, sm, pl) : 0.f;
+#pragma unroll
+    for (int o = LPR / 2; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+    if (r < n && part == 0) y[r] = acc;
+  }
+}
+
 // ------------------------------------------------------------------------------------------------ host side
-static bool g_cold = false, g_v1 = true, g_v2 = false;
+static bool g_cold = false, g_v1 = true, g_v2 = false, g_v3 = false;
 static void* g_flush = nullptr;
 static const size_t kFlushBytes = 64ull << 20;
 
@@ -722,6 +867,31 @@ static int run_shape(int n, std::mt19937& rng) {
     fails += check("v2 ZH arrays, H on 100 %", z100, zbB + static_cast<double>(n) * nb * 4,
                    [&] { gemv_w<K, 3><<<G2, T2>>>(nullptr, d_bz, d_hdr, nullptr, nullptr, d_hp, d_s100, n, dq, dsc, dsm, dpl, d_y); });
   }
+  if (g_v3) {
+    auto v3set = [&](auto rpl_tag) {
+      constexpr int RPL = decltype(rpl_tag)::value;
+      const int T3 = 128, G3 = (((n + RPL - 1) / RPL) * (K / 128) + T3 - 1) / T3;
+      std::printf("  -- version 3 (%d lanes per row, %d rows per lane, loads before arithmetic)\n", K / 128, RPL);
+      char nm[64];
+      std::snprintf(nm, sizeof nm, "v3x%d Q8_Z (int8, baseline)", RPL);
+      fails += check(nm, r8, static_cast<double>(n) * K + hdrB,
+                     [&] { gemv_w3<K, 0, RPL><<<G3, T3>>>(d_v8, nullptr, d_hdr, nullptr, nullptr, nullptr, nullptr, n, dq, dsc, dsm, dpl, d_y); });
+      std::snprintf(nm, sizeof nm, "v3x%d Q7_ZT, H as int8 bytes", RPL);
+      fails += check(nm, r7, ztB,
+                     [&] { gemv_w3<K, 1, RPL><<<G3, T3>>>(nullptr, d_b7, d_hdr, d_mask, d_hb, nullptr, nullptr, n, dq, dsc, dsm, dpl, d_y); });
+      std::snprintf(nm, sizeof nm, "v3x%d Q7_ZT, H by 1-bit decode", RPL);
+      fails += check(nm, r7, ztB,
+                     [&] { gemv_w3<K, 2, RPL><<<G3, T3>>>(nullptr, d_b7, d_hdr, d_mask, d_hb, nullptr, nullptr, n, dq, dsc, dsm, dpl, d_y); });
+      std::snprintf(nm, sizeof nm, "v3x%d ZH arrays, H on 0 %%", RPL);
+      fails += check(nm, z0, zbB,
+                     [&] { gemv_w3<K, 3, RPL><<<G3, T3>>>(nullptr, d_bz, d_hdr, nullptr, nullptr, d_hp, d_s0, n, dq, dsc, dsm, dpl, d_y); });
+      std::snprintf(nm, sizeof nm, "v3x%d ZH arrays, H on 25 %%", RPL);
+      fails += check(nm, z25, zbB + static_cast<double>(n) * (nb / 4) * 4,
+                     [&] { gemv_w3<K, 3, RPL><<<G3, T3>>>(nullptr, d_bz, d_hdr, nullptr, nullptr, d_hp, d_s25, n, dq, dsc, dsm, dpl, d_y); });
+    };
+    v3set(std::integral_constant<int, 2>{});
+    v3set(std::integral_constant<int, 4>{});
+  }
   CK(cudaGetLastError());
   for (void* p : {static_cast<void*>(dx), static_cast<void*>(dq), static_cast<void*>(dsc), static_cast<void*>(dsm), static_cast<void*>(dpl),
                   static_cast<void*>(d_v8), static_cast<void*>(d_hdr), static_cast<void*>(d_b7), static_cast<void*>(d_bz), static_cast<void*>(d_mask),
@@ -734,7 +904,14 @@ static int run_shape(int n, std::mt19937& rng) {
 int main(int argc, char** argv) {
   const std::string cmd = argc > 1 ? argv[1] : "";
   if (cmd == "mma") return run_mma();
-  if (cmd == "gemv" || cmd == "prep" || cmd == "gemv2") {
+  if (cmd == "gemv" || cmd == "prep" || cmd == "gemv2" || cmd == "gemv3") {
+    if (cmd == "gemv3") {  // versions 2 and 3, cold L2, median of 50 (run A)
+      g_v1 = false;
+      g_v2 = true;
+      g_v3 = true;
+      g_cold = true;
+      CK(cudaMalloc(&g_flush, kFlushBytes));
+    }
     if (cmd == "gemv2") {  // version 2 only, cold L2, median of 50
       g_v1 = false;
       g_v2 = true;
@@ -751,6 +928,6 @@ int main(int argc, char** argv) {
     std::printf("%s\n", fails ? "SOME ROUTES FAILED" : "all routes match the host reference");
     return fails ? 1 : 0;
   }
-  std::fprintf(stderr, "usage: tdecode mma | gemv | gemv2\n");
+  std::fprintf(stderr, "usage: tdecode mma | gemv | gemv2 | gemv3\n");
   return 1;
 }
