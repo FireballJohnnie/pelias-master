@@ -154,7 +154,8 @@ void usage() {
       "                                  chunk-clustered standard error, 95 % interval, top-token disagreements, verdict\n"
       "  imatrix --model FILE --file TEXT --out OUT.gguf [--ctx 512] [--chunks N] [--threads N] [--no-nfc]\n"
       "                                  importance matrix from a calibration text, by the fp32 reference pass, in the\n"
-      "                                  reference's GGUF imatrix format (llama-quantize --imatrix reads it)\n"
+      "                                  reference's GGUF imatrix format (llama-quantize --imatrix reads it); weights the\n"
+      "                                  file stores rotated (quantize --rotate32) are collected on the rotated inputs\n"
       "  probe | train | export | serve | bench | web   not built yet (later steps)\n"
       "options: --log debug|info|warn|error (default info)");
 }
@@ -885,7 +886,8 @@ int cmd_imatrix(const Args& a) {
     std::fprintf(stderr, "pelias: %s\n", s.text().c_str());
     return 6;
   }
-  std::fprintf(stderr, "pelias imatrix: %zu entries over %u chunks written in %.1f s\n", col.entries().size(), col.chunks(), total.seconds());
+  std::fprintf(stderr, "pelias imatrix: %zu entries over %u chunks written in %.1f s; %zu collected in the rotated basis (pelias.rot32.tensors)\n",
+               col.entries().size(), col.chunks(), total.seconds(), col.rotated().size());
   return 0;
 }
 

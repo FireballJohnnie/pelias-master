@@ -41,9 +41,20 @@ void ImatrixCollector::add_dense(const std::string& name, const float* x, std::i
   e.counts[0] += static_cast<std::uint64_t>(n_tok);
 }
 
+std::vector<std::string> ImatrixCollector::rotated() const {
+  std::vector<std::string> v;
+  for (const auto& [name, on] : rotated_)
+    if (on && entries_.count(name) != 0) v.push_back(name);
+  return v;
+}
+
 Status ImatrixCollector::write(const std::string& path, const std::vector<std::string>& datasets, std::uint32_t chunk_size) const {
   std::vector<io::GgufKvBlob> kv = {io::gguf_kv_str("general.type", "imatrix"), io::gguf_kv_arr_str("imatrix.datasets", datasets),
                                     io::gguf_kv_u32("imatrix.chunk_count", chunks_), io::gguf_kv_u32("imatrix.chunk_size", chunk_size)};
+  if (const std::vector<std::string> rot = rotated(); !rot.empty()) {
+    kv.push_back(io::gguf_kv_str("pelias.rot32.kind", "walsh-hadamard-32-orthonormal-row-blocks"));
+    kv.push_back(io::gguf_kv_arr_str("pelias.rot32.tensors", rot));
+  }
   std::vector<io::GgufOutTensor> out;
   std::vector<const std::vector<float>*> data;
   std::vector<std::vector<float>> counts_f;  // counts as floats, kept alive until written

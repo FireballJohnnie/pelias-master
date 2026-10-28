@@ -10,6 +10,7 @@
 #include "gguf_builder.h"
 #include "io/gguf_reader.h"
 #include "model/arch_qwen35moe.h"
+#include "model/imatrix.h"
 #include "model/spec.h"
 #include "pelias_test.h"
 #include "verify/kl.h"
@@ -218,4 +219,15 @@ TEST(act_rotate32_is_orthonormal_and_spreads_a_spike) {
   s[5] = 100.0f;  // one spike: spread evenly over the block
   pelias::model::act_rotate32(s.data(), 32);
   for (float v : s) CHECK(std::fabs(std::fabs(v) - 100.0f / std::sqrt(32.0f)) < 1e-4f);
+}
+
+TEST(imatrix_lists_weights_collected_rotated) {
+  pelias::model::ImatrixCollector col;
+  std::vector<float> rows(16 * 32, 1.0f);
+  col.add_dense("blk.0.attn_qkv.weight", rows.data(), 16, 32, 32);
+  col.add_dense("blk.0.ffn_gate_inp.weight", rows.data(), 16, 32, 32);
+  col.mark_rotated("blk.0.attn_qkv.weight");
+  col.mark_rotated("blk.0.never_collected.weight");  // marked but no entry: not listed
+  const std::vector<std::string> r = col.rotated();
+  CHECK(r.size() == 1 && r[0] == "blk.0.attn_qkv.weight");
 }

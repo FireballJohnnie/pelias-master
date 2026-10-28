@@ -351,7 +351,17 @@ Status check_act_rounding(const ForwardOptions& o, const Qwen35MoeWeights& w) {
 
 // matmul over the whole matrix, recording the activations for the importance matrix when asked
 void mm(const Ctx& c, const WeightView& w, const float* x, int64_t n_tok, int64_t ldx, float* y, int64_t ldy) {
-  if (c.opt.imatrix) c.opt.imatrix->add_dense(w.name, x, n_tok, ldx, static_cast<int64_t>(w.ne[0]));
+  if (c.opt.imatrix && !w.rot32) c.opt.imatrix->add_dense(w.name, x, n_tok, ldx, static_cast<int64_t>(w.ne[0]));
+  if (c.opt.imatrix && w.rot32) {  // stored rotated: the quantizer sees the rotated inputs, so collect those
+    const int64_t k = static_cast<int64_t>(w.ne[0]);
+    std::vector<float> xh(z(n_tok * k));
+    for (int64_t t = 0; t < n_tok; ++t) {
+      std::memcpy(xh.data() + t * k, x + t * ldx, z(k) * sizeof(float));
+      act_rotate32(xh.data() + t * k, k);
+    }
+    c.opt.imatrix->add_dense(w.name, xh.data(), n_tok, k, k);
+    c.opt.imatrix->mark_rotated(w.name);
+  }
   if (const ActFmt f = act_format(c.opt, w); f != ActFmt::none || w.rot32) {
     const int64_t k = static_cast<int64_t>(w.ne[0]);
     std::vector<float> xr(z(n_tok * k));
@@ -723,13 +733,10 @@ Status forward_reference(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, cons
   if (Status st = check_act_rounding(opt, w); !st) return st;
   if (opt.route && (s.n_expert_used > 8 || s.n_expert > 32767))
     return Status::fail(Code::unsupported, "the routing record holds at most 8 picked experts of at most 32767");
-  if (opt.imatrix) {
-    bool any_rot = w.output.rot32;
-    for (const Qwen35MoeLayer& l : w.layers)
-      for (const WeightView* p : {&l.wq, &l.wk, &l.wv, &l.wo, &l.wqkv, &l.wgate, &l.wbeta, &l.walpha, &l.ssm_out, &l.up_exps, &l.gate_exps, &l.down_exps,
-                                  &l.up_shexp, &l.gate_shexp, &l.down_shexp})
-        any_rot = any_rot || p->rot32;
-    if (any_rot) return Status::fail(Code::unsupported, "collecting an importance matrix on a file with rotated weights is not built yet");
+  if (opt.imatrix) {  // rotated dense weights are collected in the rotated basis (mm); rotated routed experts are not built
+    bool exp_rot = false;
+    for (const Qwen35MoeLayer& l : w.layers) exp_rot = exp_rot || l.up_exps.rot32 || l.gate_exps.rot32 || l.down_exps.rot32;
+    if (exp_rot) return Status::fail(Code::unsupported, "collecting an importance matrix on a file with rotated routed experts is not built (game plan Block J: experts stay unrotated)");
   }
   const int threads = opt.threads > 0 ? opt.threads : static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
   const int64_t n = n_tokens, e = s.n_embd;

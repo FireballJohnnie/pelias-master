@@ -11,7 +11,8 @@
 //
 // File (GGUF): general.type "imatrix"; imatrix.datasets (string array), imatrix.chunk_count, imatrix.chunk_size (u32);
 // per weight W, tensors "W.in_sum2" (F32, [columns, matrices]), "W.counts" (F32, [1, matrices]) and "W.in_sum" (F32,
-// [columns, matrices]), W in name order. What is collected matches the reference tool's defaults: every "blk." matrix
+// [columns, matrices]), W in name order. When weights stored rotated were collected (their inputs rotated per 32 values
+// first, so the sums are of the rotated activations), pelias.rot32.kind and pelias.rot32.tensors name them. What is collected matches the reference tool's defaults: every "blk." matrix
 // multiply over at least 16 tokens (output.weight left out), sums in float, experts slot by slot then token by token.
 #pragma once
 
@@ -38,6 +39,10 @@ class ImatrixCollector {
   void add_dense(const std::string& name, const float* x, std::int64_t n_tok, std::int64_t ldx, std::int64_t columns);
   // one activation row into matrix `m` of an entry (experts; the caller keeps the reference's order)
   static void add_row(ImatrixEntry& e, std::int64_t m, const float* x);
+  // Records that `name`'s activations were collected after the 32-value Walsh-Hadamard rotation (the weight is stored
+  // rotated); the names are written as pelias.rot32.tensors so a quantizer can check it rotates the same weights.
+  void mark_rotated(const std::string& name) { rotated_[name] = true; }
+  [[nodiscard]] std::vector<std::string> rotated() const;
   void finish_chunk() { ++chunks_; }
   [[nodiscard]] std::uint32_t chunks() const { return chunks_; }
   [[nodiscard]] const std::map<std::string, ImatrixEntry>& entries() const { return entries_; }
@@ -46,6 +51,7 @@ class ImatrixCollector {
 
  private:
   std::map<std::string, ImatrixEntry> entries_;
+  std::map<std::string, bool> rotated_;
   std::uint32_t chunks_ = 0;
 };
 
