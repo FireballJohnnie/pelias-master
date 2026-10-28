@@ -1,4 +1,4 @@
-// provenance: original. Build: g++ -std=c++20 -O2 -Isrc -Iinclude tools/experiments/act_format_check.cpp -Wl,--start-group build/host/*.a -Wl,--end-group -lpthread
+// provenance: original. Build: g++ -std=c++20 -O2 -Isrc -Iinclude tools/experiments/act_format_check.cpp -Wl,--start-group build/host/*.a -Wl,--end-group -lpthread [rot]
 // paper check: eight fp32 scales per 256 (gpu256x8) vs q8_1 (gpu path, the measured a8all run), and the noise of
 // gpu256 / gpu256e / gpu256x8 relative to q8_1, on rows shaped like real activations (heavy tails, a few outliers)
 #include <cmath>
@@ -9,7 +9,8 @@
 #include "model/arch_qwen35moe.h"
 #include "quant/quant_cpu.h"
 namespace q = pelias::quant;
-int main() {
+int main(int argc, char**) {
+  const bool rot = argc > 1;
   std::mt19937 rng(42);
   std::student_t_distribution<float> heavy(3.0f);
   const int n = 2048, rows = 2000;
@@ -19,6 +20,7 @@ int main() {
     std::vector<float> x(n);
     for (auto& v : x) v = heavy(rng);
     for (int k = 0; k < 4; ++k) x[rng() % n] *= 20.0f;  // a few outlier channels, as in real activations
+    if (rot) pelias::model::act_rotate32(x.data(), n);  // dense inputs in t8r are rotated per 32 before the rounding
     std::vector<float> a = x, b = x, c = x, d = x;
     std::vector<std::uint8_t> blk(36);
     for (int i = 0; i < n; i += 32) {  // q8_1 as act_round_plain does it
