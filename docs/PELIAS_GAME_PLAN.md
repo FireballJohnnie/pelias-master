@@ -1090,6 +1090,14 @@ Likeliest candidates first, then stop and decide (keep the best file or keep exp
 - **GPU shortlist (author, 11:44):** the CPU reference picks the accuracy winners; the GPU engine tests (K3, speed) run only the best two or three files by their engine-format result (per-32, gpu256x8) against Unsloth on llama.cpp's GPU path (0.012864), at or under Unsloth's MTP size. fp32 results are background only (author, 11:41). Standings: **urm 0.012499 (-0.000365 [-0.000986, +0.000256], lower but not resolved; -6 KB)**; t8r 0.013106 (+0.000242 not resolved; -168 MB); splice and urm_PT not built. urm's engine format costs nothing over its fp32 (+0.000032); its experts are our rounding of Unsloth's types (fp32 +0.000236 vs Unsloth MTP, not resolved), so the splice (Unsloth's expert bytes, our rotated dense) is next: predicted about 0.01226, about -0.0006 vs the bar.
 - Build-readiness track unchanged: step 2 benches, R3 kernel with per-32 activation scales, MTP head, engine.
 
+### Next steps (author, 2026-10-28 12:35)
+
+1. **Build Q8_Z (sandbox):** quantizer (zip scales with a scale search, int8 values), reference dequantizer, recipe name, Pelias-only type id, unit tests against the measured error (0.000031 rotated attn_qkv).
+2. **Fable's check (a) (sandbox):** emulate fp16 partial sums per 256 flushed to fp32 in the reference's dense GEMM.
+3. **bench_gpu additions:** (b) fp16 vs fp32 accumulate mma rate (5 min); (c) texture-stream GB/s vs a plain read.
+4. **urm_Z (PC, author's OK first):** urm with every Q8_0 dense tensor as Q8_Z, engine format, paired against urm; plus check (a)'s paired run.
+5. **The engine handles P and H (author: "I want to see the engine handle P and H"):** in GP3-14 the engine reads _P files (a base plane plus refinement planes in their own arrays) and applies the H read rule (heat): hot experts in the GPU bank hold every plane; cold experts are read base plane first by the copy engines, the refinement plane queued second and applied if it arrives in time, skipped for that token if not; a cold expert promoted to the bank gets its refinement plane added as it moves. Dense tensors have no heat (read every token): Q8_Z through the texture path if checks (b) and (c) pass, else int8 v10. Engine gates for P/H: (i) with every plane read, logits identical to the unsplit file (KLD 0); (ii) base-only cold reads at the measured cold share, paired KLD against (i) (the _P cold gate, run on the reference first); (iii) tok/s and cold-path bytes per token, timed.
+
 ### Run list before the engine build (updated 2026-10-28 09:4x, after Block M and M2 d)
 
 Each PC run first matches the reference to our code's exact format (docs/PELIAS_NEW_METHODS.md rule).
