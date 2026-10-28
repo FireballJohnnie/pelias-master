@@ -79,7 +79,16 @@ struct ForwardOptions {
   // kernels keep the q8_1 scale in fp32 for some types, which this does not model (a second-order difference).
   std::vector<std::string> act_int8;
   bool act_int8_gpu = false;
+  // With act_int8: rotate every 32-value block of a rounded input with the orthonormal Walsh-Hadamard transform
+  // before the rounding and rotate it back after (game plan Block J, R1). Exact in real arithmetic when the weights
+  // are rotated the same way, so this measures only what the rotation does to the activation rounding error (a
+  // single large value is spread over the block's 32 values, which shrinks the block's scale).
+  bool act_rot32 = false;
 };
+
+// The orthonormal Walsh-Hadamard transform of every 32-value block of x[0..n) in place (n a multiple of 32). It is its
+// own inverse: applying it twice gives x back (to rounding).
+void act_rotate32(float* x, std::int64_t n);
 
 // Runs tokens[0..n_tokens) and writes the logits of positions [out_begin, out_end) to `logits`
 // ((out_end - out_begin) rows of spec.n_vocab floats). With `logits` null the output layer is skipped.

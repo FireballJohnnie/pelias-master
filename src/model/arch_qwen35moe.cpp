@@ -292,7 +292,7 @@ int act_block(ActFmt f) { return f == ActFmt::q8_k ? 256 : 32; }
 
 // one row to the 8-bit format and back: Q8_0 (32: d fp16, qs int8), q8_1 (32: d fp16, s fp16, qs int8) or Q8_K
 // (256: d fp32, qs int8, sums). The row length is a multiple of the block (checked once by check_act_rounding).
-void act_round_row(float* x, int64_t n, ActFmt f) {
+void act_round_plain(float* x, int64_t n, ActFmt f) {
   if (f == ActFmt::q8_k) {
     std::uint8_t b[292];
     for (int64_t i = 0; i < n; i += 256) {
@@ -313,6 +313,13 @@ void act_round_row(float* x, int64_t n, ActFmt f) {
     const float d = quant::fp16_to_fp32(dh);
     for (int j = 0; j < 32; ++j) x[i + j] = d * static_cast<float>(static_cast<std::int8_t>(b[qs + j]));
   }
+}
+
+// the rounding, with the optional Walsh-Hadamard rotation of each 32-value block around it (ForwardOptions::act_rot32)
+void act_round_row(float* x, int64_t n, ActFmt f, bool rot) {
+  if (rot) act_rotate32(x, n);
+  act_round_plain(x, n, f);
+  if (rot) act_rotate32(x, n);
 }
 
 // every rounded input row must be a whole number of blocks (the reference's own requirement for these products)
@@ -339,7 +346,7 @@ void mm(const Ctx& c, const WeightView& w, const float* x, int64_t n_tok, int64_
     std::vector<float> xr(z(n_tok * k));
     for (int64_t t = 0; t < n_tok; ++t) {
       std::memcpy(xr.data() + t * k, x + t * ldx, z(k) * sizeof(float));
-      act_round_row(xr.data() + t * k, k, f);
+      act_round_row(xr.data() + t * k, k, f, c.opt.act_rot32);
     }
     matmul(w, xr.data(), n_tok, k, y, ldy, c.threads, c.sc);
     return;
@@ -545,14 +552,14 @@ void moe(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* out) {
     // one input feeds both gate and up, rounded once (in llama.cpp both are the same type, so the same format)
     const ActFmt fgu = act_format(c.opt, l.gate_exps) != ActFmt::none ? act_format(c.opt, l.gate_exps) : act_format(c.opt, l.up_exps);
     if (fgu != ActFmt::none)
-      for (int64_t r = 0; r < m; ++r) act_round_row(sc.xe.data() + r * e, e, fgu);
+      for (int64_t r = 0; r < m; ++r) act_round_row(sc.xe.data() + r * e, e, fgu, c.opt.act_rot32);
     matmul_rows(l.gate_exps, static_cast<uint64_t>(ex), 0, ff, sc.xe.data(), m, e, sc.ge.data(), ff, sc);
     matmul_rows(l.up_exps, static_cast<uint64_t>(ex), 0, ff, sc.xe.data(), m, e, sc.ue.data(), ff, sc);
     for (int64_t i = 0; i < m * ff; ++i) sc.ge[z(i)] = silu(sc.ge[z(i)]) * sc.ue[z(i)];
     if (!hs.empty())
       for (int64_t r = 0; r < m; ++r) std::memcpy(hs.data() + list[z(r)] * ff, sc.ge.data() + r * ff, z(ff) * sizeof(float));
     if (const ActFmt fd = act_format(c.opt, l.down_exps); fd != ActFmt::none)
-      for (int64_t r = 0; r < m; ++r) act_round_row(sc.ge.data() + r * ff, ff, fd);
+      for (int64_t r = 0; r < m; ++r) act_round_row(sc.ge.data() + r * ff, ff, fd, c.opt.act_rot32);
     matmul_rows(l.down_exps, static_cast<uint64_t>(ex), 0, e, sc.ge.data(), m, ff, sc.ye.data(), e, sc);
     for (int64_t r = 0; r < m; ++r) {
       const int64_t slot = list[z(r)];
@@ -591,6 +598,21 @@ void moe(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* out) {
 }
 
 }  // namespace
+
+void act_rotate32(float* x, std::int64_t n) {
+  const float norm = 1.0f / std::sqrt(32.0f);
+  for (std::int64_t b = 0; b + 32 <= n; b += 32) {
+    float* v = x + b;
+    for (int h = 1; h < 32; h *= 2)
+      for (int i = 0; i < 32; i += 2 * h)
+        for (int j = i; j < i + h; ++j) {
+          const float a = v[j], d = v[j + h];
+          v[j] = a + d;
+          v[j + h] = a - d;
+        }
+    for (int j = 0; j < 32; ++j) v[j] *= norm;
+  }
+}
 
 Result<Qwen35MoeWeights> bind_qwen35moe(const io::GgufReader& r, const std::uint8_t* base, const Qwen35MoeSpec& s) {
   using R = Result<Qwen35MoeWeights>;

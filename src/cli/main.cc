@@ -139,11 +139,12 @@ void usage() {
       "                                  KL divergence of the model against a base file written by llama-perplexity\n"
       "                                  --kl-divergence-base, computed by Pelias's fp32 CPU reference forward pass;\n"
       "                                  --expert-stats: per layer and expert, how often it was picked and its routing weight\n"
-      "      [--dump-kld OUT.bin] [--act-int8 GROUPS] [--act-int8-path cpu|gpu]\n"
+      "      [--dump-kld OUT.bin] [--act-int8 GROUPS] [--act-int8-path cpu|gpu] [--act-rot h32]\n"
       "                                  --dump-kld: every scored token's KL, NLLs, delta-p and top-token match (for kld-compare);\n"
       "                                  --act-int8: round the inputs of quantized weights whose names contain one of the\n"
       "                                  comma-separated GROUPS (or 'all') to 8 bits first: cpu (default) = llama.cpp's CPU\n"
       "                                  format for each weight type (Q8_K / Q8_0 / Q8_1), gpu = q8_1\n"
+      "                                  --act-rot h32: rotate each 32-value block (Walsh-Hadamard) before rounding, back after\n"
       "  kld-compare --a A.bin --b B.bin [--name-a S] [--name-b S]\n"
       "                                  paired comparison of two --dump-kld files scored on the same base: mean difference,\n"
       "                                  chunk-clustered standard error, 95 % interval, top-token disagreements, verdict\n"
@@ -630,6 +631,18 @@ int cmd_kld(const Args& a) {
     }
     fo.act_int8_gpu = b == "gpu";
   }
+  if (a.has("act-rot")) {
+    const std::string r = a.get("act-rot");
+    if (fo.act_int8.empty()) {
+      std::fprintf(stderr, "pelias: --act-rot needs --act-int8\n");
+      return 1;
+    }
+    if (r != "h32") {
+      std::fprintf(stderr, "pelias: --act-rot is h32 (the 32-value Walsh-Hadamard rotation)\n");
+      return 1;
+    }
+    fo.act_rot32 = true;
+  }
   const std::string dump_path = a.get("dump-kld");
   if (!dump_path.empty() && std::ifstream(dump_path, std::ios::binary)) {
     std::fprintf(stderr, "pelias: %s already exists (nothing is overwritten)\n", dump_path.c_str());
@@ -639,7 +652,8 @@ int cmd_kld(const Args& a) {
   if (!fo.act_int8.empty()) {
     std::string list;
     for (const std::string& x : fo.act_int8) list += (list.empty() ? "" : ",") + x;
-    std::fprintf(stderr, "pelias kld: 8-bit activation rounding (%s path) on: %s\n", fo.act_int8_gpu ? "gpu" : "cpu", list.c_str());
+    std::fprintf(stderr, "pelias kld: 8-bit activation rounding (%s path%s) on: %s\n", fo.act_int8_gpu ? "gpu" : "cpu",
+                 fo.act_rot32 ? ", Walsh-Hadamard rotation per 32 values" : "", list.c_str());
   }
   const std::string stats_path = a.get("expert-stats");
   const std::size_t n_route = static_cast<std::size_t>(spec.value.n_layer) * spec.value.n_expert;

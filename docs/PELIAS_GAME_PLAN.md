@@ -578,6 +578,19 @@ $PELIAS imatrix --model $T/qwen36-Q4_K_M.pelias.gguf --file <calibration text> -
 
 ---
 
+### Block J: rotation and kernel efficiency (author, 10-27 21:1x; A)
+
+**Background (MEASURED 10-27):** GP1-03 d puts the GPU-style rounding cost on the dense layers: +0.000975 [+0.000280, +0.001669]; the experts cost nothing measurable (c). The int8 kernel is issue-bound: 13.4 instructions per mma, 37.7 % tensor busy (Nsight Compute r8-r10); expert down (K = 512) runs at 0.27-0.29 of int8 peak (O13).
+
+| Test | What | File changed | Prediction | Time |
+|---|---|---|---|---|
+| R1 | `--act-int8 attn,ssm_,shexp,output --act-int8-path gpu --act-rot h32`: each 32-value block of the dense inputs rotated (orthonormal Walsh-Hadamard), rounded, rotated back; weights untouched (exact when the weights are rotated the same way) | No | Between fp32 0.039013 and d 0.039988 if the real activations carry large single values per block; the tiny random model got worse with it (1.302053 against 1.286214), where activations have no outliers, so the direction is open | 25 min |
+| R2 | Dense weights rotated per 32 from bf16 and quantized to Q8_0; Pelias fp32 | Yes (B2) | Equal to the unrotated dense drift or better | About 1 h |
+| R3 | `ncu` on the int8 kernel before and after a `_P` plane layout with 1-2 instruction unpack, scales converted per tile on chip, next-tile overlap; shapes attn_qkv M=4096 and expert down K=512 | No | Instructions per mma below 13.4, tensor busy above 37.7 %, O13 above 0.29 | Kernel work, scoped before it starts |
+| R4 | VRAM bandwidth with and without locked memory clocks (admin) | No | At most +2 % (CUDA lowered the memory clock 11,501 to 11,251 MHz in the 10-27 power test) | 5 min |
+
+Run R1: `bash $R/block_j.sh r1` (updates the clone from the newest bundle, rebuilds build/m1, runs R1, compares against GP1-01 and GP1-03 d).
+
 ## Part 2. What gets fixed after the tests
 
 Each fix names the test that triggers it. Fixes with no trigger are corrections known now.

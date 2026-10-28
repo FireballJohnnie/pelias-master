@@ -9,6 +9,7 @@
 
 #include "gguf_builder.h"
 #include "io/gguf_reader.h"
+#include "model/arch_qwen35moe.h"
 #include "model/spec.h"
 #include "pelias_test.h"
 #include "verify/kl.h"
@@ -201,4 +202,20 @@ TEST(kl_compare_paired_statistics) {
   // different tokens, or a single chunk: refused
   CHECK(!pelias::verify::kl_compare(da, dump_of(b, 10, 8), "A", "B").ok());
   CHECK(!pelias::verify::kl_compare(dump_of(a, 40, 7), dump_of(b, 40, 7), "A", "B").ok());
+}
+
+TEST(act_rotate32_is_orthonormal_and_spreads_a_spike) {
+  std::vector<float> x(64), y;
+  for (int i = 0; i < 64; ++i) x[static_cast<std::size_t>(i)] = std::sin(0.37f * static_cast<float>(i)) * static_cast<float>(i % 7);
+  y = x;
+  pelias::model::act_rotate32(y.data(), 64);
+  double n0 = 0, n1 = 0;
+  for (int i = 0; i < 64; ++i) { n0 += double(x[size_t(i)]) * x[size_t(i)]; n1 += double(y[size_t(i)]) * y[size_t(i)]; }
+  CHECK(std::fabs(n0 - n1) < 1e-4 * n0);  // the length is kept
+  pelias::model::act_rotate32(y.data(), 64);
+  for (int i = 0; i < 64; ++i) CHECK(std::fabs(y[size_t(i)] - x[size_t(i)]) < 1e-5f);  // its own inverse
+  std::vector<float> s(32, 0.0f);
+  s[5] = 100.0f;  // one spike: spread evenly over the block
+  pelias::model::act_rotate32(s.data(), 32);
+  for (float v : s) CHECK(std::fabs(std::fabs(v) - 100.0f / std::sqrt(32.0f)) < 1e-4f);
 }
