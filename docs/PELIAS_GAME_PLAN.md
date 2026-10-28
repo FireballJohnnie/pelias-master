@@ -1023,6 +1023,12 @@ The exact pre-gating prediction gets 83.9 % of the next layer's picks with only 
 - **Kept:** the author's "tags" (a label per 256 plus a smaller label per 32, the block's "zip code") give the same error as a full fp16 scale per 32 for 0.25 fewer bits per weight. K-quants already use exactly this two-level addressing, which is why they are hard to beat.
 - **Possible next step (parked unless the author asks):** an 8-weight code (E8-style) at 4.25 bits on the same slices, sandbox only, about 15 min; RT cores cannot serve 8 dimensions, so it would be a build-time tool on the CUDA cores.
 
+**Split planes, and the definition of _P (author's principle, 2026-10-28 02:1x-02:20):**
+- **_P = any Pelias format stored as a base plane (the top bits) plus refinement planes (the low bits), each plane in its own array.** With every plane present the values are bit-identical to the source format (same bits, different arrangement), so accuracy changes only when a plane is deliberately left out.
+- **Three jobs, one layout:** (1) R3: the base plane laid out for a 1-2 instruction unpack into the tensor cores (today 13.4 instructions per mma); (2) anytime precision on the bus: a cold expert's base plane crosses PCIe first (copy engine) and the tensor cores start on it; the refinement follows and, the product being linear, its share (W_ref x) is computed and added when it arrives, or skipped for that token if it is late; (3) VRAM: a hot expert may keep only its base plane resident (Fable: Q5_P hot-bank gain about 0.52 GiB).
+- **Readers:** copy engines, tensor cores and regular CUDA cores (one shift-and-add per weight to merge). Not the RT cores: merging planes is arithmetic, not a search, and their tree costs about 9x the memory per number.
+- **Gate (one paired run on the reference):** worst case, every cold expert (outside the engine's 7.5 GiB hot set) at its base plane only (Q4_K -> 3-bit base), against the full file. A small paired cost makes split planes a speed lever with no VRAM cost; the reference option is not built yet.
+
 ### GP3-14 Masterwork step 10: the engine
 
 **Scope:**
