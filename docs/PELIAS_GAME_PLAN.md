@@ -648,6 +648,14 @@ Run R1: `bash $R/block_j.sh r1` (updates the clone from the newest bundle, rebui
 - **Predictions (written before the runs, Pelias scale, DERIVED from the llama.cpp sweep with the stock offset 0.039013 vs 0.040965):** Unsloth 0.0117-0.0130; t8r 0.0113-0.0135 (T8 0.0129-0.0141, minus about 0.0006 for the matrix, minus 0-0.001 for rotating mostly-Q8_0 dense weights); t8r vs Unsloth a tie or a t8r win; t9r 0.0003-0.0010 above t8r at 21.81 GB.
 - **Decision:** a resolved t8r win against Unsloth meets O20 on WikiText (Block E's second text still to confirm); a tie sends the work to Block F (per-layer allocation) with rotation kept.
 
+**Block L c results so far and the size rule (2026-10-28 03:0x):**
+- Unsloth through Pelias 0.012095 (prediction 0.0117-0.0130 met). t8r 0.012941; t8r vs Unsloth +0.000846 [+0.000283, +0.001408], t 2.98: Unsloth has less drift (7.0 %), prediction "tie or t8r win" MISSED; t8r carries Q6_K on attn_qkv/attn_q (40 tensors) where Unsloth has Q8_0, and the gap widened on hard chunks 79-80.
+- **Size rule (author, 03:04): a candidate counts only if its whole file is no larger than Unsloth's, 22,134,528,992 bytes, with blk.40 (the MTP block, 523.8 MB at T8 types) kept.** Under this rule t8r's file (22,495,826,144) is 361 MB over, and Unsloth's exact types plus the MTP block would be 524 MB over. A winner must beat Unsloth while also carrying the MTP block inside the same bytes.
+- **Two fitting recipes ready (sandbox, exact byte counts from Unsloth's header and T8's types; MTP block not scored by the reference, so its types change speed only):**
+  - **Mix A** (22,131,470,560 bytes, 3.1 MB under): Unsloth's types (all dense Q8_0), token_embd Q6_K, ssm_alpha/beta Q8_0 (were F32), MTP experts Q3_K, gate/up IQ4_XS in layers 13-27.
+  - **Mix B** (22,119,936,224 bytes, 14.6 MB under): as A but attn_qkv/attn_q at Q6_K (t8r style), so gate/up IQ4_XS only in layers 17-22.
+  - Both with dense rotated and the rotated imatrix. Middle layers take the IQ4_XS on the assumption (not measured) that first and last layers are the most sensitive; GP1-12-style per-layer measurement would replace it. t9r (IQ4_XS gate/up in every layer) measures the cost that decides between A and B.
+
 **Building Block C's rotated candidates (2026-10-28 00:4x):**
 - Done: `pelias imatrix` collects rotated dense weights in the rotated basis (BUILD_LOG 00:3x).
 - Gap found: Block C's recipes (per-tensor types, `--imatrix`, IQ4_XS) are built with llama-quantize, which cannot rotate; `pelias quantize --rotate32` rotates but has no recipe or imatrix input.
