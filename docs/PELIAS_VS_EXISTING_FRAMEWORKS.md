@@ -24,7 +24,7 @@ Paired runs over the same 25,500 tokens, 8-bit activations as the engine uses th
 | urm (Unsloth's types, our rotation) | Q8_0 | 0.012499 | -0.000365, not resolved | -6 KB |
 | urm_Z | **Q8_Z** (zip scales), 8.25 bits | 0.012402 | -0.000462, not resolved | -61.0 MB |
 | urm_Q7 | Q7_Z, pure 7-bit, 7.25 bits | 0.013524 | +0.000660, **resolved worse** | -305.1 MB |
-| urm_ZT (first version) | Q7_ZT, 7.53 bits | 0.012870 | -0.000006, exact tie | -236.4 MB |
+| urm_ZT (first version, weighted levels) | Q7_ZT, 7.53 bits | 0.012870 | -0.000006, exact tie | -236.4 MB |
 | **urm_ZT2 (fixed)** | **Q7_ZT, 7.53 bits** | **0.012536** | **-0.000328, not resolved** | **-236.4 MB** |
 | urm_Z with the live H gate (25 %) | Q8_Z stored, ~7.5 bits read | *running* | *at chunk 20: 0.01213 vs urm_Z 0.01189 (partial)* | -61.0 MB stored |
 
@@ -54,7 +54,7 @@ Labels: **MEASURED (whole model)** = paired run on the PC; **MEASURED (sandbox)*
 | Rotate the dense tensors, not the experts | Rotating the experts made the file worse (+0.003979, R2b), so they stay as stored | MEASURED |
 | Q8_Z, the author's zip scales with 8-bit values [8] | Same accuracy as Q8_0 at -61 MB | MEASURED |
 | Q7_ZT, the 8th bit as a gate [9] | -236 MB, -0.000328 vs Unsloth, no difference from the 8-bit file; pure 7-bit, by contrast, loses (resolved) | MEASURED |
-| Catching our own over-fit | The first Q7_ZT weighted its level search by the calibration text and spiked on two chunks (0.0424 / 0.0397); the fix (plain levels, square-root importance for the gate only) removed the spikes and moved the result from a tie to ahead | MEASURED |
+| Plain level search for Q7_ZT | The first Q7_ZT (importance-weighted levels) tied Unsloth; the second (plain levels, square-root importance for the gate only) came out ahead. The gap between them does not resolve (t -0.86), and the first version's two bad chunks were one or two flipped tokens each, so the cause is open | MEASURED (result) / open (cause) |
 | Fused int8 kernel (v10) [4] | 1.39-1.84x the bf16 path, all 20 shapes, quantization fused into RMSNorm | MEASURED (kernel bench) |
 | Grouped int8 launch for all experts (v12) [5] | 2.5-3.0x the bf16 kernel grouped the same way | MEASURED (kernel bench) |
 | Dual bus | CPU and GPU reading RAM at once: 26.56 + 21.06 = 47.62 GB/s, 93 % of the 51.2 GB/s peak | MEASURED (probe) |
@@ -110,7 +110,6 @@ Labels: **MEASURED (whole model)** = paired run on the PC; **MEASURED (sandbox)*
 | Idea | Result |
 |---|---|
 | Pure 7-bit everywhere | +0.001122 vs the 8-bit file, resolved worse |
-| Importance-weighted level search | Over-fits the calibration text (two chunks at 2-3x) |
 | Plain two-stage E8 codebook | Ties the K-quant line at 4 bits, no gain without Hessian-aware rounding |
 | Empty activation bit planes with one scale per 32 | None occur |
 | Expert deferral; near-tie expert swap | +0.0042 and +0.0017, resolved worse |
@@ -125,7 +124,8 @@ Limited to what their formats do; we have not tested the other projects themselv
 | Area | Existing (format facts) | Pelias (labelled) |
 |---|---|---|
 | Between 6 and 8 bits | llama.cpp goes from Q6_K (6.56 bpw) to Q8_0 (8.5 bpw, 0.5 bpw of it scales); Unsloth keeps sensitive dense tensors at Q8_0, a whole tensor at a time | Q8_Z 8.25 bpw (same accuracy, MEASURED); Q7_ZT 7.53 bpw with the 8th bit per 32-block (no difference from Q8_Z, MEASURED) |
-| Importance matrix | Weighted K-quant search; none for Q8_0 | Used only to rank the gates, square-rooted; a weighted level search over-fit in our own test (MEASURED); not shown for other tools |
+| Importance matrix | Weighted K-quant search; none for Q8_0 | Used only to rank the gates, square-rooted (ranking by importance: 0.000061 vs 0.000074 plain, MEASURED sandbox); whether a weighted level search hurts is open (our first Q7_ZT's bad chunks were single flipped tokens) |
+| Fragile tokens | — | Chunk 24 holds one token that every rotated file flips hard (KL 2.5-8.1) and Unsloth does not (0.56): a lead, not yet explained |
 | Bits and memory | One tensor, one memory pool, one unit | Base and 8th bit splittable across memories and units, exact (MEASURED); speed PLAN |
 | Rotation | QuaRot, SpinQuant, QuIP# rotate linear layers of the (mostly dense) models they report | Dense tensors only on this MoE model; experts left as stored (MEASURED) |
 | Bit-serial decoding | Exists (T-MAC, Any-Precision LLM) | New here: the per-32-block gate, the 0.5 fill, the split across memories (MEASURED pieces) |

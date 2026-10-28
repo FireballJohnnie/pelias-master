@@ -21,4 +21,4 @@ Unconventional or newly derived methods that are **proven to work**. Entry rule:
 
 Methods 1-3 and 7 are one idea (rotation per 32); urm (game plan) is the test that turns it into a result against Unsloth at the same size. Methods 8-12 are the author's bit-level line (zip scales, the 8th bit as a gate, T-decode).
 
-**Proven not to work (kept so they are not retried):** pure 7-bit values everywhere (urm_Q7 +0.001122 vs urm_Z, resolved worse); a plain two-stage E8 codebook (ties the K-quant line at 4 bits); empty activation bit planes with one scale per 32 (none occur); a level search weighted by the importance matrix (over-fits the calibration text: urm_ZT chunks 23-24 at 2-3x).
+**Proven not to work (kept so they are not retried):** pure 7-bit values everywhere (urm_Q7 +0.001122 vs urm_Z, resolved worse); a plain two-stage E8 codebook (ties the K-quant line at 4 bits); empty activation bit planes with one scale per 32 (none occur); (not proven either way: a level search weighted by the importance matrix; urm_ZT's two bad chunks turned out to be one or two flipped tokens each, and urm_ZT2 vs urm_ZT does not resolve).
