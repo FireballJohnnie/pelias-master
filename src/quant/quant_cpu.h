@@ -70,6 +70,16 @@ float q7_z_scale(float d, int lv);
 // q = 2b + h - 127; others: q = 2b - 127 (odd grid). Value = s_j * q. The gates go to the two 32-blocks where the 8th bit
 // removes the most squared error, weighted by the square root of the importance when one is given (levels by plain error).
 void q7_zt_block(const float* x, std::uint8_t* out, const float* qw);
+// Q4_TG (Pelias-only, 256 per block, 144 bytes = 4.5 bits per weight, the size of Q4_K; the author's bit-tag matrix at 4
+// bits, C4, run E): fp16 d and eight 6-bit levels as Q8_Z (s_j = (d * lv_j) / 63, one per 32-block), then one tag byte per
+// 32-block (2 bits per 8 values, group g in bits 2g..2g+1) choosing that group's grid, then 128 bytes of 4-bit codes (value
+// i in byte 16 + i / 2, low nibble first). Grids (16 levels, top 1): 0 uniform, 1 log ratio 1.3, 2 log ratio 1.45, 3
+// uniform x 0.6. Value = s_j * grid[tag][code]. Scale per 32-block searched, the tag per group chosen by the (importance-
+// weighted when given) squared error, then the codes and tags chosen again with the stored scale.
+void q4_tg_block(const float* x, std::uint8_t* out, const float* qw);
+void quantize_q4_tg(const float* x, std::uint8_t* out, std::int64_t n);
+void dequantize_q4_tg(const std::uint8_t* in, float* y, std::int64_t n);
+const float* q4_tg_grid(int tag);  // 16 levels, ascending
 void quantize_q7_zt(const float* x, std::uint8_t* out, std::int64_t n);
 void dequantize_q7_zt(const std::uint8_t* in, float* y, std::int64_t n);
 void quantize_q8_1(const float* x, std::uint8_t* out, std::int64_t n);

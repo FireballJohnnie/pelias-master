@@ -260,3 +260,46 @@ TEST(q7_z_layout_and_round_trip) {
   CHECK(q::dequantize_row(q::Type::q7_z, zb.data(), back.data(), 256).ok());
   for (float v : back) CHECK(v == 0.0f);
 }
+
+TEST(q4_tg_layout_tags_and_beats_q4_k_on_heavy_tails) {
+  // Pelias-only id 203, 256 per block, 144 bytes (4.5 bits per weight, the size of Q4_K): the author's bit-tag matrix at 4
+  // bits (C4): a 2-bit grid tag per 8 values. On heavy-tailed values (unrotated experts) it must beat Q4_K at equal bytes.
+  const q::TypeInfo ti = q::type_info(q::Type::q4_tg);
+  CHECK(ti.known && std::string(ti.name) == "Q4_TG" && ti.block_elements == 256 && ti.block_bytes == 144);
+  const int n = 8192;
+  std::vector<float> x(static_cast<std::size_t>(n));
+  std::uint32_t s = 777;
+  for (float& v : x) {  // Laplace: sign x -log(u), heavy-tailed like the unrotated experts
+    s = s * 1664525u + 1013904223u;
+    const float u = (static_cast<float>(s >> 8) + 0.5f) / 16777216.0f;
+    s = s * 1664525u + 1013904223u;
+    v = 0.01f * ((s >> 31) ? 1.0f : -1.0f) * -std::log(u);
+  }
+  std::vector<std::uint8_t> tg(static_cast<std::size_t>(q::row_bytes(203, n))), k4(static_cast<std::size_t>(q::row_bytes(12, n)));
+  CHECK(tg.size() == k4.size());
+  std::vector<float> bt(static_cast<std::size_t>(n)), bk(static_cast<std::size_t>(n));
+  CHECK(q::quantize_row(q::Type::q4_tg, x.data(), tg.data(), n).ok());
+  CHECK(q::dequantize_row(q::Type::q4_tg, tg.data(), bt.data(), n).ok());
+  CHECK(q::quantize_row(q::Type::q4_k, x.data(), k4.data(), n).ok());
+  CHECK(q::dequantize_row(q::Type::q4_k, k4.data(), bk.data(), n).ok());
+  double et = 0, ek = 0, ref = 0;
+  for (int i = 0; i < n; ++i) {
+    et += std::pow(bt[size_t(i)] - x[size_t(i)], 2);
+    ek += std::pow(bk[size_t(i)] - x[size_t(i)], 2);
+    ref += std::pow(x[size_t(i)], 2);
+  }
+  int tags[4] = {0, 0, 0, 0};
+  for (int b = 0; b < n / 256; ++b)
+    for (int j = 0; j < 8; ++j)
+      for (int g = 0; g < 4; ++g) ++tags[(tg[size_t(144 * b + 8 + j)] >> (2 * g)) & 3];
+  std::printf("      Q4_TG %.4g vs Q4_K %.4g relative error (%.1f %%); tags used %d / %d / %d / %d\n", et / ref, ek / ref, 100.0 * (et / ek - 1.0),
+              tags[0], tags[1], tags[2], tags[3]);
+  CHECK(et < ek);
+  CHECK(tags[0] + tags[1] + tags[2] + tags[3] == n / 8);
+  // the grids: 16 ascending levels with top 1 (grid 3: 0.6)
+  for (int t = 0; t < 4; ++t) {
+    const float* g = q::q4_tg_grid(t);
+    for (int i = 1; i < 16; ++i) CHECK(g[i] > g[i - 1]);
+    CHECK(std::fabs(g[15] - (t == 3 ? 0.6f : 1.0f)) < 1e-6f);
+  }
+}

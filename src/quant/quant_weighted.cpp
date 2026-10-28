@@ -758,7 +758,7 @@ void quantize_iq4_xs(const float* x, std::uint8_t* out, std::int64_t n) {
 bool uses_importance(Type t) {
   switch (t) {
     case Type::q2_k: case Type::q3_k: case Type::q4_k: case Type::q5_k: case Type::q6_k: case Type::iq4_nl: case Type::iq4_xs:
-    case Type::q7_zt:
+    case Type::q7_zt: case Type::q4_tg:
       return true;
     default:
       return false;
@@ -790,6 +790,14 @@ Status quantize_rows(Type t, const float* x, std::uint8_t* out, std::int64_t nro
       case Type::iq4_nl: for (std::int64_t i = 0; i < n_per_row / 32; ++i) iq4_nl_block(xr + i * 32, o + i * 18, imatrix + i * 32); break;
       case Type::iq4_xs: for (std::int64_t i = 0; i < n_per_row / kQKK; ++i) iq4_xs_block(xr + i * kQKK, o + i * 136, imatrix + i * kQKK); break;
       case Type::q7_zt: for (std::int64_t i = 0; i < n_per_row / 256; ++i) q7_zt_block(xr + i * 256, o + i * 241, imatrix + i * 256); break;
+      case Type::q4_tg: {  // weights sqrt(importance): the run-E choice, after urm_ZT's over-fit with the full importance
+        float tw[256];
+        for (std::int64_t i = 0; i < n_per_row / 256; ++i) {
+          for (int k = 0; k < 256; ++k) tw[k] = std::sqrt(std::max(0.0f, imatrix[i * 256 + k]));
+          q4_tg_block(xr + i * 256, o + i * 144, tw);
+        }
+        break;
+      }
       default: return Status::fail(Code::internal, "weighted quantize dispatch");
     }
   }
