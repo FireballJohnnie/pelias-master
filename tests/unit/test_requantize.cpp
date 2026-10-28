@@ -15,6 +15,7 @@
 #include "os/file_map.h"
 #include "pelias_test.h"
 #include "quant/block_types.h"
+#include "quant/quant_cpu.h"
 #include "unit/synth_model.h"
 
 using namespace pelias;
@@ -125,7 +126,9 @@ TEST(recipe_file_is_read_and_checked) {
   CHECK(write_text(d + "/recipe_type.tsv", "a.weight\tQ9_X\n"));
   CHECK(!io::read_recipe(d + "/recipe_type.tsv").ok());
   CHECK(write_text(d + "/recipe_form.tsv", "a.weight Q8_0\n"));
-  CHECK(!io::read_recipe(d + "/recipe_form.tsv").ok());
+  CHECK(!io::read_recipe(d + "/recipe_form.tsv").ok());  CHECK(write_text(d + "/recipe_pelias.tsv", "a.weight\tQ8_Z\n"));  // a Pelias-only type id (200)
+  const auto pz = io::read_recipe(d + "/recipe_pelias.tsv");
+  CHECK(pz.ok() && pz.value.at("a.weight") == 200u);
 }
 
 TEST(quantize_with_recipe_and_imatrix_matches_the_reference) {
@@ -225,6 +228,34 @@ TEST(quantize_with_recipe_and_imatrix_matches_the_reference) {
   for (const io::GgufTensor& t : rs.tensors())
     if (t.name.find("attn_norm.weight") != std::string::npos) { norm = t.name; break; }
   CHECK(!norm.empty());
+  // a Q8_Z recipe goes through the whole quantizer: attn_qkv at Q8_Z, read back as type 200 and dequantizable
+  {
+    std::string tsv3;
+    for (const io::GgufTensor& t : rs.tensors())
+      tsv3 += t.name + "\t" + (t.name.find("attn_qkv.weight") != std::string::npos ? std::string("Q8_Z") : std::string(quant::type_info(t.type).name)) + "\n";
+    CHECK(write_text(d + "/synth_q8z.tsv", tsv3));
+    io::RequantOptions o3;
+    o3.threads = 3;
+    o3.recipe = io::read_recipe(d + "/synth_q8z.tsv").value;
+    const std::string out3 = d + "/synth_q8z.gguf";
+    std::filesystem::remove(out3, ec);
+    const auto rep3 = io::requantize(m, r, out3, o3);
+    CHECK(rep3.ok());
+    if (!rep3.ok()) std::printf("      %s\n", rep3.status.text().c_str());
+    os::FileMap m3;
+    CHECK(m3.open(out3).ok());
+    io::GgufReader r3;
+    CHECK(r3.parse(m3).ok());
+    int seen = 0;
+    for (const io::GgufTensor& t : r3.tensors())
+      if (t.name.find("attn_qkv.weight") != std::string::npos) {
+        CHECK(t.type == 200u);
+        ++seen;
+        std::vector<float> row(static_cast<std::size_t>(t.ne[0]));
+        CHECK(quant::dequantize_row(quant::Type::q8_z, m3.data() + t.file_offset, row.data(), static_cast<std::int64_t>(t.ne[0])).ok());
+      }
+    CHECK(seen > 0);
+  }
   for (const char* want : {"BF16", "Q8_0"}) {
     std::string tsv2;
     for (const io::GgufTensor& t : rs.tensors()) tsv2 += t.name + "\t" + (t.name == norm ? std::string(want) : std::string(quant::type_info(t.type).name)) + "\n";

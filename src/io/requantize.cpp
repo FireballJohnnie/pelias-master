@@ -125,12 +125,14 @@ Result<std::map<std::string, std::uint32_t>> read_recipe(const std::string& path
     const std::string name = line.substr(0, tab);
     std::string ty = line.substr(tab + 1);
     for (char& c : ty) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-    std::uint32_t id = 64;
-    for (std::uint32_t k = 0; k < 64; ++k) {
+    // the reference library's ids (below 64) and the Pelias-only ids (200 and up)
+    std::uint32_t id = 0xFFFFFFFFu;
+    for (std::uint32_t k = 0; k < 256; ++k) {
+      if (k == 64) k = 200;
       const quant::TypeInfo ti = quant::type_info(k);
       if (ti.known && ty == ti.name) id = k;
     }
-    if (id == 64) return R::fail(Status::fail(Code::invalid_argument, "recipe line " + std::to_string(line_no) + ": unknown type '" + ty + "'", 0, name));
+    if (id == 0xFFFFFFFFu) return R::fail(Status::fail(Code::invalid_argument, "recipe line " + std::to_string(line_no) + ": unknown type '" + ty + "'", 0, name));
     if (!out.emplace(name, id).second) return R::fail(Status::fail(Code::invalid_argument, "the recipe names a tensor twice", 0, name));
   }
   if (out.empty()) return R::fail(Status::fail(Code::invalid_argument, "the recipe is empty"));
