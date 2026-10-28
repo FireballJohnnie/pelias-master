@@ -40,6 +40,7 @@ BLOCK = {
     "TQ1_0": (256, 54), "TQ2_0": (256, 66), "MXFP4": (32, 17),
     "Q8_Z": (256, 264),  # Pelias-only (block_types.h)
     "Q7_Z": (256, 232),  # Pelias-only (block_types.h)
+    "Q7_ZT": (256, 241),  # Pelias-only (block_types.h)
 }
 
 # A tensor's record starts with "[  N/ T] NAME - [shape], type = SRC," and ends before the next record. Other messages

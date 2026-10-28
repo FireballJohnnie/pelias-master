@@ -27,7 +27,7 @@ constexpr float kGroupMaxEps = 1e-15f;
 // Q4_K: d (fp16) | dmin (fp16) | scales[12] | qs[128]                    144 bytes
 // Q6_K: ql[128] | qh[64] | scales[16] (int8) | d (fp16)                  210 bytes
 // Q8_K: d (fp32) | qs[256] (int8) | bsums[16] (int16)                    292 bytes
-constexpr std::size_t kQ8_0Bytes = 34, kQ8_1Bytes = 36, kQ4KBytes = 144, kQ6KBytes = 210, kQ8KBytes = 292, kQ8ZBytes = 264, kQ7ZBytes = 232;
+constexpr std::size_t kQ8_0Bytes = 34, kQ8_1Bytes = 36, kQ4KBytes = 144, kQ6KBytes = 210, kQ8KBytes = 292, kQ8ZBytes = 264, kQ7ZBytes = 232, kQ7ZTBytes = 241;
 constexpr std::size_t kQ2KBytes = 84, kQ3KBytes = 110, kQ5KBytes = 176, kIQ4XSBytes = 136;
 // the IQ4_NL / IQ4_XS non-linear 4-bit levels (ggml-common.h kvalues_iq4nl)
 constexpr std::int8_t kValuesIq4nl[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
@@ -441,6 +441,119 @@ void dequantize_q7_z(const std::uint8_t* in, float* y, std::int64_t n) {
   }
 }
 
+// ---- Q7_ZT (Pelias-only; provenance: original): a 7-bit base plane everywhere plus the H bit (the 8th bit) on exactly
+// two of each 256-block's eight 32-blocks, the two where H removes the most (importance-weighted) error ("H as a gate").
+namespace {
+float q7zt_err(const float* x, const float* qw, float s, bool full, int* q) {
+  float err = 0.0f;
+  const float inv = 1.0f / s;
+  for (int k = 0; k < 32; ++k) {
+    float v;
+    if (full) v = std::min(127.0f, std::max(-127.0f, std::nearbyint(x[k] * inv)));
+    else v = std::min(127.0f, std::max(-127.0f, 2.0f * std::floor(x[k] * inv * 0.5f) + 1.0f));  // nearest odd integer
+    if (q) q[k] = static_cast<int>(v);
+    const float e = x[k] - v * s;
+    err += (qw ? qw[k] : 1.0f) * e * e;
+  }
+  return err;
+}
+}  // namespace
+
+void q7_zt_block(const float* x, std::uint8_t* out, const float* qw) {
+  float amax[8], top = 0.0f;
+  for (int j = 0; j < 8; ++j) {
+    amax[j] = 0.0f;
+    for (int k = 0; k < 32; ++k) amax[j] = std::max(amax[j], std::fabs(x[32 * j + k]));
+    top = std::max(top, amax[j]);
+  }
+  const std::uint16_t dh = fp32_to_fp16(top / 127.0f);
+  const float d = fp16_to_fp32(dh);
+  put_u16(out, dh);
+  int lv_full[8], lv_odd[8];
+  float gain[8];
+  for (int j = 0; j < 8; ++j) {
+    const float* xb = x + 32 * j;
+    const float* wb = qw ? qw + 32 * j : nullptr;
+    lv_full[j] = lv_odd[j] = 63;
+    gain[j] = 0.0f;
+    if (!(d > 0.0f && amax[j] > 0.0f)) continue;
+    const float ideal = amax[j] / 127.0f / d * 63.0f;
+    const int lo = std::max(1, static_cast<int>(std::floor(0.70f * ideal)));
+    const int hi = std::min(63, std::max(1, static_cast<int>(std::ceil(1.05f * ideal))));
+    float bf = -1.0f, bo = -1.0f;
+    for (int lv = hi; lv >= lo; --lv) {
+      const float s = q8_z_scale(d, lv);
+      const float ef = q7zt_err(xb, wb, s, true, nullptr), eo = q7zt_err(xb, wb, s, false, nullptr);
+      if (bf < 0.0f || ef < bf) { bf = ef; lv_full[j] = lv; }
+      if (bo < 0.0f || eo < bo) { bo = eo; lv_odd[j] = lv; }
+    }
+    gain[j] = bo - bf;
+  }
+  int g1 = 0;
+  for (int j = 1; j < 8; ++j) if (gain[j] > gain[g1]) g1 = j;
+  int g2 = g1 == 0 ? 1 : 0;
+  for (int j = 0; j < 8; ++j) if (j != g1 && gain[j] > gain[g2]) g2 = j;
+  const std::uint8_t mask = static_cast<std::uint8_t>((1u << g1) | (1u << g2));
+  std::uint64_t packed = 0;
+  int u[256];
+  std::uint32_t hbits[2] = {0, 0};
+  int hslot = 0;
+  for (int j = 0; j < 8; ++j) {
+    const bool gated = (mask >> j) & 1u;
+    const int lv = gated ? lv_full[j] : lv_odd[j];
+    packed |= static_cast<std::uint64_t>(lv) << (6 * j);
+    int q[32];
+    q7zt_err(x + 32 * j, nullptr, q8_z_scale(d, lv), gated, q);
+    for (int k = 0; k < 32; ++k) {
+      const int v = q[k] + 127;  // gated: 0..254 = 2b + h; ungated (odd q): 0..254 even, = 2b
+      u[32 * j + k] = v >> 1;
+      if (gated) hbits[hslot] |= static_cast<std::uint32_t>(v & 1) << k;
+    }
+    if (gated) ++hslot;
+  }
+  for (int b = 0; b < 6; ++b) out[2 + b] = static_cast<std::uint8_t>(packed >> (8 * b));
+  out[8] = mask;
+  for (int g = 0; g < 32; ++g) {
+    std::uint64_t wv = 0;
+    for (int k = 0; k < 8; ++k) wv |= static_cast<std::uint64_t>(u[8 * g + k]) << (7 * k);
+    for (int b = 0; b < 7; ++b) out[9 + 7 * g + b] = static_cast<std::uint8_t>(wv >> (8 * b));
+  }
+  for (int h = 0; h < 2; ++h)
+    for (int b = 0; b < 4; ++b) out[233 + 4 * h + b] = static_cast<std::uint8_t>(hbits[h] >> (8 * b));
+}
+
+void quantize_q7_zt(const float* x, std::uint8_t* out, std::int64_t n) {
+  for (std::int64_t i = 0; i < n / 256; ++i, x += 256, out += kQ7ZTBytes) q7_zt_block(x, out, nullptr);
+}
+
+void dequantize_q7_zt(const std::uint8_t* in, float* y, std::int64_t n) {
+  for (std::int64_t i = 0; i < n / 256; ++i, in += kQ7ZTBytes, y += 256) {
+    const float d = fp16_to_fp32(get_u16(in));
+    std::uint64_t packed = 0;
+    for (int b = 0; b < 6; ++b) packed |= static_cast<std::uint64_t>(in[2 + b]) << (8 * b);
+    const std::uint8_t mask = in[8];
+    int hslot = 0;
+    for (int j = 0; j < 8; ++j) {
+      const float s = q8_z_scale(d, static_cast<int>((packed >> (6 * j)) & 63u));
+      const bool gated = (mask >> j) & 1u;
+      std::uint32_t hb = 0;
+      if (gated) {
+        for (int b = 0; b < 4; ++b) hb |= static_cast<std::uint32_t>(in[233 + 4 * hslot + b]) << (8 * b);
+        ++hslot;
+      }
+      for (int g = 0; g < 4; ++g) {
+        std::uint64_t wv = 0;
+        for (int b = 0; b < 7; ++b) wv |= static_cast<std::uint64_t>(in[9 + 7 * (4 * j + g) + b]) << (8 * b);
+        for (int k = 0; k < 8; ++k) {
+          const int bb = static_cast<int>((wv >> (7 * k)) & 127u), idx = 8 * g + k;
+          const int q = gated ? 2 * bb + static_cast<int>((hb >> idx) & 1u) - 127 : 2 * bb - 127;
+          y[32 * j + idx] = static_cast<float>(q) * s;
+        }
+      }
+    }
+  }
+}
+
 void dequantize_q8_0(const std::uint8_t* in, float* y, std::int64_t n) {
   const std::int64_t nb = n / kQK8;
   for (std::int64_t i = 0; i < nb; ++i, in += kQ8_0Bytes, y += kQK8) {
@@ -787,7 +900,7 @@ bool can_quantize(Type t) {
   switch (t) {
     case Type::f32: case Type::f16: case Type::bf16: case Type::q8_0: case Type::q8_1: case Type::q4_k: case Type::q6_k:
     case Type::q8_k: case Type::q2_k: case Type::q3_k: case Type::q5_k: case Type::iq4_nl: case Type::iq4_xs: case Type::q8_z:
-    case Type::q7_z:
+    case Type::q7_z: case Type::q7_zt:
       return true;
     default:
       return false;
@@ -800,7 +913,7 @@ bool can_dequantize(Type t) {
     case Type::q2_k: case Type::q3_k: case Type::q5_k: case Type::iq4_xs:
     case Type::q4_0: case Type::q4_1: case Type::q5_0: case Type::q5_1: case Type::iq4_nl: case Type::mxfp4:
     case Type::tq1_0: case Type::tq2_0: case Type::iq2_xxs: case Type::iq2_xs: case Type::iq2_s: case Type::iq3_xxs:
-    case Type::iq3_s: case Type::iq1_s: case Type::iq1_m: case Type::q8_z: case Type::q7_z:
+    case Type::iq3_s: case Type::iq1_s: case Type::iq1_m: case Type::q8_z: case Type::q7_z: case Type::q7_zt:
       return true;
     default:
       return false;
@@ -856,6 +969,7 @@ Status quantize_row(Type t, const float* x, std::uint8_t* out, std::int64_t n) {
     case Type::iq4_xs: quantize_iq4_xs(x, out, n); break;
     case Type::q8_z: quantize_q8_z(x, out, n); break;
     case Type::q7_z: quantize_q7_z(x, out, n); break;
+    case Type::q7_zt: quantize_q7_zt(x, out, n); break;
     default: return Status::fail(Code::internal, "quantize dispatch");
   }
   return Status::good();
@@ -881,6 +995,7 @@ Status dequantize_row(Type t, const std::uint8_t* in, float* y, std::int64_t n) 
     case Type::iq4_xs: dequantize_iq4_xs(in, y, n); break;
     case Type::q8_z: dequantize_q8_z(in, y, n); break;
     case Type::q7_z: dequantize_q7_z(in, y, n); break;
+    case Type::q7_zt: dequantize_q7_zt(in, y, n); break;
     case Type::q4_0: dequantize_q4_0(in, y, n); break;
     case Type::q4_1: dequantize_q4_1(in, y, n); break;
     case Type::q5_0: dequantize_q5_0(in, y, n); break;

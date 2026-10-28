@@ -19,7 +19,8 @@ enum class Type : std::uint32_t {
   tq1_0 = 34, tq2_0 = 35, mxfp4 = 39, nvfp4 = 40, q1_0 = 41, q2_0 = 42,
   // Pelias-only ids, far above the reference library's range so it refuses such a file instead of misreading it
   q8_z = 200,
-  q7_z = 201,  // Q7_Z: Q8_Z's scales with tight 7-bit values (game plan, 7pH ladder, Q7_P rung, 2026-10-28)  // Q8_Z: the author's "zip code" scales with 8-bit values (game plan, Q7_PT review, 2026-10-28)
+  q7_z = 201,
+  q7_zt = 202,  // Q7_ZT: 7-bit base + the 8th bit gated on 2 of 8 32-blocks per 256 (game plan, Q7_ZH and the binary gate)  // Q7_Z: Q8_Z's scales with tight 7-bit values (game plan, 7pH ladder, Q7_P rung, 2026-10-28)  // Q8_Z: the author's "zip code" scales with 8-bit values (game plan, Q7_PT review, 2026-10-28)
 };
 
 struct TypeInfo {

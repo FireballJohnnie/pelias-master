@@ -64,6 +64,14 @@ float q8_z_scale(float d, int lv);
 void quantize_q7_z(const float* x, std::uint8_t* out, std::int64_t n);
 void dequantize_q7_z(const std::uint8_t* in, float* y, std::int64_t n);
 float q7_z_scale(float d, int lv);
+// Q7_ZT (Pelias-only, 256 per block, 241 bytes = 7.53 bits per weight): fp16 d = top / 127, eight 6-bit levels (Q8_Z's
+// scales, s_j = (d * lv_j) / 63), one byte gate mask with exactly two bits set, 224 bytes of 7-bit base values b (eight per
+// 7 bytes, as Q7_Z), then 2 x 4 bytes of H bits for the gated 32-blocks in block order (bit k = value k). Gated 32-block:
+// q = 2b + h - 127; others: q = 2b - 127 (odd grid). Value = s_j * q. The gates go to the two 32-blocks where the 8th bit
+// removes the most squared error, weighted by the importance matrix when one is given.
+void q7_zt_block(const float* x, std::uint8_t* out, const float* qw);
+void quantize_q7_zt(const float* x, std::uint8_t* out, std::int64_t n);
+void dequantize_q7_zt(const std::uint8_t* in, float* y, std::int64_t n);
 void quantize_q8_1(const float* x, std::uint8_t* out, std::int64_t n);
 void quantize_q4_k(const float* x, std::uint8_t* out, std::int64_t n);
 void quantize_q6_k(const float* x, std::uint8_t* out, std::int64_t n);

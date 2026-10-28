@@ -162,6 +162,51 @@ TEST(q8_z_layout_and_round_trip) {
   CHECK(zb[2] != 0);
 }
 
+TEST(q7_zt_layout_gates_and_round_trip) {
+  // Pelias-only id 202, 256 per block, 241 bytes (7.53 bits per weight): 7-bit base, the 8th bit on two 32-blocks
+  const q::TypeInfo ti = q::type_info(q::Type::q7_zt);
+  CHECK(ti.known && std::string(ti.name) == "Q7_ZT" && ti.block_elements == 256 && ti.block_bytes == 241);
+  std::vector<float> x(4096), imp(4096, 1.0f);
+  std::uint32_t s = 4242;
+  for (float& v : x) {
+    s = s * 1664525u + 1013904223u;
+    const float u = (static_cast<float>(s >> 8) / 16777216.0f) - 0.5f;
+    v = 0.02f * u / (0.05f + std::fabs(u));
+  }
+  std::vector<std::uint8_t> zt(static_cast<std::size_t>(q::row_bytes(202, 4096))), z7(static_cast<std::size_t>(q::row_bytes(201, 4096))),
+      z8(static_cast<std::size_t>(q::row_bytes(200, 4096)));
+  std::vector<float> bt(4096), b7(4096), b8(4096);
+  CHECK(q::quantize_row(q::Type::q7_zt, x.data(), zt.data(), 4096).ok());
+  CHECK(q::dequantize_row(q::Type::q7_zt, zt.data(), bt.data(), 4096).ok());
+  CHECK(q::quantize_row(q::Type::q7_z, x.data(), z7.data(), 4096).ok());
+  CHECK(q::dequantize_row(q::Type::q7_z, z7.data(), b7.data(), 4096).ok());
+  CHECK(q::quantize_row(q::Type::q8_z, x.data(), z8.data(), 4096).ok());
+  CHECK(q::dequantize_row(q::Type::q8_z, z8.data(), b8.data(), 4096).ok());
+  double et = 0, e7 = 0, e8 = 0;
+  for (int i = 0; i < 4096; ++i) {
+    et += std::pow(bt[size_t(i)] - x[size_t(i)], 2);
+    e7 += std::pow(b7[size_t(i)] - x[size_t(i)], 2);
+    e8 += std::pow(b8[size_t(i)] - x[size_t(i)], 2);
+  }
+  std::printf("      Q7_ZT %.3g, Q7_Z %.3g, Q8_Z %.3g\n", et, e7, e8);
+  CHECK(et < e7 && et > e8);  // between the 7-bit and the 8-bit format
+  for (int b = 0; b < 16; ++b) {
+    const std::uint8_t mask = zt[size_t(241 * b + 8)];
+    int bits = 0;
+    for (int j = 0; j < 8; ++j) bits += (mask >> j) & 1;
+    CHECK(bits == 2);
+  }
+  // the weighted path: heavy importance on one 32-block of each 256 pulls a gate onto it
+  for (int b = 0; b < 16; ++b) for (int k = 0; k < 32; ++k) imp[size_t(256 * b + 32 * 5 + k)] = 1000.0f;
+  CHECK(q::quantize_rows(q::Type::q7_zt, x.data(), zt.data(), 1, 4096, imp.data()).ok());
+  for (int b = 0; b < 16; ++b) CHECK((zt[size_t(241 * b + 8)] >> 5) & 1u);
+  std::vector<float> zero(256, 0.0f), back(256, 1.0f);
+  std::vector<std::uint8_t> zb(241);
+  CHECK(q::quantize_row(q::Type::q7_zt, zero.data(), zb.data(), 256).ok());
+  CHECK(q::dequantize_row(q::Type::q7_zt, zb.data(), back.data(), 256).ok());
+  for (float v : back) CHECK(std::fabs(v) == 0.0f);
+}
+
 TEST(q7_z_layout_and_round_trip) {
   // Pelias-only id 201, 256 per block, 232 bytes (7.25 bits per weight): Q8_Z's header with tight 7-bit values
   const q::TypeInfo ti = q::type_info(q::Type::q7_z);
