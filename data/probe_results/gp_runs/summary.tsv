@@ -24,3 +24,5 @@
 2026-10-28 07:04:24	M	skip50 1335 s	Mean KLD: 0.024159 ± 0.000562	Same top p: 93.306 ± 0.157 %	/mnt/d/pelias-tests/gp/M/b_20261028_055721.log
 2026-10-28 07:43:42	M	a8all 1431 s	Mean KLD: 0.013106 ± 0.000406	Same top p: 95.212 ± 0.134 %	/mnt/d/pelias-tests/gp/M/c_20261028_071951.log
 2026-10-28 08:06:05	M	a4dense 1343 s	Mean KLD: 0.045766 ± 0.000637	Same top p: 89.788 ± 0.190 %	/mnt/d/pelias-tests/gp/M/c_20261028_071951.log
+2026-10-28 09:17:49	M	t8r_g256 1339 s	Mean KLD: 0.013939 ± 0.000459	Same top p: 95.016 ± 0.136 %	/mnt/d/pelias-tests/gp/M/d_20261028_085525.log
+2026-10-28 09:39:47	M	unsloth_mtp_g256 1318 s	Mean KLD: 0.015665 ± 0.000440	Same top p: 94.349 ± 0.145 %	/mnt/d/pelias-tests/gp/M/d_20261028_085525.log

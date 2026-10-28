@@ -1,0 +1,1 @@
+2026-10-28 08:55-09:39 | BUNDLE=.../2026-10-28/pelias-master_main_bfbbff2-e74a52a.bundle wsl bash /mnt/d/pelias-tests/gp/block_m2.sh d | log D:\pelias-tests\gp\M\d_20261028_085525.log | clone fast-forwarded to e74a52a and rebuilt; dumps M\t8r_g256.kld, N\mtp_g256.kld | all pairs re-verified from the dumps in Python

@@ -1072,6 +1072,17 @@ The exact pre-gating prediction gets 83.9 % of the next layer's picks with only 
 - **Readers:** copy engines, tensor cores and regular CUDA cores (one shift-and-add per weight to merge). Not the RT cores: merging planes is arithmetic, not a search, and their tree costs about 9x the memory per number.
 - **Gate (one paired run on the reference):** worst case, every cold expert (outside the engine's 7.5 GiB hot set) at its base plane only (Q4_K -> 3-bit base), against the full file. A small paired cost makes split planes a speed lever with no VRAM cost; the reference option is not built yet.
 
+### Run list before the engine build (updated 2026-10-28 09:4x, after Block M and M2 d)
+
+Each PC run first matches the reference to our code's exact format (docs/PELIAS_NEW_METHODS.md rule).
+
+1. **R3 activation format, decided first (sandbox):** the int8 kernel moves from one scale per 256 to eight per 256 (Block H `q8_k32`, the precision of per-32 in the kernel's layout). Reason: per-256 costs t8r +0.000834 over per-32 (Block M2 d). Measure: instructions per mma and tensor busy against v10 (`ncu`, as Batch C r10), and the reference format matched value for value before any KLD run.
+2. **urm merge tool and the _P cold-expert reference option (sandbox).**
+3. **Step 2 benches (PC):** bench_cpu (CPU cold kernel GB/s, 8 vs 16 threads, large pages, file location), bench_gpu (PCIe copies during compute, FP16 half-rate check, R4 clock lock).
+4. **urm runs (PC):** fp32 and the kernel's activation format, paired against Unsloth's MTP file at the same format; then the _P gate run.
+5. **Q7_PT quantizer, then urm-plus** (attention at Q7_PT, below Unsloth's size).
+6. **R3 kernel**, then **GP3-08 MTP head in the reference**, then the engine (GP3-14).
+
 ### GP3-14 Masterwork step 10: the engine
 
 **Scope:**
