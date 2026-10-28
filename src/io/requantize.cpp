@@ -234,7 +234,9 @@ Result<RequantReport> quantize_source(const QuantSource& src, const std::string&
       if (it == opt.recipe.end()) return R::fail(Status::fail(Code::invalid_argument, "the recipe does not name this tensor", 0, t.name));
       seen.insert(t.name);
       const std::uint32_t want = it->second;
-      if (!quant::tensor_allows_quantization(descs[j], src.facts.arch) && want != t.type)
+      // a tensor the reference never quantizes may still change float width (F32 / F16 / BF16): Unsloth's MTP file keeps
+      // blk.40.ffn_gate_inp in BF16 where the reference keeps F32; a block format stays refused
+      if (!quant::tensor_allows_quantization(descs[j], src.facts.arch) && want != t.type && !(is_float_type(want) && is_float_type(t.type)))
         return R::fail(Status::fail(Code::unsupported, std::string("the recipe asks for ") + quant::type_info(want).name +
                                                            " but the reference never quantizes this tensor (it keeps " + quant::type_info(t.type).name + ")", 0, t.name));
       if (want != t.type && quant::row_bytes(want, t.ne[0]) == 0)

@@ -40,6 +40,7 @@ def write(path, entries, rot=None, chunks=10, size=512, ds="d.txt"):
 
 
 def read_sum2(path):
+    sys.dont_write_bytecode = True  # no __pycache__ next to the tool
     sys.path.insert(0, os.path.dirname(TOOL))
     import imatrix_merge
     g = imatrix_merge.Gguf(path)

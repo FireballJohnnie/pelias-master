@@ -219,4 +219,32 @@ TEST(quantize_with_recipe_and_imatrix_matches_the_reference) {
   const std::string sha = file_sha(out);
   CHECK_EQ(sha, std::string(kReferenceRecipeImatrixSha));
   if (sha != kReferenceRecipeImatrixSha) std::printf("      output sha %s\n", sha.c_str());
+
+  // a tensor the reference never quantizes (a norm, F32) may change float width but not become a block format
+  std::string norm;
+  for (const io::GgufTensor& t : rs.tensors())
+    if (t.name.find("attn_norm.weight") != std::string::npos) { norm = t.name; break; }
+  CHECK(!norm.empty());
+  for (const char* want : {"BF16", "Q8_0"}) {
+    std::string tsv2;
+    for (const io::GgufTensor& t : rs.tensors()) tsv2 += t.name + "\t" + (t.name == norm ? std::string(want) : std::string(quant::type_info(t.type).name)) + "\n";
+    CHECK(write_text(d + "/synth_norm_" + want + ".tsv", tsv2));
+    io::RequantOptions o2;
+    o2.threads = 3;
+    o2.recipe = io::read_recipe(d + "/synth_norm_" + want + ".tsv").value;
+    const std::string out2 = d + "/synth_norm_" + want + ".gguf";
+    std::filesystem::remove(out2, ec);
+    const auto rep2 = io::requantize(m, r, out2, o2);
+    if (std::string(want) == "Q8_0") {
+      CHECK(!rep2.ok());
+      continue;
+    }
+    CHECK(rep2.ok());
+    os::FileMap m2;
+    CHECK(m2.open(out2).ok());
+    io::GgufReader r2;
+    CHECK(r2.parse(m2).ok());
+    for (const io::GgufTensor& t : r2.tensors())
+      if (t.name == norm) CHECK(t.type == static_cast<std::uint32_t>(quant::Type::bf16));
+  }
 }
