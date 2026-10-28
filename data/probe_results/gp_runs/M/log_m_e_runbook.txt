@@ -1,0 +1,1 @@
+2026-10-28 09:47-10:32 | wsl bash /mnt/d/pelias-tests/gp/block_m3.sh e | log D:\pelias-tests\gp\M\e_20261028_094735.log | dumps M\t8r_g256_dense.kld, M\t8r_g256_exps.kld | re-verified from the dumps in Python
