@@ -12,12 +12,18 @@
 // Formats (r3_formats.h): dense Q7_ZT (fold route, dp4a), expert gate/up Q4_TG2 (grid table), expert down Q5_K, output
 // head Q6_K. Activations: int8 per 32 with an fp32 scale (the gpu256x8 reference format). Lanes split each row in
 // 128-value parts (K / 128 lanes per row), every weight load of a part issued before any arithmetic.
-// Build (WSL): nvcc -std=c++17 -O3 -arch=sm_89 r3.cu -o r3
+//   v2 step 1 (Fable's review, docs/reviews/FABLE_R3_V1_REVIEW_2026-10-29.md, item 1 + harness notes; kernels unchanged
+//   apart from an optional clock record): per-format (b) rows on >= 256 MiB of distinct matrices each, the grid-sync cost
+//   alone (161 syncs, no work), (a) replayed from a CUDA graph (GPU-side cost without the host submission path), the
+//   registers / local memory of each kernel, and the SM clock measured inside the (b) run (clock64 vs globaltimer).
+//   r3 stream --soak S : after the rows, (b) back to back for S seconds (for an outside clock / power log)
+// Build (WSL): nvcc -std=c++17 -O3 -arch=sm_89 r3.cu -o r3     (Windows: the same with -o r3.exe, from a VS x64 prompt)
 #include <cooperative_groups.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -235,10 +241,22 @@ __device__ __forceinline__ void run_task(const Job* __restrict__ jobs, int njobs
 }
 
 // (a) and (b): every warp walks the task range [t_begin, t_end) of the table
-__global__ void __launch_bounds__(256) r3_stream(const Job* __restrict__ jobs, int njobs, long long t_begin, long long t_end) {
+__device__ __forceinline__ unsigned long long gtimer() {
+  unsigned long long t;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+  return t;
+}
+
+// clk (optional, v2 step 1): block 0's thread 0 records clock64 and globaltimer (ns) at its start and its end, so the
+// SM clock during the run is (c1 - c0) / (g1 - g0) GHz
+__global__ void __launch_bounds__(256) r3_stream(const Job* __restrict__ jobs, int njobs, long long t_begin, long long t_end,
+                                                 unsigned long long* clk) {
+  const bool rec = clk != nullptr && blockIdx.x == 0 && threadIdx.x == 0;
+  if (rec) { clk[0] = clock64(); clk[1] = gtimer(); }
   const long long warps = static_cast<long long>(gridDim.x) * (blockDim.x / 32);
   for (long long t = t_begin + (static_cast<long long>(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32); t < t_end; t += warps)
     run_task(jobs, njobs, t);
+  if (rec) { clk[2] = clock64(); clk[3] = gtimer(); }
 }
 
 // (c): stages in order, a grid-wide sync between them (cooperative launch)
@@ -252,6 +270,12 @@ __global__ void __launch_bounds__(256) r3_staged(const Job* __restrict__ jobs, i
     begin = stage_end[s];
     grid.sync();
   }
+}
+
+// (c0), v2 step 1: the grid syncs alone, no tasks (Fable item 6: what one boundary costs before any work is added)
+__global__ void __launch_bounds__(256) r3_sync_only(int nstages) {
+  cg::grid_group grid = cg::this_grid();
+  for (int s = 0; s < nstages; ++s) grid.sync();
 }
 
 // ------------------------------------------------------------------------------------------------ host
@@ -466,7 +490,7 @@ static int run_check() {
     Job J = job_of(M, A, dy);
     J.task0 = 0;
     Job* dj = up(std::vector<Job>{J});
-    r3_stream<<<sms() * 4, 256>>>(dj, 1, 0, J.ntask);
+    r3_stream<<<sms() * 4, 256>>>(dj, 1, 0, J.ntask, nullptr);
     CK(cudaDeviceSynchronize());
     std::vector<float> yg(static_cast<size_t>(c.n));
     CK(cudaMemcpy(yg.data(), dy, c.n * 4, cudaMemcpyDeviceToHost));
@@ -485,7 +509,7 @@ static int run_check() {
 }
 
 // ---- stream: one token's weight reads, three ways
-static int run_stream() {
+static int run_stream(int soak_s) {
   set_grids();
   std::mt19937 rng(7);
   const int nsm = sms();
@@ -577,40 +601,160 @@ static int run_stream() {
               "Q6_K head), %.3f GB of weights (head %.3f GB), %lld warp tasks; cold (64 MiB written first), median of 7\n",
               prop.name, nsm, jobs.size(), bytes / 1e9, head_bytes / 1e9, total);
   // (a) one launch per matrix, queued back to back
+  auto grid_a = [&](const Job& J) { return std::max(1, static_cast<int>(std::min<long long>((J.ntask + 7) / 8, nsm * 8LL))); };
   const double ta = timed([&] {
-    for (size_t i = 0; i < jobs.size(); ++i) {
-      const long long tasks = jobs[i].ntask;
-      const int grid = static_cast<int>(std::min<long long>((tasks + 7) / 8, nsm * 8LL));
-      r3_stream<<<std::max(grid, 1), 256>>>(dj, static_cast<int>(jobs.size()), jobs[i].task0, jobs[i].task0 + tasks);
-    }
+    for (size_t i = 0; i < jobs.size(); ++i)
+      r3_stream<<<grid_a(jobs[i]), 256>>>(dj, static_cast<int>(jobs.size()), jobs[i].task0, jobs[i].task0 + jobs[i].ntask, nullptr);
   });
-  // (b) one launch for the whole table
+  // (a') the same 1,091 launches captured once in a CUDA graph and replayed: the GPU-side cost without the per-launch host
+  // submission path (under WSL2 that path goes through GPU-PV; Fable harness note)
+  cudaStream_t cs;
+  CK(cudaStreamCreate(&cs));  // a blocking stream: ordered with the legacy stream's flush and events, so e0/e1 bracket the replay
+  cudaGraph_t graph;
+  cudaGraphExec_t gexec;
+  CK(cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal));
+  for (size_t i = 0; i < jobs.size(); ++i)
+    r3_stream<<<grid_a(jobs[i]), 256, 0, cs>>>(dj, static_cast<int>(jobs.size()), jobs[i].task0, jobs[i].task0 + jobs[i].ntask, nullptr);
+  CK(cudaStreamEndCapture(cs, &graph));
+  CK(cudaGraphInstantiate(&gexec, graph, 0));
+  const double tg = timed([&] {
+    CK(cudaGraphLaunch(gexec, cs));
+  });
+  // (b) one launch for the whole table; the SM clock is recorded inside the run
   int occ = 0;
   CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, r3_stream, 256, 0));
-  const double tb = timed([&] { r3_stream<<<nsm * occ, 256>>>(dj, static_cast<int>(jobs.size()), 0, total); });
+  unsigned long long* dclk;
+  CK(cudaMalloc(&dclk, 4 * sizeof(unsigned long long)));
+  const double tb = timed([&] { r3_stream<<<nsm * occ, 256>>>(dj, static_cast<int>(jobs.size()), 0, total, dclk); });
+  unsigned long long clk[4];
+  CK(cudaMemcpy(clk, dclk, sizeof clk, cudaMemcpyDeviceToHost));
+  const double ghz_b = clk[3] > clk[1] ? static_cast<double>(clk[2] - clk[0]) / static_cast<double>(clk[3] - clk[1]) : 0.0;
   // (c) one cooperative launch, a grid-wide sync after every stage
   int occc = 0;
   CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occc, r3_staged, 256, 0));
   int njobs = static_cast<int>(jobs.size()), nst = nstages;
   void* args[] = {&dj, &njobs, &dse, &nst};
   const double tc = timed([&] { CK(cudaLaunchCooperativeKernel(reinterpret_cast<void*>(r3_staged), dim3(nsm * occc), dim3(256), args, 0, nullptr)); });
+  // (c0) the 161 syncs alone, same grid as (c)
+  void* args0[] = {&nst};
+  const double tc0 = timed([&] { CK(cudaLaunchCooperativeKernel(reinterpret_cast<void*>(r3_sync_only), dim3(nsm * occc), dim3(256), args0, 0, nullptr)); });
+  // (c0') one cooperative launch with a single sync: the launch alone, so (c0 - c0') / 160 is one boundary
+  int one = 1;
+  void* args1[] = {&one};
+  const double tc1 = timed([&] { CK(cudaLaunchCooperativeKernel(reinterpret_cast<void*>(r3_sync_only), dim3(nsm * occc), dim3(256), args1, 0, nullptr)); });
   CK(cudaGetLastError());
-  auto row = [&](const char* name, double ms) {
-    std::printf("  %-58s %8.3f ms  %6.1f GB/s\n", name, ms, bytes / (ms * 1e6));
+  auto row = [&](const char* name, double ms, size_t by) {
+    std::printf("  %-62s %8.3f ms  %6.1f GB/s\n", name, ms, by / (ms * 1e6));
   };
-  row("(a) one launch per matrix (today's kernels), queued", ta);
-  row("(b) one streaming launch, whole table", tb);
-  row("(c) one cooperative launch, grid sync after each of 161 stages", tc);
+  row("(a) one launch per matrix (today's kernels), queued", ta, bytes);
+  row("(a') the same 1,091 launches replayed from a CUDA graph", tg, bytes);
+  row("(b) one streaming launch, whole table", tb, bytes);
+  row("(c) one cooperative launch, grid sync after each of 161 stages", tc, bytes);
   std::printf("  blocks: (b) %d per SM, (c) %d per SM; (c) - (b) = %.3f ms over 160 syncs = %.2f us per stage boundary\n", occ, occc, tc - tb,
               (tc - tb) * 1e3 / 160.0);
+  std::printf("  (c0) 161 grid syncs, no work: %.3f ms; one sync: %.3f ms; per boundary %.2f us (sync alone)\n", tc0, tc1,
+              (tc0 - tc1) * 1e3 / 160.0);
+  std::printf("  SM clock inside (b), block 0: %.3f GHz (clock64 / globaltimer over %.3f ms)\n", ghz_b, (clk[3] - clk[1]) / 1e6);
+
+  // ---- per-format (b) rows (Fable item 1): one format per table, real shapes, >= 256 MiB of distinct matrices (one
+  // allocation, jobs are row slices of it; nothing is read twice, so nothing is served from the 36 MB L2)
+  std::printf("per format, (b) one streaming launch, cold, median of 7:\n");
+  struct PF { int fmt, n, K; const char* name; };
+  const PF pf[] = {{r3::kQ7ZT, 8192, 2048, "Q7_ZT only (8192 x 2048 matrices, dense)"},
+                   {r3::kQ4TG2, 512, 2048, "Q4_TG2 only (512 x 2048, expert gate/up)"},
+                   {r3::kQ5K, 2048, 512, "Q5_K only (2048 x 512, expert down)"}};
+  const size_t want = 256ull << 20;
+  for (const PF& f : pf) {
+    const size_t per = static_cast<size_t>(f.n) * (f.K / 256) * (f.fmt == r3::kQ7ZT ? 241 : (f.fmt == r3::kQ4TG2 ? 144 : 176));
+    const int count = static_cast<int>((want + per - 1) / per);
+    Mat big;
+    make_mat(big, f.fmt, f.n * count, f.K, rng);
+    upload(big);
+    const Act& A = f.K == 512 ? A512 : A2048;
+    std::vector<Job> pj;
+    long long t0 = 0;
+    const long long nB = f.K / 256;
+    for (int c = 0; c < count; ++c) {
+      Job J = job_of(big, A, dy);
+      const long long rb0 = static_cast<long long>(c) * f.n * nB;  // first 256-block of this slice
+      J.n = f.n;
+      J.ntask = (f.n + 32 / J.lpr - 1) / (32 / J.lpr);
+      if (f.fmt == r3::kQ7ZT) { J.w += rb0 * 224; J.hdr += rb0; J.mask += rb0; J.hb += rb0 * 2; }
+      else J.w += rb0 * (f.fmt == r3::kQ4TG2 ? 144 : 176);
+      J.task0 = t0;
+      t0 += J.ntask;
+      pj.push_back(J);
+    }
+    Job* dpj = up(pj);
+    int np = static_cast<int>(pj.size());
+    const double tp = timed([&] { r3_stream<<<nsm * occ, 256>>>(dpj, np, 0, t0, nullptr); });
+    char name[128];
+    std::snprintf(name, sizeof name, "%s, %d matrices", f.name, count);
+    row(name, tp, big.bytes());
+    CK(cudaFree(dpj));
+    CK(cudaFree(big.dw));
+    if (big.dhdr) CK(cudaFree(big.dhdr));
+    if (big.dmask) CK(cudaFree(big.dmask));
+    if (big.dhb) CK(cudaFree(big.dhb));
+  }
+  {  // Q6_K: the output head alone (one 417 MB job, distinct rows)
+    Job J = job_of(head, A2048, dy);
+    J.task0 = 0;
+    Job* dh = up(std::vector<Job>{J});
+    const double th = timed([&] { r3_stream<<<nsm * occ, 256>>>(dh, 1, 0, J.ntask, nullptr); });
+    row("Q6_K only (the 248,320 x 2048 output head)", th, head.bytes());
+    CK(cudaFree(dh));
+  }
+  if (soak_s > 0) {  // (b) back to back for an outside clock / power log (no flush between runs)
+    std::printf("soak: (b) back to back for %d s\n", soak_s);
+    std::fflush(stdout);
+    CK(cudaDeviceSynchronize());
+    const auto s0 = std::chrono::steady_clock::now();
+    long long runs = 0;
+    while (std::chrono::duration<double>(std::chrono::steady_clock::now() - s0).count() < soak_s) {
+      for (int k = 0; k < 20; ++k) r3_stream<<<nsm * occ, 256>>>(dj, static_cast<int>(jobs.size()), 0, total, nullptr);
+      CK(cudaDeviceSynchronize());
+      runs += 20;
+    }
+    const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - s0).count();
+    std::printf("  soak: %lld runs in %.2f s = %.3f ms per run, %.1f GB/s\n", runs, sec, sec * 1e3 / runs, bytes * runs / (sec * 1e9));
+  }
   CK(cudaFree(flush));
   return 0;
+}
+
+static void print_kernels() {
+  const struct { const void* f; const char* name; } K[] = {{reinterpret_cast<const void*>(r3_stream), "r3_stream"},
+                                                           {reinterpret_cast<const void*>(r3_staged), "r3_staged"},
+                                                           {reinterpret_cast<const void*>(r3_sync_only), "r3_sync_only"}};
+  for (const auto& k : K) {
+    cudaFuncAttributes fa;
+    CK(cudaFuncGetAttributes(&fa, k.f));
+    int occ = 0;
+    CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, k.f, 256, 0));
+    std::printf("kernel %-13s registers %3d, local memory %zu bytes, spill-free %s, blocks of 256 per SM %d\n", k.name, fa.numRegs,
+                fa.localSizeBytes, fa.localSizeBytes == 0 ? "yes" : "NO", occ);
+  }
+  int clk = 0, mclk = 0, bus = 0;
+  cudaDeviceGetAttribute(&clk, cudaDevAttrClockRate, 0);        // kHz, the board's rated SM clock
+  cudaDeviceGetAttribute(&mclk, cudaDevAttrMemoryClockRate, 0);  // kHz
+  cudaDeviceGetAttribute(&bus, cudaDevAttrGlobalMemoryBusWidth, 0);
+  cudaGetLastError();  // an attribute this runtime does not report leaves 0, not an error for the run
+  std::printf("device attributes: SM clock %.3f GHz (rated), memory clock %.3f GHz, bus %d bits (peak from these %.1f GB/s; "
+              "the memory clock the driver reports may be the stock one, nvidia-smi shows the clock in use)\n",
+              clk / 1e6, mclk / 1e6, bus, 2.0 * mclk * 1e3 * (bus / 8) / 1e9);
 }
 
 int main(int argc, char** argv) {
   const std::string cmd = argc > 1 ? argv[1] : "";
   if (cmd == "check") return run_check();
-  if (cmd == "stream") return run_stream();
-  std::fprintf(stderr, "usage: r3 check | stream\n");
+  if (cmd == "stream") {
+    int soak = 0;
+    for (int i = 2; i + 1 < argc; ++i)
+      if (std::string(argv[i]) == "--soak") soak = std::atoi(argv[i + 1]);
+    print_kernels();
+    return run_stream(soak);
+  }
+  std::fprintf(stderr, "usage: r3 check | stream [--soak SECONDS]\n");
   return 1;
 }
