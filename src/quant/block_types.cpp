@@ -46,6 +46,7 @@ TypeInfo type_info(std::uint32_t id) {
     case 200: return {"Q8_Z", 256, 264, true};
     case 201: return {"Q7_Z", 256, 232, true};
     case 202: return {"Q7_ZT", 256, 241, true};
+    case 204: return {"Q4_TG2", 256, 144, true};  // Pelias-only: Q4_TG layout, v2 grids
     case 203: return {"Q4_TG", 256, 144, true};  // Pelias-only: 2 (fp16 d) + 6 (levels) + 8 (tag bytes) + 128 (4-bit codes)  // Pelias-only: 2 + 6 + 1 (gate mask) + 224 (7-bit base) + 8 (H bits)  // Pelias-only: 2 (fp16 d) + 6 (levels) + 224 (7-bit values)  // Pelias-only: 2 (fp16 d) + 6 (eight 6-bit levels) + 256 (int8)
     default: return {"?", 0, 0, false};
   }

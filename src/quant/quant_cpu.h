@@ -76,10 +76,10 @@ void q7_zt_block(const float* x, std::uint8_t* out, const float* qw);
 // i in byte 16 + i / 2, low nibble first). Grids (16 levels, top 1): 0 uniform, 1 log ratio 1.3, 2 log ratio 1.45, 3
 // uniform x 0.6. Value = s_j * grid[tag][code]. Scale per 32-block searched, the tag per group chosen by the (importance-
 // weighted when given) squared error, then the codes and tags chosen again with the stored scale.
-void q4_tg_block(const float* x, std::uint8_t* out, const float* qw);
-void quantize_q4_tg(const float* x, std::uint8_t* out, std::int64_t n);
-void dequantize_q4_tg(const std::uint8_t* in, float* y, std::int64_t n);
-const float* q4_tg_grid(int tag);  // 16 levels, ascending
+void q4_tg_block(const float* x, std::uint8_t* out, const float* qw, int version = 1);  // version 2 = Q4_TG2 grids
+void quantize_q4_tg(const float* x, std::uint8_t* out, std::int64_t n, int version = 1);
+void dequantize_q4_tg(const std::uint8_t* in, float* y, std::int64_t n, int version = 1);
+const float* q4_tg_grid(int tag, int version = 1);  // 16 levels, ascending
 void quantize_q7_zt(const float* x, std::uint8_t* out, std::int64_t n);
 void dequantize_q7_zt(const std::uint8_t* in, float* y, std::int64_t n);
 void quantize_q8_1(const float* x, std::uint8_t* out, std::int64_t n);

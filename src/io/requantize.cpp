@@ -55,6 +55,7 @@ bool row_data_finite(std::uint32_t t, const std::uint8_t* p, std::uint64_t bytes
       for (std::uint64_t i = 0; i < bytes; i += 241) if (!half_finite(p + i)) return false;
       return true;
     case quant::Type::q4_tg:
+    case quant::Type::q4_tg2:
       for (std::uint64_t i = 0; i < bytes; i += 144) if (!half_finite(p + i)) return false;
       return true;
     case quant::Type::q6_k:

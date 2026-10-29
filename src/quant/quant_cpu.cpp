@@ -548,7 +548,16 @@ struct Q4TGGrids {
       }
     }
     for (int i = 0; i < 16; ++i) g[3][i] = 0.6f * g[0][i];
+    // v2 (Q4_TG2; author's 0-weight idea, sandbox q4tg_zero_level_check.py "uniform + log with 0"): grid 0 = (i - 7) / 8,
+    // levels -7/8..1 with an exact 0; grid 1 = the 1.3 log grid with its smallest positive level replaced by 0; grid 2 as
+    // v1; grid 3 = 0.6 x grid 0
+    for (int i = 0; i < 16; ++i) h[0][i] = (static_cast<float>(i) - 7.0f) / 8.0f;
+    for (int i = 0; i < 16; ++i) h[1][i] = g[1][i];
+    h[1][8] = 0.0f;
+    for (int i = 0; i < 16; ++i) h[2][i] = g[2][i];
+    for (int i = 0; i < 16; ++i) h[3][i] = 0.6f * h[0][i];
   }
+  float h[4][16];
 };
 const Q4TGGrids kQ4TG;
 inline int q4tg_nearest(const float* g, float v) {  // g ascending, 16 levels
@@ -560,15 +569,15 @@ inline int q4tg_nearest(const float* g, float v) {  // g ascending, 16 levels
   return (v - g[lo] <= g[hi] - v) ? lo : hi;
 }
 // one group of 8 values at scale s: the best tag, its codes and its error
-float q4tg_group(const float* x, const float* qw, float s, int* tag, std::uint8_t* code) {
+float q4tg_group(const float* x, const float* qw, float s, int* tag, std::uint8_t* code, const float (*grids)[16]) {
   float best = std::numeric_limits<float>::infinity();
   const float inv = s > 0.0f ? 1.0f / s : 0.0f;
   for (int t = 0; t < 4; ++t) {
     float e = 0.0f;
     std::uint8_t c[8];
     for (int k = 0; k < 8; ++k) {
-      c[k] = static_cast<std::uint8_t>(q4tg_nearest(kQ4TG.g[t], x[k] * inv));
-      const float d = x[k] - s * kQ4TG.g[t][c[k]];
+      c[k] = static_cast<std::uint8_t>(q4tg_nearest(grids[t], x[k] * inv));
+      const float d = x[k] - s * grids[t][c[k]];
       e += (qw ? qw[k] : 1.0f) * d * d;
     }
     if (e < best) {
@@ -581,9 +590,10 @@ float q4tg_group(const float* x, const float* qw, float s, int* tag, std::uint8_
 }
 }  // namespace
 
-const float* q4_tg_grid(int tag) { return kQ4TG.g[tag & 3]; }
+const float* q4_tg_grid(int tag, int version) { return version == 2 ? kQ4TG.h[tag & 3] : kQ4TG.g[tag & 3]; }
 
-void q4_tg_block(const float* x, std::uint8_t* out, const float* qw) {
+void q4_tg_block(const float* x, std::uint8_t* out, const float* qw, int version) {
+  const float (*grids)[16] = version == 2 ? kQ4TG.h : kQ4TG.g;
   static const float kF[19] = {0.35f, 0.4f, 0.45f, 0.5f, 0.55f, 0.6f, 0.65f, 0.7f, 0.75f, 0.8f, 0.85f, 0.9f, 0.95f, 1.0f, 1.05f, 1.1f, 1.15f, 1.2f, 1.25f};
   float sbest[8], top = 0.0f;
   for (int j = 0; j < 8; ++j) {
@@ -595,7 +605,7 @@ void q4_tg_block(const float* x, std::uint8_t* out, const float* qw) {
       for (float f : kF) {
         const float s = amax * f;
         float e = 0.0f;
-        for (int g = 0; g < 4; ++g) e += q4tg_group(x + 32 * j + 8 * g, qw ? qw + 32 * j + 8 * g : nullptr, s, nullptr, nullptr);
+        for (int g = 0; g < 4; ++g) e += q4tg_group(x + 32 * j + 8 * g, qw ? qw + 32 * j + 8 * g : nullptr, s, nullptr, nullptr, grids);
         if (e < be) { be = e; sbest[j] = s; }
       }
     top = std::max(top, sbest[j]);
@@ -615,7 +625,7 @@ void q4_tg_block(const float* x, std::uint8_t* out, const float* qw) {
     for (int g = 0; g < 4; ++g) {
       int t = 0;
       std::uint8_t c[8];
-      q4tg_group(x + 32 * j + 8 * g, qw ? qw + 32 * j + 8 * g : nullptr, s, &t, c);
+      q4tg_group(x + 32 * j + 8 * g, qw ? qw + 32 * j + 8 * g : nullptr, s, &t, c, grids);
       tagbyte = static_cast<std::uint8_t>(tagbyte | (t << (2 * g)));
       for (int k = 0; k < 8; ++k) {
         const int i = 32 * j + 8 * g + k;
@@ -627,11 +637,12 @@ void q4_tg_block(const float* x, std::uint8_t* out, const float* qw) {
   for (int b = 0; b < 6; ++b) out[2 + b] = static_cast<std::uint8_t>(packed >> (8 * b));
 }
 
-void quantize_q4_tg(const float* x, std::uint8_t* out, std::int64_t n) {
-  for (std::int64_t i = 0; i < n / 256; ++i, x += 256, out += 144) q4_tg_block(x, out, nullptr);
+void quantize_q4_tg(const float* x, std::uint8_t* out, std::int64_t n, int version) {
+  for (std::int64_t i = 0; i < n / 256; ++i, x += 256, out += 144) q4_tg_block(x, out, nullptr, version);
 }
 
-void dequantize_q4_tg(const std::uint8_t* in, float* y, std::int64_t n) {
+void dequantize_q4_tg(const std::uint8_t* in, float* y, std::int64_t n, int version) {
+  const float (*grids)[16] = version == 2 ? kQ4TG.h : kQ4TG.g;
   for (std::int64_t i = 0; i < n / 256; ++i, in += 144, y += 256) {
     const float d = fp16_to_fp32(get_u16(in));
     std::uint64_t packed = 0;
@@ -639,7 +650,7 @@ void dequantize_q4_tg(const std::uint8_t* in, float* y, std::int64_t n) {
     for (int j = 0; j < 8; ++j) {
       const float s = q8_z_scale(d, static_cast<int>((packed >> (6 * j)) & 63u));
       for (int g = 0; g < 4; ++g) {
-        const float* gr = kQ4TG.g[(in[8 + j] >> (2 * g)) & 3];
+        const float* gr = grids[(in[8 + j] >> (2 * g)) & 3];
         for (int k = 0; k < 8; ++k) {
           const int idx = 32 * j + 8 * g + k;
           y[idx] = s * gr[(in[16 + idx / 2] >> (4 * (idx & 1))) & 15];
@@ -1027,7 +1038,7 @@ bool can_quantize(Type t) {
   switch (t) {
     case Type::f32: case Type::f16: case Type::bf16: case Type::q8_0: case Type::q8_1: case Type::q4_k: case Type::q6_k:
     case Type::q8_k: case Type::q2_k: case Type::q3_k: case Type::q5_k: case Type::iq4_nl: case Type::iq4_xs: case Type::q8_z:
-    case Type::q7_z: case Type::q7_zt: case Type::q4_tg:
+    case Type::q7_z: case Type::q7_zt: case Type::q4_tg: case Type::q4_tg2:
       return true;
     default:
       return false;
@@ -1040,7 +1051,7 @@ bool can_dequantize(Type t) {
     case Type::q2_k: case Type::q3_k: case Type::q5_k: case Type::iq4_xs:
     case Type::q4_0: case Type::q4_1: case Type::q5_0: case Type::q5_1: case Type::iq4_nl: case Type::mxfp4:
     case Type::tq1_0: case Type::tq2_0: case Type::iq2_xxs: case Type::iq2_xs: case Type::iq2_s: case Type::iq3_xxs:
-    case Type::iq3_s: case Type::iq1_s: case Type::iq1_m: case Type::q8_z: case Type::q7_z: case Type::q7_zt: case Type::q4_tg:
+    case Type::iq3_s: case Type::iq1_s: case Type::iq1_m: case Type::q8_z: case Type::q7_z: case Type::q7_zt: case Type::q4_tg: case Type::q4_tg2:
       return true;
     default:
       return false;
@@ -1097,7 +1108,8 @@ Status quantize_row(Type t, const float* x, std::uint8_t* out, std::int64_t n) {
     case Type::q8_z: quantize_q8_z(x, out, n); break;
     case Type::q7_z: quantize_q7_z(x, out, n); break;
     case Type::q7_zt: quantize_q7_zt(x, out, n); break;
-    case Type::q4_tg: quantize_q4_tg(x, out, n); break;
+    case Type::q4_tg: quantize_q4_tg(x, out, n, 1); break;
+    case Type::q4_tg2: quantize_q4_tg(x, out, n, 2); break;
     default: return Status::fail(Code::internal, "quantize dispatch");
   }
   return Status::good();
@@ -1124,7 +1136,8 @@ Status dequantize_row(Type t, const std::uint8_t* in, float* y, std::int64_t n) 
     case Type::q8_z: dequantize_q8_z(in, y, n); break;
     case Type::q7_z: dequantize_q7_z(in, y, n); break;
     case Type::q7_zt: dequantize_q7_zt(in, y, n); break;
-    case Type::q4_tg: dequantize_q4_tg(in, y, n); break;
+    case Type::q4_tg: dequantize_q4_tg(in, y, n, 1); break;
+    case Type::q4_tg2: dequantize_q4_tg(in, y, n, 2); break;
     case Type::q4_0: dequantize_q4_0(in, y, n); break;
     case Type::q4_1: dequantize_q4_1(in, y, n); break;
     case Type::q5_0: dequantize_q5_0(in, y, n); break;

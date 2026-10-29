@@ -303,3 +303,40 @@ TEST(q4_tg_layout_tags_and_beats_q4_k_on_heavy_tails) {
     CHECK(std::fabs(g[15] - (t == 3 ? 0.6f : 1.0f)) < 1e-6f);
   }
 }
+
+TEST(q4_tg2_has_an_exact_zero_and_beats_q4_tg) {
+  // Pelias-only id 204: Q4_TG's 144-byte layout with the v2 grids (author's 0-weight idea): grids 0, 1 and 3 hold an exact
+  // 0. On Laplace values (many near 0) it must beat v1 at the same bytes.
+  const q::TypeInfo ti = q::type_info(q::Type::q4_tg2);
+  CHECK(ti.known && std::string(ti.name) == "Q4_TG2" && ti.block_elements == 256 && ti.block_bytes == 144);
+  for (int t = 0; t < 4; ++t) {
+    const float* g = q::q4_tg_grid(t, 2);
+    bool zero = false;
+    for (int i = 0; i < 16; ++i) {
+      if (i) CHECK(g[i] > g[i - 1]);
+      if (g[i] == 0.0f) zero = true;
+    }
+    CHECK(zero == (t != 2));
+    CHECK(std::fabs(g[15] - (t == 3 ? 0.6f : 1.0f)) < 1e-6f);
+  }
+  const int n = 8192;
+  std::vector<float> x(static_cast<std::size_t>(n));
+  std::uint32_t s = 4242;
+  for (float& v : x) {
+    s = s * 1664525u + 1013904223u;
+    const float u = (static_cast<float>(s >> 8) + 0.5f) / 16777216.0f;
+    s = s * 1664525u + 1013904223u;
+    v = 0.01f * ((s >> 31) ? 1.0f : -1.0f) * -std::log(u);
+  }
+  std::vector<std::uint8_t> a(static_cast<std::size_t>(q::row_bytes(203, n))), b(static_cast<std::size_t>(q::row_bytes(204, n)));
+  std::vector<float> ya(static_cast<std::size_t>(n)), yb(static_cast<std::size_t>(n));
+  CHECK(q::quantize_row(q::Type::q4_tg, x.data(), a.data(), n).ok() && q::dequantize_row(q::Type::q4_tg, a.data(), ya.data(), n).ok());
+  CHECK(q::quantize_row(q::Type::q4_tg2, x.data(), b.data(), n).ok() && q::dequantize_row(q::Type::q4_tg2, b.data(), yb.data(), n).ok());
+  double ea = 0, eb = 0;
+  for (int i = 0; i < n; ++i) {
+    ea += std::pow(ya[size_t(i)] - x[size_t(i)], 2);
+    eb += std::pow(yb[size_t(i)] - x[size_t(i)], 2);
+  }
+  std::printf("      Q4_TG2 vs Q4_TG: %.1f %% error\n", 100.0 * (eb / ea - 1.0));
+  CHECK(eb < ea);
+}

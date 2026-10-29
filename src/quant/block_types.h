@@ -20,7 +20,8 @@ enum class Type : std::uint32_t {
   // Pelias-only ids, far above the reference library's range so it refuses such a file instead of misreading it
   q8_z = 200,
   q7_z = 201,
-  q4_tg = 203,  // Q4_TG: 4-bit values with a 2-bit grid tag per 8 values (author's bit-tag matrix, C4; run E 2026-10-28)
+  q4_tg = 203,
+  q4_tg2 = 204,  // Q4_TG2: Q4_TG's layout with the v2 grids (an exact 0 in two of them; the author's 0-weight idea) and full importance  // Q4_TG: 4-bit values with a 2-bit grid tag per 8 values (author's bit-tag matrix, C4; run E 2026-10-28)
   q7_zt = 202,  // Q7_ZT: 7-bit base + the 8th bit gated on 2 of 8 32-blocks per 256 (game plan, Q7_ZH and the binary gate)  // Q7_Z: Q8_Z's scales with tight 7-bit values (game plan, 7pH ladder, Q7_P rung, 2026-10-28)  // Q8_Z: the author's "zip code" scales with 8-bit values (game plan, Q7_PT review, 2026-10-28)
 };
 

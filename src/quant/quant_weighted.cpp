@@ -758,7 +758,7 @@ void quantize_iq4_xs(const float* x, std::uint8_t* out, std::int64_t n) {
 bool uses_importance(Type t) {
   switch (t) {
     case Type::q2_k: case Type::q3_k: case Type::q4_k: case Type::q5_k: case Type::q6_k: case Type::iq4_nl: case Type::iq4_xs:
-    case Type::q7_zt: case Type::q4_tg:
+    case Type::q7_zt: case Type::q4_tg: case Type::q4_tg2:
       return true;
     default:
       return false;
@@ -798,6 +798,9 @@ Status quantize_rows(Type t, const float* x, std::uint8_t* out, std::int64_t nro
         }
         break;
       }
+      case Type::q4_tg2:  // full importance (sandbox: -3 % vs sqrt) and the v2 grids with an exact 0 (about -7 %)
+        for (std::int64_t i = 0; i < n_per_row / 256; ++i) q4_tg_block(xr + i * 256, o + i * 144, imatrix + i * 256, 2);
+        break;
       default: return Status::fail(Code::internal, "weighted quantize dispatch");
     }
   }
