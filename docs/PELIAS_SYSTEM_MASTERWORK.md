@@ -1304,6 +1304,12 @@ What turns this into fps numbers (probe P-G1, DECISION (proposed)): a small test
 
 ### 21.6 End-to-end gains, calibrated by the measured LLM result (author's questions, 2026-10-26 12:29 to 12:43)
 
+**Update 2026-10-29.**
+- The 88.2-92 tok/s ceiling used below is the model of 2026-10-20. The game plan now carries Fable-corrected rungs: 89-103 / 112 / 116 tok/s, 119 with today's ~3.2 ms per-token overhead, and a 193 tok/s memory floor (about 211 at this card's overclocked memory) reachable only with GPU-side work such as R3.
+- R3 v1 is MEASURED: one token's weights in 8.79 ms streaming, vs 20.81 ms one launch per matrix.
+- The read ceiling, 494 GB/s, is 89.5 % of this card's peak as run: its memory is overclocked to about 552 GB/s (author's +1000 MHz).
+- Other cards: 21.8. What the PC needs: 21.9.
+
 A primitive speeds up only the part of a job it fixes, so the end-to-end gain follows Amdahl's law: gain = 1 ÷ ((1 − f) + f ÷ k) − 1, where k is the primitive's factor and f is the share of the job's time spent in that bottleneck.
 
 **Calibration.** f is unmeasured for every field but one. For the LLM, k = 1 / (1 − 0.775) = 4.444 (the live hit rate), and the measured runs give f back-solved: 0.269 (38.8 → 49.0 tok/s), 0.299 (41.1 → 53.5), 0.466 (31.3 → 49.0) and 0.522 (31.8 → 53.5), so **27 % to 52 %**. The table uses those two ends for every field as the best measured guide until each field measures its own f (ruling 12:52). "Whole job" is k itself: the gain if the entire job were that bottleneck, an upper bound only. All values DERIVED; the anchor row reproduces the measured runs by construction.
@@ -1351,3 +1357,249 @@ For scale, the end-to-end gains measured so far: the LLM hot-bank tier +30 % ove
 3. After the first benchmark (16.4) and the release gates: extract Layer 0 (`libpelias_substrate`) as a stand-alone library with its own examples; then, per the 12:52 ruling, one scripted probe per field of 21.3 and 21.5, each against a stock baseline with unchanged output, measuring that field's own f and k (proposed first: vector search over an index larger than VRAM, the access pattern closest to the hot-bank case); P-G1 for games; H-U2 against H-U3 on the LLM workload, where the traces already exist.
 
 No step here starts before the author says so.
+
+### 21.8 Older and smaller cards: what the measured levers imply (author, 2026-10-29)
+
+**Status:** every tok/s figure here is a DERIVED proposal. The inputs are measurements from the author's machine, carried to other cards under the assumptions stated below. No other card has run Pelias yet. The section exists so that owners of these cards can measure them (21.8.10), and each measurement replaces its row.
+
+#### 21.8.1 The model
+
+For a token of a mixture-of-experts model:
+
+```
+t = D / (e·B)  +  h·X / (e·B)  +  (1 − h)·X / C  +  o
+```
+
+| Symbol | Meaning | Value | Label / source |
+|---|---|---|---|
+| D | Dense weights + output head read per token | 1.74 GB (35B) | DERIVED (R3 token table: 2.27 GB minus the routed experts) |
+| X | Routed-expert weights read per token | 0.532 GB (35B) | DERIVED (R3 token table: Q4_TG2 0.330 + Q5_K 0.202) |
+| B | The card's memory bandwidth | per card | PUBLISHED (vendor spec) |
+| e | Fraction of B the decode kernel reaches | 0.47 low, 0.895 high | MEASURED on the 4070: R3 v1 259 GB/s, read ceiling 494 GB/s, against its 552 GB/s peak |
+| h | Hit rate of the hot-expert bank | from the curve below | DERIVED (simulated on the 121k-token router trace) |
+| C | CPU read rate for the cold experts | 42.5 GB/s | DERIVED (game plan 40-45 GB/s on DDR4-3200 dual channel; DDR4 measured 47.8 GB/s on 2 threads) |
+| o | Per-token overhead (launches, syncs, attention, norms, sampling) | 3.2 ms low, 0.5 ms high | DERIVED (game plan; Fable's estimate of the sync cost after the R3 fixes) |
+
+**How the inputs are set:**
+- **Hot bank:** VRAM − D − 1.0 GB. The 1.0 GB is an ASSUMPTION covering the KV cache, workspace and desktop.
+- **Hit-rate curve:** 2 GiB → 0.43, 4 GiB → 0.63, 6 GiB → 0.76, linear in between and held at 0.76 above (past 6 GiB is unmeasured). The 6.1 GiB bank's held-out hit rate was 0.765 (MEASURED).
+- **Whole model in VRAM:** the file (22.43 GB, MEASURED) + 1.0 GB fits, so h = 1.
+- **Calibration check:** with e = 0.895, o = 3.2 ms and h = 0.765, the model gives the 4070 95.3 tok/s. The game plan's independent rung-1 figure is 89-103 tok/s (DERIVED, Fable-corrected).
+
+**Small MoE models** (21.8.5) use the same formula, scaled from the 35B by two ratios and one assumption:
+- bytes per total parameter: 0.641 (22.43 GB / 35B);
+- bytes per active parameter: 0.757 (2.27 GB / 3B);
+- the dense share of the active bytes: 77 %, as in the 35B (ASSUMPTION).
+
+The hit-rate curve is read by the share of expert bytes the bank holds, not by GiB (ASSUMPTION: routing skew like the 35B's). A smaller model uses a 0.6 GB reserve.
+
+**Dense models** (21.8.4): every weight is read every token, so t = S / (e·B) + o·L/40, where S is the model's size in GB. o scales with the number of layers (ASSUMPTION), with L = 28 as a typical small model.
+
+#### 21.8.2 NVIDIA consumer cards, 6 GB to the largest (Qwen3.6-35B-A3B)
+
+| Card | VRAM GB | GB/s | Placement | h | tok/s |
+|---|---|---|---|---|---|
+| RTX 2060 | 6 | 336 | bank 3.0 GiB | 0.53 | 46-77 |
+| RTX 2080 Ti | 11 | 616 | bank 7.7 GiB | 0.76 | 73-135 |
+| RTX 3060 12GB | 12 | 360 | bank 8.6 GiB | 0.76 | 53-98 |
+| RTX 3070 | 8 | 448 | bank 4.9 GiB | 0.69 | 58-104 |
+| RTX 3080 10GB | 10 | 760 | bank 6.8 GiB | 0.76 | 82-150 |
+| RTX 3090 | 24 | 936 | all in VRAM | — | 119-311 |
+| RTX 4060 | 8 | 272 | bank 4.9 GiB | 0.69 | 42-77 |
+| RTX 4060 Ti 16GB | 16 | 288 | bank 12.3 GiB | 0.76 | 45-85 |
+| RTX 4070 (this PC, stock memory) | 12 | 504 | bank 8.6 GiB | 0.76 | 65-121 |
+| RTX 4090 | 24 | 1008 | all in VRAM | — | 125-331 |
+| RTX 5060 | 8 | 448 | bank 4.9 GiB | 0.69 | 58-104 |
+| RTX 5060 Ti 16GB | 16 | 448 | bank 12.3 GiB | 0.76 | 61-113 |
+| RTX 5070 | 12 | 672 | bank 8.6 GiB | 0.76 | 77-141 |
+| RTX 5090 | 32 | 1792 | all in VRAM | — | 169-522 |
+
+On the 24 GB cards the whole model fits, but only about 1.5 GB is left after the 22.4 GB file. That is enough for a moderate context only; the KV/state test now running decides how much more.
+
+#### 21.8.3 Retired data-centre cards (Qwen3.6-35B-A3B)
+
+| Card | VRAM GB | GB/s | Placement | h | tok/s |
+|---|---|---|---|---|---|
+| Tesla P40 | 24 | 346 | all in VRAM | — | 58-128 |
+| Tesla P100 16GB | 16 | 732 | bank 12.3 GiB | 0.76 | 80-148 |
+| Tesla T4 | 16 | 320 | bank 12.3 GiB | 0.76 | 49-91 |
+| Tesla V100 16GB | 16 | 900 | bank 12.3 GiB | 0.76 | 89-162 |
+| Tesla V100 32GB | 32 | 900 | all in VRAM | — | 117-301 |
+| Instinct MI25 | 16 | 484 | bank 12.3 GiB | 0.76 | 64-118 |
+| Instinct MI50 16GB | 16 | 1024 | bank 12.3 GiB | 0.76 | 94-171 |
+| Instinct MI50 32GB / MI60 | 32 | 1024 | all in VRAM | — | 126-336 |
+
+**Why these cards are in the table:** one-token decode is mostly a memory-bandwidth job. These 2016-2018 data-centre cards have high bandwidth for their age: the V100 has 900 GB/s against the reference 4070's 504 (PUBLISHED). A V100 32GB could hold the whole Pelias file with room for context. Whether its older compute keeps up is exactly what a measurement on one would show.
+
+#### 21.8.4 The oldest cards, 4 GB and up: dense models by size
+
+No model is named here. The rows give the largest dense model that fits (VRAM − 0.6 GB) and the speed of a 1 GB model for scale.
+
+| Card | VRAM GB | GB/s | Largest dense model that fits | tok/s at that size | tok/s, a 1 GB model |
+|---|---|---|---|---|---|
+| GTX 960 4GB | 4 | 112 | 3.4 GB | 14-29 | 47-96 |
+| GTX 970 | 3.5 | 224 | 2.9 GB | 33-67 | 85-187 |
+| GTX 980 Ti | 6 | 336.5 | 5.4 GB | 27-54 | 116-272 |
+| GTX 1050 Ti | 4 | 112 | 3.4 GB | 14-29 | 47-96 |
+| GTX 1060 6GB | 6 | 192 | 5.4 GB | 16-31 | 74-162 |
+| GTX 1070 | 8 | 256 | 7.4 GB | 15-30 | 94-212 |
+| GTX 1080 Ti | 11 | 484 | 10.4 GB | 20-41 | 150-376 |
+| RX 570 4GB | 4 | 224 | 3.4 GB | 28-57 | 85-187 |
+| RX 580 8GB | 8 | 256 | 7.4 GB | 15-30 | 94-212 |
+| Arc A380 | 6 | 186 | 5.4 GB | 15-30 | 73-157 |
+
+**Reading it:**
+- A dense model this small is a narrow tool, suited to things like short answers, classification and simple chat.
+- Pelias adds speed (the streaming kernel) and accuracy per byte (its formats). It does not change what a model of that size can know.
+- The interesting step on these cards is the small MoE (21.8.5).
+
+#### 21.8.5 Small MoE models on small cards
+
+Each class is a published size: total parameters, active parameters per token. Models of each size exist; the class is what matters here, not a particular model.
+
+| Class | File at Pelias formats, GB | Read per token, GB | Dense part, GB |
+|---|---|---|---|
+| 7B-A1.3B | 4.4 | 0.98 | 0.75 |
+| 16B-A2.4B | 10.1 | 1.82 | 1.39 |
+| 21B-A3.6B | 13.5 | 2.72 | 2.09 |
+| 30B-A3.3B | 19.5 | 2.50 | 1.91 |
+
+| Card | VRAM GB | GB/s | 7B-A1.3B class | 16B-A2.4B class | 21B-A3.6B class | 30B-A3.3B class |
+|---|---|---|---|---|---|---|
+| GTX 970 | 3.5 | 224 | 75-156 (h 0.76) | 43-77 (h 0.57) | 28-45 (h 0.30) | 30-47 (h 0.23) |
+| GTX 1050 Ti | 4 | 112 | 45-90 (h 0.76) | 26-49 (h 0.66) | 18-31 (h 0.45) | 19-33 (h 0.35) |
+| RX 570 4GB | 4 | 224 | 75-156 (h 0.76) | 44-82 (h 0.66) | 29-49 (h 0.45) | 31-50 (h 0.35) |
+| GTX 980 Ti | 6 | 336.5 | 106-266 (all) | 61-116 (h 0.76) | 43-77 (h 0.73) | 44-75 (h 0.61) |
+| GTX 1060 6GB | 6 | 192 | 71-161 (all) | 41-78 (h 0.76) | 28-52 (h 0.73) | 30-52 (h 0.61) |
+| RTX 2060 | 6 | 336 | 106-265 (all) | 61-116 (h 0.76) | 43-77 (h 0.73) | 44-75 (h 0.61) |
+| Arc A380 | 6 | 186 | 69-156 (all) | 40-76 (h 0.76) | 27-50 (h 0.73) | 29-51 (h 0.61) |
+| GTX 1070 | 8 | 256 | 88-209 (all) | 50-96 (h 0.76) | 35-65 (h 0.76) | 38-71 (h 0.76) |
+| RX 580 8GB | 8 | 256 | 88-209 (all) | 50-96 (h 0.76) | 35-65 (h 0.76) | 38-71 (h 0.76) |
+| RX 6600 | 8 | 224 | 80-185 (all) | 46-87 (h 0.76) | 32-59 (h 0.76) | 35-64 (h 0.76) |
+| RX 7600 | 8 | 288 | 95-232 (all) | 55-105 (h 0.76) | 39-71 (h 0.76) | 42-77 (h 0.76) |
+| RTX 4060 | 8 | 272 | 92-220 (all) | 53-101 (h 0.76) | 37-68 (h 0.76) | 40-74 (h 0.76) |
+| RTX 3070 | 8 | 448 | 127-339 (all) | 73-139 (h 0.76) | 53-95 (h 0.76) | 56-103 (h 0.76) |
+| RTX 5060 | 8 | 448 | 127-339 (all) | 73-139 (h 0.76) | 53-95 (h 0.76) | 56-103 (h 0.76) |
+| Arc A750 | 8 | 512 | 137-378 (all) | 79-151 (h 0.76) | 57-103 (h 0.76) | 61-112 (h 0.76) |
+| GTX 1080 Ti | 11 | 484 | 133-361 (all) | 89-213 (all) | 55-100 (h 0.76) | 59-108 (h 0.76) |
+| Tesla P40 | 24 | 346 | 108-272 (all) | 70-157 (all) | 50-108 (all) | 54-117 (all) |
+| Tesla V100 16GB | 16 | 900 | 181-581 (all) | 133-363 (all) | 104-258 (all) | 83-149 (h 0.76) |
+
+"(all)" means the whole model sits in VRAM. "(h …)" means it runs through the bus, with the bank's hit rate shown.
+
+**What the arithmetic says:** an MoE reads only its active slice per token. On paper, a 4-6 GB card that tops out at about a 3-5 GB dense model could run a 16B-class MoE at 26-116 tok/s, and a 21-30B-class MoE at 18-77, with the rest of the model in system RAM. That is a model 2.5-5x larger than the card's VRAM. These are the rows most worth measuring.
+
+#### 21.8.6 AMD consumer cards (Qwen3.6-35B-A3B)
+
+| Card | VRAM GB | GB/s | Placement | h | tok/s |
+|---|---|---|---|---|---|
+| RX 5700 XT | 8 | 448 | bank 4.9 GiB | 0.69 | 58-104 |
+| RX 6600 | 8 | 224 | bank 4.9 GiB | 0.69 | 37-67 |
+| RX 6700 XT | 12 | 384 | bank 8.6 GiB | 0.76 | 55-103 |
+| RX 6800 | 16 | 512 | bank 12.3 GiB | 0.76 | 66-122 |
+| RX 7600 | 8 | 288 | bank 4.9 GiB | 0.69 | 44-80 |
+| RX 7800 XT | 16 | 624 | bank 12.3 GiB | 0.76 | 74-136 |
+| RX 7900 XTX | 24 | 960 | all in VRAM | — | 121-318 |
+| RX 9060 XT 16GB | 16 | 320 | bank 12.3 GiB | 0.76 | 49-91 |
+| RX 9070 XT | 16 | 640 | bank 12.3 GiB | 0.76 | 75-138 |
+
+#### 21.8.7 Intel
+
+| Card | VRAM GB | GB/s | Placement | h | tok/s |
+|---|---|---|---|---|---|
+| Arc A380 | 6 | 186 | bank 3.0 GiB | 0.53 | 31-54 |
+| Arc A750 | 8 | 512 | bank 4.9 GiB | 0.69 | 63-111 |
+| Arc A770 16GB | 16 | 560 | bank 12.3 GiB | 0.76 | 70-128 |
+| Arc B570 | 10 | 380 | bank 6.8 GiB | 0.76 | 55-102 |
+| Arc B580 | 12 | 456 | bank 8.6 GiB | 0.76 | 62-114 |
+
+**Integrated graphics (Intel Xe and AMD APUs):** the GPU reads the same system RAM as the CPU, so the whole file sits in RAM and t = 2.27 GB / (e·B_RAM) + o. With dual-channel DDR5-5600 (89.6 GB/s, PUBLISHED theoretical) that is 17-35 tok/s for the 35B MoE. The iGPU's compute rate at this load is UNVERIFIED.
+
+#### 21.8.8 "Today" vs Pelias (planned column, fills in after R3 v2 step 1)
+
+Each table gets a "today" column: what stock software does on that card, or "won't run" where the stock file can't load or the card has lost software support. It is derived with the same formula, set up the way stock software works:
+- one launch per matrix, at the rate R3 v2 step 1 measures (its graph-replay row, which leaves out WSL's launch cost);
+- today's overhead;
+- experts moved to the CPU in whole layers, as `--n-cpu-moe` does.
+
+It is anchored to the two MEASURED stock runs on this PC (31.8 and 41.1 tok/s). The boost column is Pelias divided by today.
+
+#### 21.8.9 What has to be true, and the caveats
+
+1. **Backends.**
+   - Pelias's GPU code today is CUDA, tuned and measured on sm_89 only. Other NVIDIA generations need builds for their architecture.
+   - AMD and Intel need the Vulkan backend (planned; its building blocks MEASURED through Vulkan on the reference machine, 21.2.1). It is not built yet.
+2. **dp4a, the packed int8 multiply-add the decoders use.**
+   - On NVIDIA it needs compute capability 6.1 or newer (PUBLISHED, CUDA documentation). The GTX 900 series (5.2) and the Tesla P100 (6.0) lack it: there the decode uses plain integer multiply-adds, about 4x the instructions. Whether it stays memory-bound is UNVERIFIED; one probe per card settles it.
+   - On AMD and Intel, the int8 dot instructions differ by GPU generation. They are listed per card when the Vulkan backend is built.
+3. **Accuracy:** Pelias's accuracy gains are MEASURED on the 35B only. Smaller models usually lose more to low-bit rounding, so each needs its own KL runs before any quality claim.
+4. **The host:** the bus rows depend on the host's RAM speed (21.9.3).
+5. **e on other memory types:** e was measured on GDDR6X. HBM2, GDDR5 and GDDR7 may differ. `tdecode ceil` measures it per card.
+6. **Context:** the reserves cover a moderate context. Long contexts shrink the bank.
+7. **Not included, could add more:**
+   - MTP drafting (C5: 1.42-1.73x DERIVED);
+   - the H gate on KV pages;
+   - the light 8th bit read only where needed.
+
+#### 21.8.10 Turning a row into a measurement
+
+On the card, run:
+1. The probe: `pelias membw`, `tdecode ceil` (measures e), and the governor's bank size.
+2. `r3 stream`.
+3. The engine's tok/s.
+
+Each result replaces its DERIVED row with MEASURED, plus the card and date. The first candidates are a V100 and the author's RTX 3070 Ti (the X list).
+
+#### 21.8.11 Sources for the card specs (checked 2026-10-29)
+
+- GeForce, Radeon RX 5000-7000 and Arc A-series bandwidths: [eatyourbytes, GPUs by memory bandwidth](https://www.eatyourbytes.com/list-of-gpus-by-memory-bandwidth/)
+- GeForce RTX 50 series: [GeForce RTX 50 series, desktop specifications (Wikipedia mirror)](https://wiki.krisyotam.com/content/wikipedia_en_all_nopic_2026-03/GeForce_RTX_5080)
+- Radeon RX 9000 series: [Radeon RX 9000 series (Wikipedia mirror)](https://wiki.krisyotam.com/content/wikipedia_en_all_nopic_2026-03/AMD_Radeon_RX_9070_XT)
+- Radeon Instinct MI25 / MI50 / MI60: [Radeon Instinct (Wikiwand)](https://wikiwand.com/en/articles/Radeon_Instinct)
+- Arc B-series and A750 / A770: [Tom's Hardware, Intel Battlemage and Arc B-series](https://www.tomshardware.com/pc-components/gpus/intel-battlemage-arc-b-series-gpus-everything-we-know)
+- Tesla P40, P100: [flopper.io, P100 PCIe 16GB vs Tesla P40](https://flopper.io/compare/nvidia-p100-pcie-16gb-vs-nvidia-tesla-p40-24gb)
+- Tesla V100 (PCIe 16 GB 897 GB/s; 900 GB/s used, NVIDIA's rounded figure): [sysrqmts, Tesla P40 vs V100](https://sysrqmts.com/gpus/compare/nvidia-tesla-p40-vs-nvidia-tesla-v100-pcie-16-gb)
+- Tesla T4, GTX 980 Ti: [fpsbench, T4 vs GTX 980 Ti](https://fpsbench.com/compare/gpu/nvidia-tesla-t4-vs-nvidia-geforce-gtx-980-ti)
+- GTX 970: [gagadget, GTX 970 vs T4](https://gagadget.com/en/graphics-cards/geforce-gtx-970-vs-tesla-t4/)
+- GTX 1060 6 GB: [gagadget, GTX 1060 6 GB vs T4](https://gagadget.com/en/graphics-cards/geforce-gtx-1060-6-gb-vs-tesla-t4/)
+- GTX 960: [fpsbench, GTX 960 vs T4](https://fpsbench.com/compare/gpu/nvidia-geforce-gtx-960-vs-nvidia-tesla-t4) (the 4 GB board shares the 128-bit bus and 112 GB/s)
+
+### 21.9 What the PC needs for the unified bus, and the earliest CPUs that have it
+
+#### 21.9.1 Absolutely necessary
+
+| Need | Why | Earliest / minimum | Label |
+|---|---|---|---|
+| A 64-bit x86 CPU and a 64-bit OS (Windows 10/11, Linux or WSL2) | Pelias is built and tested there; ARM is untested | Any x86-64 CPU | DECISION (build targets) |
+| A GPU with a Pelias backend | The hot bank and the decode run on the GPU | NVIDIA via CUDA today; AMD and Intel once the Vulkan backend exists | DECISION |
+| System RAM for the part of the model not in VRAM, plus the OS | The cold experts are read from RAM | For the 35B: the 22.4 GB file plus about 8 GB → 32 GB as a floor (the reference has 64 GB) | DERIVED (8 GB is an ASSUMPTION) |
+| Two memory channels populated | The cold path is RAM-bandwidth bound; one channel halves it | Two DIMMs in the board's paired slots | PUBLISHED (channel width) + MEASURED (2 threads already fill dual-channel DDR4) |
+| At least 4 physical cores | 2 cold-reader threads fill dual-channel DDR4; +1 for the engine's host thread; +1 left for the user | 4 cores | DERIVED from MEASURED (no lag felt by the user with up to 4 readers on the 8-core reference) |
+
+#### 21.9.2 Strongly recommended
+
+| Item | Why | Earliest CPUs with it | Label |
+|---|---|---|---|
+| AVX2 + FMA | The CPU readers and the reference forward pass are tuned for it. Portable fallbacks exist, but slower | Intel 4th-gen Core (Haswell, 2013); AMD Excavator (2015) and every Ryzen (2017 on). Intel Pentium / Celeron only from the Tiger Lake generation (2020) | PUBLISHED |
+| PCIe 3.0 x16 or better | In this design the CPU computes the cold experts, so only small activations cross PCIe. Gen4 helps the zero-copy variant (26.2 GB/s MEASURED on Gen4 x16) | Any PCIe 3.0 board | MEASURED / DERIVED |
+| An NVMe drive for the model | Load time: about 22 GB in ~7 s cold on Windows (MEASURED) | Any NVMe | MEASURED |
+
+#### 21.9.3 What the host RAM does to the bus rows (example, DERIVED)
+
+| Host memory | C (cold path) | RTX 3060 12GB, 35B | RTX 4060 8GB, 35B |
+|---|---|---|---|
+| DDR3-1600 dual channel (Haswell era) | 21 GB/s | 45-75 tok/s | 36-58 tok/s |
+| DDR4-3200 dual channel (the reference) | 42.5 GB/s | 52-98 tok/s | 42-76 tok/s |
+| DDR5-6000 dual channel | 80 GB/s | 57-114 tok/s | 45-89 tok/s |
+
+C is scaled from the reference by each memory's published peak (25.6 / 51.2 / 96 GB/s).
+
+#### 21.9.4 Optional, and when it becomes required
+
+| Item | When it matters | Earliest platforms | Label |
+|---|---|---|---|
+| Resizable BAR | Required for the graphics-API doorbell (the Vulkan path for AMD and Intel cards). Not needed for CUDA, whose doorbell works without it (MEASURED, 21.2) | Intel 10th-gen Core and newer; AMD Ryzen 3000 and newer, on boards with ReBAR in the BIOS | PUBLISHED (Intel's Arc guidance; NVIDIA's ReBAR notes) |
+| A large L3 cache (e.g. the 5800X3D's 96 MB) | Keeps repeated cold experts on chip ("L3 repeats", rung 3) | Any; the gain grows with L3 | DERIVED (game plan rung 3) |
+| Huge pages (Linux / WSL) | Fewer page walks on the cold path | Any | MEASURED: under 1 % on the reference |
+
+**In one line:** to run Pelias's bus on an NVIDIA card, the floor is a 4-core AVX2 CPU (Intel Haswell or AMD Ryzen and newer), two memory channels and enough RAM for the model. AMD and Intel cards add Resizable BAR, which means Intel 10th gen or Ryzen 3000 and newer.

@@ -4,6 +4,8 @@
 
 > **PRE-RELEASE, PRIVATE. Updated 2026-10-29.** Milestone 1 runs: Pelias reads the model, quantizes it with its own formats (`pelias quantize`), runs the whole model on the CPU reference path and scores it against the original (`pelias kld`). All of it is ground-up code. The GPU engine is being built now: R3, the streaming decode kernel, is exact on every format and is being tuned. Every number below carries a label. The raw results are in `data/probe_results/` and `logs/BUILD_LOG.md`.
 
+> **How to read the numbers in this repository.** Every result marked MEASURED was measured on one machine: the author's PC (RTX 4070 12 GB with its memory overclocked, Ryzen 7 5800X3D, 64 GB DDR4-3200, Windows 11 + WSL2). Every figure for other hardware is DERIVED: a proposal, with its formula and inputs written down, so anyone with that hardware can run the same benchmark and report what they measure. Where a measurement disagrees with a derived figure, the measurement wins and the derivation gets fixed.
+
 **Author and maintainer:** John Lipka. Developed with AI assistance under his direction. Sibling repositories (records of the design and measurements): pelias-trainer, pelias-engine.
 
 ## Origin
@@ -85,6 +87,36 @@ The newer projections sit above that ceiling because they rest on measurements t
    - cheaper syncs.
 4. **The engine (GP3-08), then the server:** R3 inside Pelias, MTP drafting, the bus view (live CPU / GPU charts with a green "Unified bus confirmed" when every check passes).
 
+## Other cards: proposed numbers, waiting for your benchmarks
+
+Pelias was built and measured on one 12 GB consumer card. The levers behind its numbers aren't specific to that card:
+- reading weights at 89.5 % of the card's peak in one long stream;
+- a quantizer that beats the best published 4-bit file at a smaller size;
+- a bus that keeps the hot experts in VRAM and lets the CPU handle the rest.
+
+The table carries the same arithmetic over to other cards, including older ones and retired data-centre cards. These are proposals, not results (DERIVED; the formula and every input are in masterwork 21.8). They exist so people with these cards can benchmark them and replace each row with a measurement:
+
+| Card | VRAM | What it runs (Pelias formats) | tok/s, DERIVED |
+|---|---|---|---|
+| Tesla V100 32GB (data centre, 2017) | 32 GB | Qwen3.6-35B-A3B, whole model in VRAM | 117-301 |
+| Tesla V100 16GB | 16 GB | the same 35B: dense + 12 GiB of hot experts, the rest from RAM | 89-162 |
+| Instinct MI50 32GB / MI60 | 32 GB | the same 35B, whole model in VRAM | 126-336 |
+| Tesla P40 (data centre, 2016) | 24 GB | the same 35B, whole model in VRAM | 58-128 |
+| RTX 3060 12GB | 12 GB | the same 35B through the bus | 53-98 |
+| RTX 2060 | 6 GB | the same 35B through the bus | 46-77 |
+| GTX 1060 6GB (2016) | 6 GB | a small MoE (16B total, 2.4B active class) through the bus | 41-78 |
+| GTX 1050 Ti 4GB (2016) | 4 GB | a small MoE (7B total, 1.3B active class) through the bus | 45-90 |
+| *For scale: this PC today* | 12 GB | *the 35B: stock llama.cpp best layout 41.1, the author's tier build 53.5 (MEASURED)* | — |
+
+**How to read a range:**
+- **Low end:** the streaming kernel as measured today (R3 v1) plus today's per-token overhead.
+- **High end:** the kernel at the measured read ceiling with most of the overhead moved onto the GPU.
+- **"Through the bus"** means the CPU reads the experts that don't fit in VRAM from system RAM, so the PC needs RAM for the rest of the model. Masterwork 21.9 lists what the PC needs.
+
+On the oldest cards, dense models are limited to what fits in 4-6 GB. Small MoE models are the more interesting case on paper: only a slice of the weights is read per token, so the arithmetic puts models several times larger than the card's VRAM within reach.
+
+**To turn a row into a measurement:** run the steps in masterwork 21.8.10 on your card and open an issue with the log. Measured rows replace derived ones, with the card, the date and the submitter's setup.
+
 ## Key documents
 
 | Document | What it is |
@@ -143,7 +175,7 @@ The GPU probes build on their own with nvcc (`tools/probes/tdecode`, `tools/prob
 | `src/` | The product code: GGUF / safetensors I/O, tokenizer, quantizers, the reference model, the OS and device layers, the `pelias` commands |
 | `tests/` | Unit tests (run by `ctest`) |
 | `tools/probes/` | GPU and CPU probes: `tdecode` (1-bit decoder, read ceiling), `r3` (streaming decode kernel), `gfx_probe`, `e16`, `batch_c` |
-| `tools/experiments/` | Sandbox checks behind each result (named in the game plan) |
+| `tools/experiments/` | Sandbox checks behind each result (named in the game plan); `older_cards/` computes masterwork 21.8 |
 | `tools/` | Recipe tool, imatrix merge, route statistics, table generators, UI texture baker |
 | `data/probe_results/` | Measured results kept with the code (run logs, miss logs, per-token KL summaries) |
 | `docs/` | The game plan, method and comparison papers, the masterwork, build notes, reviews, the author's input files (`docs/inputs/`, unchanged) |
