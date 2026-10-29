@@ -458,6 +458,61 @@ __global__ void __launch_bounds__(256) r3_counted2(const Job* __restrict__ jobs,
   }
 }
 
+// Item 7 (Fable): per-expert counters at gate/up -> down. A layer's expert stage (gate/up) and its down stage become one stage
+// with no grid-wide barrier between them: each gate/up task adds 1 to its expert group's counter (lane 0, release, after
+// __syncwarp), and a down task first waits (acquire) until its own expert's gate/up tasks are all done. Tasks are taken in
+// increasing order and every gate/up task precedes every down task, so a waiting warp has finished all its own gate/up work and
+// the blocks are co-resident (cooperative launch): no deadlock. grp[j] = group job j signals (-1 none), dep[j] = group it waits
+// for (-1 none), gtasks[g] = tasks in group g. Lookup as M1 (incremental), no prefetch.
+__device__ __forceinline__ void red_release_add(unsigned long long* p, unsigned long long v) {
+  asm volatile("red.release.gpu.global.add.u64 [%0], %1;" ::"l"(p), "l"(v) : "memory");
+}
+
+template <int Q4V>
+__global__ void __launch_bounds__(256) r3_grouped(const Job* __restrict__ jobs, int njobs, const long long* __restrict__ stage_end, int nstages,
+                                                  unsigned long long* done, const int* __restrict__ grp, const int* __restrict__ dep,
+                                                  const long long* __restrict__ gtasks, unsigned long long* gdone, unsigned long long epoch) {
+  R3_LUT_SETUP(Q4V)
+  const long long warps = static_cast<long long>(gridDim.x) * (blockDim.x / 32);
+  const long long w0 = static_cast<long long>(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32;
+  const int lane = threadIdx.x & 31;
+  int hint = 0;
+  long long begin = 0;
+  for (int s = 0; s < nstages; ++s) {
+    const long long end = stage_end[s];
+    unsigned long long mine = 0;
+    for (long long t = begin + w0; t < end; t += warps) {
+      int j = hint;
+      while (j + 1 < njobs && jobs[j + 1].task0 <= t) ++j;
+      const int dg = dep[j];
+      if (dg >= 0) {
+        if (lane == 0) {
+          const unsigned long long target = epoch * static_cast<unsigned long long>(gtasks[dg]);
+          while (ld_acquire_u64(gdone + dg) < target) __nanosleep(32);
+        }
+        __syncwarp();
+      }
+      run_task<Q4V>(jobs, njobs, t, s_lut, &hint);
+      const int sg = grp[j];
+      if (sg >= 0) {
+        __syncwarp();  // the lanes' outputs are ordered before lane 0's release
+        if (lane == 0) red_release_add(gdone + sg, 1ull);
+      }
+      ++mine;
+    }
+    if (s + 1 == nstages) break;
+    __syncwarp();
+    if (lane == 0) {
+      __threadfence();
+      if (mine) atomicAdd(done + s, mine);
+      const unsigned long long target = epoch * static_cast<unsigned long long>(end - begin);
+      while (ld_acquire_u64(done + s) < target) __nanosleep(32);
+    }
+    __syncwarp();
+    begin = end;
+  }
+}
+
 // (c0), v2 step 1: the grid syncs alone, no tasks (Fable item 6: what one boundary costs before any work is added)
 __global__ void __launch_bounds__(256) r3_sync_only(int nstages) {
   cg::grid_group grid = cg::this_grid();
@@ -677,9 +732,46 @@ static int run_check() {
     J.task0 = 0;
     Job* dj = up(std::vector<Job>{J});
     const std::vector<double> yr = reference(M, A);
-    for (int v = 0; v < 6; ++v) {  // paths 0-2 (fix 2); 3 = fix 6's counted kernel over 2 stages; 4 = routes 1+2 streaming; 5 = routes 1+2 counted, 2 stages
+    for (int v = 0; v < 7; ++v) {  // paths 0-2 (fix 2); 3 = fix 6 counted, 2 stages; 4/5 = routes 1+2 streaming / counted; 6 = item 7 grouped (2 jobs, the second waits on the first)
       CK(cudaMemset(dy, 0, c.n * 4));
-      if (v == 4) r3_stream2<2, 3><<<sms() * 4, 256, kLutBytes>>>(dj, 1, 0, J.ntask);
+      if (v == 6) {
+        float* dy2;
+        CK(cudaMalloc(&dy2, c.n * 4));
+        CK(cudaMemset(dy2, 0, c.n * 4));
+        Job J2 = J;
+        J2.task0 = J.ntask;
+        J2.y = dy2;
+        Job* dj2 = up(std::vector<Job>{J, J2});
+        std::vector<long long> se{2 * J.ntask};
+        std::vector<int> g{0, -1}, d{-1, 0};
+        std::vector<long long> gt{J.ntask};
+        long long* dse = up(se);
+        int* dg = up(g);
+        int* dd = up(d);
+        long long* dgt = up(gt);
+        unsigned long long *ddone, *dgd;
+        CK(cudaMalloc(&ddone, sizeof(unsigned long long)));
+        CK(cudaMalloc(&dgd, sizeof(unsigned long long)));
+        CK(cudaMemset(ddone, 0, sizeof(unsigned long long)));
+        CK(cudaMemset(dgd, 0, sizeof(unsigned long long)));
+        int oc = 0;
+        CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&oc, r3_grouped<2>, 256, kLutBytes));
+        int nj = 2, ns = 1;
+        unsigned long long ep = 1;
+        void* a6[] = {&dj2, &nj, &dse, &ns, &ddone, &dg, &dd, &dgt, &dgd, &ep};
+        CK(cudaLaunchCooperativeKernel(reinterpret_cast<void*>(r3_grouped<2>), dim3(sms() * oc), dim3(256), a6, kLutBytes, nullptr));
+        CK(cudaDeviceSynchronize());
+        std::vector<float> y2(static_cast<size_t>(c.n));
+        CK(cudaMemcpy(y2.data(), dy2, c.n * 4, cudaMemcpyDeviceToHost));
+        double w2 = 0, sc2 = 0;
+        for (int r = 0; r < c.n; ++r) {
+          sc2 = std::max(sc2, std::fabs(yr[static_cast<size_t>(r)]));
+          w2 = std::max(w2, std::fabs(y2[static_cast<size_t>(r)] - yr[static_cast<size_t>(r)]));
+        }
+        const bool ok2 = sc2 > 0 && w2 / sc2 < 2e-5;
+        std::printf("  %-38s path 6b (the waiting job) max error %.2e (%s)\n", c.name, w2 / sc2, ok2 ? "ok" : "FAIL");
+        fails += !ok2;
+      } else if (v == 4) r3_stream2<2, 3><<<sms() * 4, 256, kLutBytes>>>(dj, 1, 0, J.ntask);
       else if (v == 5) {
         int oc = 0;
         CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&oc, r3_counted2<2, 3>, 256, kLutBytes));
@@ -791,8 +883,41 @@ static int run_stream(int soak_s, bool distinct) {
   const int nstages = 161;
   std::vector<long long> stage_end(nstages, 0);
   for (size_t i = 0; i < jobs.size(); ++i) stage_end[static_cast<size_t>(jstage[i])] = jobs[i].task0 + jobs[i].ntask;
+  // item 7: expert groups (8 per layer: the shared expert + 7 routed) and the merged stage list (stages 2 and 3 of a layer
+  // become one, 121 stages); jobs of a layer's stage 2 come in table order shared gate, shared up, e0 gate, e0 up, ... and
+  // stage 3 shared down, e0 down, ...
+  std::vector<int> jgrp(jobs.size(), -1), jdep(jobs.size(), -1);
+  std::vector<long long> gtask(40 * 8, 0);
+  {
+    int k2 = 0, k3 = 0, cur = -1;
+    for (size_t i = 0; i < jobs.size(); ++i) {
+      const int st = jstage[i];
+      if (st >= 160) continue;
+      const int L = st / 4, sl = st % 4;
+      if (L != cur) { cur = L; k2 = 0; k3 = 0; }
+      if (sl == 2) {
+        const int g = L * 8 + (k2 < 2 ? 0 : 1 + (k2 - 2) / 2);
+        jgrp[i] = g;
+        gtask[static_cast<size_t>(g)] += jobs[i].ntask;
+        ++k2;
+      } else if (sl == 3) {
+        jdep[i] = L * 8 + (k3 < 8 ? k3 : 7);
+        ++k3;
+      }
+    }
+  }
+  std::vector<long long> stage_end_g;
+  for (int st = 0; st < 161; ++st)
+    if (st == 160 || st % 4 != 2) stage_end_g.push_back(stage_end[static_cast<size_t>(st)]);
+  int nstages_g = static_cast<int>(stage_end_g.size());
   Job* dj = up(jobs);
   long long* dse = up(stage_end);
+  long long* dse_g = up(stage_end_g);
+  int* dgrp = up(jgrp);
+  int* ddep = up(jdep);
+  long long* dgt = up(gtask);
+  unsigned long long* dgdone;
+  CK(cudaMalloc(&dgdone, gtask.size() * sizeof(unsigned long long)));
   void* flush;
   CK(cudaMalloc(&flush, kFlush));
   cudaEvent_t e0, e1;
@@ -910,6 +1035,15 @@ static int run_stream(int soak_s, bool distinct) {
   CK(cudaMemset(ddone, 0, nstages * sizeof(unsigned long long)));
   void* aq3[] = {&dj, &njobs, &dse, &nst, &ddone, &eq3};
   const double tq3 = timed([&] { ++eq3; CK(cudaLaunchCooperativeKernel(reinterpret_cast<void*>(r3_counted2<2, 3>), dim3(nsm * oq3), dim3(256), aq3, kLutBytes, nullptr)); });
+  // item 7: per-expert counters (merged expert stages, 121 global barriers instead of 160)
+  int og = 0;
+  CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&og, r3_grouped<2>, 256, kLutBytes));
+  unsigned long long eg = 0;
+  CK(cudaDeviceSynchronize());
+  CK(cudaMemset(ddone, 0, nstages * sizeof(unsigned long long)));
+  CK(cudaMemset(dgdone, 0, gtask.size() * sizeof(unsigned long long)));
+  void* ag[] = {&dj, &njobs, &dse_g, &nstages_g, &ddone, &dgrp, &ddep, &dgt, &dgdone, &eg};
+  const double tg7 = timed([&] { ++eg; CK(cudaLaunchCooperativeKernel(reinterpret_cast<void*>(r3_grouped<2>), dim3(nsm * og), dim3(256), ag, kLutBytes, nullptr)); });
   CK(cudaGetLastError());
   auto row = [&](const char* name, double ms, size_t by) {
     const auto it = spread.find(ms);
@@ -942,6 +1076,9 @@ static int run_stream(int soak_s, bool distinct) {
   row("(c) M1 counter barrier, incremental lookup", tq1, bytes);
   row("(c) M3 counter barrier, incremental lookup + rolling prefetch", tq3, bytes);
   std::printf("  per stage boundary, M3 counted over M3 streaming: %.2f us; blocks per SM %d / %d / %d / %d\n", (tq3 - tm3) * 1e3 / 160.0, os1, os3, oq1, oq3);
+  std::printf("item 7 (path 2, M1 lookup; per-expert counters at gate/up -> down, %d global barriers instead of 160):\n", nstages_g - 1);
+  row("(c) M1 + per-expert counters", tg7, bytes);
+  std::printf("  vs (c) M1 counter barrier: %+.3f ms; over (b) M1 streaming: %.3f ms; blocks per SM %d\n", tg7 - tq1, tg7 - tm1, og);
   std::printf("  per stage boundary over (b) path 2: grid sync %.2f us, counter %.2f us, + one-task prefetch %.2f us, + whole-share prefetch %.2f us; blocks per SM %d / %d / %d\n",
               (tc2 - tb2) * 1e3 / 160.0, (tk1 - tb2) * 1e3 / 160.0, (tk2 - tb2) * 1e3 / 160.0, (tk3 - tb2) * 1e3 / 160.0, occk1, occk2, occk3);
 
@@ -1035,6 +1172,7 @@ static void print_kernels() {
                                                            {reinterpret_cast<const void*>(r3_counted<2, 2>), "r3_counted<2,2>", kLutBytes},
                                                            {reinterpret_cast<const void*>(r3_stream2<2, 3>), "r3_stream2<2,3>", kLutBytes},
                                                            {reinterpret_cast<const void*>(r3_counted2<2, 3>), "r3_counted2<2,3>", kLutBytes},
+                                                           {reinterpret_cast<const void*>(r3_grouped<2>), "r3_grouped<2>", kLutBytes},
                                                            {reinterpret_cast<const void*>(r3_sync_only), "r3_sync_only", 0}};
   for (const auto& k : K) {
     cudaFuncAttributes fa;
