@@ -1,5 +1,5 @@
-// Copyright (c) 2026 John Lipka and the Pelias contributors. Apache-2.0.
 // provenance: original
+// Copyright (c) 2026 John Lipka and the Pelias contributors. Apache-2.0.
 #include "quant/tdecode.h"
 
 #include <algorithm>

@@ -34,6 +34,7 @@
 #include "io/sha256.h"
 #include "os/clock.h"
 #include "os/file_map.h"
+#include "os/membw.h"
 #include "pelias/log.h"
 #include "pelias/timer.h"
 #include "pelias/version.h"
@@ -121,6 +122,9 @@ void usage() {
       "pelias <command> [options]\n"
       "  version                         build version and backends\n"
       "  device [--index N]              what the GPU reports (CUDA and NVML), and the VRAM ceiling\n"
+      "  membw [--mib N] [--threads 1,2,4,6,8,12,16] [--reps N]\n"
+      "                                  probe: RAM read speed by thread count, 4 KB vs 2 MB pages, prefetch on / off,\n"
+      "                                  and how a 1 ms foreground job (the user's own work) wakes and runs meanwhile\n"
       "  inspect --model FILE [--json] [--header-only]\n"
       "                                  every tensor of a GGUF or safetensors file: name, type, shape, bytes\n"
       "                                  (--header-only: read a file whose data is cut off, e.g. a header sample)\n"
@@ -219,6 +223,68 @@ int cmd_device(const Args& a) {
   const hal::Ceiling c = hal::ceiling_from_device(d);
   if (c.bytes) std::printf("VRAM ceiling: %s (basis %s %s minus margin %s; standing rule 3)\n", plan::format_bytes(c.bytes).c_str(), c.basis, plan::format_bytes(c.basis_free).c_str(), plan::format_bytes(c.margin).c_str());
   return d.available ? 0 : 4;
+}
+
+int cmd_membw(const Args& a) {
+  os::MemBwOptions opt;
+  if (a.has("mib")) {
+    const Result<std::uint64_t> r = io::parse_whole(a.get("mib"), 1u << 20);
+    if (!r.ok() || r.value < 64) {
+      std::fprintf(stderr, "pelias: --mib needs a whole number of MiB, at least 64\n");
+      return 1;
+    }
+    opt.bytes = static_cast<std::size_t>(r.value) << 20;
+  }
+  if (a.has("reps")) {
+    const Result<std::uint64_t> r = io::parse_whole(a.get("reps"), 100);
+    if (!r.ok() || r.value == 0) {
+      std::fprintf(stderr, "pelias: --reps needs 1 to 100\n");
+      return 1;
+    }
+    opt.reps = static_cast<int>(r.value);
+  }
+  if (a.has("threads")) {
+    opt.threads.clear();
+    const std::string t = a.get("threads");
+    std::size_t p = 0;
+    while (p <= t.size()) {
+      const std::size_t q = t.find(',', p) == std::string::npos ? t.size() : t.find(',', p);
+      const Result<std::uint64_t> r = io::parse_whole(t.substr(p, q - p), 1024);
+      if (!r.ok() || r.value == 0) {
+        std::fprintf(stderr, "pelias: --threads needs a comma-separated list of thread counts\n");
+        return 1;
+      }
+      opt.threads.push_back(static_cast<int>(r.value));
+      p = q + 1;
+    }
+  }
+  os::MemBwResult res;
+  std::string err;
+  if (!os::membw_run(opt, res, err)) {
+    std::fprintf(stderr, "pelias: %s\n", err.c_str());
+    return 6;
+  }
+  std::printf("platform: %s; %d logical CPUs, %d physical cores; buffer %zu MiB; median of %d passes per cell\n", os::platform_name().c_str(),
+              res.logical_cpus, res.physical_cores, opt.bytes >> 20, opt.reps);
+  std::printf("transparent huge pages: %s; AnonHugePages while the 2 MB buffer was in use: %lld kB%s\n",
+              res.thp_mode.empty() ? "(unknown)" : res.thp_mode.c_str(), res.huge_kib_seen, res.note.empty() ? "" : (" (" + res.note + ")").c_str());
+  std::printf("idle machine, foreground job: wake-up late by %.0f us (p50) / %.0f us (p99); job %.0f us\n", res.idle_wake_p50_us, res.idle_wake_p99_us,
+              res.idle_work_us);
+  std::printf("\n%-8s %-6s %-9s %9s   %s\n", "threads", "pages", "prefetch", "GB/s", "foreground job meanwhile (wake late p50 / p99, job time vs idle)");
+  double best = 0;
+  for (const os::MemBwCell& c : res.cells) best = std::max(best, c.gbps);
+  for (const os::MemBwCell& c : res.cells) {
+    std::printf("%-8d %-6s %-9s %9.2f", c.threads, c.huge ? "2 MB" : "4 KB", c.prefetch ? "on" : "off", c.gbps);
+    if (c.work_ratio > 0) std::printf("   %.0f / %.0f us, x%.2f", c.wake_p50_us, c.wake_p99_us, c.work_ratio);
+    std::printf("\n");
+  }
+  for (const os::MemBwCell& c : res.cells)
+    if (c.gbps >= 0.95 * best) {
+      std::printf("\nfewest threads within 95 %% of the best (%.2f GB/s): %d (%s pages, prefetch %s)\n", best, c.threads, c.huge ? "2 MB" : "4 KB",
+                  c.prefetch ? "on" : "off");
+      break;
+    }
+  return 0;
 }
 
 int cmd_inspect(const Args& a) {
@@ -1159,6 +1225,7 @@ int main(int argc, char** argv) {
   const std::string cmd = a.pos[0];
   if (cmd == "version") return cmd_version();
   if (cmd == "device") return cmd_device(a);
+  if (cmd == "membw") return cmd_membw(a);
   if (cmd == "inspect") return cmd_inspect(a);
   if (cmd == "key") return cmd_key(a);
   if (cmd == "plan") return cmd_plan(a);

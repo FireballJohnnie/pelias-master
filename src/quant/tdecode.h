@@ -1,5 +1,5 @@
-// Copyright (c) 2026 John Lipka and the Pelias contributors. Apache-2.0.
 // provenance: original
+// Copyright (c) 2026 John Lipka and the Pelias contributors. Apache-2.0.
 #pragma once
 // T-decode (docs/PELIAS_GAME_PLAN.md, "Q7_ZH and the binary gate"; author 2026-10-28 14:39-14:45): the dot product of a
 // Q7_ZT row with an activation in the per-32 int8 format, with the 8th bit (H) taken one of three ways:
