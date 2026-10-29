@@ -1,0 +1,90 @@
+{
+ "source": "run B, urm_ZT2, engine format, wikitext 100 chunks x 255 scored tokens",
+ "n_ctx": 512,
+ "file_mean_kl": 0.012536205048135428,
+ "top1pct_threshold": 0.12137192152920778,
+ "median_chunk_mean_kl": 0.011277179260944785,
+ "worst10_share_of_total_kl": 0.227010042547199,
+ "worst_chunks": [
+  {
+   "chunk": 78,
+   "mean_kl": 0.05959519171887033,
+   "share_of_total_kl": 0.047538462788413165,
+   "max_token_kl": 2.1033900588892793,
+   "max_token_pos": 201,
+   "top1pct_tokens": 25
+  },
+  {
+   "chunk": 39,
+   "mean_kl": 0.04123024492413909,
+   "share_of_total_kl": 0.03288893629756915,
+   "max_token_kl": 7.9523142687548765,
+   "max_token_pos": 157,
+   "top1pct_tokens": 4
+  },
+  {
+   "chunk": 2,
+   "mean_kl": 0.0381523846643731,
+   "share_of_total_kl": 0.03043375927394207,
+   "max_token_kl": 1.4548888453505078,
+   "max_token_pos": 214,
+   "top1pct_tokens": 19
+  },
+  {
+   "chunk": 79,
+   "mean_kl": 0.03052941504479158,
+   "share_of_total_kl": 0.024352995924657735,
+   "max_token_kl": 0.46537474938351153,
+   "max_token_pos": 74,
+   "top1pct_tokens": 15
+  },
+  {
+   "chunk": 23,
+   "mean_kl": 0.029082802285520792,
+   "share_of_total_kl": 0.023199048016406227,
+   "max_token_kl": 5.221073264884353,
+   "max_token_pos": 18,
+   "top1pct_tokens": 2
+  },
+  {
+   "chunk": 49,
+   "mean_kl": 0.02110127657997723,
+   "share_of_total_kl": 0.016832268217498347,
+   "max_token_kl": 0.20530476343680565,
+   "max_token_pos": 67,
+   "top1pct_tokens": 8
+  },
+  {
+   "chunk": 35,
+   "mean_kl": 0.01767981079421573,
+   "share_of_total_kl": 0.014103000649981656,
+   "max_token_kl": 1.1357709924764552,
+   "max_token_pos": 70,
+   "top1pct_tokens": 4
+  },
+  {
+   "chunk": 66,
+   "mean_kl": 0.01603307473290033,
+   "share_of_total_kl": 0.012789416471203147,
+   "max_token_kl": 0.40377966911643615,
+   "max_token_pos": 94,
+   "top1pct_tokens": 9
+  },
+  {
+   "chunk": 98,
+   "mean_kl": 0.015890387687640686,
+   "share_of_total_kl": 0.012675596503587936,
+   "max_token_kl": 0.729388081935312,
+   "max_token_pos": 72,
+   "top1pct_tokens": 3
+  },
+  {
+   "chunk": 81,
+   "mean_kl": 0.015289855703334614,
+   "share_of_total_kl": 0.012196558403939597,
+   "max_token_kl": 0.29143589183121377,
+   "max_token_pos": 132,
+   "top1pct_tokens": 2
+  }
+ ]
+}
