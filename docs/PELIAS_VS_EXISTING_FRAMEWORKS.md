@@ -45,6 +45,7 @@ Paired runs over the same 25,500 tokens, 8-bit activations as the engine uses th
 | urm_Z with the live H gate (25 %) | Q8_Z stored, ~7.5 bits read | 0.012919 | +0.000055, tie | -61.0 MB stored |
 | urm_ZT2 through the 1-bit decoder (run D) | Q7_ZT, 8th bit by counting ones | 0.012923 | +0.000059, tie (vs the float path: +0.000387, not resolved; int8 rounding flips, see A) | -236.4 MB |
 | urm_TG (expert gate/up as Q4_TG, bit tags) | Q7_ZT dense | 0.012876 | +0.000012, tie | -236.4 MB |
+| **urm_TG2 (expert gate/up as Q4_TG2: bit tags with an exact 0, full importance; MTP eh_proj rotated)** | **Q7_ZT dense** | **0.012056** | **-0.000808, t -1.98 (a hair short of resolved)** | **-236.4 MB** |
 
 **On the author's own chat text** (run C; 53,334 tokens, never published): urm_Z 0.020977, urm_ZT2 0.021198, Unsloth 0.022368. Ours lower by 0.0012-0.0014, not resolved (chat text swings about 4x more from chunk to chunk).
 

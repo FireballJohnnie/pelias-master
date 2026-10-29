@@ -21,7 +21,7 @@ The goal of the first build: beat Unsloth's best 4-bit file of the same model (Q
 | **Q7_ZT: 7 bits + the 8th bit gated per 32 values (light bit, rotated)** | **urm_ZT2: KL 0.012536 vs Unsloth 0.012864 at -236 MB** (lower, not yet statistically resolved) | MEASURED (whole model) |
 | The 1-bit decoder (8th bit added by AND + popcount on idle integer units) | Bit-identical to 8-bit across the whole model; GPU kernel 5.7-6.9 % faster than 8-bit | MEASURED |
 | Light vs heavy 8th bit | Rotated + light best in every case; a missing heavy bit is ~360x worse, a missing light bit ~1.4x | MEASURED (sandbox, real weights) |
-| Q4_TG2: the author's bit tags with an exact 0 (expert gate/up) | -10 to -11 % weighted error vs imatrix Q4_K at the same 144 bytes | MEASURED (sandbox); whole-model run in progress |
+| **Q4_TG2: the author's bit tags with an exact 0 (expert gate/up), in urm_TG2** | **KL 0.012056 vs Unsloth 0.012864 (-0.000808, t -1.98) at -236 MB**; -10 to -11 % weighted error per tensor | MEASURED (whole model) |
 | The miss map (where the model gets stuck) | Hard tokens repeat across every file (47-66 % vs 1 %); number / math tokens stuck at 2x the base rate | MEASURED |
 | The author's H gate on KV pages | 72.6 % of attention mass in 1/8 of the keys vs 62.0 % (Quest pages), 42.6 % (recent window) | MEASURED (512-token chunks) |
 | Unified bus probes (doorbell, replay, overlap, two DRAM readers) | 42-78x faster CPU/GPU hand-off; 93 % of DDR4 peak with both readers; tier build 31.8 -> 53.5 tok/s | MEASURED |

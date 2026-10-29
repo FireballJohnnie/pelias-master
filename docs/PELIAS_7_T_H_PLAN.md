@@ -145,3 +145,6 @@ Rotated wins every column (about 17 %), light wins every row (1.5 %); a missing 
 | rANS on bus transfers (entropy of stored codes) | Q4_K 3.87 of 4 bits, Q5_K 4.87 of 5, Q7_ZT base 6.75 of 7, Q6_K 5.80 of 6: lossless coding -3 to -4 % | Ruled out for active weights |
 | Worst-chunk codes (C6) | The 10 worst chunks hold 22.7 % of all KL; codes saved for the miss map | Data |
 
+### 9.4 Run A: urm_TG2 (MEASURED 2026-10-29 03:37)
+
+Expert gate/up as Q4_TG2, MTP eh_proj rotated, same size as urm_ZT2 (-236.4 MB vs Unsloth): **KL 0.012056**, same top 95.47 %. Paired: vs Unsloth -0.000808 [-0.001618, +0.000002] (t -1.98); vs urm_ZT2 -0.000480; vs run E -0.000820; vs urm_Z -0.000346. The best file so far; Q4_TG2 option A is the expert gate/up format for R3.
