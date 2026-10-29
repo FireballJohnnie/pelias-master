@@ -17,6 +17,9 @@
 //   alone (161 syncs, no work), (a) replayed from a CUDA graph (GPU-side cost without the host submission path), the
 //   registers / local memory of each kernel, and the SM clock measured inside the (b) run (clock64 vs globaltimer).
 //   r3 stream --soak S : after the rows, (b) back to back for S seconds (for an outside clock / power log)
+//   v2 fix 2 (Fable item 2): the Q4_TG2 grid read from a 32-way replicated table in shared memory (grid path 1), and with the
+//   int8 -> float done by the magic number (path 2); path 0 is v1. Every check case runs all three paths; the stream rows add
+//   (b) and (c) for the new paths and the Q4_TG2-only rows for paths 1 and 2.
 // Build (WSL): nvcc -std=c++17 -O3 -arch=sm_89 r3.cu -o r3     (Windows: the same with -o r3.exe, from a VS x64 prompt)
 #include <cooperative_groups.h>
 #include <cuda_fp16.h>
@@ -72,8 +75,22 @@ __device__ __forceinline__ int sx8(const int* xw, int i) {  // int8 value i of a
   return static_cast<int>(static_cast<int8_t>((xw[i >> 2] >> (8 * (i & 3))) & 0xff));
 }
 
+// v2 fix 2 (Fable item 2): the Q4_TG2 grid. Q4V 0 = v1 (__constant__ table, one address per pass, so a warp's 32 different
+// addresses serialise); 1 = the 64 grid floats replicated 32 times in shared memory, lane L reads lut[L + 32 * (tag * 16 + code)]
+// (bank = L, conflict-free, exact: the same floats); 2 = as 1, plus the int8 activation turned into a float with the magic
+// number (2 full-rate ops) instead of a conversion instruction (exact for int8)
+extern __shared__ float s_dyn[];  // fix 2: the replicated grid (2,048 floats = 8 KB, dynamic shared memory; paths 1 and 2 only)
+constexpr int kLutBytes = 2048 * 4;
+
+__device__ __forceinline__ float i8f(const int* xw, int i) {
+  const unsigned b = (static_cast<unsigned>(xw[i >> 2]) >> (8 * (i & 3))) & 0xffu;
+  return __int_as_float(static_cast<int>((b ^ 0x80u) | 0x4B000000u)) - 8388736.f;
+}
+
 // one lane's part (128 values = 4 sub-blocks of 32) of one row; returns the partial dot product
-__device__ float lane_part(const Job& J, int r, int part) {
+template <int Q4V>
+__device__ float lane_part(const Job& J, int r, int part, const float* lut) {
+  (void)lut;  // fix 2 reads s_dyn directly (so the loads are ld.shared); kept for the call shape
   const int B = part >> 1, half = part & 1, nB = J.K / 256;
   const long long rb = static_cast<long long>(r) * nB + B;
   const int jg0 = B * 8 + half * 4;  // first 32-block of the part in the row
@@ -147,10 +164,21 @@ __device__ float lane_part(const Job& J, int r, int part) {
       float sum = 0.f;
 #pragma unroll
       for (int g = 0; g < 4; ++g) {
-        const float* gr = c_grid[(tb >> (2 * g)) & 3u];
+        const unsigned tg = (tb >> (2 * g)) & 3u;
         const uint32_t word = cw[jj * 4 + g];  // 8 codes = values 32 jj + 8 g .. + 7 of the part
+        if (Q4V == 0) {
+          const float* gr = c_grid[tg];
 #pragma unroll
-        for (int k = 0; k < 8; ++k) sum += gr[(word >> (4 * k)) & 15u] * static_cast<float>(sx8(xw, 32 * jj + 8 * g + k));
+          for (int k = 0; k < 8; ++k) sum += gr[(word >> (4 * k)) & 15u] * static_cast<float>(sx8(xw, 32 * jj + 8 * g + k));
+        } else {
+          const float* lr = s_dyn + (threadIdx.x & 31) + 32 * 16 * tg;  // the shared symbol itself, so loads are ld.shared
+#pragma unroll
+          for (int k = 0; k < 8; ++k) {
+            const float w = lr[32 * ((word >> (4 * k)) & 15u)];
+            const float xv = Q4V == 2 ? i8f(xw, 32 * jj + 8 * g + k) : static_cast<float>(sx8(xw, 32 * jj + 8 * g + k));
+            sum += w * xv;
+          }
+        }
       }
       const float s = (d * static_cast<float>((lv >> (6 * j)) & 63u)) / 63.f;
       acc += s * __ldg(J.xs + jg) * sum;
@@ -226,7 +254,8 @@ __device__ float lane_part(const Job& J, int r, int part) {
   return acc;
 }
 
-__device__ __forceinline__ void run_task(const Job* __restrict__ jobs, int njobs, long long t) {
+template <int Q4V>
+__device__ __forceinline__ void run_task(const Job* __restrict__ jobs, int njobs, long long t, const float* lut) {
   int lo = 0, hi = njobs - 1;  // the job whose task range holds t
   while (lo < hi) {
     const int mid = (lo + hi + 1) / 2;
@@ -235,7 +264,7 @@ __device__ __forceinline__ void run_task(const Job* __restrict__ jobs, int njobs
   const Job& J = jobs[lo];
   const int lane = threadIdx.x & 31, rpw = 32 / J.lpr;
   const int r = static_cast<int>((t - J.task0) * rpw) + lane / J.lpr, part = lane % J.lpr;
-  float acc = r < J.n ? lane_part(J, r, part) : 0.f;
+  float acc = r < J.n ? lane_part<Q4V>(J, r, part, lut) : 0.f;
   for (int o = J.lpr / 2; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
   if (r < J.n && part == 0) J.y[r] = acc;
 }
@@ -249,24 +278,36 @@ __device__ __forceinline__ unsigned long long gtimer() {
 
 // clk (optional, v2 step 1): block 0's thread 0 records clock64 and globaltimer (ns) at its start and its end, so the
 // SM clock during the run is (c1 - c0) / (g1 - g0) GHz
+// the shared grid table of fix 2 (8 KB per block), filled from c_grid at kernel start
+#define R3_LUT_SETUP(Q4V)                                                                         \
+  const float* s_lut = nullptr;                                                                   \
+  if (Q4V) {                                                                                      \
+    for (int i = threadIdx.x; i < 2048; i += blockDim.x) s_dyn[i] = c_grid[(i >> 9) & 3][(i >> 5) & 15]; \
+    __syncthreads();                                                                              \
+  }
+
+template <int Q4V>
 __global__ void __launch_bounds__(256) r3_stream(const Job* __restrict__ jobs, int njobs, long long t_begin, long long t_end,
                                                  unsigned long long* clk) {
+  R3_LUT_SETUP(Q4V)
   const bool rec = clk != nullptr && blockIdx.x == 0 && threadIdx.x == 0;
   if (rec) { clk[0] = clock64(); clk[1] = gtimer(); }
   const long long warps = static_cast<long long>(gridDim.x) * (blockDim.x / 32);
   for (long long t = t_begin + (static_cast<long long>(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32); t < t_end; t += warps)
-    run_task(jobs, njobs, t);
+    run_task<Q4V>(jobs, njobs, t, s_lut);
   if (rec) { clk[2] = clock64(); clk[3] = gtimer(); }
 }
 
 // (c): stages in order, a grid-wide sync between them (cooperative launch)
+template <int Q4V>
 __global__ void __launch_bounds__(256) r3_staged(const Job* __restrict__ jobs, int njobs, const long long* __restrict__ stage_end, int nstages) {
+  R3_LUT_SETUP(Q4V)
   cg::grid_group grid = cg::this_grid();
   const long long warps = static_cast<long long>(gridDim.x) * (blockDim.x / 32);
   const long long w0 = static_cast<long long>(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32;
   long long begin = 0;
   for (int s = 0; s < nstages; ++s) {
-    for (long long t = begin + w0; t < stage_end[s]; t += warps) run_task(jobs, njobs, t);
+    for (long long t = begin + w0; t < stage_end[s]; t += warps) run_task<Q4V>(jobs, njobs, t, s_lut);
     begin = stage_end[s];
     grid.sync();
   }
@@ -490,19 +531,24 @@ static int run_check() {
     Job J = job_of(M, A, dy);
     J.task0 = 0;
     Job* dj = up(std::vector<Job>{J});
-    r3_stream<<<sms() * 4, 256>>>(dj, 1, 0, J.ntask, nullptr);
-    CK(cudaDeviceSynchronize());
-    std::vector<float> yg(static_cast<size_t>(c.n));
-    CK(cudaMemcpy(yg.data(), dy, c.n * 4, cudaMemcpyDeviceToHost));
     const std::vector<double> yr = reference(M, A);
-    double worst = 0, scale = 0;
-    for (int r = 0; r < c.n; ++r) {
-      scale = std::max(scale, std::fabs(yr[static_cast<size_t>(r)]));
-      worst = std::max(worst, std::fabs(yg[static_cast<size_t>(r)] - yr[static_cast<size_t>(r)]));
+    for (int v = 0; v < 3; ++v) {  // the three Q4_TG2 grid paths (v2 fix 2); the other formats run the same code in each
+      CK(cudaMemset(dy, 0, c.n * 4));
+      if (v == 0) r3_stream<0><<<sms() * 4, 256>>>(dj, 1, 0, J.ntask, nullptr);
+      else if (v == 1) r3_stream<1><<<sms() * 4, 256, kLutBytes>>>(dj, 1, 0, J.ntask, nullptr);
+      else r3_stream<2><<<sms() * 4, 256, kLutBytes>>>(dj, 1, 0, J.ntask, nullptr);
+      CK(cudaDeviceSynchronize());
+      std::vector<float> yg(static_cast<size_t>(c.n));
+      CK(cudaMemcpy(yg.data(), dy, c.n * 4, cudaMemcpyDeviceToHost));
+      double worst = 0, scale = 0;
+      for (int r = 0; r < c.n; ++r) {
+        scale = std::max(scale, std::fabs(yr[static_cast<size_t>(r)]));
+        worst = std::max(worst, std::fabs(yg[static_cast<size_t>(r)] - yr[static_cast<size_t>(r)]));
+      }
+      const bool ok = scale > 0 && worst / scale < 2e-5;  // an all-zero output is a failed test, not a pass
+      std::printf("  %-38s grid path %d  max error %.2e of max |y| %.3g (%s)\n", c.name, v, worst / scale, scale, ok ? "ok" : "FAIL");
+      fails += !ok;
     }
-    const bool ok = scale > 0 && worst / scale < 2e-5;  // an all-zero output is a failed test, not a pass
-    std::printf("  %-38s max error %.2e of max |y| %.3g (%s)\n", c.name, worst / scale, scale, ok ? "ok" : "FAIL");
-    fails += !ok;
   }
   std::printf("%s\n", fails ? "SOME FORMATS FAILED" : "every format matches the host reference");
   return fails ? 1 : 0;
@@ -604,7 +650,7 @@ static int run_stream(int soak_s) {
   auto grid_a = [&](const Job& J) { return std::max(1, static_cast<int>(std::min<long long>((J.ntask + 7) / 8, nsm * 8LL))); };
   const double ta = timed([&] {
     for (size_t i = 0; i < jobs.size(); ++i)
-      r3_stream<<<grid_a(jobs[i]), 256>>>(dj, static_cast<int>(jobs.size()), jobs[i].task0, jobs[i].task0 + jobs[i].ntask, nullptr);
+      r3_stream<0><<<grid_a(jobs[i]), 256>>>(dj, static_cast<int>(jobs.size()), jobs[i].task0, jobs[i].task0 + jobs[i].ntask, nullptr);
   });
   // (a') the same 1,091 launches captured once in a CUDA graph and replayed: the GPU-side cost without the per-launch host
   // submission path (under WSL2 that path goes through GPU-PV; Fable harness note)
@@ -614,7 +660,7 @@ static int run_stream(int soak_s) {
   cudaGraphExec_t gexec;
   CK(cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal));
   for (size_t i = 0; i < jobs.size(); ++i)
-    r3_stream<<<grid_a(jobs[i]), 256, 0, cs>>>(dj, static_cast<int>(jobs.size()), jobs[i].task0, jobs[i].task0 + jobs[i].ntask, nullptr);
+    r3_stream<0><<<grid_a(jobs[i]), 256, 0, cs>>>(dj, static_cast<int>(jobs.size()), jobs[i].task0, jobs[i].task0 + jobs[i].ntask, nullptr);
   CK(cudaStreamEndCapture(cs, &graph));
   CK(cudaGraphInstantiate(&gexec, graph, 0));
   const double tg = timed([&] {
@@ -622,19 +668,19 @@ static int run_stream(int soak_s) {
   });
   // (b) one launch for the whole table; the SM clock is recorded inside the run
   int occ = 0;
-  CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, r3_stream, 256, 0));
+  CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, r3_stream<0>, 256, 0));
   unsigned long long* dclk;
   CK(cudaMalloc(&dclk, 4 * sizeof(unsigned long long)));
-  const double tb = timed([&] { r3_stream<<<nsm * occ, 256>>>(dj, static_cast<int>(jobs.size()), 0, total, dclk); });
+  const double tb = timed([&] { r3_stream<0><<<nsm * occ, 256>>>(dj, static_cast<int>(jobs.size()), 0, total, dclk); });
   unsigned long long clk[4];
   CK(cudaMemcpy(clk, dclk, sizeof clk, cudaMemcpyDeviceToHost));
   const double ghz_b = clk[3] > clk[1] ? static_cast<double>(clk[2] - clk[0]) / static_cast<double>(clk[3] - clk[1]) : 0.0;
   // (c) one cooperative launch, a grid-wide sync after every stage
   int occc = 0;
-  CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occc, r3_staged, 256, 0));
+  CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occc, r3_staged<0>, 256, 0));
   int njobs = static_cast<int>(jobs.size()), nst = nstages;
   void* args[] = {&dj, &njobs, &dse, &nst};
-  const double tc = timed([&] { CK(cudaLaunchCooperativeKernel(reinterpret_cast<void*>(r3_staged), dim3(nsm * occc), dim3(256), args, 0, nullptr)); });
+  const double tc = timed([&] { CK(cudaLaunchCooperativeKernel(reinterpret_cast<void*>(r3_staged<0>), dim3(nsm * occc), dim3(256), args, 0, nullptr)); });
   // (c0) the 161 syncs alone, same grid as (c)
   void* args0[] = {&nst};
   const double tc0 = timed([&] { CK(cudaLaunchCooperativeKernel(reinterpret_cast<void*>(r3_sync_only), dim3(nsm * occc), dim3(256), args0, 0, nullptr)); });
@@ -642,6 +688,14 @@ static int run_stream(int soak_s) {
   int one = 1;
   void* args1[] = {&one};
   const double tc1 = timed([&] { CK(cudaLaunchCooperativeKernel(reinterpret_cast<void*>(r3_sync_only), dim3(nsm * occc), dim3(256), args1, 0, nullptr)); });
+  // v2 fix 2: the same (b) and (c) with the shared-memory grid (path 1) and with it plus the magic-number int8 -> float (path 2)
+  int occ1 = 0, occ2 = 0, occc2 = 0;
+  CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ1, r3_stream<1>, 256, kLutBytes));
+  CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ2, r3_stream<2>, 256, kLutBytes));
+  CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occc2, r3_staged<2>, 256, kLutBytes));
+  const double tb1 = timed([&] { r3_stream<1><<<nsm * occ1, 256, kLutBytes>>>(dj, static_cast<int>(jobs.size()), 0, total, nullptr); });
+  const double tb2 = timed([&] { r3_stream<2><<<nsm * occ2, 256, kLutBytes>>>(dj, static_cast<int>(jobs.size()), 0, total, nullptr); });
+  const double tc2 = timed([&] { CK(cudaLaunchCooperativeKernel(reinterpret_cast<void*>(r3_staged<2>), dim3(nsm * occc2), dim3(256), args, kLutBytes, nullptr)); });
   CK(cudaGetLastError());
   auto row = [&](const char* name, double ms, size_t by) {
     std::printf("  %-62s %8.3f ms  %6.1f GB/s\n", name, ms, by / (ms * 1e6));
@@ -655,6 +709,11 @@ static int run_stream(int soak_s) {
   std::printf("  (c0) 161 grid syncs, no work: %.3f ms; one sync: %.3f ms; per boundary %.2f us (sync alone)\n", tc0, tc1,
               (tc0 - tc1) * 1e3 / 160.0);
   std::printf("  SM clock inside (b), block 0: %.3f GHz (clock64 / globaltimer over %.3f ms)\n", ghz_b, (clk[3] - clk[1]) / 1e6);
+  std::printf("v2 fix 2 (Q4_TG2 grid in shared memory), whole table:\n");
+  row("(b) grid path 1: shared-memory grid", tb1, bytes);
+  row("(b) grid path 2: shared-memory grid + magic int8 -> float", tb2, bytes);
+  row("(c) grid path 2, grid sync after each of 161 stages", tc2, bytes);
+  std::printf("  blocks per SM: path 1 %d, path 2 %d, (c) path 2 %d\n", occ1, occ2, occc2);
 
   // ---- per-format (b) rows (Fable item 1): one format per table, real shapes, >= 256 MiB of distinct matrices (one
   // allocation, jobs are row slices of it; nothing is read twice, so nothing is served from the 36 MB L2)
@@ -687,10 +746,16 @@ static int run_stream(int soak_s) {
     }
     Job* dpj = up(pj);
     int np = static_cast<int>(pj.size());
-    const double tp = timed([&] { r3_stream<<<nsm * occ, 256>>>(dpj, np, 0, t0, nullptr); });
+    const double tp = timed([&] { r3_stream<0><<<nsm * occ, 256>>>(dpj, np, 0, t0, nullptr); });
     char name[128];
     std::snprintf(name, sizeof name, "%s, %d matrices", f.name, count);
     row(name, tp, big.bytes());
+    if (f.fmt == r3::kQ4TG2) {
+      const double tp1 = timed([&] { r3_stream<1><<<nsm * occ1, 256, kLutBytes>>>(dpj, np, 0, t0, nullptr); });
+      const double tp2 = timed([&] { r3_stream<2><<<nsm * occ2, 256, kLutBytes>>>(dpj, np, 0, t0, nullptr); });
+      row("  the same, grid path 1 (shared-memory grid)", tp1, big.bytes());
+      row("  the same, grid path 2 (+ magic int8 -> float)", tp2, big.bytes());
+    }
     CK(cudaFree(dpj));
     CK(cudaFree(big.dw));
     if (big.dhdr) CK(cudaFree(big.dhdr));
@@ -701,18 +766,18 @@ static int run_stream(int soak_s) {
     Job J = job_of(head, A2048, dy);
     J.task0 = 0;
     Job* dh = up(std::vector<Job>{J});
-    const double th = timed([&] { r3_stream<<<nsm * occ, 256>>>(dh, 1, 0, J.ntask, nullptr); });
+    const double th = timed([&] { r3_stream<0><<<nsm * occ, 256>>>(dh, 1, 0, J.ntask, nullptr); });
     row("Q6_K only (the 248,320 x 2048 output head)", th, head.bytes());
     CK(cudaFree(dh));
   }
   if (soak_s > 0) {  // (b) back to back for an outside clock / power log (no flush between runs)
-    std::printf("soak: (b) back to back for %d s\n", soak_s);
+    std::printf("soak: (b) grid path 2 back to back for %d s\n", soak_s);
     std::fflush(stdout);
     CK(cudaDeviceSynchronize());
     const auto s0 = std::chrono::steady_clock::now();
     long long runs = 0;
     while (std::chrono::duration<double>(std::chrono::steady_clock::now() - s0).count() < soak_s) {
-      for (int k = 0; k < 20; ++k) r3_stream<<<nsm * occ, 256>>>(dj, static_cast<int>(jobs.size()), 0, total, nullptr);
+      for (int k = 0; k < 20; ++k) r3_stream<2><<<nsm * occ2, 256, kLutBytes>>>(dj, static_cast<int>(jobs.size()), 0, total, nullptr);
       CK(cudaDeviceSynchronize());
       runs += 20;
     }
@@ -724,15 +789,18 @@ static int run_stream(int soak_s) {
 }
 
 static void print_kernels() {
-  const struct { const void* f; const char* name; } K[] = {{reinterpret_cast<const void*>(r3_stream), "r3_stream"},
-                                                           {reinterpret_cast<const void*>(r3_staged), "r3_staged"},
-                                                           {reinterpret_cast<const void*>(r3_sync_only), "r3_sync_only"}};
+  const struct { const void* f; const char* name; int smem; } K[] = {{reinterpret_cast<const void*>(r3_stream<0>), "r3_stream<0>", 0},
+                                                           {reinterpret_cast<const void*>(r3_stream<1>), "r3_stream<1>", kLutBytes},
+                                                           {reinterpret_cast<const void*>(r3_stream<2>), "r3_stream<2>", kLutBytes},
+                                                           {reinterpret_cast<const void*>(r3_staged<0>), "r3_staged<0>", 0},
+                                                           {reinterpret_cast<const void*>(r3_staged<2>), "r3_staged<2>", kLutBytes},
+                                                           {reinterpret_cast<const void*>(r3_sync_only), "r3_sync_only", 0}};
   for (const auto& k : K) {
     cudaFuncAttributes fa;
     CK(cudaFuncGetAttributes(&fa, k.f));
     int occ = 0;
-    CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, k.f, 256, 0));
-    std::printf("kernel %-13s registers %3d, local memory %zu bytes, spill-free %s, blocks of 256 per SM %d\n", k.name, fa.numRegs,
+    CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, k.f, 256, k.smem));
+    std::printf("kernel %-14s registers %3d, local memory %zu bytes, spill-free %s, blocks of 256 per SM %d\n", k.name, fa.numRegs,
                 fa.localSizeBytes, fa.localSizeBytes == 0 ? "yes" : "NO", occ);
   }
   int clk = 0, mclk = 0, bus = 0;
