@@ -340,23 +340,3 @@ TEST(q4_tg2_has_an_exact_zero_and_beats_q4_tg) {
   std::printf("      Q4_TG2 vs Q4_TG: %.1f %% error\n", 100.0 * (eb / ea - 1.0));
   CHECK(eb < ea);
 }
-
-// Q8_0 activation rounding as llama.cpp's x86 CPU path does it (127 / max, ties to even), against the weight quantizer
-TEST(q8_0_x86_activation_rounding) {
-  float x[32];
-  for (int j = 0; j < 32; ++j) x[j] = 0.0f;
-  x[0] = 127.0f;  // max 127: the multiplier is exactly 1
-  x[1] = 2.5f;    // a tie: 2 (even) here, 3 (away from zero) in quantize_q8_0
-  x[2] = -3.5f;   // -4 both ways
-  x[3] = 0.5f;    // 0 here, 1 there
-  std::uint8_t a[34], w[34];
-  pelias::quant::quantize_q8_0_x86_act(x, a, 32);
-  pelias::quant::quantize_q8_0(x, w, 32);
-  CHECK(static_cast<std::int8_t>(a[2 + 1]) == 2 && static_cast<std::int8_t>(w[2 + 1]) == 3);
-  CHECK(static_cast<std::int8_t>(a[2 + 2]) == -4 && static_cast<std::int8_t>(w[2 + 2]) == -4);
-  CHECK(static_cast<std::int8_t>(a[2 + 3]) == 0 && static_cast<std::int8_t>(w[2 + 3]) == 1);
-  CHECK(std::memcmp(a, w, 2) == 0);  // same fp16 scale
-  float z[32] = {};
-  pelias::quant::quantize_q8_0_x86_act(z, a, 32);
-  for (int j = 0; j < 32; ++j) CHECK(a[2 + j] == 0);
-}

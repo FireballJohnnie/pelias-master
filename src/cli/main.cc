@@ -187,13 +187,12 @@ void usage() {
       "  generate --model FILE (--prompt TEXT | --prompt-file F) [--n-predict 128] [--ctx 32768] [--threads N]\n"
       "      [--temp 1.0] [--top-k 20] [--top-p 0.95] [--min-p 0] [--repeat-penalty 1] [--repeat-last-n 64]\n"
       "      [--presence-penalty 0] [--frequency-penalty 0] [--seed 20261019 | -1] [--ignore-eos] [--show-special]\n"
-      "      [--ids-out FILE] [--no-nfc] [--no-special] [--act-int8 GROUPS] [--act-int8-path ...] [--act-rot h32] [--no-mmap]\n"
+      "      [--ids-out FILE] [--no-nfc] [--no-special] [--act-int8 GROUPS] [--act-int8-path ...] [--act-rot h32]\n"
       "                                  text from the fp32 reference pass on the CPU (slow; a correctness reference, not the\n"
       "                                  engine): the prompt once, then one token per step on the carried KV cache and\n"
       "                                  DeltaNet state. --temp 0 is greedy; the draw is Philox4x32-10 keyed by --seed.\n"
       "                                  Defaults are the parameter dictionary's. --ids-out writes the prompt and output ids\n"
-      "                                  and each step's top-1 minus top-2 raw logit (tools/greedy_compare.py reads it)\n"      "                                  --no-mmap reads the whole file into RAM first (for mounts that do not cache it);\n"
-      "                                  --ignore-eos bans the end-of-generation tokens, as llama.cpp's ignore_eos does\n"
+      "                                  and each step's top-1 minus top-2 raw logit (tools/greedy_compare.py reads it)\n"
       "  probe | train | export | serve | bench | web   not built yet (later steps)\n"
       "options: --log debug|info|warn|error (default info)");
 }
@@ -1331,32 +1330,13 @@ int cmd_generate(const Args& a) {
     return 1;
   }
   os::FileMap m;
-  Status s;
-  if (a.has("no-mmap")) {
-    Timer tl;
-    s = m.load(path);
-    if (!s) return fail_input(s);
-    std::fprintf(stderr, "pelias generate: model read into RAM (--no-mmap): %.2f GB in %.1f s\n", static_cast<double>(m.size()) / 1e9, tl.seconds());
-    if (m.unread_from() < m.size())
-      std::fprintf(stderr, "pelias generate: the mount refused the file's last %llu bytes (from byte %llu); they are left zero and checked below\n",
-                   static_cast<unsigned long long>(m.size() - m.unread_from()), static_cast<unsigned long long>(m.unread_from()));
-  } else {
-    s = m.open(path);
-    if (!s) return fail_input(s);
-  }
+  Status s = m.open(path);
+  if (!s) return fail_input(s);
   io::GgufReader g;
   s = g.parse(m);
   if (!s) return fail_input(s);
   const Result<model::Qwen35MoeSpec> spec = model::read_qwen35moe_spec(g);
   if (!spec.ok()) return fail_input(spec.status);
-  if (m.unread_from() < m.size()) {  // only tensors the reference pass does not run (the MTP block) may lie in the unread bytes
-    const std::string mtp = "blk." + std::to_string(spec.value.n_layer) + ".";
-    for (const io::GgufTensor& t : g.tensors())
-      if (t.file_offset + t.bytes > m.unread_from() && t.name.rfind(mtp, 0) != 0) {
-        std::fprintf(stderr, "pelias: tensor %s lies in the bytes the mount refused; run without --no-mmap or from another drive\n", t.name.c_str());
-        return 2;
-      }
-  }
   const Result<model::Qwen35MoeWeights> w = model::bind_qwen35moe(g, m.data(), spec.value);
   if (!w.ok()) return fail_input(w.status);
   Result<tok::Tokenizer> tk = tok::Tokenizer::from_gguf(g);
@@ -1383,21 +1363,12 @@ int cmd_generate(const Args& a) {
     std::fprintf(stderr, "pelias: the prompt (%d tokens) and --n-predict %d do not fit --ctx %d\n", n_prompt, n_predict, n_ctx);
     return 1;
   }
-  // End-of-generation tokens, as llama.cpp names them (READ-SRC 2ca15f5 src/llama-vocab.cpp, special_eog_ids: the EOS id,
-  // the FIM pad / repo / separator tokens and the end-of-turn texts below; for Qwen: <|endoftext|>, <|im_end|>, <|fim_pad|>,
-  // <|repo_name|>, <|file_sep|>). Generation stops on one; with --ignore-eos they are banned instead (logit -inf before the
-  // sampler), as llama.cpp's ignore_eos does (common/common.cpp logit_bias_eog), so greedy runs stay comparable.
-  std::vector<std::int32_t> eog;
-  auto add_eog = [&eog](std::int32_t id) {
-    if (id >= 0 && std::find(eog.begin(), eog.end(), id) == eog.end()) eog.push_back(id);
-  };
-  add_eog(tk.value.eos_id());
-  for (const char* t : {"<|fim_pad|>", "<|repo_name|>", "<|file_sep|>", "<|eot_id|>", "<|im_end|>", "<|end|>", "<|return|>", "<|call|>",
-                        "<|flush|>", "<|calls|>", "<end_of_turn>", "<|endoftext|>", "</s>", "<|eom_id|>", "<EOT>", "_<EOT>", "[EOT]", "[EOS]",
-                        "<|end_of_text|>", "<end_of_utterance>", "<eos>", "<turn|>", "<|tool_response>"})
-    add_eog(tk.value.find(t));
-  const bool ban_eog = a.has("ignore-eos");
-  const std::vector<std::int32_t> stop = ban_eog ? std::vector<std::int32_t>{} : eog;
+  std::vector<std::int32_t> stop;
+  if (!a.has("ignore-eos")) {
+    if (tk.value.eos_id() >= 0) stop.push_back(tk.value.eos_id());
+    for (const char* t : {"<|im_end|>", "<|endoftext|>"})
+      if (const std::int32_t id = tk.value.find(t); id >= 0 && std::find(stop.begin(), stop.end(), id) == stop.end()) stop.push_back(id);
+  }
   const bool show_special = a.has("show-special");
   std::fprintf(stderr, "pelias generate: %d prompt tokens, up to %d new, %d threads, fp32 reference pass; %s (seed %llu)\n", n_prompt, n_predict, threads,
                sc.temperature <= 0.0f ? "greedy" : "sampling: temperature, top-k, top-p, min-p",
@@ -1431,10 +1402,7 @@ int cmd_generate(const Args& a) {
       } else if (x > l2) {
         l2 = x;
       }
-    gap.push_back(l1 - l2);  // on the raw logits, before any ban (llama-server's top_logprobs are raw too)
-    if (ban_eog)
-      for (const std::int32_t id : eog)
-        if (id < nv) logits[static_cast<std::size_t>(id)] = -INFINITY;
+    gap.push_back(l1 - l2);
     const std::int32_t next = sampler.sample(logits.data(), nv, history);
     out.push_back(next);
     history.push_back(next);

@@ -157,27 +157,3 @@ TEST(gguf_reads_the_real_header_when_present) {
   }
   CHECK_EQ(q4, 80); CHECK_EQ(q6, 4); CHECK_EQ(q5, 37); CHECK_EQ(q8, 251); CHECK_EQ(f32, 361);
 }
-
-// os::FileMap::load (pelias generate --no-mmap): the same bytes as the map, in private memory; a missing file is refused
-TEST(file_map_load_equals_the_map) {
-  const std::vector<std::uint8_t> bytes = ptest::GgufBuilder().kv_string("general.architecture", "x").tensor("a", {64, 3}, 0).build();
-  pelias::os::FileMap mapped;
-  CHECK(ptest::write_and_map(ptest::data_dir() + "/file_map_load.gguf", bytes, mapped));
-  pelias::os::FileMap loaded;
-  std::uint64_t last = 0;
-  static std::uint64_t seen;
-  seen = 0;
-  CHECK(loaded.load(ptest::data_dir() + "/file_map_load.gguf", [](std::uint64_t d, std::uint64_t) { seen = d; }).ok());
-  last = seen;
-  CHECK(loaded.is_open() && loaded.size() == mapped.size() && last == mapped.size());
-  CHECK(std::memcmp(loaded.data(), mapped.data(), static_cast<std::size_t>(mapped.size())) == 0);
-  pelias::io::GgufReader r;
-  CHECK(r.parse(loaded).ok());
-  pelias::os::FileMap moved = std::move(loaded);
-  CHECK(moved.size() == mapped.size() && !loaded.is_open());
-  moved.close();
-  CHECK(!moved.is_open());
-  pelias::os::FileMap missing;
-  const pelias::Status st = missing.load(ptest::data_dir() + "/no_such_file.gguf");
-  CHECK(!st.ok() && st.code == pelias::Code::not_found);
-}
