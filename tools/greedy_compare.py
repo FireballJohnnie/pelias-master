@@ -35,10 +35,18 @@ def read_llama(path):
     with open(path, encoding="utf-8") as f:
         r = json.load(f)
     toks = list(r.get("tokens") or [])
-    gaps = []
-    for step in r.get("completion_probabilities") or []:
-        top = step.get("top_logprobs") or []
-        gaps.append(top[0]["logprob"] - top[1]["logprob"] if len(top) >= 2 else float("nan"))
+    # completion_probabilities can hold fewer entries than tokens (llama-server leaves one out where a character's UTF-8
+    # bytes span two tokens; MEASURED in the sandbox dry run: 127 entries for 128 tokens), so the entries are matched to
+    # the tokens by id, in order; a token with no entry gets no gap (nan) instead of its neighbour's
+    gaps = [float("nan")] * len(toks)
+    j = 0
+    steps = r.get("completion_probabilities") or []
+    for i, tid in enumerate(toks):
+        if j < len(steps) and steps[j].get("id") == tid:
+            top = steps[j].get("top_logprobs") or []
+            if len(top) >= 2:
+                gaps[i] = top[0]["logprob"] - top[1]["logprob"]
+            j += 1
     return toks, gaps
 
 

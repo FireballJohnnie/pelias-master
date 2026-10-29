@@ -1363,12 +1363,21 @@ int cmd_generate(const Args& a) {
     std::fprintf(stderr, "pelias: the prompt (%d tokens) and --n-predict %d do not fit --ctx %d\n", n_prompt, n_predict, n_ctx);
     return 1;
   }
-  std::vector<std::int32_t> stop;
-  if (!a.has("ignore-eos")) {
-    if (tk.value.eos_id() >= 0) stop.push_back(tk.value.eos_id());
-    for (const char* t : {"<|im_end|>", "<|endoftext|>"})
-      if (const std::int32_t id = tk.value.find(t); id >= 0 && std::find(stop.begin(), stop.end(), id) == stop.end()) stop.push_back(id);
-  }
+  // End-of-generation tokens, as llama.cpp names them (READ-SRC 2ca15f5 src/llama-vocab.cpp, special_eog_ids: the EOS id,
+  // the FIM pad / repo / separator tokens and the end-of-turn texts below; for Qwen: <|endoftext|>, <|im_end|>, <|fim_pad|>,
+  // <|repo_name|>, <|file_sep|>). Generation stops on one; with --ignore-eos they are banned instead (logit -inf before the
+  // sampler), as llama.cpp's ignore_eos does (common/common.cpp logit_bias_eog), so greedy runs stay comparable.
+  std::vector<std::int32_t> eog;
+  auto add_eog = [&eog](std::int32_t id) {
+    if (id >= 0 && std::find(eog.begin(), eog.end(), id) == eog.end()) eog.push_back(id);
+  };
+  add_eog(tk.value.eos_id());
+  for (const char* t : {"<|fim_pad|>", "<|repo_name|>", "<|file_sep|>", "<|eot_id|>", "<|im_end|>", "<|end|>", "<|return|>", "<|call|>",
+                        "<|flush|>", "<|calls|>", "<end_of_turn>", "<|endoftext|>", "</s>", "<|eom_id|>", "<EOT>", "_<EOT>", "[EOT]", "[EOS]",
+                        "<|end_of_text|>", "<end_of_utterance>", "<eos>", "<turn|>", "<|tool_response>"})
+    add_eog(tk.value.find(t));
+  const bool ban_eog = a.has("ignore-eos");
+  const std::vector<std::int32_t> stop = ban_eog ? std::vector<std::int32_t>{} : eog;
   const bool show_special = a.has("show-special");
   std::fprintf(stderr, "pelias generate: %d prompt tokens, up to %d new, %d threads, fp32 reference pass; %s (seed %llu)\n", n_prompt, n_predict, threads,
                sc.temperature <= 0.0f ? "greedy" : "sampling: temperature, top-k, top-p, min-p",
@@ -1402,7 +1411,10 @@ int cmd_generate(const Args& a) {
       } else if (x > l2) {
         l2 = x;
       }
-    gap.push_back(l1 - l2);
+    gap.push_back(l1 - l2);  // on the raw logits, before any ban (llama-server's top_logprobs are raw too)
+    if (ban_eog)
+      for (const std::int32_t id : eog)
+        if (id < nv) logits[static_cast<std::size_t>(id)] = -INFINITY;
     const std::int32_t next = sampler.sample(logits.data(), nv, history);
     out.push_back(next);
     history.push_back(next);
