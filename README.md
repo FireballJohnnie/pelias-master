@@ -53,6 +53,26 @@ urm_TG2 is lower than Unsloth at a smaller size. Its 95 % interval, [-0.001618, 
 
 **Where the rest of the speed is:** an independent review of R3 v1 (`docs/reviews/FABLE_R3_V1_REVIEW_2026-10-29.md`) traces about 4 of the 8.79 ms to one lookup in the Q4_TG2 decode. Without it, the other formats already stream at about 375-405 GB/s (DERIVED). R3 v2 removes the bottlenecks one at a time, measuring each. At the 494 GB/s ceiling a token's weights take 4.60 ms (DERIVED). Projected speeds once R3 is in the engine are in the game plan (DERIVED, not measured).
 
+### Before vs now: speed on the same PC
+
+The first measured speeds of this model on this machine, before any of the work above. The first four rows are the stock llama.cpp server with a Q8_0 KV cache; the fifth is the author's tier build in a patched llama.cpp. Records are in the pelias-engine repository, 2026-10-19 to 10-22.:
+
+| When | Setup | Generation, tok/s (short / 4K / 12K tokens) | Label |
+|---|---|---|---|
+| 2026-10-19 23:17 | Q5_K_M, all experts on the CPU, 32K context: **the very first run** | 29.2 / 28.5 / 27.0 | MEASURED |
+| 2026-10-20 02:00 | Q4_K_M, all experts on the CPU | 32.1 / 30.7 / 30.4 | MEASURED |
+| 2026-10-20 02:55 | Q4_K_M, 128K context, `-ub 2048` | 31.8 / 31.5 / 31.3 | MEASURED |
+| 2026-10-20 03:20 | Q4_K_M, best stock layout (`--n-cpu-moe 28`: 12 layers of experts on the GPU) | 41.1 / 40.2 / 38.8 | MEASURED |
+| 2026-10-22 | The author's tier build (hot experts on the GPU, bypass 32) | 53.5 / 53.0 / 49.1 | MEASURED |
+| next | Pelias engine: unified bus rungs 1-3 (bus speed + doorbells, one-layer-ahead prediction, L3 repeats + draft prefetch) | 89-103 / 112 / 116; 119 with today's ~3.2 ms per-token overhead; 193 memory floor (about 211 at this card's overclocked memory), reachable only with GPU-side work such as R3 | DERIVED (game plan, Fable's corrected figures) |
+
+**The first targets, set 2026-10-20 to 10-21:**
+- A custom engine would need about 47 tok/s to be 15 % faster than the best stock layout.
+- The 12K-context target was at least 55 tok/s; the best tier run reached 46.8, so it failed at that point.
+- The hardware-ceiling model of that day put the limit at 88-92 tok/s (DERIVED).
+
+The newer projections sit above that ceiling because they rest on measurements taken since then: bus speed, doorbells, the hot set and the 494 GB/s read. The arithmetic is in the game plan. They are projections until the engine runs and its timers decide.
+
 ### Running now and next
 
 1. **KV / DeltaNet-state compaction test on urm_TG2:** keys and values at 8 and 4 bits, the DeltaNet state checkpoint at int8 and 4 bits. Whole-model KL (running).
