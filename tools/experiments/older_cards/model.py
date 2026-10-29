@@ -36,6 +36,9 @@ cards = [
  ('RX 6700 XT',12,384,'A','RDNA 2'),('RX 6800',16,512,'A','RDNA 2'),('RX 7600',8,288,'A','RDNA 3'),('RX 7800 XT',16,624,'A','RDNA 3'),
  ('RX 7900 XTX',24,960,'A','RDNA 3'),('RX 9060 XT 16GB',16,320,'A','RDNA 4'),('RX 9070 XT',16,640,'A','RDNA 4'),
  ('Instinct MI25',16,484,'A','Vega 10, data centre'),('Instinct MI50 16GB',16,1024,'A','Vega 20, data centre'),('Instinct MI50 32GB / MI60',32,1024,'A','Vega 20, data centre'),
+ ('TITAN Xp',12,547.6,'N','sm_61'),('TITAN V',12,651.3,'N','sm_70, HBM2'),('TITAN RTX',24,672,'N','sm_75'),
+ ('Quadro P6000',24,432.8,'N','sm_61'),('Quadro RTX 8000',48,672,'N','sm_75'),('RTX A4000',16,448,'N','sm_86'),('RTX A5000',24,768,'N','sm_86'),
+ ('RTX A6000',48,768,'N','sm_86'),('RTX 6000 Ada',48,960,'N','sm_89'),('Tesla M40 24GB',24,288,'N','sm_52, no dp4a'),
  ('Arc A380',6,186,'I','Alchemist'),('Arc A750',8,512,'I','Alchemist'),('Arc A770 16GB',16,560,'I','Alchemist'),('Arc B570',10,380,'I','Battlemage'),('Arc B580',12,456,'I','Battlemage'),
 ]
 print('| Card | VRAM | GB/s | 35B-A3B (urm_TG2) placement | hit | tok/s (DERIVED) |')

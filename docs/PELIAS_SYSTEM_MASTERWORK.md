@@ -1431,6 +1431,23 @@ On the 24 GB cards the whole model fits, but only about 1.5 GB is left after the
 
 **Why these cards are in the table:** one-token decode is mostly a memory-bandwidth job. These 2016-2018 data-centre cards have high bandwidth for their age: the V100 has 900 GB/s against the reference 4070's 504 (PUBLISHED). A V100 32GB could hold the whole Pelias file with room for context. Whether its older compute keeps up is exactly what a measurement on one would show.
 
+#### 21.8.3b Titan and workstation cards (Quadro, RTX A, RTX Ada; Qwen3.6-35B-A3B)
+
+| Card | VRAM GB | GB/s | Placement | h | tok/s |
+|---|---|---|---|---|---|
+| TITAN Xp | 12 | 547.6 | bank 8.6 GiB | 0.76 | 69-127 |
+| TITAN V | 12 | 651.3 | bank 8.6 GiB | 0.76 | 76-139 |
+| TITAN RTX | 24 | 672 | all in VRAM | — | 96-234 |
+| Quadro P6000 | 24 | 432.8 | all in VRAM | — | 70-157 |
+| Quadro RTX 8000 | 48 | 672 | all in VRAM | — | 96-234 |
+| RTX A4000 | 16 | 448 | bank 12.3 GiB | 0.76 | 61-113 |
+| RTX A5000 | 24 | 768 | all in VRAM | — | 105-263 |
+| RTX A6000 | 48 | 768 | all in VRAM | — | 105-263 |
+| RTX 6000 Ada | 48 | 960 | all in VRAM | — | 121-318 |
+| Tesla M40 24GB | 24 | 288 | all in VRAM | — | 50-107 |
+
+The 48 GB cards hold the whole file with room for long contexts, and they could also hold larger models, which this table leaves out. The Tesla M40 (sm_52) lacks dp4a (21.8.9).
+
 #### 21.8.4 The oldest cards, 4 GB and up: dense models by size
 
 No model is named here. The rows give the largest dense model that fits (VRAM − 0.6 GB) and the speed of a 1 GB model for scale.
@@ -1562,6 +1579,12 @@ Each result replaces its DERIVED row with MEASURED, plus the card and date. The 
 - Tesla T4, GTX 980 Ti: [fpsbench, T4 vs GTX 980 Ti](https://fpsbench.com/compare/gpu/nvidia-tesla-t4-vs-nvidia-geforce-gtx-980-ti)
 - GTX 970: [gagadget, GTX 970 vs T4](https://gagadget.com/en/graphics-cards/geforce-gtx-970-vs-tesla-t4/)
 - GTX 1060 6 GB: [gagadget, GTX 1060 6 GB vs T4](https://gagadget.com/en/graphics-cards/geforce-gtx-1060-6-gb-vs-tesla-t4/)
+- TITAN V, Quadro RTX 8000: [sysrqmts, Quadro RTX 8000 vs TITAN V](https://sysrqmts.com/gpus/compare/nvidia-quadro-rtx-8000-vs-nvidia-titan-v). For the RTX 8000, 672 GB/s is used; one other site lists 768.
+- TITAN Xp: [sysrqmts, Quadro RTX 8000 vs TITAN Xp](https://sysrqmts.com/en/gpus/compare/nvidia-quadro-rtx-8000-vs-nvidia-titan-xp)
+- TITAN RTX: [chipversus, TITAN RTX vs Quadro RTX 8000](https://chipversus.com/compare/titan-rtx-vs-quadro-rtx-8000)
+- RTX A4000, A6000: [fpsbench, RTX A6000 vs A4000](https://fpsbench.com/compare/gpu/nvidia-rtx-a6000-vs-nvidia-rtx-a4000)
+- RTX A5000, RTX 6000 Ada: [gpu-monkey, RTX A5000 vs RTX 6000 Ada](https://www.gpu-monkey.com/en/compare_gpu-nvidia_rtx_a5000-vs-nvidia_rtx_6000_ada)
+- Quadro P6000, Tesla M40 (288 GB/s; the 24 GB board shares the bus): [fpsbench, Quadro P6000 vs Tesla M40](https://fpsbench.com/compare/gpu/nvidia-quadro-p6000-vs-nvidia-tesla-m40)
 - GTX 960: [fpsbench, GTX 960 vs T4](https://fpsbench.com/compare/gpu/nvidia-geforce-gtx-960-vs-nvidia-tesla-t4) (the 4 GB board shares the 128-bit bus and 112 GB/s)
 
 ### 21.9 What the PC needs for the unified bus, and the earliest CPUs that have it
