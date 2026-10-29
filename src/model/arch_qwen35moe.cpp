@@ -426,7 +426,7 @@ void h_gate_impl(const std::uint8_t* data, std::uint64_t row_bytes, int64_t n_ou
 }
 
 void t_decode_impl(const std::uint8_t* data, std::uint64_t row_bytes, int64_t n_out, int64_t k, const float* x, int64_t n_tok, int64_t ldx,
-                   float* y, int64_t ldy, int threads) {
+                   float* y, int64_t ldy, int threads, bool fold = false) {
   const int64_t nb = k / 32;
   std::vector<quant::ActBlock32> act(z(n_tok * nb));
   for (int64_t t = 0; t < n_tok; ++t) quant::act_quantize_32(x + t * ldx, k, act.data() + t * nb);
@@ -468,8 +468,13 @@ void t_decode_impl(const std::uint8_t* data, std::uint64_t row_bytes, int64_t n_
         std::int64_t P2 = 2 * (2 * static_cast<std::int64_t>(pb) - 127 * static_cast<std::int64_t>(a.sum));
         if (gated[z(j)]) {
           const std::uint32_t h = hw[z(j)];
-          std::int64_t hc = -128 * std::popcount(h);
-          for (int kk = 0; kk < 8; ++kk) hc += static_cast<std::int64_t>(std::popcount(h & a.plane[kk])) << kk;
+          std::int64_t hc = 0;
+          if (fold) {  // control: h folded into the values, sum h x directly
+            for (int i = 0; i < 32; ++i) hc += static_cast<std::int64_t>((h >> i) & 1u) * a.q[i];
+          } else {
+            hc = -128 * std::popcount(h);
+            for (int kk = 0; kk < 8; ++kk) hc += static_cast<std::int64_t>(std::popcount(h & a.plane[kk])) << kk;
+          }
           P2 += 2 * hc;
         }
         acc += s[z(j)] * a.scale * (0.5f * static_cast<float>(P2));
@@ -500,7 +505,7 @@ void mm(const Ctx& c, const WeightView& w, const float* x, int64_t n_tok, int64_
         std::memcpy(xr.data() + t * k, x + t * ldx, z(k) * sizeof(float));
         if (w.rot32) act_rotate32(xr.data() + t * k, k);
       }
-      t_decode_impl(w.data, w.row_bytes, static_cast<int64_t>(w.ne[1]), k, xr.data(), n_tok, k, y, ldy, c.threads);
+      t_decode_impl(w.data, w.row_bytes, static_cast<int64_t>(w.ne[1]), k, xr.data(), n_tok, k, y, ldy, c.threads, c.opt.t_decode_fold);
       return;
     }
     for (int64_t t = 0; t < n_tok; ++t) {

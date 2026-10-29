@@ -129,6 +129,9 @@ struct ForwardOptions {
   // gated 32-block added by AND + popcount against the activation's bit planes (quant/tdecode.h). Off: the dequantized
   // weights times the rounded activations (the same integers, summed in another order).
   bool t_decode = false;
+  // With t_decode: false = the 1-bit route (AND + popcount); true = the 8th bit folded into the integers (q = 2b + h - 127)
+  // in the same loop and order, the control that shows the two routes give bit-identical sums.
+  bool t_decode_fold = false;
   // swap_margin m > 0 with hot (n_layer x n_expert, 1 = resident): when a token's last pick is not resident, the first
   // unpicked expert is, and their probabilities differ by less than m, the resident one is used instead.
   float swap_margin = 0.0f;
