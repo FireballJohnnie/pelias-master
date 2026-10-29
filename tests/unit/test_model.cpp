@@ -430,3 +430,148 @@ TEST(state_store_roundtrip_formats) {
   pelias::model::state_store_roundtrip(zero.data(), 64, K::int4r);
   for (float v : zero) CHECK(v == 0.0f);
 }
+
+// GP3-07: a tiny bindable qwen35moe (4 trunk blocks: three DeltaNet, one full attention; every tensor f32) whose data is
+// small deterministic values instead of the builder's byte pattern, so the forward pass is finite and well scaled
+namespace {
+struct TinyModel {
+  pelias::os::FileMap map;
+  pelias::io::GgufReader reader;
+  pelias::model::Qwen35MoeSpec spec;
+  pelias::model::Qwen35MoeWeights w;
+  bool ok = false;
+};
+
+void tiny_model(TinyModel& tm) {
+  ptest::GgufBuilder b = qwen35moe_meta(4, 0);
+  // a byte-level tokenizer over the 1,000-token vocabulary, so `pelias generate` runs on this file too: ids 0..255 are
+  // the bytes (GPT-2 byte-to-character map), a few merges, fillers, then <|endoftext|> <|im_start|> <|im_end|> as control
+  {
+    std::vector<std::string> toks;
+    std::vector<std::int32_t> types;
+    int extra = 0;
+    for (int by = 0; by < 256; ++by) {
+      const bool keep = (by >= 33 && by <= 126) || (by >= 161 && by <= 172) || (by >= 174 && by <= 255);
+      const char32_t cp = keep ? static_cast<char32_t>(by) : static_cast<char32_t>(256 + extra++);
+      std::string u;
+      if (cp < 0x80) u += static_cast<char>(cp);
+      else {
+        u += static_cast<char>(0xC0 | (cp >> 6));
+        u += static_cast<char>(0x80 | (cp & 0x3F));
+      }
+      toks.push_back(u);
+      types.push_back(6);
+    }
+    const std::vector<std::string> merges{"H e", "l l", "He ll", "o r"};
+    for (const char* t : {"He", "ll", "Hell", "or"}) {
+      toks.emplace_back(t);
+      types.push_back(1);
+    }
+    while (toks.size() < 997) {
+      toks.push_back("<|filler_" + std::to_string(toks.size()) + "|>");
+      types.push_back(5);
+    }
+    for (const char* t : {"<|endoftext|>", "<|im_start|>", "<|im_end|>"}) {
+      toks.emplace_back(t);
+      types.push_back(3);
+    }
+    b.kv_string("tokenizer.ggml.model", "gpt2").kv_string("tokenizer.ggml.pre", "qwen35").kv_string_array("tokenizer.ggml.tokens", toks)
+        .kv_i32_array("tokenizer.ggml.token_type", types).kv_string_array("tokenizer.ggml.merges", merges)
+        .kv_u32("tokenizer.ggml.eos_token_id", 999).kv_bool("tokenizer.ggml.add_bos_token", false);
+  }
+  const std::uint64_t e = 256, hd = 64, nh = 4, nkv = 2, ch = 512, di = 256, ds = 32, nvh = 8, ne = 8, ff = 256, ffs = 256;
+  b.tensor("output_norm.weight", {e}, 0);
+  for (int il = 0; il < 4; ++il) {
+    const std::string p = "blk." + std::to_string(il) + ".";
+    b.tensor(p + "attn_norm.weight", {e}, 0).tensor(p + "post_attention_norm.weight", {e}, 0);
+    if (il == 3) {
+      b.tensor(p + "attn_q.weight", {e, 2 * hd * nh}, 0).tensor(p + "attn_k.weight", {e, hd * nkv}, 0).tensor(p + "attn_v.weight", {e, hd * nkv}, 0);
+      b.tensor(p + "attn_output.weight", {hd * nh, e}, 0).tensor(p + "attn_q_norm.weight", {hd}, 0).tensor(p + "attn_k_norm.weight", {hd}, 0);
+    } else {
+      b.tensor(p + "attn_qkv.weight", {e, ch}, 0).tensor(p + "attn_gate.weight", {e, di}, 0).tensor(p + "ssm_beta.weight", {e, nvh}, 0);
+      b.tensor(p + "ssm_alpha.weight", {e, nvh}, 0).tensor(p + "ssm_out.weight", {di, e}, 0).tensor(p + "ssm_conv1d.weight", {4, ch}, 0);
+      b.tensor(p + "ssm_dt.bias", {nvh}, 0).tensor(p + "ssm_a", {nvh}, 0).tensor(p + "ssm_norm.weight", {ds}, 0);
+    }
+    b.tensor(p + "ffn_gate_inp.weight", {e, ne}, 0).tensor(p + "ffn_up_exps.weight", {e, ff, ne}, 0).tensor(p + "ffn_gate_exps.weight", {e, ff, ne}, 0);
+    b.tensor(p + "ffn_down_exps.weight", {ff, e, ne}, 0).tensor(p + "ffn_up_shexp.weight", {e, ffs}, 0).tensor(p + "ffn_gate_shexp.weight", {e, ffs}, 0);
+    b.tensor(p + "ffn_down_shexp.weight", {ffs, e}, 0).tensor(p + "ffn_gate_inp_shexp.weight", {e}, 0);
+  }
+  std::vector<std::uint8_t> bytes = b.build();
+  pelias::os::FileMap m0;
+  pelias::io::GgufReader r0;
+  if (!ptest::write_and_map(ptest::data_dir() + "/decode_tiny_layout.gguf", bytes, m0) || !r0.parse(m0).ok()) return;
+  std::uint32_t h = 20261019u;
+  auto unit = [&h]() {  // xorshift, uniform in [-1, 1)
+    h ^= h << 13;
+    h ^= h >> 17;
+    h ^= h << 5;
+    return static_cast<float>(h) / 2147483648.0f - 1.0f;
+  };
+  for (const pelias::io::GgufTensor& t : r0.tensors()) {
+    float* d = reinterpret_cast<float*>(bytes.data() + t.file_offset);
+    const std::string& nm = t.name;
+    const float row = 1.0f / std::sqrt(static_cast<float>(t.ne[0]));
+    for (std::uint64_t i = 0; i < t.elements(); ++i) {
+      const float u = unit();
+      float v = u * row;
+      if (nm.find("norm") != std::string::npos) v = 1.0f + 0.1f * u;
+      else if (nm.find("ssm_a") != std::string::npos) v = -(0.5f + 0.5f * std::fabs(u));
+      else if (nm.find("ssm_dt") != std::string::npos) v = 0.1f * u;
+      else if (nm.find("conv1d") != std::string::npos) v = 0.3f * u;
+      else if (nm == "token_embd.weight") v = 0.5f * u;
+      std::memcpy(d + i, &v, 4);
+    }
+  }
+  if (!ptest::write_and_map(ptest::data_dir() + "/decode_tiny.gguf", bytes, tm.map) || !tm.reader.parse(tm.map).ok()) return;
+  auto s = pelias::model::read_qwen35moe_spec(tm.reader);
+  if (!s.ok()) return;
+  tm.spec = s.value;
+  auto w = pelias::model::bind_qwen35moe(tm.reader, tm.map.data(), tm.spec);
+  if (!w.ok()) return;
+  tm.w = std::move(w.value);
+  tm.ok = true;
+}
+}  // namespace
+
+TEST(decode_incremental_equals_the_fresh_pass) {
+  TinyModel tm;
+  tiny_model(tm);
+  CHECK(tm.ok);
+  if (!tm.ok) return;
+  const std::vector<std::int32_t> tok{11, 427, 3, 999, 58, 58, 0, 731, 210, 64, 5};
+  const int n = static_cast<int>(tok.size()), v = static_cast<int>(tm.spec.n_vocab);
+  pelias::model::ForwardOptions opt;
+  opt.threads = 3;
+  std::vector<float> full(static_cast<std::size_t>(n) * static_cast<std::size_t>(v));
+  CHECK(pelias::model::forward_reference(tm.spec, tm.w, tok.data(), n, 0, n, full.data(), opt).ok());
+  float amax = 0.0f;
+  for (float x : full) {
+    CHECK(std::isfinite(x));
+    amax = std::max(amax, std::fabs(x));
+  }
+  CHECK(amax > 1e-3f);
+  // prefill 4, then one token, then a chunk of 3 (all rows), then one at a time with only the last row
+  pelias::model::DecodeState st;
+  pelias::model::decode_state_reset(tm.spec, st);
+  std::vector<float> got(full.size(), 0.0f);
+  const int chunks[][2] = {{0, 4}, {4, 1}, {5, 3}, {8, 1}, {9, 1}, {10, 1}};
+  for (const auto& ck : chunks) {
+    const bool last_only = ck[0] >= 8;
+    std::vector<float> lg(static_cast<std::size_t>(last_only ? 1 : ck[1]) * static_cast<std::size_t>(v));
+    CHECK(pelias::model::forward_decode(tm.spec, tm.w, st, tok.data() + ck[0], ck[1], lg.data(), last_only, opt).ok());
+    const int first = last_only ? ck[0] + ck[1] - 1 : ck[0];
+    std::copy(lg.begin(), lg.end(), got.begin() + static_cast<std::ptrdiff_t>(first) * v);
+  }
+  CHECK(st.pos == n);
+  double worst = 0.0;
+  for (std::size_t i = 0; i < full.size(); ++i) worst = std::max(worst, static_cast<double>(std::fabs(full[i] - got[i])));
+  std::printf("    decode vs fresh: max |diff| %.3g of max |logit| %.3g\n", worst, static_cast<double>(amax));
+  CHECK(worst <= 1e-5 * static_cast<double>(amax));
+  // the whole-chunk records are refused, and an unsized state is refused
+  pelias::model::ForwardOptions bad = opt;
+  bad.state_store = pelias::model::ForwardOptions::StateStore::q8;
+  std::vector<float> one(static_cast<std::size_t>(v));
+  CHECK(!pelias::model::forward_decode(tm.spec, tm.w, st, tok.data(), 1, one.data(), true, bad).ok());
+  pelias::model::DecodeState empty;
+  CHECK(!pelias::model::forward_decode(tm.spec, tm.w, empty, tok.data(), 1, one.data(), true, opt).ok());
+}

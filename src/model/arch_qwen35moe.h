@@ -184,6 +184,24 @@ void t_decode_q7zt(const std::uint8_t* data, std::uint64_t row_bytes, std::int64
 void act_round_q8_256x8(float* x, std::int64_t n);
 void act_round_q8_256e(float* x, std::int64_t n);
 
+// GP3-07: what a decode session carries from one call to the next, so new tokens run at positions pos, pos + 1, ...
+// against everything before them instead of a fresh sequence. Per trunk layer: the full-attention layers keep every
+// position's keys (after norm and rope) and values; the DeltaNet layers keep the last ssm_d_conv - 1 rows of the conv input
+// (zeros before the first token, as the fresh pass pads) and the recurrent state of every value head (zero at the start).
+struct DecodeState {
+  std::int64_t pos = 0;                          // tokens already run
+  std::vector<std::vector<float>> k, v;          // [layer] pos x (head_dim x n_head_kv), full-attention layers only
+  std::vector<std::vector<float>> conv_tail;     // [layer] (ssm_d_conv - 1) x conv_channels, DeltaNet layers only
+  std::vector<std::vector<float>> rec;           // [layer] ssm_dt_rank x d_state x d_state, DeltaNet layers only
+};
+// Sizes the state for `s` and sets it to the start of a sequence (position 0, empty cache, zero state).
+void decode_state_reset(const Qwen35MoeSpec& s, DecodeState& st);
+// Runs tokens[0..n_new) at positions st.pos .. st.pos + n_new - 1, extends the state, and writes the logits of every new
+// token (n_new rows of spec.n_vocab) or, with last_only, of the last one (one row). The result equals the fresh pass over
+// the whole sequence (tests/unit/test_model.cpp). Options that need a whole chunk (state_store, qk_dump) are refused.
+Status forward_decode(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, DecodeState& st, const std::int32_t* tokens, int n_new, float* logits,
+                      bool last_only, const ForwardOptions& opt = {});
+
 // Runs tokens[0..n_tokens) and writes the logits of positions [out_begin, out_end) to `logits`
 // ((out_end - out_begin) rows of spec.n_vocab floats). With `logits` null the output layer is skipped.
 Status forward_reference(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, const std::int32_t* tokens, int n_tokens, int out_begin,

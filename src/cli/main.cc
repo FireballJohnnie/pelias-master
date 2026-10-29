@@ -18,6 +18,7 @@
 #include <fstream>
 #include <limits>
 #include <map>
+#include <random>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -45,6 +46,7 @@
 #include "quant/type_rules.h"
 #include "io/text_file.h"
 #include "model/arch_qwen35moe.h"
+#include "model/sampler.h"
 #include "model/spec.h"
 #include "tok/tokenizer.h"
 #include "verify/kl.h"
@@ -181,6 +183,14 @@ void usage() {
       "                                  importance matrix from a calibration text, by the fp32 reference pass, in the\n"
       "                                  reference's GGUF imatrix format (llama-quantize --imatrix reads it); weights the\n"
       "                                  file stores rotated (quantize --rotate32) are collected on the rotated inputs\n"
+      "  generate --model FILE (--prompt TEXT | --prompt-file F) [--n-predict 128] [--ctx 32768] [--threads N]\n"
+      "      [--temp 1.0] [--top-k 20] [--top-p 0.95] [--min-p 0] [--repeat-penalty 1] [--repeat-last-n 64]\n"
+      "      [--presence-penalty 0] [--frequency-penalty 0] [--seed 20261019 | -1] [--ignore-eos] [--show-special]\n"
+      "      [--ids-out FILE] [--no-nfc] [--no-special] [--act-int8 GROUPS] [--act-int8-path ...] [--act-rot h32]\n"
+      "                                  text from the fp32 reference pass on the CPU (slow; a correctness reference, not the\n"
+      "                                  engine): the prompt once, then one token per step on the carried KV cache and\n"
+      "                                  DeltaNet state. --temp 0 is greedy; the draw is Philox4x32-10 keyed by --seed.\n"
+      "                                  Defaults are the parameter dictionary's. --ids-out writes the prompt and output ids\n"
       "  probe | train | export | serve | bench | web   not built yet (later steps)\n"
       "options: --log debug|info|warn|error (default info)");
 }
@@ -672,6 +682,58 @@ int cmd_verify(const Args& a) {
   return all_tensors && rep.files_identical ? 0 : 5;
 }
 
+// --act-int8 GROUPS, --act-int8-path cpu|gpu|gpu256|gpu256x8|gpu256e and --act-rot h32 into `fo` (kld and generate).
+// Bad text: prints why, returns false (exit 1).
+bool act_options(const Args& a, model::ForwardOptions& fo) {
+  if (a.has("act-int8")) {
+    const std::string groups = a.get("act-int8");
+    if (groups == "1") {  // the argument parser's value for a flag given with no value
+      std::fprintf(stderr, "pelias: --act-int8 needs a value: 'all' or comma-separated parts of tensor names\n");
+      return false;
+    }
+    for (std::size_t p = 0; p <= groups.size();) {
+      const std::size_t q = std::min(groups.find(',', p), groups.size());
+      if (q > p) fo.act_int8.push_back(groups.substr(p, q - p));
+      p = q + 1;
+    }
+    if (fo.act_int8.empty()) {
+      std::fprintf(stderr, "pelias: --act-int8 needs 'all' or comma-separated parts of tensor names\n");
+      return false;
+    }
+  }
+  if (a.has("act-int8-block")) {
+    std::fprintf(stderr, "pelias: --act-int8-block was replaced by --act-int8-path cpu|gpu (the format follows each weight's type)\n");
+    return false;
+  }
+  if (a.has("act-int8-path")) {
+    const std::string b = a.get("act-int8-path");
+    if (fo.act_int8.empty()) {
+      std::fprintf(stderr, "pelias: --act-int8-path needs --act-int8\n");
+      return false;
+    }
+    if (b != "cpu" && b != "gpu" && b != "gpu256" && b != "gpu256x8" && b != "gpu256e") {
+      std::fprintf(stderr, "pelias: --act-int8-path is cpu (llama.cpp's CPU formats per weight type), gpu (q8_1), gpu256 (the Pelias int8 kernel: one scale per 256), gpu256x8 (eight scales per 256) or gpu256e (one scale per 256, a power-of-two exponent per 32)\n");
+      return false;
+    }
+    fo.act_gpu256 = b.rfind("gpu256", 0) == 0;
+    fo.act_int8_gpu = b == "gpu" || fo.act_gpu256;
+    fo.act_gpu256_sub = b == "gpu256x8" ? 1 : b == "gpu256e" ? 2 : 0;
+  }
+  if (a.has("act-rot")) {
+    const std::string r = a.get("act-rot");
+    if (fo.act_int8.empty()) {
+      std::fprintf(stderr, "pelias: --act-rot needs --act-int8\n");
+      return false;
+    }
+    if (r != "h32") {
+      std::fprintf(stderr, "pelias: --act-rot is h32 (the 32-value Walsh-Hadamard rotation)\n");
+      return false;
+    }
+    fo.act_rot32 = true;
+  }
+  return true;
+}
+
 int cmd_kld(const Args& a) {
   const std::string path = a.get("model"), base_path = a.get("base");
   if (path.empty() || base_path.empty()) {
@@ -739,52 +801,7 @@ int cmd_kld(const Args& a) {
   verify::KlStats stats;
   model::ForwardOptions fo;
   fo.threads = threads;
-  if (a.has("act-int8")) {
-    const std::string groups = a.get("act-int8");
-    if (groups == "1") {  // the argument parser's value for a flag given with no value
-      std::fprintf(stderr, "pelias: --act-int8 needs a value: 'all' or comma-separated parts of tensor names\n");
-      return 1;
-    }
-    for (std::size_t p = 0; p <= groups.size();) {
-      const std::size_t q = std::min(groups.find(',', p), groups.size());
-      if (q > p) fo.act_int8.push_back(groups.substr(p, q - p));
-      p = q + 1;
-    }
-    if (fo.act_int8.empty()) {
-      std::fprintf(stderr, "pelias: --act-int8 needs 'all' or comma-separated parts of tensor names\n");
-      return 1;
-    }
-  }
-  if (a.has("act-int8-block")) {
-    std::fprintf(stderr, "pelias: --act-int8-block was replaced by --act-int8-path cpu|gpu (the format follows each weight's type)\n");
-    return 1;
-  }
-  if (a.has("act-int8-path")) {
-    const std::string b = a.get("act-int8-path");
-    if (fo.act_int8.empty()) {
-      std::fprintf(stderr, "pelias: --act-int8-path needs --act-int8\n");
-      return 1;
-    }
-    if (b != "cpu" && b != "gpu" && b != "gpu256" && b != "gpu256x8" && b != "gpu256e") {
-      std::fprintf(stderr, "pelias: --act-int8-path is cpu (llama.cpp's CPU formats per weight type), gpu (q8_1), gpu256 (the Pelias int8 kernel: one scale per 256), gpu256x8 (eight scales per 256) or gpu256e (one scale per 256, a power-of-two exponent per 32)\n");
-      return 1;
-    }
-    fo.act_gpu256 = b.rfind("gpu256", 0) == 0;
-    fo.act_int8_gpu = b == "gpu" || fo.act_gpu256;
-    fo.act_gpu256_sub = b == "gpu256x8" ? 1 : b == "gpu256e" ? 2 : 0;
-  }
-  if (a.has("act-rot")) {
-    const std::string r = a.get("act-rot");
-    if (fo.act_int8.empty()) {
-      std::fprintf(stderr, "pelias: --act-rot needs --act-int8\n");
-      return 1;
-    }
-    if (r != "h32") {
-      std::fprintf(stderr, "pelias: --act-rot is h32 (the 32-value Walsh-Hadamard rotation)\n");
-      return 1;
-    }
-    fo.act_rot32 = true;
-  }
+  if (!act_options(a, fo)) return 1;
   // Block M: speed ideas, each measured for its accuracy cost
   std::uint64_t m_stats[6] = {0, 0, 0, 0, 0, 0};
   fo.m_stats = m_stats;
@@ -1212,6 +1229,207 @@ int cmd_imatrix(const Args& a) {
   return 0;
 }
 
+// Reads --k as a decimal number in [lo, hi] (negative allowed). Absent: true, `v` unchanged. Bad text: prints why, false.
+bool float_option(const Args& a, const char* k, float lo, float hi, float& v) {
+  if (!a.has(k)) return true;
+  const std::string t = a.get(k);
+  char* end = nullptr;
+  errno = 0;
+  const double d = std::strtod(t.c_str(), &end);
+  if (t.empty() || end != t.c_str() + t.size() || errno != 0 || !(d >= static_cast<double>(lo) && d <= static_cast<double>(hi))) {
+    std::fprintf(stderr, "pelias: --%s takes a number from %g to %g\n", k, static_cast<double>(lo), static_cast<double>(hi));
+    return false;
+  }
+  v = static_cast<float>(d);
+  return true;
+}
+
+// GP3-07: text generation on the CPU reference pass. The prompt runs once (prefill), then one token per step against the
+// carried KV cache and DeltaNet state; the sampler picks each token (temperature 0 = greedy).
+int cmd_generate(const Args& a) {
+  const std::string path = a.get("model");
+  if (path.empty() || (a.has("prompt") == a.has("prompt-file"))) {
+    usage();
+    return 1;
+  }
+  int threads = static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
+  if (a.has("threads")) {
+    const Result<std::uint64_t> r = io::parse_whole(a.get("threads"), 4096);
+    if (!r.ok() || r.value == 0) {
+      std::fprintf(stderr, "pelias: --threads needs a whole number from 1 to 4096\n");
+      return 1;
+    }
+    threads = static_cast<int>(r.value);
+  }
+  int n_predict = 128, n_ctx = 32768;
+  if (a.has("n-predict")) {
+    const Result<std::uint64_t> r = io::parse_whole(a.get("n-predict"), 1u << 20);
+    if (!r.ok() || r.value == 0) {
+      std::fprintf(stderr, "pelias: --n-predict needs a whole number from 1\n");
+      return 1;
+    }
+    n_predict = static_cast<int>(r.value);
+  }
+  if (a.has("ctx")) {
+    const Result<std::uint64_t> r = io::parse_whole(a.get("ctx"), 262144);
+    if (!r.ok() || r.value < 2) {
+      std::fprintf(stderr, "pelias: --ctx needs a whole number from 2 to 262144\n");
+      return 1;
+    }
+    n_ctx = static_cast<int>(r.value);
+  }
+  model::SamplerConfig sc;
+  if (!float_option(a, "temp", 0.0f, 2.0f, sc.temperature) || !float_option(a, "top-p", 0.01f, 1.0f, sc.top_p) ||
+      !float_option(a, "min-p", 0.0f, 1.0f, sc.min_p) || !float_option(a, "repeat-penalty", 1.0f, 2.0f, sc.repeat_penalty) ||
+      !float_option(a, "presence-penalty", -2.0f, 2.0f, sc.presence_penalty) ||
+      !float_option(a, "frequency-penalty", -2.0f, 2.0f, sc.frequency_penalty))
+    return 1;
+  if (a.has("top-k")) {
+    const Result<std::uint64_t> r = io::parse_whole(a.get("top-k"), 1000);
+    if (!r.ok()) {
+      std::fprintf(stderr, "pelias: --top-k needs a whole number from 0 (off) to 1000\n");
+      return 1;
+    }
+    sc.top_k = static_cast<int>(r.value);
+  }
+  if (a.has("repeat-last-n")) {
+    const std::string t = a.get("repeat-last-n");
+    const Result<std::uint64_t> r = io::parse_whole(t, 65536);
+    if (t != "-1" && !r.ok()) {
+      std::fprintf(stderr, "pelias: --repeat-last-n is -1 (all), 0 (none) or up to 65536\n");
+      return 1;
+    }
+    sc.repeat_last_n = t == "-1" ? -1 : static_cast<int>(r.value);
+  }
+  if (a.has("seed")) {
+    const std::string t = a.get("seed");
+    if (t == "-1") {
+      std::random_device rd;
+      sc.seed = (static_cast<std::uint64_t>(rd()) << 32 | rd()) & 0x7fffffffffffffffull;
+    } else {
+      const Result<std::uint64_t> r = io::parse_whole(t, 0x7fffffffffffffffull);
+      if (!r.ok()) {
+        std::fprintf(stderr, "pelias: --seed is -1 (random) or a whole number from 0 to 2^63-1\n");
+        return 1;
+      }
+      sc.seed = r.value;
+    }
+  }
+  if (Status cs = model::check_sampler_config(sc); !cs) {
+    std::fprintf(stderr, "pelias: %s\n", cs.message.c_str());
+    return 1;
+  }
+  model::ForwardOptions fo;
+  fo.threads = threads;
+  if (!act_options(a, fo)) return 1;
+  const std::string ids_path = a.get("ids-out");
+  if (!ids_path.empty() && std::ifstream(ids_path, std::ios::binary)) {
+    std::fprintf(stderr, "pelias: %s already exists (nothing is overwritten)\n", ids_path.c_str());
+    return 1;
+  }
+  os::FileMap m;
+  Status s = m.open(path);
+  if (!s) return fail_input(s);
+  io::GgufReader g;
+  s = g.parse(m);
+  if (!s) return fail_input(s);
+  const Result<model::Qwen35MoeSpec> spec = model::read_qwen35moe_spec(g);
+  if (!spec.ok()) return fail_input(spec.status);
+  const Result<model::Qwen35MoeWeights> w = model::bind_qwen35moe(g, m.data(), spec.value);
+  if (!w.ok()) return fail_input(w.status);
+  Result<tok::Tokenizer> tk = tok::Tokenizer::from_gguf(g);
+  if (!tk.ok()) return fail_input(tk.status);
+  std::string text;
+  if (a.has("prompt-file")) {
+    Result<std::string> r = io::read_text_file(a.get("prompt-file"));
+    if (!r.ok()) return fail_input(r.status);
+    text = std::move(r.value);
+  } else {
+    text = a.get("prompt");
+  }
+  tok::EncodeOptions eo;
+  eo.nfc = !a.has("no-nfc");
+  eo.parse_special = !a.has("no-special");
+  std::vector<std::int32_t> ids = tk.value.encode(text, eo);
+  if (tk.value.add_bos() && tk.value.bos_id() >= 0) ids.insert(ids.begin(), tk.value.bos_id());
+  if (ids.empty()) {
+    std::fprintf(stderr, "pelias: the prompt is empty after tokenizing\n");
+    return 1;
+  }
+  const int n_prompt = static_cast<int>(ids.size());
+  if (n_prompt + n_predict > n_ctx) {
+    std::fprintf(stderr, "pelias: the prompt (%d tokens) and --n-predict %d do not fit --ctx %d\n", n_prompt, n_predict, n_ctx);
+    return 1;
+  }
+  std::vector<std::int32_t> stop;
+  if (!a.has("ignore-eos")) {
+    if (tk.value.eos_id() >= 0) stop.push_back(tk.value.eos_id());
+    for (const char* t : {"<|im_end|>", "<|endoftext|>"})
+      if (const std::int32_t id = tk.value.find(t); id >= 0 && std::find(stop.begin(), stop.end(), id) == stop.end()) stop.push_back(id);
+  }
+  const bool show_special = a.has("show-special");
+  std::fprintf(stderr, "pelias generate: %d prompt tokens, up to %d new, %d threads, fp32 reference pass; %s (seed %llu)\n", n_prompt, n_predict, threads,
+               sc.temperature <= 0.0f ? "greedy" : "sampling: temperature, top-k, top-p, min-p",
+               static_cast<unsigned long long>(sc.seed));
+  if (!fo.act_int8.empty()) {
+    std::string list;
+    for (const std::string& x : fo.act_int8) list += (list.empty() ? "" : ",") + x;
+    std::fprintf(stderr, "pelias generate: 8-bit activation rounding (%s path%s) on: %s\n",
+                 fo.act_gpu256 ? (fo.act_gpu256_sub == 1 ? "gpu256x8" : fo.act_gpu256_sub == 2 ? "gpu256e" : "gpu256") : (fo.act_int8_gpu ? "gpu" : "cpu"),
+                 fo.act_rot32 ? ", Walsh-Hadamard rotation per 32 values" : "", list.c_str());
+  }
+  model::DecodeState st;
+  model::decode_state_reset(spec.value, st);
+  model::Sampler sampler(sc);
+  const auto nv = static_cast<std::int64_t>(spec.value.n_vocab);
+  std::vector<float> logits(static_cast<std::size_t>(nv));
+  std::vector<std::int32_t> history = ids, out;
+  Timer tp;
+  s = model::forward_decode(spec.value, w.value, st, ids.data(), n_prompt, logits.data(), true, fo);
+  if (!s) return fail_input(s);
+  const double prefill_s = tp.seconds();
+  Timer td;
+  const char* why = "the --n-predict limit";
+  for (int i = 0; i < n_predict; ++i) {
+    const std::int32_t next = sampler.sample(logits.data(), nv, history);
+    out.push_back(next);
+    history.push_back(next);
+    if (std::find(stop.begin(), stop.end(), next) != stop.end()) {
+      why = "an end-of-generation token";
+      break;
+    }
+    if (show_special || tk.value.type(next) != tok::TokenType::control) {
+      const std::string piece = tk.value.piece(next);
+      std::fwrite(piece.data(), 1, piece.size(), stdout);
+      std::fflush(stdout);
+    }
+    if (i + 1 == n_predict) break;
+    s = model::forward_decode(spec.value, w.value, st, &next, 1, logits.data(), true, fo);
+    if (!s) return fail_input(s);
+  }
+  const double decode_s = td.seconds();
+  std::fputs("\n", stdout);
+  std::fflush(stdout);
+  const int steps = static_cast<int>(out.size()) - 1;  // forward steps after the prefill (the last token is not run)
+  std::fprintf(stderr, "pelias generate: prefill %d tokens in %.2f s (%.2f tok/s); %zu tokens out, stopped by %s; %d decode steps in %.2f s (%.3f tok/s)\n",
+               n_prompt, prefill_s, n_prompt / std::max(prefill_s, 1e-9), out.size(), why, steps, decode_s,
+               steps > 0 ? steps / std::max(decode_s, 1e-9) : 0.0);
+  if (!ids_path.empty()) {
+    std::ofstream f(ids_path, std::ios::binary);
+    std::string line = "prompt:";
+    for (std::int32_t id : ids) line += " " + std::to_string(id);
+    line += "\noutput:";
+    for (std::int32_t id : out) line += " " + std::to_string(id);
+    line += "\n";
+    f << line;
+    if (!f) {
+      std::fprintf(stderr, "pelias: could not write %s\n", ids_path.c_str());
+      return 6;
+    }
+  }
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1236,6 +1454,7 @@ int main(int argc, char** argv) {
   if (cmd == "kld") return cmd_kld(a);
   if (cmd == "kld-compare") return cmd_kld_compare(a);
   if (cmd == "imatrix") return cmd_imatrix(a);
+  if (cmd == "generate") return cmd_generate(a);
   for (const char* later : {"probe", "train", "export", "serve", "bench", "web"})
     if (cmd == later) {
       std::fprintf(stderr, "pelias: '%s' is not built yet (a later step of the order of operations)\n", later);

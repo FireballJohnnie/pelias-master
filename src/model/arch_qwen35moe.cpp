@@ -266,6 +266,8 @@ struct Ctx {
   const ForwardOptions& opt;
   std::uint32_t il = 0;  // the layer being run
   std::uint32_t ai = 0;  // full-attention layers run before this one (ForwardOptions::qk_dump)
+  int64_t pos0 = 0;               // GP3-07: the position of the first token of this call
+  DecodeState* st = nullptr;      // GP3-07: the carried state (null: a fresh sequence from position 0)
 };
 
 // the 8-bit activation format the inputs of `w` are rounded to (ForwardOptions::act_int8), or none; float weights never
@@ -534,7 +536,7 @@ void full_attention(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, floa
   // per-head norms, then rope at each token's position
   parallel_items(n, c.threads, [&](int64_t t, int) {
     std::vector<float> cs, tmp(z(hd));
-    rope_cache(s, t, cs);
+    rope_cache(s, c.pos0 + t, cs);
     for (int64_t h = 0; h < nh; ++h) {
       float* q = qg.data() + t * q_w + h * 2 * hd;
       rms_norm(q, l.q_norm.data(), tmp.data(), hd, s.rms_eps);
@@ -561,27 +563,41 @@ void full_attention(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, floa
       for (int64_t i = 0; i < nkv * hd; ++i) dst[t * row + nh * hd + i] = quant::fp32_to_fp16(k[z(t * kv_w + i)]);
     }
   }
+  // GP3-07: with a carried state the new keys and values are appended to the layer's cache and every query attends to all
+  // cached positions before it; without one the cache is this call's own k and v
+  const float* kall = k.data();
+  const float* vall = v.data();
+  const int64_t p0 = c.st ? c.pos0 : 0;
+  if (c.st) {
+    std::vector<float>& K = c.st->k[c.il];
+    std::vector<float>& V = c.st->v[c.il];
+    K.insert(K.end(), k.begin(), k.end());
+    V.insert(V.end(), v.begin(), v.end());
+    kall = K.data();
+    vall = V.data();
+  }
   const float scale = s.attn_scale != 0.0f ? s.attn_scale : 1.0f / std::sqrt(static_cast<float>(hd));
   const int64_t group = nh / nkv;
   // causal attention, one (head, query) per item; then the output is gated by sigmoid(gate) of the same head
   parallel_items(nh * n, c.threads, [&](int64_t item, int tid) {
     const int64_t h = item / n, t = item % n, kvh = h / group;
     Scratch& sc = c.sc[z(tid)];
-    if (sc.scores.size() < z(n)) sc.scores.resize(z(n));
+    if (sc.scores.size() < z(p0 + n)) sc.scores.resize(z(p0 + n));
     float* sco = sc.scores.data();
     const float* q = qg.data() + t * q_w + h * 2 * hd;
-    for (int64_t u = 0; u <= t; ++u) {
-      const float* kk = k.data() + u * kv_w + kvh * hd;
+    const int64_t last = p0 + t;  // the query's own position: it attends to 0..last
+    for (int64_t u = 0; u <= last; ++u) {
+      const float* kk = kall + u * kv_w + kvh * hd;
       float d = 0.0f;
       for (int64_t i = 0; i < hd; ++i) d += q[i] * kk[i];
       sco[u] = d * scale;
     }
-    softmax(sco, t + 1);
+    softmax(sco, last + 1);
     float* o = att.data() + t * hd * nh + h * hd;
     for (int64_t i = 0; i < hd; ++i) o[i] = 0.0f;
-    for (int64_t u = 0; u <= t; ++u) {
+    for (int64_t u = 0; u <= last; ++u) {
       const float p = sco[u];
-      const float* vv = v.data() + u * kv_w + kvh * hd;
+      const float* vv = vall + u * kv_w + kvh * hd;
       for (int64_t i = 0; i < hd; ++i) o[i] += p * vv[i];
     }
     const float* gate = q + hd;
@@ -616,7 +632,9 @@ void delta_net(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* ou
     mixed_ck.assign(mixed.begin() + r0 * ch, mixed.begin() + at * ch);
     state_store_roundtrip(mixed_ck.data(), static_cast<int64_t>(mixed_ck.size()), c.opt.state_store);
   }
-  // causal depthwise conv over [taps-1 zeros, tokens], then SiLU
+  // causal depthwise conv over [taps-1 rows before the call, tokens], then SiLU; the rows before are zeros for a fresh
+  // sequence and the carried conv tail with a decode state (GP3-07)
+  const float* tail = c.st ? c.st->conv_tail[c.il].data() : nullptr;
   std::vector<float> conv(z(n * ch));
   parallel_items((ch + 255) / 256, c.threads, [&](int64_t blk, int) {
     const int64_t c0 = blk * 256, c1 = std::min(ch, c0 + 256);
@@ -625,13 +643,22 @@ void delta_net(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* ou
         float sum = 0.0f;
         for (int64_t kk = 0; kk < taps; ++kk) {
           const int64_t src = t + kk - (taps - 1);
-          float xv = src >= 0 ? mixed[z(src * ch + cc)] : 0.0f;
+          float xv = src >= 0 ? mixed[z(src * ch + cc)] : (tail ? tail[z((taps - 1 + src) * ch + cc)] : 0.0f);
           if (!mixed_ck.empty() && t >= at && src >= 0 && src < at) xv = mixed_ck[z((src - (at - (taps - 1) < 0 ? 0 : at - (taps - 1))) * ch + cc)];
           sum += xv * l.conv1d[z(cc * taps + kk)];
         }
         conv[z(t * ch + cc)] = silu(sum);
       }
   });
+  if (c.st) {  // the new tail: the last taps-1 rows of [old tail, this call's conv input]
+    std::vector<float>& T = c.st->conv_tail[c.il];
+    std::vector<float> nt(z((taps - 1) * ch));
+    for (int64_t r = 0; r < taps - 1; ++r) {
+      const int64_t src = n - (taps - 1) + r;  // row index in this call; negative = from the old tail
+      for (int64_t cc = 0; cc < ch; ++cc) nt[z(r * ch + cc)] = src >= 0 ? mixed[z(src * ch + cc)] : T[z((taps - 1 + src) * ch + cc)];
+    }
+    T.swap(nt);
+  }
   // q, k: L2-normalized per key head
   for (int64_t t = 0; t < n; ++t)
     for (int64_t h = 0; h < 2 * nk; ++h) l2_norm(conv.data() + t * ch + h * ds, ds, s.rms_eps);
@@ -641,6 +668,7 @@ void delta_net(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* ou
   parallel_items(nv, c.threads, [&](int64_t hv, int tid) {
     Scratch& sc = c.sc[z(tid)];
     sc.state.assign(z(ds * ds), 0.0f);  // M[j][i]: row j = value index, column i = key index
+    if (c.st) std::copy_n(c.st->rec[c.il].data() + hv * ds * ds, ds * ds, sc.state.data());  // GP3-07: the carried state
     if (sc.delta.size() < z(ds)) sc.delta.resize(z(ds));
     float* m = sc.state.data();
     float* delta = sc.delta.data();
@@ -667,6 +695,7 @@ void delta_net(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* ou
         o[j] = sum * qscale;
       }
     }
+    if (c.st) std::copy_n(m, ds * ds, c.st->rec[c.il].data() + hv * ds * ds);
   });
   // gated norm per value head: rms_norm(o) * w * silu(z)
   std::vector<float> tmp(z(ds));
@@ -979,8 +1008,42 @@ Result<Qwen35MoeWeights> bind_qwen35moe(const io::GgufReader& r, const std::uint
   return R::good(std::move(w));
 }
 
+namespace {
+Status forward_impl(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, const std::int32_t* tokens, int n_tokens, int out_begin, int out_end,
+                    float* logits, const ForwardOptions& opt, DecodeState* st);
+}  // namespace
+
 Status forward_reference(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, const std::int32_t* tokens, int n_tokens, int out_begin,
                          int out_end, float* logits, const ForwardOptions& opt) {
+  return forward_impl(s, w, tokens, n_tokens, out_begin, out_end, logits, opt, nullptr);
+}
+
+void decode_state_reset(const Qwen35MoeSpec& s, DecodeState& st) {
+  st.pos = 0;
+  const std::size_t L = s.n_layer;
+  st.k.assign(L, {});
+  st.v.assign(L, {});
+  st.conv_tail.assign(L, {});
+  st.rec.assign(L, {});
+  for (std::size_t il = 0; il < L; ++il)
+    if (s.is_recurrent(static_cast<std::uint32_t>(il))) {
+      st.conv_tail[il].assign(static_cast<std::size_t>(s.ssm_d_conv - 1) * s.conv_channels(), 0.0f);
+      st.rec[il].assign(static_cast<std::size_t>(s.ssm_dt_rank) * s.ssm_d_state * s.ssm_d_state, 0.0f);
+    }
+}
+
+Status forward_decode(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, DecodeState& st, const std::int32_t* tokens, int n_new, float* logits,
+                      bool last_only, const ForwardOptions& opt) {
+  if (opt.state_store != ForwardOptions::StateStore::exact || opt.qk_dump || opt.state_codes)
+    return Status::fail(Code::invalid_argument, "the checkpoint, q/k and state-code records need a whole chunk; they are not built for decoding");
+  if (st.k.size() != s.n_layer) return Status::fail(Code::invalid_argument, "the decode state was not sized for this model (decode_state_reset)");
+  if (n_new <= 0) return Status::fail(Code::invalid_argument, "no new tokens");
+  return forward_impl(s, w, tokens, n_new, last_only ? n_new - 1 : 0, n_new, logits, opt, &st);
+}
+
+namespace {
+Status forward_impl(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, const std::int32_t* tokens, int n_tokens, int out_begin, int out_end,
+                    float* logits, const ForwardOptions& opt, DecodeState* dst) {
   if (n_tokens <= 0 || out_begin < 0 || out_end > n_tokens || out_begin >= out_end)
     return Status::fail(Code::invalid_argument, "the token count or the output range is empty or out of range");
   if (w.layers.size() != s.n_layer) return Status::fail(Code::invalid_argument, "the weights were bound for another spec");
@@ -1010,6 +1073,8 @@ Status forward_reference(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, cons
   const int64_t n = n_tokens, e = s.n_embd;
   std::vector<Scratch> sc(z(threads));
   Ctx c{s, threads, sc, n, opt};
+  c.st = dst;
+  c.pos0 = dst ? dst->pos : 0;
 
   // embedding rows
   std::vector<float> x(z(n * e)), xn(z(n * e)), y(z(n * e));
@@ -1062,12 +1127,14 @@ Status forward_reference(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, cons
   }
   if (opt.defer_experts > 0)  // the last layer's deferred experts arrive before the output norm
     for (int64_t i = 0; i < n * e; ++i) x[z(i)] += ydef_prev[z(i)];
+  if (dst) dst->pos += n;
   if (!logits) return Status::good();  // the activations were all the caller wanted (importance matrix)
   const int64_t m = out_end - out_begin;
   for (int64_t t = 0; t < m; ++t) rms_norm(x.data() + (out_begin + t) * e, w.output_norm.data(), xn.data() + t * e, e, s.rms_eps);
   mm(c, w.output, xn.data(), m, e, logits, s.n_vocab);  // through mm(), so --act-int8 reaches the output layer too
   return Status::good();
 }
+}  // namespace
 
 }  // namespace pelias::model
 
