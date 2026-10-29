@@ -1,6 +1,6 @@
 # Making 7 bits viable: what was done, and the plan for T, H and the 1-bit decoder
 
-Author's request, 2026-10-28 14:48. Every number is labelled: **MEASURED** (sandbox on real weights, or a whole-model run on the PC) or **DERIVED** (worked out on paper, to be measured). Engine format = 8-bit activations, eight scales per 256 (gpu256x8), paired against the same 25,500 tokens.
+Author's request, 2026-10-28 14:48; updated 2026-10-29 01:2x (section 9: light vs heavy, rotation coverage, MTP rule, the idle-units tour). Every number is labelled: **MEASURED** (sandbox on real weights, or a whole-model run on the PC) or **DERIVED** (worked out on paper, to be measured). Engine format = 8-bit activations, eight scales per 256 (gpu256x8), paired against the same 25,500 tokens.
 
 ## 1. The goal and the bar
 
@@ -48,7 +48,7 @@ Author's request, 2026-10-28 14:48. Every number is labelled: **MEASURED** (sand
 1. **Dense tensors**: read every token, so H is not a heat rule there. It is a quality switch per tensor or per token, using the 0.5 fill when skipped.
 2. **Experts**: the heat rule. Hot experts in VRAM read every plane; predicted cold experts get every plane prefetched into L3 during the GPU step; unpredicted cold experts read the base plane, with H filled by 0.5 if it is late.
 3. **Planes by need** (sandbox, MEASURED): decide with the expected-size estimate (exact to 1.00x), never the worst-case bound (17-33x too loose); multiply by the router weight. 52 % of unpredicted cold picks have router weight under 0.08.
-4. **MTP block**: Q3 base + H; the first draft reads H, deeper drafts read the base only (draft 1's acceptance multiplies every later draft).
+4. **MTP block**: Q3 base + H; the first draft reads H, deeper drafts read the base only (draft 1's acceptance multiplies every later draft). **Rule for PEL7_P_(T)_H (2026-10-29, DERIVED):** Q3 saves only 0.9-1.9 % of a draft + verify cycle, so the MTP block stays at 7-bit rotated unless Q3 keeps acceptance within about 1.5 points (1 draft) or 2 % of expected tokens (3 drafts); measured with the acceptance test once the MTP path runs.
 5. **Why:** H turns stored bits into a per-read choice, so one file serves the fast path and the accurate path.
 
 ## 6. Proposed plan for the 1-bit decoder (T-decode)
@@ -74,7 +74,7 @@ Author's request, 2026-10-28 14:48. Every number is labelled: **MEASURED** (sand
 Runs A-E done (game plan, "Runs A-E and the checks around them"). Stopped before R3 for the author's review (author 19:36).
 1. Author's review; Fable's math check of #3 (engine: U1/U2, C3, C1, C5, C6).
 2. R3 (the per-32 activation kernel; the T-decode decode path folds into it), with the read-only ceiling kernel first.
-3. Candidates waiting for the author: Q4_TG v2 (full importance + 0 levels); C6 sharpening (several layers, energy weighting, previous-token signal); own-text stuck tokens by kind; more own-text chunks to resolve the order.
+3. Idle-units tour done (2026-10-29, section 9). On hold (author): own-text stuck tokens by kind; Q4_TG v2 (full importance + 0 levels). Then C6 sharpening (several layers, energy weighting, previous-token signal); more own-text chunks; C1 at long context.
 4. GP3-08 MTP head (3-bit tag type), engine, server.
 
 ## 8. Where everything lands (author + Claude + Fable, 2026-10-28 19:1x)
@@ -86,8 +86,8 @@ The 7-bit / T / H / 1-bit decoder work is the spine; each newer idea plugs into 
 | Idea | Lands as | Status | Next |
 |---|---|---|---|
 | T gate, dense (Q7_ZT) | Dense tensors at 7.53 bpw | Gates 1 and 2 passed (MEASURED) | Gate 3, speed, via kernel v3 |
-| C4 grid tags + H (author's bit-tag matrix) | 3-bit: tag byte per 32-block (3.5 bpw), for the MTP block; 4-bit: Q4_TG (id 203, 4.5 bpw, the size of Q4_K) for expert gate/up | 3-bit sandbox passed (0.0190 vs K-line 0.0210). Q4_TG whole model (run E): 0.012876, tie with Unsloth, +0.000339 vs ZT2 (not resolved); built with sqrt importance and no 0 level | **Q4_TG v2** (full importance + grids with an exact 0, the author's 0-weight idea): sandbox about -11 % vs imatrix Q4_K; author's review |
-| C3 fragility tags | Per-tensor sensitivity from calibration (fit on chunks 0-49, scored on 50-99); tagged experts get refinement planes | Idea | Knife-edge view (author 19:12): no separate chunk-24 diagnosis; the near-tie flag treats fragile tokens as a class. Revisit only if the own-text check shows rotated files losing fragile tokens Unsloth keeps |
+| C4 grid tags + H (author's bit-tag matrix) | 3-bit: tag byte per 32-block (3.5 bpw), for the MTP block; 4-bit: Q4_TG (id 203, 4.5 bpw, the size of Q4_K) for expert gate/up | 3-bit sandbox passed (0.0190 vs K-line 0.0210); **tags + H at 3.785 bpw do not pay** (0.0149, about 6 % above the K-line; 2026-10-29). Q4_TG whole model (run E): 0.012876, tie with Unsloth, +0.000339 vs ZT2 (not resolved); built with sqrt importance and no 0 level | **Q4_TG v2** (full importance + grids with an exact 0, the author's 0-weight idea): sandbox about -11 % vs imatrix Q4_K; author's review |
+| C3 fragility tags | Per-tensor sensitivity from calibration (fit on chunks 0-49, scored on 50-99); tagged experts get refinement planes | MEASURED 2026-10-29: free signals weak (reference margin AUROC 0.63; wrong n-gram copy 2x risk); tags come from the C6 miss map instead; in-model attention near-tie flag untested | Knife-edge view (author 19:12): no separate chunk-24 diagnosis; the near-tie flag treats fragile tokens as a class. Revisit only if the own-text check shows rotated files losing fragile tokens Unsloth keeps |
 
 ### 8.2 Kernels
 
@@ -96,7 +96,7 @@ The 7-bit / T / H / 1-bit decoder work is the spine; each newer idea plugs into 
 | Fold route | Default decode (M = 1) for Q7_ZT | MEASURED: 5.7-6.9 % faster than Q8_Z |
 | 1-bit decoder (T-decode) | The route when base and H live apart (J1, spill-over) and for batched verify | Exact on GPU; tie to +7 % vs fold |
 | Kernel v3 | 2 or 4 rows per lane, loads first | MEASURED (run A): no gain (331 vs 325 GB/s on the largest shape, slower elsewhere); v2 stays. Next: a read-only ceiling kernel over the same 17 MB cold |
-| C1 KV codes | Same bit-plane family: scaled 1-bit dot on q and k codes (own warp ballot, random sign diagonal folded into W_q and W_k, page bound first) | Paper; needs a one-chunk q, k dump |
+| C1 KV codes | Same bit-plane family: scaled 1-bit dot on q and k codes (own warp ballot, random sign diagonal folded into W_q and W_k, page bound first) | MEASURED 2026-10-29 (real q, k, 4 chunks, `--dump-qk`): attention mass kept at 1/8 of keys 72.6 % (best possible 85.7 %, Quest 62.0 %, recent 42.6 %); at 1/32 47.1 % (64.6 / 45.2 / 28.1). Next: long context |
 
 ### 8.3 Engine runtime (decode loop)
 
@@ -115,3 +115,33 @@ The 7-bit / T / H / 1-bit decoder work is the spine; each newer idea plugs into 
 |---|---|
 | C2 tiered context | Raw tiers VRAM -> pinned RAM -> NVMe with CRC32 keys (U11), restored on a low-priority stream |
 | DeltaNet checkpoint grid | U11: int8 or rotated int4 + rANS |
+
+## 9. Since the review stop (2026-10-29 00:1x-01:2x)
+
+### 9.1 The 8th bit: light vs heavy, rotated vs not (author's question; MEASURED, sandbox, real blk.20 attn_qkv)
+
+Light = the extra bit is one fine step (q = 2b + h, ours, the "0-weighted" bit); heavy = 64 steps (range). Relative squared error, lower is better.
+
+| | Light | Light, not read | Heavy | Heavy, not read |
+|---|---|---|---|---|
+| Unrotated | 9.43e-5 | 1.41e-4 | 9.58e-5 | 3.22e-2 |
+| **Rotated** | **7.86e-5** | 1.12e-4 | 7.98e-5 | 2.88e-2 |
+
+Rotated wins every column (about 17 %), light wins every row (1.5 %); a missing light bit costs 1.4x, a missing heavy bit about 360x. **Rule (author): always keep the light 1-bit rotated.**
+
+### 9.2 Rotation coverage (MEASURED: urm_ZT2's own list; sandbox error on the bf16 source)
+
+- urm_ZT2 rotates 257 of its 259 Q7_ZT tensors (the original 7-bit proof was rotated).
+- Not rotated: token_embd (rotation -0.9 %, near Gaussian, kurtosis 2.86: stays) and blk.40.nextn.eh_proj (rotation **-49.5 %**: rotated from now on, author's decision; `--rotate32 ...,eh_proj`, commit e7b5bc0).
+- Routed experts -0.8 to -3.4 % per tensor, no type stands out; R2b showed no whole-model gain: they stay as stored. Routers and norms are F32 / BF16.
+
+### 9.3 The idle-units tour (author: "any of these steps may make something read that much better")
+
+| Step | Result | Verdict |
+|---|---|---|
+| C3 fragility tags from free signals | Reference margin / entropy / top-1 prob AUROC 0.61-0.65; flag 10 % by margin -> 16 % of hard tokens; wrong n=3 copy 2.0 % risk vs 1 %, right copy 0.38 % | Weak; C3 tags come from the C6 miss map |
+| C4 tags + H at 3.785 bpw | 0.01491 / 0.01485 vs the K-line 0.0141 / 0.0140 | H on top of tags does not pay; tags alone (-9 %) do |
+| C1 1-bit KV codes on real attention | 1/8 of keys: 72.6 % of attention mass (best 85.7, Quest 62.0, recent 42.6); 1/32: 47.1 % (64.6 / 45.2 / 28.1) | Beats both baselines; long context next |
+| rANS on bus transfers (entropy of stored codes) | Q4_K 3.87 of 4 bits, Q5_K 4.87 of 5, Q7_ZT base 6.75 of 7, Q6_K 5.80 of 6: lossless coding -3 to -4 % | Ruled out for active weights |
+| Worst-chunk codes (C6) | The 10 worst chunks hold 22.7 % of all KL; codes saved for the miss map | Data |
+

@@ -1,6 +1,6 @@
 # Pelias: what we found by thinking outside the box, and how it compares
 
-*Updated 2026-10-29 00:1x: the 1-bit decoder now runs as a real GPU kernel and through a whole model, exact. Previous version: 2026-10-28 16:1x.*
+*Updated 2026-10-29 01:2x: light vs heavy 8th bit and rotation coverage (every tensor checked), the MTP piece rotated, and the idle-units tour (C1 KV codes on real attention, C3 fragility signals, C4 tags + H, rANS entropy). Previous versions: 2026-10-29 00:1x (1-bit decoder exact on GPU and whole model), 2026-10-28 16:1x.*
 
 ## Plain-language summary
 
@@ -12,6 +12,8 @@ Three things made the difference:
 2. **We store 7 bits and add the 8th only where it matters.** Computers like 8 bits; 7 is "odd" and normally awkward. We keep a 7-bit base everywhere and save the 8th bit only on the quarter of each block where it removes the most error. When the computer calculates, every number becomes an exact 8-bit number again, so the fast hardware sees what it expects.
 3. **We put idle parts of the chip to work.** The extra bit can be added with a simple "count the ones" instruction that the processor's integer units can do while the main maths units are busy, on either the CPU or the graphics card, and the base and the extra bit can even live in different memory.
 4. **The 1-bit decoder works.** On the graphics card, the 7-bit file now runs 5.7-6.9 % faster than the 8-bit one on the large matrices, with every result exact. Across a whole model, adding the 8th bit by counting ones gives exactly the same numbers as rebuilding full 8-bit values. Filling the 7 bits back to 8 is what recovers the accuracy: pure 7-bit costs about 8x more error than 7 bits plus the gated 8th.
+
+5. **The light bit, rotated, is the rule.** Of the two ways to use the 8th bit, the light one (one fine step, "0-weighted") rotated is the most accurate in every case, and it is the only safe one: if it is not read, the number falls back to its 7-bit value, while a heavy (range) bit that goes missing wrecks the number (about 360x more error).
 
 **Where it stands:** our 7.53-bit file is **236 MB smaller than Unsloth's and slightly more accurate** (0.012536 against 0.012864; not yet a statistically settled win), and it is **as accurate as our own 8-bit file**. On the author's own chat text the order holds (0.021198 against Unsloth's 0.022368, not yet settled). The speed of the whole engine is still to be measured.
 
@@ -25,6 +27,8 @@ Three things made the difference:
 | The miss map (the author's accuracy-assisted miss map) | The hard tokens repeat across every file tested (47-66 % shared, 1 % by chance) and hold a quarter to a half of the error; logging them tells the system where to spend extra bits | MEASURED (pattern); map PLAN |
 | Bit tags per 8 values (the author's bit-tag matrix) with a 0 level | Same bytes as Q4_K, about 11 % less weighted error on real experts in the sandbox | MEASURED (sandbox); whole model next |
 | CPU and GPU reading RAM at once | 93 % of the memory's rated speed on a consumer desktop | MEASURED (probe) |
+| A 1-bit code per attention key (the author's H gate on KV pages) | Picks the keys that hold the attention better than page bounds (Quest) or a recent window, so long contexts read a fraction of the KV cache | MEASURED (real q, k; 512-token chunks) |
+| The light 8th bit, rotated | Most accurate and safe to skip: a late or missing bit costs 1.4x, not 360x | MEASURED (sandbox, real weights) |
 
 ## Scoreboard (whole model, measured)
 
@@ -55,6 +59,21 @@ Each link depends on the one before it:
 5. **The bus** (the unified CPU + GPU system). The CPU and GPU read the same DDR4 at once; the CPU computes the cold experts, the GPU the hot ones; predicted experts are fetched into L3 while the GPU works.
 6. **The engine** (GP3-14). Puts 1-5 into one token loop. Not built yet; it is where speed is measured.
 
+## The 8th bit: light vs heavy, rotated vs not (author's question, 2026-10-29)
+
+Same 7-bit base plus one gated extra bit on 2 of every 8 blocks (the Q7_ZT layout), on real blk.20 attn_qkv weights. **Light** = the extra bit is worth one fine step (refines; q = 2b + h, our design, the "0-weighted" bit). **Heavy** = the extra bit is worth 64 steps (extends the range). "If not read" = the extra bit is skipped (a fast path, or H not on the card yet). Relative squared error, **lower is better** (e-5 is about 0.0001, e-2 about 0.03). MEASURED (sandbox), `tools/experiments/light_heavy_bit_check.py`.
+
+| | Light bit | Light bit, if not read | Heavy bit | Heavy bit, if not read |
+|---|---|---|---|---|
+| Unrotated | 9.43e-5 | 1.41e-4 | 9.58e-5 | 3.22e-2 |
+| **Rotated** | **7.86e-5** | 1.12e-4 | 7.98e-5 | 2.88e-2 |
+
+- Rotated wins every column (about 17 % less error); the light bit wins every row (1.5 %).
+- A missing light bit costs 1.4x (the 7-bit value still stands); a missing heavy bit costs about 360x (large values are clipped).
+- **Rule (author): always keep the light 1-bit rotated.** Our best file (urm_ZT2) already does: 257 of its 259 Q7_ZT tensors are rotated.
+
+**Rotation coverage, every tensor checked (2026-10-29, sandbox on the bf16 source):** the two Q7_ZT tensors left unrotated were the token table (rotation -0.9 % error: its values are already near a bell curve, kurtosis 2.86; left as is) and the MTP input projection blk.40 eh_proj (rotation **-49.5 %**: now rotated in every new build, author's decision). Routed experts -0.8 to -3.4 % per tensor, whole model no gain (R2b), left as stored. Routers and norms are stored in full precision, nothing to round.
+
 ## Outside-the-box wins
 
 Labels: **MEASURED (whole model)** = paired run on the PC; **MEASURED (sandbox)** = real weights or unit tests; **PAPER** = derived or checked read-only by Fable; **PLAN** = designed, not built or not run. Numbers in brackets are entries in `docs/PELIAS_NEW_METHODS.md`.
@@ -77,6 +96,7 @@ Labels: **MEASURED (whole model)** = paired run on the PC; **MEASURED (sandbox)*
 | **1-bit decoder on the GPU (T-decode kernel v2)** | Every route exact; Q7_ZT fold 5.7-6.9 % faster than Q8_Z cold on the large shapes; the 1-bit route tie to +7 % vs fold; the 1-bit tensor path 937.4 T bit-MAC/s, 8.00x int8 | MEASURED (GPU probe) |
 | **1-bit decoder through a whole model** | Bit-identical to the integer fold over a full forward pass (max logit difference 0); against the float path, int8 rounding flips give a noise floor of about +-0.0004 KL on 100 chunks | MEASURED |
 | Live H gate (25 %) | 0.012919: ties Unsloth; the fixed gate (Q7_ZT) stays the choice | MEASURED |
+| Logging q and k for the KV-page check (C1) | KL identical to run B on the same 4 chunks (max difference 0) | MEASURED |
 | Hard tokens repeat across files (C6) | Top-1 % KL tokens shared 47-66 % between files (own text 59-63 %), 1 % by chance; they hold 23-26 % of the KL (own text 52 %); logging them changes nothing (exact) | MEASURED |
 
 ### B. Working in the sandbox
@@ -96,6 +116,10 @@ Labels: **MEASURED (whole model)** = paired run on the PC; **MEASURED (sandbox)*
 | Bit tags at 4 bits with a 0 level (Q4_TG v2) | About -11 % weighted error vs imatrix Q4_K at the same bytes | MEASURED (sandbox) |
 | Light vs heavy 8th bit, rotated vs not (author's question) | Rotated + light bit best (by 17 % and 1.5 %); a missing heavy bit collapses (about 300x), a missing light bit falls back to the 7-bit base | MEASURED (sandbox) |
 | Miss map in state space | Nearest logged neighbour of a hard token is hard 3-5x the base rate; the nearest logged state predicts 43-53 % of the experts two layers ahead | MEASURED (sandbox, run B codes) |
+| The author's H gate on KV pages (C1), on real attention | Share of attention mass kept, 1/8 of the keys: best possible 85.7 %, **1-bit code 72.6 %**, Quest pages 62.0 %, recent window 42.6 %; at 1/32: 64.6 / **47.1** / 45.2 / 28.1 %. Beats both baselines; absolute numbers are a floor (512-token chunks spread the attention) | MEASURED (real q, k from urm_ZT2, 4 chunks x 10 layers) |
+| MTP input projection (eh_proj) rotated | -49.5 % error; built into `--rotate32` | MEASURED (sandbox) |
+| C4 tags + H gate at 3.785 bpw | 0.01491 / 0.01485: at Fable's target, but about 6 % above the K-quant line at the same size; tags alone stay -9 % | MEASURED (sandbox) |
+| C3 free fragility signals (reference margin, entropy, copyable n-grams) | Weak: AUROC 0.61-0.65; a wrong n-gram copy doubles the risk (2.0 % vs 1 %), a right one halves it. The miss map's state codes are far stronger (3-5x) | MEASURED (wikitext base + run B) |
 | Cold-expert routing shares | 6.3 unpredicted cold picks per token, 52 % under router weight 0.08; 67 % of cold picks predicted one layer ahead | MEASURED (routing record) |
 
 ### C. Planned, with the math checked
@@ -105,11 +129,11 @@ Labels: **MEASURED (whole model)** = paired run on the PC; **MEASURED (sandbox)*
 | The unified bus: 2 MB pages + 8 pinned streams, always-spinning doorbells, predicted experts prefetched with all planes into L3 during the GPU step, the rest one layer late | Token time 18.5 ms -> about 8.65 ms (54 -> about 116 tok/s); ceiling about 119 with the GPU's own overhead, 193 as the memory floor | PAPER (Fable) |
 | J1 split-plane cold expert | Full-file accuracy on the unpredicted cold experts for about +0.1 ms; a speed gain only if the CPU leg stays under about 35 GB/s | PAPER (Fable) |
 | GPU 1-bit tensor path (and-popc mma) | Right unit for batched MTP verification (5-8 tokens); at single-token decode the CUDA cores do it in about 0.7 us | PAPER (Fable) |
-| MTP block as Q3 base + H, H read on the first draft only | About -140 MB; draft 1's acceptance multiplies every later draft | PLAN (needs GP3-08) |
+| MTP block as Q3 base + H, H read on the first draft only | About -140 MB; draft 1's acceptance multiplies every later draft. Break-even (derived from the file's sizes): Q3 saves only 0.9-1.9 % of a draft + verify cycle, so the MTP block stays at 7-bit rotated unless Q3 keeps acceptance within about 1.5 points (1 draft) / 2 % (3 drafts). Most of a draft's read is the 417 MB output head | PLAN (needs GP3-08) |
 | CRC32 prefix store with a DeltaNet checkpoint grid (int8 or rotated int4 + rANS on idle CPU cores) | A repeated 4K-token prompt skips about 1.8 s; a partial hit about -400 ms | PAPER (Fable) |
 | Texture units decoding Q8_Z as RGBA8 | About 10x fewer instructions at decode; prefill depends on the fp16-accumulate rate | PAPER (Fable) |
 | Carry-over to dense models that spill onto CPU/RAM | Bus, J1, planes by need, Q8_Z / Q7_ZT, MTP all apply; prefetch is 100 % predictable there | PAPER |
-| The author's H gate on KV pages (C1) | Sign-plane codes pick the KV pages a token needs: at 128K, KV reads 2.83 -> 0.26-0.52 ms per token | PAPER (Fable checked) |
+| The author's H gate on KV pages (C1) | Sign-plane codes pick the KV pages a token needs: at 128K, KV reads 2.83 -> 0.26-0.52 ms per token. First real-attention check passed against the baselines (section B); long-context recall still to measure | PAPER (speed) / MEASURED (selection) |
 | Three drafters, one verify (C5, the author's matrix array) | 1.6-1.9x at acceptance 0.7-0.8, after the bus fixes | PAPER (Fable checked) |
 | RT cores as the miss-map lookup (author) | Hardware nearest-neighbour search beside the SMs, only on a hit; pays once the map reaches millions of entries | PLAN |
 
@@ -134,7 +158,10 @@ Labels: **MEASURED (whole model)** = paired run on the PC; **MEASURED (sandbox)*
 | The accuracy-assisted miss map, "the more we look at where it got stuck, the better we know when to look" | C6: logging built, the pattern measured, miss log v1 in the repo | MEASURED (pattern) |
 | The bit-tag matrix (7+7+7+7+4) | Pays at 3 and 4 bits as a tag byte per 32-block (C4, Q4_TG) | MEASURED (sandbox), whole model next |
 | "Does a 0 have more weight?" | A 0 level in the 4-bit tag grids: about -7 % more error | MEASURED (sandbox) |
-| Light vs heavy 8th bit, rotated vs not | Rotated + light bit; the heavy bit collapses when missing | MEASURED (sandbox) |
+| Light vs heavy 8th bit, rotated vs not | Rotated + light bit; the heavy bit collapses when missing; rule: always keep the light 1-bit rotated | MEASURED (sandbox) |
+| "Did we check which tensors to rotate?" | Every Q7_ZT tensor checked: the MTP eh_proj gains 49.5 % and is now rotated; the token table gains 0.9 % and stays | MEASURED (sandbox) |
+| MTP at 7 vs 3 bits (PEL7_P_(T)_H) | Stay at 7 unless Q3 is within about 1.5 points of acceptance | PAPER |
+| The rANS int4 checkpoint vs NVENC, applied to active tensors | Stored codes already carry 3.87 of 4 bits (experts) and 6.75 of 7 (dense): lossless coding saves 3-4 %, not worth a decoder | MEASURED |
 | ROPs to flag fragile tokens | Became the near-tie flag (`red.global.or`, no wait) feeding the doorbell | PAPER (Fable) |
 
 ## Proven not to work (kept so nobody retries them)
@@ -145,12 +172,16 @@ Labels: **MEASURED (whole model)** = paired run on the PC; **MEASURED (sandbox)*
 | Plain two-stage E8 codebook | Ties the K-quant line at 4 bits, no gain without Hessian-aware rounding |
 | Empty activation bit planes with one scale per 32 | None occur |
 | Expert deferral; near-tie expert swap | +0.0042 and +0.0017, resolved worse |
-| Rotating the routed experts | +0.003979 |
+| Rotating the routed experts | No gain: +0.000530 vs stock (not resolved), +0.003979 vs rotating the dense tensors only (R2b) |
 | Video units (NVENC/NVDEC) for the live KV cache | 1.3 s per token |
 | AES / SHA / CLMUL, vector gather, 1 GB pages, L3 as a fixed expert bank | No gain on the math (AES and CLMUL share the vector pipes on Zen 3) |
 | More rows per GPU lane (kernel v3) | No gain over v2 (331 vs 325 GB/s), slower on smaller shapes |
 | A heavy (range) 8th bit | Ties the light bit when read; collapses when missing |
 | NVENC / NVDEC for the stored-context tier; the SFU as a decoder | No job survives the math (Fable) |
+| Rotating the token table | -0.9 % error only (near Gaussian) |
+| The H gate on top of 3-bit tags (3.785 bpw) | About 6 % above the K-quant line at the same size |
+| Lossless entropy coding (rANS) of weights on bus transfers | Codes already near full entropy: 3-4 % smaller |
+| The reference's own uncertainty as the fragility flag | AUROC 0.61-0.65, too weak; use the miss map |
 
 ## Compared with existing frameworks
 
@@ -168,7 +199,7 @@ Limited to what their formats do; we have not tested the other projects themselv
 
 ## Next
 
-1. The author's review; Fable's math check of the engine plan (#3).
+1. The author's review; Fable's math check of the engine plan (#3). The idle-units tour is done (C1, C3, C4 stack, rANS entropy); the status board of every idle-unit item is in the Idle Units List doc.
 2. R3: the per-32 int8 kernel, which the T-decode decode path folds into; first a read-only ceiling kernel (is ~325 GB/s the limit of one cold launch?).
-3. Q4_TG v2 (full importance + the 0 level) on the whole model; the miss map sharpened; more own-text chunks.
+3. On hold (author): stuck tokens by kind, Q4_TG v2 (full importance + the 0 level) on the whole model. Then the miss map sharpened; more own-text chunks; C1 at long context.
 4. The engine, where the speed of all of this is measured end to end.
