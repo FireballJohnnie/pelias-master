@@ -30,7 +30,11 @@ class FileMap {
   // file, read once; after that no access depends on the file system. Used where every token re-reads the weights and the
   // file sits on a mount that does not cache them (MEASURED 2026-10-29: WSL2's /mnt/c with a DAX bind mount kept about
   // 1 GB of a 22.7 GB model cached; llama-server decoded at 0.24 tok/s from it). progress, if set, gets bytes read so far.
+  // A mount that refuses reads inside the file's last partial 2 MiB (MEASURED 2026-10-29: WSL2's DAX virtiofs bind mount
+  // returns EINVAL for every read of a 22.7 GB model's final 1,562,912 bytes) is tolerated there only: those bytes are
+  // left zero and unread_from() says where they start, so the caller can refuse if a tensor it uses lies there.
   Status load(const std::string& path, void (*progress)(std::uint64_t done, std::uint64_t total) = nullptr);
+  [[nodiscard]] std::uint64_t unread_from() const { return unread_from_; }  // == size() when every byte was read
   void close();
 
   [[nodiscard]] const std::uint8_t* data() const { return data_; }
@@ -45,6 +49,7 @@ class FileMap {
   std::uint64_t size_ = 0;
   bool open_ = false;
   bool owned_ = false;  // data_ is private memory from load(), not a file view
+  std::uint64_t unread_from_ = 0;
 #ifdef _WIN32
   void* file_ = nullptr;     // HANDLE
   void* mapping_ = nullptr;  // HANDLE

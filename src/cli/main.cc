@@ -1337,6 +1337,9 @@ int cmd_generate(const Args& a) {
     s = m.load(path);
     if (!s) return fail_input(s);
     std::fprintf(stderr, "pelias generate: model read into RAM (--no-mmap): %.2f GB in %.1f s\n", static_cast<double>(m.size()) / 1e9, tl.seconds());
+    if (m.unread_from() < m.size())
+      std::fprintf(stderr, "pelias generate: the mount refused the file's last %llu bytes (from byte %llu); they are left zero and checked below\n",
+                   static_cast<unsigned long long>(m.size() - m.unread_from()), static_cast<unsigned long long>(m.unread_from()));
   } else {
     s = m.open(path);
     if (!s) return fail_input(s);
@@ -1346,6 +1349,14 @@ int cmd_generate(const Args& a) {
   if (!s) return fail_input(s);
   const Result<model::Qwen35MoeSpec> spec = model::read_qwen35moe_spec(g);
   if (!spec.ok()) return fail_input(spec.status);
+  if (m.unread_from() < m.size()) {  // only tensors the reference pass does not run (the MTP block) may lie in the unread bytes
+    const std::string mtp = "blk." + std::to_string(spec.value.n_layer) + ".";
+    for (const io::GgufTensor& t : g.tensors())
+      if (t.file_offset + t.bytes > m.unread_from() && t.name.rfind(mtp, 0) != 0) {
+        std::fprintf(stderr, "pelias: tensor %s lies in the bytes the mount refused; run without --no-mmap or from another drive\n", t.name.c_str());
+        return 2;
+      }
+  }
   const Result<model::Qwen35MoeWeights> w = model::bind_qwen35moe(g, m.data(), spec.value);
   if (!w.ok()) return fail_input(w.status);
   Result<tok::Tokenizer> tk = tok::Tokenizer::from_gguf(g);

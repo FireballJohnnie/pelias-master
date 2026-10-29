@@ -34,6 +34,8 @@ FileMap& FileMap::operator=(FileMap&& o) noexcept {
     open_ = o.open_;
     owned_ = o.owned_;
     o.owned_ = false;
+    unread_from_ = o.unread_from_;
+    o.unread_from_ = 0;
 #ifdef _WIN32
     file_ = o.file_;
     mapping_ = o.mapping_;
@@ -86,6 +88,7 @@ Status FileMap::open(const std::string& path) {
     return Status::fail(Code::io_error, "cannot map file (Windows error " + std::to_string(e) + ")");
   }
   data_ = static_cast<const std::uint8_t*>(v);
+  unread_from_ = size_;
   return Status::good();
 }
 
@@ -111,7 +114,7 @@ Status FileMap::load(const std::string& path, void (*progress)(std::uint64_t, st
   }
   std::uint64_t done = 0;
   while (done < n) {
-    const DWORD want = static_cast<DWORD>(std::min<std::uint64_t>(n - done, std::uint64_t{1} << 30));
+    const DWORD want = static_cast<DWORD>(std::min<std::uint64_t>(n - done, std::uint64_t{64} << 20));  // 64 MiB, as llama.cpp
     DWORD got = 0;
     if (!ReadFile(h, static_cast<std::uint8_t*>(buf) + done, want, &got, nullptr) || got == 0) {
       const DWORD e = GetLastError();
@@ -127,10 +130,12 @@ Status FileMap::load(const std::string& path, void (*progress)(std::uint64_t, st
   size_ = n;
   open_ = true;
   owned_ = true;
+  unread_from_ = n;
   return Status::good();
 }
 
 void FileMap::close() {
+  unread_from_ = 0;
   if (data_ && owned_) VirtualFree(const_cast<std::uint8_t*>(data_), 0, MEM_RELEASE);
   else if (data_) UnmapViewOfFile(data_);
   owned_ = false;
@@ -185,6 +190,7 @@ Status FileMap::open(const std::string& path) {
     return Status::fail(Code::io_error, std::string("cannot map file: ") + std::strerror(e));
   }
   data_ = static_cast<const std::uint8_t*>(m);
+  unread_from_ = size_;
   return Status::good();
 }
 
@@ -212,11 +218,21 @@ Status FileMap::load(const std::string& path, void (*progress)(std::uint64_t, st
     madvise(buf, static_cast<size_t>(n), MADV_HUGEPAGE);  // a hint: 2 MB pages for the weights
 #endif
   }
+  // 64 MiB per read, as llama.cpp's reader uses; some mounts refuse large reads with EINVAL (MEASURED 2026-10-29: 1 GiB
+  // reads from a DAX virtiofs bind mount under WSL2), so a refused size is halved down to 1 MiB before giving up
   std::uint64_t done = 0;
+  std::size_t chunk = std::size_t{64} << 20;
   while (done < n) {
-    const size_t want = static_cast<size_t>(std::min<std::uint64_t>(n - done, std::uint64_t{1} << 30));
+    const size_t want = static_cast<size_t>(std::min<std::uint64_t>(n - done, chunk));
     const ssize_t got = ::read(fd, static_cast<std::uint8_t*>(buf) + done, want);
     if (got < 0 && errno == EINTR) continue;
+    if (got < 0 && errno == EINVAL && chunk > (std::size_t{1} << 20)) {
+      chunk /= 2;
+      continue;
+    }
+    if (got < 0 && errno == EINVAL && n - done < (std::uint64_t{2} << 20) && done % (std::uint64_t{2} << 20) == 0) {
+      break;  // the last partial 2 MiB window refused (see file_map.h): left zero, reported by unread_from()
+    }
     if (got <= 0) {
       const int e = got < 0 ? errno : EIO;
       munmap(buf, static_cast<size_t>(n));
@@ -231,10 +247,12 @@ Status FileMap::load(const std::string& path, void (*progress)(std::uint64_t, st
   size_ = n;
   open_ = true;
   owned_ = true;
+  unread_from_ = done;
   return Status::good();
 }
 
 void FileMap::close() {
+  unread_from_ = 0;
   if (data_) munmap(const_cast<std::uint8_t*>(data_), static_cast<size_t>(size_));
   owned_ = false;
   if (fd_ >= 0) ::close(fd_);
