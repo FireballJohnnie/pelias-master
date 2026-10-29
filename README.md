@@ -2,7 +2,7 @@
 
 **One ground-up program that probes the machine, takes a local GGUF or safetensors model, coaches and runs training or quantization, writes the resulting GGUF, and serves it on port 8062 through its own engine and server.**
 
-> **PRE-RELEASE, PRIVATE. Updated 2026-10-29.** Milestone 1 runs: Pelias reads the model, quantizes it with its own formats (`pelias quantize`), runs the whole model on the CPU reference path and scores it against the original (`pelias kld`), all ground-up. The GPU engine is next (R3, the streaming decode kernel, is in progress). The plan of record is [`docs/PELIAS_GAME_PLAN.md`](docs/PELIAS_GAME_PLAN.md); the design is [`docs/PELIAS_SYSTEM_MASTERWORK.md`](docs/PELIAS_SYSTEM_MASTERWORK.md). Every number below is labelled; the probe and run results are in `data/probe_results/` and `logs/BUILD_LOG.md`.
+> **PRE-RELEASE, PRIVATE. Updated 2026-10-29.** Milestone 1 runs: Pelias reads the model, quantizes it with its own formats (`pelias quantize`), runs the whole model on the CPU reference path and scores it against the original (`pelias kld`). All of it is ground-up code. The GPU engine is being built now: R3, the streaming decode kernel, is exact on every format and is being tuned. Every number below carries a label. The raw results are in `data/probe_results/` and `logs/BUILD_LOG.md`.
 
 **Author and maintainer:** John Lipka. Developed with AI assistance under his direction. Sibling repositories (records of the design and measurements): pelias-trainer, pelias-engine.
 
@@ -10,74 +10,87 @@
 
 In the author's words: "this started as an effort for me to better create my own llm, when i found this... accidentally. everything said we couldn't train an moe using my type of system, we found a way. then we saw the hardware ceiling limit when running that quantized llm, and we found a way to unify the bus to make it run even better from the way we found to train it... and then even more!" The full timeline, from the first training folder of September 2026 to this repository, is Section 20 of the masterwork.
 
-## Where it stands (2026-10-29)
+## The goal
 
-The goal of the first build: beat Unsloth's best 4-bit file of the same model (Qwen3.6-35B-A3B, MTP UD-Q4_K_M, KL 0.012864 on llama.cpp's GPU path) at the same size or smaller, then run it faster on one consumer PC (RTX 4070 12 GB, Ryzen 7 5800X3D, dual-channel DDR4).
+Beat the best published 4-bit file of Qwen3.6-35B-A3B on accuracy, at the same size or smaller, then run it faster on one consumer PC. The bar is Unsloth's MTP UD-Q4_K_M: KL 0.012864 on llama.cpp's GPU path (MEASURED). The PC has an RTX 4070 12 GB, a Ryzen 7 5800X3D and 64 GB of dual-channel DDR4-3200.
+
+## Where it stands
+
+### Accuracy: the best file so far
+
+| File | KL vs the original (lower is better) | Size vs Unsloth | Label |
+|---|---|---|---|
+| Unsloth MTP UD-Q4_K_M (the bar) | 0.012864 | — | MEASURED |
+| urm_ZT2: dense Q7_ZT | 0.012536 | -236 MB | MEASURED (100 chunks) |
+| **urm_TG2: dense Q7_ZT + expert gate/up Q4_TG2** | **0.012056 (-0.000808 vs Unsloth, t -1.98)** | **-236 MB** | MEASURED (100 chunks) |
+
+urm_TG2 is lower than Unsloth at a smaller size. Its 95 % interval, [-0.001618, +0.000002], just touches zero (t -1.98 at 100 chunks), so the gap is not yet called resolved; more chunks or a second text settle it.
+
+### Methods proven so far
+
+| Method | Result | Label |
+|---|---|---|
+| Rotation per 32 values (dense weights and their inputs) | File error -8.9 %; 8-bit activations then cost nothing | MEASURED (whole model) |
+| Q8_Z, the author's zip scales | Same accuracy as Q8_0, 61 MB smaller | MEASURED (whole model) |
+| **Q7_ZT: 7 bits plus an 8th bit gated per 32 values** | urm_ZT2 below Unsloth at -236 MB (table above); the 8th bit is stored on 2 of every 8 blocks of 32 values | MEASURED (whole model) |
+| Light vs heavy 8th bit, rotated vs not | Rotated + light is best in every case. A missing heavy bit costs about 340-360x; a missing light bit costs about 1.4-1.5x | MEASURED (sandbox, real weights) |
+| The 1-bit decoder (8th bit added by AND + popcount on idle integer units) | Bit-identical to 8-bit across the whole model; GPU kernel 5.7-6.9 % faster than 8-bit | MEASURED |
+| **Q4_TG2: the author's bit tags with an exact 0 (expert gate/up)** | Weighted error -10 to -11 % per tensor vs imatrix Q4_K, same bytes | MEASURED |
+| The miss map (where the model gets stuck) | The same hard tokens repeat across every file (47-66 % vs 1 % by chance); number and math tokens get stuck at 2x the base rate | MEASURED |
+| The author's H gate on KV pages | 72.6 % of attention mass kept in 1/8 of the keys, vs 62.0 % (Quest pages) and 42.6 % (recent window) | MEASURED (512-token chunks) |
+
+**Candidate file (PEL7):** dense Q7_ZT, rotated, with the light 8th bit; expert gate/up Q4_TG2; expert down at Unsloth's types; the MTP input projection rotated.
+
+### Speed: measured so far
 
 | What | Result | Label |
 |---|---|---|
-| Rotation per 32 values (dense weights and activations only) | File error -8.9 %; 8-bit activations cost nothing | MEASURED (whole model) |
-| Q8_Z, the author's zip scales | Same accuracy as Q8_0, -61 MB | MEASURED (whole model) |
-| **Q7_ZT: 7 bits + the 8th bit gated per 32 values (light bit, rotated)** | **urm_ZT2: KL 0.012536 vs Unsloth 0.012864 at -236 MB** (lower, not yet statistically resolved) | MEASURED (whole model) |
-| The 1-bit decoder (8th bit added by AND + popcount on idle integer units) | Bit-identical to 8-bit across the whole model; GPU kernel 5.7-6.9 % faster than 8-bit | MEASURED |
-| Light vs heavy 8th bit | Rotated + light best in every case; a missing heavy bit is ~360x worse, a missing light bit ~1.4x | MEASURED (sandbox, real weights) |
-| **Q4_TG2: the author's bit tags with an exact 0 (expert gate/up), in urm_TG2** | **KL 0.012056 vs Unsloth 0.012864 (-0.000808, t -1.98) at -236 MB**; -10 to -11 % weighted error per tensor | MEASURED (whole model) |
-| The miss map (where the model gets stuck) | Hard tokens repeat across every file (47-66 % vs 1 %); number / math tokens stuck at 2x the base rate | MEASURED |
-| The author's H gate on KV pages | 72.6 % of attention mass in 1/8 of the keys vs 62.0 % (Quest pages), 42.6 % (recent window) | MEASURED (512-token chunks) |
-| Unified bus probes (doorbell, replay, overlap, two DRAM readers) | 42-78x faster CPU/GPU hand-off; 93 % of DDR4 peak with both readers; tier build 31.8 -> 53.5 tok/s | MEASURED |
-| R3, the streaming decode kernel | One launch per matrix reads at 150-352 GB/s; one long stream at 494 GB/s (98 % of the card): ~3 ms per token to gain | MEASURED ceiling; kernel in test |
+| Unified-bus probes (doorbell, replay, overlap, two DRAM readers) | CPU/GPU hand-off 42-78x faster; tier build 31.8 -> 53.5 tok/s | MEASURED |
+| System RAM read rate (`pelias membw`) | DDR4 saturates at 2 threads (47.8 GB/s, 93 % of 51.2); no lag felt by the user up to 4 reader threads | MEASURED |
+| GPU read ceiling | 494 GB/s on one long read: 98 % of the stock 504 GB/s, 89.5 % of this card's overclocked memory (about 552 GB/s) | MEASURED |
+| One launch per matrix (how engines read today) | 150-352 GB/s per matrix size | MEASURED |
+| **R3 v1, one token's weights (2.27 GB) in one streaming launch** | **8.79 ms (259 GB/s) vs 20.81 ms one launch per matrix**; with 160 dependency syncs 12.57 ms | MEASURED |
 
-**Candidate file (PEL7):** dense Q7_ZT rotated with the light 8th bit, expert gate/up Q4_TG2, expert down at Unsloth's types, the MTP input projection rotated.
+**Where the rest of the speed is:** an independent review of R3 v1 (`docs/reviews/FABLE_R3_V1_REVIEW_2026-10-29.md`) traces about 4 of the 8.79 ms to one lookup in the Q4_TG2 decode. Without it, the other formats already stream at about 375-405 GB/s (DERIVED). R3 v2 removes the bottlenecks one at a time, measuring each. At the 494 GB/s ceiling a token's weights take 4.60 ms (DERIVED). Projected speeds once R3 is in the engine are in the game plan (DERIVED, not measured).
 
-**Key documents:** [`docs/PELIAS_GAME_PLAN.md`](docs/PELIAS_GAME_PLAN.md) (plan, every run and decision), [`docs/PELIAS_7_T_H_PLAN.md`](docs/PELIAS_7_T_H_PLAN.md) (the 7-bit / T / H / 1-bit decoder line), [`docs/PELIAS_NEW_METHODS.md`](docs/PELIAS_NEW_METHODS.md) (methods proven to work), [`docs/PELIAS_VS_EXISTING_FRAMEWORKS.md`](docs/PELIAS_VS_EXISTING_FRAMEWORKS.md) (plain-language summary and comparison), [`docs/reviews/`](docs/reviews/) (independent reviews, latest: Fable's math check of the engine plan).
+### Running now and next
+
+1. **KV / DeltaNet-state compaction test on urm_TG2:** keys and values at 8 and 4 bits, the DeltaNet state checkpoint at int8 and 4 bits. Whole-model KL (running).
+2. **R3 v2 step 1:** per-format timing, sync cost and SM clock, run in WSL and natively on Windows (coded, waiting to run).
+3. **R3 v2 fixes, in the review's ranked order:**
+   - the Q4_TG2 lookup moved to shared memory;
+   - packed integer math for Q5_K / Q6_K;
+   - one-load job lookup;
+   - more reads in flight;
+   - cheaper syncs.
+4. **The engine (GP3-08), then the server:** R3 inside Pelias, MTP drafting, the bus view (live CPU / GPU charts with a green "Unified bus confirmed" when every check passes).
+
+## Key documents
+
+| Document | What it is |
+|---|---|
+| [`docs/PELIAS_GAME_PLAN.md`](docs/PELIAS_GAME_PLAN.md) | The plan of record: every run, result and decision, in order |
+| [`docs/PELIAS_7_T_H_PLAN.md`](docs/PELIAS_7_T_H_PLAN.md) | The 7-bit / T / H / 1-bit decoder line |
+| [`docs/PELIAS_NEW_METHODS.md`](docs/PELIAS_NEW_METHODS.md) | Methods proven to work, with their numbers |
+| [`docs/PELIAS_VS_EXISTING_FRAMEWORKS.md`](docs/PELIAS_VS_EXISTING_FRAMEWORKS.md) | Plain-language summary and comparison with existing frameworks |
+| [`docs/PELIAS_SYSTEM_MASTERWORK.md`](docs/PELIAS_SYSTEM_MASTERWORK.md) | The full design specification |
+| [`docs/reviews/`](docs/reviews/) | Independent reviews and what was done with each finding (latest: the R3 v1 review) |
+| [`logs/BUILD_LOG.md`](logs/BUILD_LOG.md) | Dated log of every build, run and correction |
 
 ## What it will be
 
 | Piece | One line |
 |---|---|
-| probe | Detects CPU, GPU, RAM, drives, OS and ReBAR; measures what matters; uses published values only until it has measured |
+| probe | Detects CPU, GPU, RAM, drives, OS and ReBAR; measures what matters (`pelias membw` is the first piece); uses published values only until it has measured |
 | plan | Fits the work under the measured VRAM ceiling and offers two to four plans; recommends a bigger plan when it finds more room than an imported profile assumed (and waits for the user's OK) |
 | intake / coach | Imports parameters from json, txt, log, csv, md (and `.py`, parsed, never run); coaches the training set for the clients that will call the model |
 | quantize / train / export | Own bit-exact quantizers; layer-major training with the core trained through the exact quantizer; frozen bytes proven unchanged |
-| engine + server | The unified bus (GPU hot bank, CPU cold experts, doorbell handoff, dual DRAM readers) behind an OpenAI-compatible server on 127.0.0.1:**8062** |
-| web interface | Served by Pelias itself: lithic style, the Pelias logo, the spear progress bar |
+| engine + server | The unified bus (GPU hot bank, CPU cold experts, doorbell handoff, dual DRAM readers, R3 streaming decode) behind an OpenAI-compatible server on 127.0.0.1:**8062** |
+| web interface | Served by Pelias itself: lithic style, the Pelias logo, the spear progress bar, the bus view |
 | web tools | Search, fetch and read for the model; FlareSolverr as the one optional outside process |
 | installers | Windows 10/11, and Linux (WSL first, native capable) |
 
-## Repository map
-
-| Path | Holds |
-|---|---|
-| `docs/PELIAS_SYSTEM_MASTERWORK.md` | The specification: requirements, product, boundary, detection, models, flow, parameters, training, quantizing, engine, server, web tools, installers, scaffold, order of operations, gates, numbers, conflicts, sources, history, and future hypotheses beyond LLMs (Section 21) |
-| `docs/PELIAS_SYSTEM_MASTER.md` | The one-page scaffold and audited numbers of 2026-10-25 (two toolchain rows corrected) |
-| `docs/BUILD_NOTES.md` | How to build, per platform (filled as the build proceeds) |
-| `docs/inputs/` | The author's input files, unchanged, and `REVIEW.md` |
-| `docs/reviews/` | Independent reviews and what was done with each finding |
-| `THIRD_PARTY_NOTICES.md` | Every outside work the product or its build relies on, with its licence |
-| `docs/scaffold/` | `REPO_INVENTORY.tsv` and `verify_inventory.py` |
-| `profiles/reference_pelias/` | Import files for the author's machine and model |
-| `profiles/local_only/` | The author's private training profile (ignored by git) |
-| `resources/ui/` | Logo, spear stages, baked spear textures |
-| `support/ui_reference/` | The lithic interface header of 2026-10-24 (specification for the web interface) |
-| `tools/ui/` | The spear texture baker (offline tool) |
-| `docs/PELIAS_GAME_PLAN.md` | The plan of record: every run, result and decision, in order |
-| `docs/PELIAS_7_T_H_PLAN.md`, `docs/PELIAS_NEW_METHODS.md`, `docs/PELIAS_VS_EXISTING_FRAMEWORKS.md` | The 7-bit line, the proven-methods tally, the plain-language comparison |
-| `src/` | The product code: GGUF / safetensors I/O, quantizers (incl. Q8_Z, Q7_ZT, Q4_TG2), the reference model, `pelias` commands |
-| `tools/experiments/` | Sandbox checks behind each result (scripts named in the game plan) |
-| `tools/probes/` | GPU and CPU probes: `tdecode` (1-bit decoder, read ceiling), `r3` (streaming decode kernel) |
-| `data/probe_results/` | Measured results kept with the code (miss logs, per-token KL summaries) |
-| `logs/` | `BUILD_LOG.md`, `DECISIONS_LOG.md` |
-
-## Rules
-
-Every number carries a label (MEASURED, READ-SRC, PUBLISHED, DERIVED, ESTIMATE, UNVERIFIED, DECISION, AUTHOR-STATED). No llama.cpp or other outside code in the product; llama.cpp is an external, test-only comparison. Never truncate training data. The VRAM ceiling is measured at start and enforced. No model downloads. Dataset text, persona and private equations never enter this repository. Nothing is pushed without the author's word.
-
-## Licence
-
-Apache-2.0 (`LICENSE`). Copyright (c) 2026 John Lipka and the Pelias contributors.
-
-
-## Building (step 2 onward)
+## Building
 
 No third-party libraries: C++20, CMake 3.24+, Ninja; the CUDA toolkit only for `-DPELIAS_CUDA=ON`.
 
@@ -90,4 +103,44 @@ cmake --preset wsl && cmake --build --preset wsl && ctest --preset wsl
 cmake --preset windows && cmake --build --preset windows && ctest --preset windows
 ```
 
-Then `build/<preset>/pelias inspect --model <file.gguf>`, `pelias plan --model <file.gguf> [--bank-gib N] [--ceiling-gib C]`, `pelias device`, `pelias key --model <file>`. Milestone 1: `pelias quantize --model IN.gguf --out OUT.gguf [--recipe R.tsv] [--imatrix M.gguf] [--rotate32 GROUPS]`, `pelias imatrix`, `pelias kld --model F --base BASE.bin` (with `--dump-kld`, `--route-dump`, `--dump-codes`, `--dump-qk`), `pelias kld-compare`; `pelias --help` lists every option. Repository checks: `python3 tools/check_module_deps.py` (module boundaries) and `python3 docs/scaffold/verify_inventory.py` (inventory and privacy scan).
+**Commands** (`pelias --help` lists every option):
+
+| Command | Does |
+|---|---|
+| `pelias inspect --model F`, `pelias device`, `pelias plan --model F`, `pelias key --model F` | Read a model, list the devices, plan a fit, key a file |
+| `pelias quantize --model IN --out OUT [--recipe R.tsv] [--imatrix M.gguf] [--rotate32 GROUPS]` | Quantize with Pelias's own formats (incl. Q8_Z, Q7_ZT, Q4_TG2) |
+| `pelias imatrix --model F --file TEXT --out M.gguf` | Importance matrix from the fp32 reference pass |
+| `pelias kld --model F --base BASE.bin` | Score a file against the original. `--dump-kld`, `--route-dump`, `--dump-codes` and `--dump-qk` write per-token data; `--kv-store` / `--state-store` test KV and DeltaNet-state compaction |
+| `pelias kld-compare --a A.bin --b B.bin` | Paired comparison of two scored files (difference, interval, verdict) |
+| `pelias membw` | System RAM read rate by threads, page size and prefetch, and the lag the user would feel |
+
+The GPU probes build on their own with nvcc (`tools/probes/tdecode`, `tools/probes/r3`; the build line is at the top of each `.cu`). Repository checks: `python3 tools/check_module_deps.py` (module boundaries) and `python3 docs/scaffold/verify_inventory.py` (inventory and privacy scan).
+
+## Repository map
+
+| Path | Holds |
+|---|---|
+| `src/` | The product code: GGUF / safetensors I/O, tokenizer, quantizers, the reference model, the OS and device layers, the `pelias` commands |
+| `tests/` | Unit tests (run by `ctest`) |
+| `tools/probes/` | GPU and CPU probes: `tdecode` (1-bit decoder, read ceiling), `r3` (streaming decode kernel), `gfx_probe`, `e16`, `batch_c` |
+| `tools/experiments/` | Sandbox checks behind each result (named in the game plan) |
+| `tools/` | Recipe tool, imatrix merge, route statistics, table generators, UI texture baker |
+| `data/probe_results/` | Measured results kept with the code (run logs, miss logs, per-token KL summaries) |
+| `docs/` | The game plan, method and comparison papers, the masterwork, build notes, reviews, the author's input files (`docs/inputs/`, unchanged) |
+| `profiles/reference_pelias/` | Import files for the reference machine and model |
+| `profiles/local_only/`, `support/local_only/` | The author's private material (ignored by git, never pushed) |
+| `resources/ui/`, `support/ui_reference/` | Logo, spear stages and textures; the lithic interface specification |
+| `logs/` | `BUILD_LOG.md`, `DECISIONS_LOG.md` |
+| `THIRD_PARTY_NOTICES.md` | Every outside work the product or its build relies on, with its licence |
+
+## Rules
+
+- Every number carries a label: MEASURED, READ-SRC, PUBLISHED, DERIVED, ESTIMATE, UNVERIFIED, DECISION or AUTHOR-STATED. No made-up numbers. Predictions are written down before each run.
+- No llama.cpp or other outside code in the product. llama.cpp is an external, test-only comparison.
+- Never truncate training data. The VRAM ceiling is measured at start and enforced. No model downloads.
+- Dataset text, persona and private equations never enter this repository.
+- Nothing is pushed without the author's word.
+
+## Licence
+
+Apache-2.0 (`LICENSE`). Copyright (c) 2026 John Lipka and the Pelias contributors.
