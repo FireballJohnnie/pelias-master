@@ -152,7 +152,9 @@ bool rot32_selected(const std::string& name, const std::vector<std::string>& gro
   static const char* const kProducts[] = {"attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight", "attn_qkv.weight",
                                           "attn_gate.weight", "ssm_alpha.weight", "ssm_beta.weight", "ssm_out.weight", "ffn_up_exps.weight",
                                           "ffn_gate_exps.weight", "ffn_down_exps.weight", "ffn_up_shexp.weight", "ffn_gate_shexp.weight",
-                                          "ffn_down_shexp.weight"};
+                                          "ffn_down_shexp.weight",
+                                          // MTP input projection (author 2026-10-29: rotation -49.5 % error, rot_coverage_check)
+                                          "nextn.eh_proj.weight"};
   bool product = name == "output.weight";
   if (name.rfind("blk.", 0) == 0) {
     const std::size_t dot = name.find('.', 4);

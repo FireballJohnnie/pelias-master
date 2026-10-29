@@ -100,6 +100,11 @@ TEST(rot32_selects_product_weights_only) {
   CHECK(!rot32_selected("blk.0.ffn_gate_inp_shexp.weight", all));
   CHECK(rot32_selected("blk.0.attn_gate.weight", all));
   CHECK(!rot32_selected("blk.0.attn_gate.weight", {}));
+  const std::vector<std::string> dense_mtp{"attn", "ssm_", "shexp", "output", "eh_proj"};
+  CHECK(rot32_selected("blk.40.nextn.eh_proj.weight", dense_mtp));  // the MTP piece: rotated (author 2026-10-29)
+  CHECK(!rot32_selected("blk.40.nextn.eh_proj.weight", dense));     // only when the group is named
+  CHECK(!rot32_selected("blk.40.nextn.enorm.weight", all));         // its norms stay as they are
+  CHECK(!rot32_selected("token_embd.weight", dense_mtp));           // the token table stays unrotated (-0.9 % only)
 }
 
 namespace {
