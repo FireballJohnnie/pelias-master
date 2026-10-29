@@ -60,7 +60,7 @@ Author's request, 2026-10-28 14:48. Every number is labelled: **MEASURED** (sand
 | 3 | CPU kernel (popcount on the integer units, beside the vector base) | Sandbox correctness / PC timing | Correctness done (reference); speed kernel next |
 | 4 | GPU kernels: CUDA-core AND + popc for decode (M = 1); 1-bit mma for batched MTP verify (M = 5-8) | PC | **Probe v2 done** (19:05): exact; fold 5.7-6.9 % faster than Q8_Z cold; 1-bit route tie to +7 % vs fold |
 | 5 | 1-bit mma rate probe on sm_89 | PC, 5 min | **Done**: 937.4 T bit-MAC/s, 8.00x int8 (MEASURED) |
-| 6 | `--t-decode` option in `pelias kld` (whole-model proof on urm_ZT) | Sandbox build, PC run | To build |
+| 6 | `--t-decode` option in `pelias kld` (whole-model proof on urm_ZT2) | Sandbox build, PC run | **Done (run D)**: 1-bit route = integer fold bit for bit over a whole forward pass; vs the float path +0.000387 (t 1.47), from int8 rounding flips (noise floor about +-0.0004) |
 | 7 | Split storage (base 233 bytes + H 8 bytes per 256, separate arrays) | Sandbox | **Done** (split / join, tested) |
 | 8 | Timing: T-decode vs the plain int8 route | PC | **Probe done**; kernel v3 (bytes in flight, Q8_Z at 64 % of 504 GB/s) next |
 
@@ -69,15 +69,13 @@ Author's request, 2026-10-28 14:48. Every number is labelled: **MEASURED** (sand
 - **It lets the base and the H bits live in different places** (H is 3 % of Q7_ZT's bytes): base in VRAM, H streamed from RAM; CPU base + GPU H (J1); dense models spilling onto RAM.
 - **The int8 kernel still "sees 8".** The fold route rebuilds exact int8 values (-127..127) for the existing v10 kernel, so nothing chokes; the 1-bit route gives the same integers.
 
-## 7. Order from here (updated 2026-10-28 19:1x)
+## 7. Order from here (updated 2026-10-29 00:1x, after runs A-E)
 
-1. Sandbox: C4 (grid tags + H on real blk.20 expert slices vs Q3_K 0.0230) and C3 (fragile tokens in the per-token dumps).
-2. Kernel v3: gate 3 (speed) for Q7_ZT.
-3. `--t-decode` whole-model proof.
-4. R3 kernel.
-5. GP3-08 MTP head, with the C4 type.
-6. Engine: U1/U2, then C3, C1, C5.
-7. Server: C2.
+Runs A-E done (game plan, "Runs A-E and the checks around them"). Stopped before R3 for the author's review (author 19:36).
+1. Author's review; Fable's math check of #3 (engine: U1/U2, C3, C1, C5, C6).
+2. R3 (the per-32 activation kernel; the T-decode decode path folds into it), with the read-only ceiling kernel first.
+3. Candidates waiting for the author: Q4_TG v2 (full importance + 0 levels); C6 sharpening (several layers, energy weighting, previous-token signal); own-text stuck tokens by kind; more own-text chunks to resolve the order.
+4. GP3-08 MTP head (3-bit tag type), engine, server.
 
 ## 8. Where everything lands (author + Claude + Fable, 2026-10-28 19:1x)
 
@@ -88,7 +86,7 @@ The 7-bit / T / H / 1-bit decoder work is the spine; each newer idea plugs into 
 | Idea | Lands as | Status | Next |
 |---|---|---|---|
 | T gate, dense (Q7_ZT) | Dense tensors at 7.53 bpw | Gates 1 and 2 passed (MEASURED) | Gate 3, speed, via kernel v3 |
-| C4 grid tags + H (author's bit-tag matrix) | New 3-bit type: 3 bit planes + 1 tag byte per 32-block (3.5 bpw; 3.75 with the H gate) for the MTP block and expert gate/up; replaces the planned MTP Q3_PH | Paper only | Sandbox on real blk.20 slices; must reach <= 0.0211 at 3.5 bpw or <= 0.0148 at 3.75 |
+| C4 grid tags + H (author's bit-tag matrix) | 3-bit: tag byte per 32-block (3.5 bpw), for the MTP block; 4-bit: Q4_TG (id 203, 4.5 bpw, the size of Q4_K) for expert gate/up | 3-bit sandbox passed (0.0190 vs K-line 0.0210). Q4_TG whole model (run E): 0.012876, tie with Unsloth, +0.000339 vs ZT2 (not resolved); built with sqrt importance and no 0 level | **Q4_TG v2** (full importance + grids with an exact 0, the author's 0-weight idea): sandbox about -11 % vs imatrix Q4_K; author's review |
 | C3 fragility tags | Per-tensor sensitivity from calibration (fit on chunks 0-49, scored on 50-99); tagged experts get refinement planes | Idea | Knife-edge view (author 19:12): no separate chunk-24 diagnosis; the near-tie flag treats fragile tokens as a class. Revisit only if the own-text check shows rotated files losing fragile tokens Unsloth keeps |
 
 ### 8.2 Kernels
@@ -97,7 +95,7 @@ The 7-bit / T / H / 1-bit decoder work is the spine; each newer idea plugs into 
 |---|---|---|
 | Fold route | Default decode (M = 1) for Q7_ZT | MEASURED: 5.7-6.9 % faster than Q8_Z |
 | 1-bit decoder (T-decode) | The route when base and H live apart (J1, spill-over) and for batched verify | Exact on GPU; tie to +7 % vs fold |
-| Kernel v3 | More bytes in flight, several rows per warp: 64 % toward 85-90 % of 504 GB/s | Next |
+| Kernel v3 | 2 or 4 rows per lane, loads first | MEASURED (run A): no gain (331 vs 325 GB/s on the largest shape, slower elsewhere); v2 stays. Next: a read-only ceiling kernel over the same 17 MB cold |
 | C1 KV codes | Same bit-plane family: scaled 1-bit dot on q and k codes (own warp ballot, random sign diagonal folded into W_q and W_k, page bound first) | Paper; needs a one-chunk q, k dump |
 
 ### 8.3 Engine runtime (decode loop)
@@ -109,7 +107,7 @@ The 7-bit / T / H / 1-bit decoder work is the spine; each newer idea plugs into 
 | C1 KV page selector | 10 attention layers; at 128K, KV reads 2.83 -> 0.26-0.52 ms per token |
 | C5 three drafters + batched verify | One chain (exact n-gram > MTP > fuzzy); after GP3-08 and U1/U2; 1.64x at rung 1 |
 | U1 / U2 / U8 bus fixes | Before C5 pays anything |
-| C6 accuracy-assisted miss map (author) | Log every stuck place (fragile token, prefetch miss, rejected draft) with its state code; a hit takes the expensive path. First check MEASURED: stuck places repeat across files (47-66 % vs 1 % random), come in runs (11x), and hold 23-26 % of the KL |
+| C6 accuracy-assisted miss map (author) | Log every stuck place (fragile token, prefetch miss, rejected draft) with its state code; a hit takes the expensive path. MEASURED: stuck places repeat across files (WikiText 47-66 %, own text 59-63 %, random 1 %), come in runs (11x), hold 23-26 % of the KL (own text 52 %); in state space the nearest logged neighbour is stuck 3-5x the base rate; code kNN predicts 43-53 % of experts two layers ahead. `pelias kld --dump-codes` built |
 
 ### 8.4 Server and context
 
