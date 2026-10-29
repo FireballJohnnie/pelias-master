@@ -77,15 +77,9 @@ The newer projections sit above that ceiling because they rest on measurements t
 
 ### Running now and next
 
-1. **KV / DeltaNet-state compaction test on urm_TG2:** keys and values at 8 and 4 bits, the DeltaNet state checkpoint at int8 and 4 bits. Whole-model KL (running).
-2. **R3 v2 step 1:** per-format timing, sync cost and SM clock, run in WSL and natively on Windows (coded, waiting to run).
-3. **R3 v2 fixes, in the review's ranked order:**
-   - the Q4_TG2 lookup moved to shared memory;
-   - packed integer math for Q5_K / Q6_K;
-   - one-load job lookup;
-   - more reads in flight;
-   - cheaper syncs.
-4. **The engine (GP3-08), then the server:** R3 inside Pelias, MTP drafting, the bus view (live CPU / GPU charts with a green "Unified bus confirmed" when every check passes).
+1. **Done:** the KV / DeltaNet-state compaction test (KV at 8 bits costs +0.00035 KL; the DeltaNet state needs 8 bits or more), and R3 v2 (one token of real weights in 5.685 ms on 40 distinct layers, from v1's 8.76 ms; the remaining ~0.93 ms gap to pure streaming is measured and explained in masterwork 21.6).
+2. **GP3-07, the decode loop (built; the gate is next):** the reference pass now carries its KV cache and DeltaNet state from token to token, with a sampler (greedy, temperature, top-k, top-p, min-p, penalties; seeded Philox) and `pelias generate`. Incremental decode equals the full re-run exactly on the test model. The gate is greedy decode against llama.cpp, token for token, on 20 fixed prompts.
+3. **Next:** GP3-08 (the MTP head in the reference), GP3-10 (CPU and GPU kernels, R3 inside Pelias), then the engine (GP3-14) and the server.
 
 ## Other cards: proposed numbers, waiting for your benchmarks
 
@@ -144,29 +138,59 @@ On the oldest cards, dense models are limited to what fits in 4-6 GB. Small MoE 
 
 ## Building
 
-No third-party libraries: C++20, CMake 3.24+, Ninja; the CUDA toolkit only for `-DPELIAS_CUDA=ON`.
+Everything needed to build is in this repository: C++20, CMake 3.24+ and Ninja; no third-party libraries. The CUDA toolkit is needed only for the CUDA presets and the GPU probes. Every step is built and tested on Linux (gcc, clang and gcc with AddressSanitizer, in the sandbox) and on the author's WSL2. The Windows preset (MSVC x64) was built and tested through step 3 (d6b7100) and not since, so a Windows build of the current code is untested; the R3 probe was built natively on Windows (see below). Other setups are untested.
 
 ```
+git clone https://github.com/FireballJohnnie/pelias-master.git && cd pelias-master
 # host-only (any machine, no GPU): build, unit tests, the corrupt-input gate
 cmake --preset host && cmake --build --preset host && ctest --preset host
-# WSL2 / Linux with CUDA
+# WSL2 / Linux with CUDA (nvcc at /usr/local/cuda/bin/nvcc)
 cmake --preset wsl && cmake --build --preset wsl && ctest --preset wsl
 # Windows: from an x64 Native Tools Command Prompt (where cl -> Hostx64\x64)
 cmake --preset windows && cmake --build --preset windows && ctest --preset windows
 ```
+
+Options (add to the configure line):
+- `-DPELIAS_CPU_AVX2=ON`: the CPU reference pass with AVX2 and FMA (gcc / clang; identical logits, faster; the author's runs use it). `-march=native` was measured slower and is not offered.
+- `-DPELIAS_CUDA_ARCHITECTURES=86`: the CUDA architecture of your card (default 89, the author's RTX 4070; only 89 has been run).
+
+The binary is `build/<preset>/pelias`. A first run on your own GGUF file (Qwen3.6-35B-A3B class, `qwen35moe`; Pelias never downloads models):
+
+```
+build/host/pelias inspect --model model.gguf
+build/host/pelias generate --model model.gguf --prompt "The capital of France is" --temp 0 --n-predict 32
+```
+
+`generate` runs the fp32 reference pass on the CPU: it is the correctness reference that the engine is checked against, not the fast path, so expect it to be slow. The engine (GP3-14) is the fast path.
 
 **Commands** (`pelias --help` lists every option):
 
 | Command | Does |
 |---|---|
 | `pelias inspect --model F`, `pelias device`, `pelias plan --model F`, `pelias key --model F` | Read a model, list the devices, plan a fit, key a file |
+| `pelias generate --model F --prompt TEXT` | Text from the CPU reference pass: prefill, then one token per step on the carried KV cache and DeltaNet state. `--temp 0` is greedy; `--top-k`, `--top-p`, `--min-p`, the penalties and `--seed` follow the parameter dictionary; `--ids-out` writes the token ids |
+| `pelias tokenize --model F --text TEXT` | The model's tokenizer (equal to llama.cpp's, token for token, on the P-D1 test files; `logs/BUILD_LOG.md`) |
 | `pelias quantize --model IN --out OUT [--recipe R.tsv] [--imatrix M.gguf] [--rotate32 GROUPS]` | Quantize with Pelias's own formats (incl. Q8_Z, Q7_ZT, Q4_TG2) |
 | `pelias imatrix --model F --file TEXT --out M.gguf` | Importance matrix from the fp32 reference pass |
 | `pelias kld --model F --base BASE.bin` | Score a file against the original. `--dump-kld`, `--route-dump`, `--dump-codes` and `--dump-qk` write per-token data; `--kv-store` / `--state-store` test KV and DeltaNet-state compaction |
 | `pelias kld-compare --a A.bin --b B.bin` | Paired comparison of two scored files (difference, interval, verdict) |
 | `pelias membw` | System RAM read rate by threads, page size and prefetch, and the lag the user would feel |
 
-The GPU probes build on their own with nvcc (`tools/probes/tdecode`, `tools/probes/r3`; the build line is at the top of each `.cu`). Repository checks: `python3 tools/check_module_deps.py` (module boundaries) and `python3 docs/scaffold/verify_inventory.py` (inventory and privacy scan).
+**GPU probes** (stand-alone, one `.cu` each; the build line is at the top of each file):
+
+```
+# WSL / Linux
+nvcc -std=c++17 -O3 -arch=sm_89 tools/probes/r3/r3.cu -o r3
+# Windows (x64 Native Tools prompt): MSVC needs its standard preprocessor for the CUDA headers
+nvcc -std=c++17 -O3 -arch=sm_89 -Xcompiler /Zc:preprocessor tools/probes/r3/r3.cu -o r3.exe
+```
+
+Use your card's `-arch` (sm_70 V100, sm_75 Turing, sm_80 / sm_86 Ampere, sm_89 Ada, sm_120 Blackwell). Only sm_89 has been run. `r3 check` must pass before any timing; `r3 stream --distinct` is the 40-layer timing used in masterwork 21.6. Results from other cards are welcome as issues (see "Other cards" above).
+
+**Checks:**
+- `python3 tools/check_module_deps.py`: module boundaries.
+- `python3 docs/scaffold/verify_inventory.py`: inventory and privacy scan.
+- `python3 tools/greedy_compare.py FOLDER`: the GP3-07 gate's comparison of `pelias generate --ids-out` with llama-server output (prompts in `tools/gates/gp3_07_prompts.txt`).
 
 ## Repository map
 

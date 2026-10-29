@@ -1,0 +1,20 @@
+The capital of France is
+Write a Python function that returns the n-th Fibonacci number.
+Explain in two sentences why the sky is blue.
+Here is a list of five common kitchen tools: 1.
+Translate to French: The library opens at nine in the morning.
+The derivative of x^3 + 2x is
+Once upon a time, in a small village by the sea,
+SELECT name, COUNT(*) FROM orders GROUP BY
+The three states of matter are
+In C++, a std::vector differs from a std::array because
+Q: What is 17 multiplied by 23? A:
+The main causes of the First World War were
+// A shell command that counts the lines in every .txt file:
+Photosynthesis is the process by which plants
+The quick brown fox jumps over the lazy dog. The quick brown fox
+Ein Satz auf Deutsch über das Wetter:
+JSON example of a user record: {"name":
+The difference between TCP and UDP is
+用一句话介绍长城：
+A haiku about autumn leaves:

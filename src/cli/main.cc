@@ -13,6 +13,7 @@
 // Exit codes: 0 ok; 1 usage; 2 the input could not be read (missing, corrupt, unsupported); 3 a gate refused (plan
 // over the ceiling); 4 no device; 5 verify found differences; 6 quantize or convert failed while writing (disk, I/O).
 #include <cerrno>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -191,6 +192,7 @@ void usage() {
       "                                  engine): the prompt once, then one token per step on the carried KV cache and\n"
       "                                  DeltaNet state. --temp 0 is greedy; the draw is Philox4x32-10 keyed by --seed.\n"
       "                                  Defaults are the parameter dictionary's. --ids-out writes the prompt and output ids\n"
+      "                                  and each step's top-1 minus top-2 raw logit (tools/greedy_compare.py reads it)\n"
       "  probe | train | export | serve | bench | web   not built yet (later steps)\n"
       "options: --log debug|info|warn|error (default info)");
 }
@@ -1384,6 +1386,7 @@ int cmd_generate(const Args& a) {
   const auto nv = static_cast<std::int64_t>(spec.value.n_vocab);
   std::vector<float> logits(static_cast<std::size_t>(nv));
   std::vector<std::int32_t> history = ids, out;
+  std::vector<float> gap;  // per output token: the largest raw logit minus the second (how near a greedy tie was)
   Timer tp;
   s = model::forward_decode(spec.value, w.value, st, ids.data(), n_prompt, logits.data(), true, fo);
   if (!s) return fail_input(s);
@@ -1391,6 +1394,15 @@ int cmd_generate(const Args& a) {
   Timer td;
   const char* why = "the --n-predict limit";
   for (int i = 0; i < n_predict; ++i) {
+    float l1 = -INFINITY, l2 = -INFINITY;
+    for (const float x : logits)
+      if (x > l1) {
+        l2 = l1;
+        l1 = x;
+      } else if (x > l2) {
+        l2 = x;
+      }
+    gap.push_back(l1 - l2);
     const std::int32_t next = sampler.sample(logits.data(), nv, history);
     out.push_back(next);
     history.push_back(next);
@@ -1420,6 +1432,12 @@ int cmd_generate(const Args& a) {
     for (std::int32_t id : ids) line += " " + std::to_string(id);
     line += "\noutput:";
     for (std::int32_t id : out) line += " " + std::to_string(id);
+    line += "\ngap:";
+    char buf[32];
+    for (const float x : gap) {
+      std::snprintf(buf, sizeof buf, " %.5f", static_cast<double>(x));
+      line += buf;
+    }
     line += "\n";
     f << line;
     if (!f) {

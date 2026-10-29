@@ -23,7 +23,11 @@
 //   v2 fix 6 (Fable item 6): (c) with a per-stage counter waited per warp (c1), and with the next stage's weights prefetched into
 //   L2 before the wait (c2), and with the warp's whole next-stage share prefetched (c3); the check runs the counted kernel with
 //   the whole-share prefetch over two stages (path 3).
-// Build (WSL): nvcc -std=c++17 -O3 -arch=sm_89 r3.cu -o r3     (Windows: the same with -o r3.exe, from a VS x64 prompt)
+// Build (WSL / Linux): nvcc -std=c++17 -O3 -arch=sm_89 r3.cu -o r3
+// Build (Windows, from an x64 Native Tools prompt): nvcc -std=c++17 -O3 -arch=sm_89 -Xcompiler /Zc:preprocessor r3.cu -o r3.exe
+//   (MSVC's traditional preprocessor stops on the CUDA headers without /Zc:preprocessor; MEASURED with nvcc 13.4)
+// Other cards: -arch=sm_XX for the card (sm_70 V100, sm_75 Turing, sm_80/86 Ampere, sm_89 Ada, sm_120 Blackwell); only
+//   sm_89 has been run (the author's RTX 4070).
 #include <cooperative_groups.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

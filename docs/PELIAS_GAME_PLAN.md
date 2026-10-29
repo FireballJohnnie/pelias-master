@@ -894,6 +894,8 @@ The imatrix or the GPTQ objective adds weight to the router's input space and to
 - Without matched rounding, the first differing position is reported, not failed.
 - Incremental decode equals the full re-run of the same sequence: logits within 1e-5 relative.
 
+**Status (2026-10-29):** built. Incremental = full re-run: passed in the sandbox, bit-identical (max |difference| 0 of 55.4, MEASURED; `decode_incremental_equals_the_fresh_pass`). Sampler and Philox known answers: passed. Greedy vs llama.cpp: prompts and comparison tool in `tools/gates/` and `tools/greedy_compare.py`, llama-server with f32 K/V and flash attention off so the attention arithmetic is fp32 on both sides; run pending.
+
 ### GP3-08 MTP head in the reference (O18; needed by the engine)
 
 **Build:** blk.40 run after the trunk as the model's graph does (READ-SRC llama.cpp at 2ca15f5).
