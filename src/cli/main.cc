@@ -187,12 +187,13 @@ void usage() {
       "  generate --model FILE (--prompt TEXT | --prompt-file F) [--n-predict 128] [--ctx 32768] [--threads N]\n"
       "      [--temp 1.0] [--top-k 20] [--top-p 0.95] [--min-p 0] [--repeat-penalty 1] [--repeat-last-n 64]\n"
       "      [--presence-penalty 0] [--frequency-penalty 0] [--seed 20261019 | -1] [--ignore-eos] [--show-special]\n"
-      "      [--ids-out FILE] [--no-nfc] [--no-special] [--act-int8 GROUPS] [--act-int8-path ...] [--act-rot h32]\n"
+      "      [--ids-out FILE] [--no-nfc] [--no-special] [--act-int8 GROUPS] [--act-int8-path ...] [--act-rot h32] [--no-mmap]\n"
       "                                  text from the fp32 reference pass on the CPU (slow; a correctness reference, not the\n"
       "                                  engine): the prompt once, then one token per step on the carried KV cache and\n"
       "                                  DeltaNet state. --temp 0 is greedy; the draw is Philox4x32-10 keyed by --seed.\n"
       "                                  Defaults are the parameter dictionary's. --ids-out writes the prompt and output ids\n"
-      "                                  and each step's top-1 minus top-2 raw logit (tools/greedy_compare.py reads it)\n"
+      "                                  and each step's top-1 minus top-2 raw logit (tools/greedy_compare.py reads it)\n"      "                                  --no-mmap reads the whole file into RAM first (for mounts that do not cache it);\n"
+      "                                  --ignore-eos bans the end-of-generation tokens, as llama.cpp's ignore_eos does\n"
       "  probe | train | export | serve | bench | web   not built yet (later steps)\n"
       "options: --log debug|info|warn|error (default info)");
 }
@@ -1330,8 +1331,16 @@ int cmd_generate(const Args& a) {
     return 1;
   }
   os::FileMap m;
-  Status s = m.open(path);
-  if (!s) return fail_input(s);
+  Status s;
+  if (a.has("no-mmap")) {
+    Timer tl;
+    s = m.load(path);
+    if (!s) return fail_input(s);
+    std::fprintf(stderr, "pelias generate: model read into RAM (--no-mmap): %.2f GB in %.1f s\n", static_cast<double>(m.size()) / 1e9, tl.seconds());
+  } else {
+    s = m.open(path);
+    if (!s) return fail_input(s);
+  }
   io::GgufReader g;
   s = g.parse(m);
   if (!s) return fail_input(s);
