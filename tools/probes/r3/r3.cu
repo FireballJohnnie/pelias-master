@@ -1,0 +1,616 @@
+// Copyright (c) 2026 John Lipka and the Pelias contributors. Apache-2.0.
+// provenance: original
+// r3.cu - R3, the streaming decode kernel (game plan, "Decision: R3 goes with Q4_TG2 option A"; Fable's test 1: one launch
+// per matrix reads at 150-352 GB/s, a long read at 494). One kernel walks a table of matrices (jobs) for a single token
+// (decode, M = 1) and streams their rows back to back, so the memory pipeline stays full across matrix boundaries.
+//   r3 check   : every format's GEMV against a double-precision host reference built from r3_formats.h (which matches
+//                Pelias's dequantizers value for value)
+//   r3 stream  : one token's weight reads, 40 layers (10 attention + 30 DeltaNet, real shapes) + the output head, timed
+//                cold three ways: (a) one launch per matrix, queued back to back (today's kernels); (b) one launch for
+//                the whole table (no dependencies: the read ceiling of the streaming kernel); (c) one cooperative launch
+//                with a grid-wide sync between dependent stages (4 per layer + the head), the shape a real token needs
+// Formats (r3_formats.h): dense Q7_ZT (fold route, dp4a), expert gate/up Q4_TG2 (grid table), expert down Q5_K, output
+// head Q6_K. Activations: int8 per 32 with an fp32 scale (the gpu256x8 reference format). Lanes split each row in
+// 128-value parts (K / 128 lanes per row), every weight load of a part issued before any arithmetic.
+// Build (WSL): nvcc -std=c++17 -O3 -arch=sm_89 r3.cu -o r3
+#include <cooperative_groups.h>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <random>
+#include <string>
+#include <vector>
+
+#include "r3_formats.h"
+
+namespace cg = cooperative_groups;
+
+#define CK(x)                                                                                            \
+  do {                                                                                                   \
+    cudaError_t e_ = (x);                                                                                \
+    if (e_ != cudaSuccess) {                                                                             \
+      std::fprintf(stderr, "CUDA error %s at %s:%d\n", cudaGetErrorString(e_), __FILE__, __LINE__);      \
+      std::exit(2);                                                                                      \
+    }                                                                                                    \
+  } while (0)
+
+struct Job {
+  int fmt, n, K, lpr;          // format, rows, inputs, lanes per row (K / 128)
+  long long task0, ntask;      // first warp task of this job in the table, warp tasks (32 / lpr rows each)
+  const uint8_t* w;            // Q7ZT base / Q4TG2, Q5K blocks / Q6K repacked 208-byte blocks
+  const uint64_t* hdr;         // Q7ZT
+  const uint8_t* mask;         // Q7ZT
+  const uint32_t* hb;          // Q7ZT
+  const uint16_t* d6;          // Q6K d per 256-block
+  const int8_t* xq;            // activation int8, K
+  const float* xs;             // activation scale per 32
+  const int* xsum;             // activation sum per 32
+  float* y;                    // n outputs
+};
+
+__constant__ float c_grid[4][16];
+
+__device__ __forceinline__ int4 ld_cs4(const void* p) {
+  int4 r;
+  asm volatile("ld.global.cs.v4.s32 {%0, %1, %2, %3}, [%4];" : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "l"(p));
+  return r;
+}
+
+__device__ __forceinline__ int sx8(const int* xw, int i) {  // int8 value i of a 128-value activation slice in 32 words
+  return static_cast<int>(static_cast<int8_t>((xw[i >> 2] >> (8 * (i & 3))) & 0xff));
+}
+
+// one lane's part (128 values = 4 sub-blocks of 32) of one row; returns the partial dot product
+__device__ float lane_part(const Job& J, int r, int part) {
+  const int B = part >> 1, half = part & 1, nB = J.K / 256;
+  const long long rb = static_cast<long long>(r) * nB + B;
+  const int jg0 = B * 8 + half * 4;  // first 32-block of the part in the row
+  int xw[32];
+  {
+    const int4* x4 = reinterpret_cast<const int4*>(J.xq + jg0 * 32);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int4 t = __ldg(x4 + i);
+      xw[4 * i] = t.x; xw[4 * i + 1] = t.y; xw[4 * i + 2] = t.z; xw[4 * i + 3] = t.w;
+    }
+  }
+  float acc = 0.f;
+  if (J.fmt == r3::kQ7ZT) {
+    uint32_t wd[29];
+    const uint8_t* bp = J.w + rb * 224 + half * 112;
+#pragma unroll
+    for (int i = 0; i < 7; ++i) {
+      const int4 t = ld_cs4(bp + 16 * i);
+      wd[4 * i] = t.x; wd[4 * i + 1] = t.y; wd[4 * i + 2] = t.z; wd[4 * i + 3] = t.w;
+    }
+    wd[28] = 0u;
+    const uint64_t h = J.hdr[rb];
+    const unsigned m = J.mask[rb];
+    const float d = __half2float(__ushort_as_half(static_cast<unsigned short>(h & 0xffffu)));
+#pragma unroll
+    for (int jj = 0; jj < 4; ++jj) {
+      const int j = half * 4 + jj, jg = jg0 + jj;
+      int pb = 0;
+#pragma unroll
+      for (int g = 0; g < 8; ++g) {
+        uint32_t packed = 0;
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+          const int i = 32 * jj + 4 * g + t, bit = 7 * i;
+          packed |= (__funnelshift_r(wd[bit >> 5], wd[(bit >> 5) + 1], bit & 31) & 127u) << (8 * t);
+        }
+        pb = __dp4a(static_cast<int>(packed), xw[8 * jj + g], pb);
+      }
+      int hx = 0;
+      if ((m >> j) & 1u) {
+        const uint32_t H = J.hb[rb * 2 + __popc(m & ((1u << j) - 1u))];
+#pragma unroll
+        for (int g = 0; g < 8; ++g) {
+          const uint32_t nib = (H >> (4 * g)) & 0xfu;
+          hx = __dp4a(static_cast<int>((nib * 0x00204081u) & 0x01010101u), xw[8 * jj + g], hx);
+        }
+      }
+      const int P = 2 * pb - 127 * __ldg(J.xsum + jg) + hx;  // sum (2b + h - 127) x
+      const float s = (d * static_cast<float>((h >> (16 + 6 * j)) & 63u)) / 63.f;
+      acc += s * __ldg(J.xs + jg) * static_cast<float>(P);
+    }
+  } else if (J.fmt == r3::kQ4TG2) {
+    const uint8_t* bp = J.w + rb * 144;
+    const int4 hd = ld_cs4(bp);
+    int4 c[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) c[i] = ld_cs4(bp + 16 + half * 64 + 16 * i);
+    const uint32_t cw[16] = {static_cast<uint32_t>(c[0].x), static_cast<uint32_t>(c[0].y), static_cast<uint32_t>(c[0].z), static_cast<uint32_t>(c[0].w),
+                             static_cast<uint32_t>(c[1].x), static_cast<uint32_t>(c[1].y), static_cast<uint32_t>(c[1].z), static_cast<uint32_t>(c[1].w),
+                             static_cast<uint32_t>(c[2].x), static_cast<uint32_t>(c[2].y), static_cast<uint32_t>(c[2].z), static_cast<uint32_t>(c[2].w),
+                             static_cast<uint32_t>(c[3].x), static_cast<uint32_t>(c[3].y), static_cast<uint32_t>(c[3].z), static_cast<uint32_t>(c[3].w)};
+    const uint32_t h0 = static_cast<uint32_t>(hd.x), h1 = static_cast<uint32_t>(hd.y);
+    const uint64_t lv = (static_cast<uint64_t>(h0 >> 16)) | (static_cast<uint64_t>(h1) << 16);  // 6 level bytes at 2..7
+    const float d = __half2float(__ushort_as_half(static_cast<unsigned short>(h0 & 0xffffu)));
+    const uint64_t tags = static_cast<uint64_t>(static_cast<uint32_t>(hd.z)) | (static_cast<uint64_t>(static_cast<uint32_t>(hd.w)) << 32);
+#pragma unroll
+    for (int jj = 0; jj < 4; ++jj) {
+      const int j = half * 4 + jj, jg = jg0 + jj;
+      const unsigned tb = static_cast<unsigned>((tags >> (8 * j)) & 0xffu);
+      float sum = 0.f;
+#pragma unroll
+      for (int g = 0; g < 4; ++g) {
+        const float* gr = c_grid[(tb >> (2 * g)) & 3u];
+        const uint32_t word = cw[jj * 4 + g];  // 8 codes = values 32 jj + 8 g .. + 7 of the part
+#pragma unroll
+        for (int k = 0; k < 8; ++k) sum += gr[(word >> (4 * k)) & 15u] * static_cast<float>(sx8(xw, 32 * jj + 8 * g + k));
+      }
+      const float s = (d * static_cast<float>((lv >> (6 * j)) & 63u)) / 63.f;
+      acc += s * __ldg(J.xs + jg) * sum;
+    }
+  } else if (J.fmt == r3::kQ5K) {
+    const uint8_t* bp = J.w + rb * 176;
+    const int4 hd = ld_cs4(bp);
+    const int4 qa = ld_cs4(bp + 16), qb = ld_cs4(bp + 32);
+    int4 ql[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) ql[i] = ld_cs4(bp + 48 + half * 64 + 16 * i);
+    uint8_t hb[4], qh[32], qlb[64];
+    memcpy(hb, &hd, 4);
+    memcpy(qh, &qa, 16);
+    memcpy(qh + 16, &qb, 16);
+    memcpy(qlb, ql, 64);
+    const float d = __half2float(__ushort_as_half(static_cast<unsigned short>(hb[0] | (hb[1] << 8))));
+    const float dmin = __half2float(__ushort_as_half(static_cast<unsigned short>(hb[2] | (hb[3] << 8))));
+#pragma unroll
+    for (int jj = 0; jj < 4; ++jj) {
+      const int j = half * 4 + jj, jg = jg0 + jj;
+      // the 12 scale bytes sit in header words y, z, w (bytes 4..15); read by shifts, so nothing goes to local memory
+      const uint32_t s0 = static_cast<uint32_t>(hd.y), s1 = static_cast<uint32_t>(hd.z), s2 = static_cast<uint32_t>(hd.w);
+      auto qb = [&](int k) { return static_cast<int>(((k < 4 ? s0 : (k < 8 ? s1 : s2)) >> (8 * (k & 3))) & 0xffu); };
+      int sc, mn;
+      if (j < 4) {
+        sc = qb(j) & 63;
+        mn = qb(j + 4) & 63;
+      } else {
+        sc = (qb(j + 4) & 0xF) | ((qb(j - 4) >> 6) << 4);
+        mn = (qb(j + 4) >> 4) | ((qb(j) >> 6) << 4);
+      }
+      const uint8_t* q = qlb + 32 * (jj >> 1);
+      int sq = 0;
+#pragma unroll
+      for (int l = 0; l < 32; ++l) {
+        const int lo = (j & 1) ? (q[l] >> 4) : (q[l] & 0xF);
+        sq += (lo + (((qh[l] >> j) & 1) << 4)) * sx8(xw, 32 * jj + l);
+      }
+      acc += __ldg(J.xs + jg) * (d * static_cast<float>(sc) * static_cast<float>(sq) - dmin * static_cast<float>(mn) * static_cast<float>(__ldg(J.xsum + jg)));
+    }
+  } else {  // kQ6K
+    const uint8_t* bp = J.w + rb * 208;
+    int4 l4[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) l4[i] = ld_cs4(bp + half * 64 + 16 * i);
+    const int4 h4a = ld_cs4(bp + 128 + half * 32), h4b = ld_cs4(bp + 128 + half * 32 + 16);
+    const uint2 s2 = *reinterpret_cast<const uint2*>(bp + 192 + half * 8);
+    uint8_t ql[64], qh[32];
+    int8_t sc[8];
+    memcpy(ql, l4, 64);
+    memcpy(qh, &h4a, 16);
+    memcpy(qh + 16, &h4b, 16);
+    memcpy(sc, &s2, 8);
+    const float d = __half2float(__ushort_as_half(J.d6[rb]));
+#pragma unroll
+    for (int p = 0; p < 4; ++p) {
+      const int jg = jg0 + p;
+      int s0 = 0, s1 = 0;
+#pragma unroll
+      for (int l = 0; l < 32; ++l) {
+        int q;
+        if (p == 0) q = (ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4);
+        else if (p == 1) q = (ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4);
+        else if (p == 2) q = (ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4);
+        else q = (ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4);
+        const int v = (q - 32) * sx8(xw, 32 * p + l);
+        if (l < 16) s0 += v; else s1 += v;
+      }
+      acc += d * __ldg(J.xs + jg) * static_cast<float>(sc[2 * p] * s0 + sc[2 * p + 1] * s1);
+    }
+  }
+  return acc;
+}
+
+__device__ __forceinline__ void run_task(const Job* __restrict__ jobs, int njobs, long long t) {
+  int lo = 0, hi = njobs - 1;  // the job whose task range holds t
+  while (lo < hi) {
+    const int mid = (lo + hi + 1) / 2;
+    if (jobs[mid].task0 <= t) lo = mid; else hi = mid - 1;
+  }
+  const Job& J = jobs[lo];
+  const int lane = threadIdx.x & 31, rpw = 32 / J.lpr;
+  const int r = static_cast<int>((t - J.task0) * rpw) + lane / J.lpr, part = lane % J.lpr;
+  float acc = r < J.n ? lane_part(J, r, part) : 0.f;
+  for (int o = J.lpr / 2; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+  if (r < J.n && part == 0) J.y[r] = acc;
+}
+
+// (a) and (b): every warp walks the task range [t_begin, t_end) of the table
+__global__ void __launch_bounds__(256) r3_stream(const Job* __restrict__ jobs, int njobs, long long t_begin, long long t_end) {
+  const long long warps = static_cast<long long>(gridDim.x) * (blockDim.x / 32);
+  for (long long t = t_begin + (static_cast<long long>(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32); t < t_end; t += warps)
+    run_task(jobs, njobs, t);
+}
+
+// (c): stages in order, a grid-wide sync between them (cooperative launch)
+__global__ void __launch_bounds__(256) r3_staged(const Job* __restrict__ jobs, int njobs, const long long* __restrict__ stage_end, int nstages) {
+  cg::grid_group grid = cg::this_grid();
+  const long long warps = static_cast<long long>(gridDim.x) * (blockDim.x / 32);
+  const long long w0 = static_cast<long long>(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32;
+  long long begin = 0;
+  for (int s = 0; s < nstages; ++s) {
+    for (long long t = begin + w0; t < stage_end[s]; t += warps) run_task(jobs, njobs, t);
+    begin = stage_end[s];
+    grid.sync();
+  }
+}
+
+// ------------------------------------------------------------------------------------------------ host
+static const size_t kFlush = 64ull << 20;
+
+struct Mat {  // one weight matrix on the host and the device
+  int fmt = 0, n = 0, K = 0;
+  std::vector<uint8_t> w;     // device-layout weight bytes
+  std::vector<uint64_t> hdr;  // Q7ZT
+  std::vector<uint8_t> mask;  // Q7ZT
+  std::vector<uint32_t> hb;   // Q7ZT
+  std::vector<uint16_t> d6;   // Q6K
+  uint8_t* dw = nullptr;
+  uint64_t* dhdr = nullptr;
+  uint8_t* dmask = nullptr;
+  uint32_t* dhb = nullptr;
+  uint16_t* dd6 = nullptr;
+  size_t bytes() const { return w.size() + hdr.size() * 8 + mask.size() + hb.size() * 4 + d6.size() * 2; }
+};
+
+static uint16_t f2h(float f) {  // round to nearest fp16 (normal range only; the scales used here are normal)
+  uint32_t b;
+  std::memcpy(&b, &f, 4);
+  const uint32_t s = (b >> 16) & 0x8000u;
+  int e = static_cast<int>((b >> 23) & 255) - 127 + 15;
+  uint32_t m = b & 0x7fffffu;
+  if (e <= 0) return static_cast<uint16_t>(s);
+  uint32_t h = s | (static_cast<uint32_t>(e) << 10) | (m >> 13);
+  if ((m & 0x1fffu) > 0x1000u || ((m & 0x1fffu) == 0x1000u && (h & 1u))) ++h;
+  return static_cast<uint16_t>(h);
+}
+
+static void make_mat(Mat& M, int fmt, int n, int K, std::mt19937& rng) {
+  M.fmt = fmt;
+  M.n = n;
+  M.K = K;
+  const int nB = K / 256;
+  const size_t blocks = static_cast<size_t>(n) * nB;
+  std::uniform_int_distribution<int> byte(0, 255), lv(20, 63), pick(0, 7), s6(8, 63), s8(-40, 40);
+  std::uniform_real_distribution<float> ud(0.5f, 1.5f);
+  if (fmt == r3::kQ7ZT) {
+    M.w.resize(blocks * 224);
+    M.hdr.resize(blocks);
+    M.mask.resize(blocks);
+    M.hb.resize(blocks * 2);
+    for (size_t b = 0; b < blocks; ++b) {
+      uint64_t h = f2h(0.0004f * ud(rng));
+      for (int j = 0; j < 8; ++j) h |= static_cast<uint64_t>(lv(rng)) << (16 + 6 * j);
+      M.hdr[b] = h;
+      int g1 = pick(rng), g2 = pick(rng);
+      while (g2 == g1) g2 = pick(rng);
+      M.mask[b] = static_cast<uint8_t>((1u << g1) | (1u << g2));
+      for (int i = 0; i < 224; ++i) M.w[b * 224 + i] = static_cast<uint8_t>(byte(rng));
+      M.hb[b * 2] = static_cast<uint32_t>(rng());
+      M.hb[b * 2 + 1] = static_cast<uint32_t>(rng());
+    }
+  } else if (fmt == r3::kQ4TG2) {
+    M.w.resize(blocks * 144);
+    for (size_t b = 0; b < blocks; ++b) {
+      uint8_t* p = M.w.data() + b * 144;
+      const uint16_t d = f2h(0.0004f * ud(rng));
+      p[0] = static_cast<uint8_t>(d & 0xff);
+      p[1] = static_cast<uint8_t>(d >> 8);
+      uint64_t packed = 0;
+      for (int j = 0; j < 8; ++j) packed |= static_cast<uint64_t>(lv(rng)) << (6 * j);
+      for (int i = 0; i < 6; ++i) p[2 + i] = static_cast<uint8_t>(packed >> (8 * i));
+      for (int i = 8; i < 144; ++i) p[i] = static_cast<uint8_t>(byte(rng));
+    }
+  } else if (fmt == r3::kQ5K) {
+    M.w.resize(blocks * 176);
+    for (size_t b = 0; b < blocks; ++b) {
+      uint8_t* p = M.w.data() + b * 176;
+      const uint16_t d = f2h(0.0002f * ud(rng)), dm = f2h(0.0003f * ud(rng));
+      p[0] = static_cast<uint8_t>(d & 0xff); p[1] = static_cast<uint8_t>(d >> 8);
+      p[2] = static_cast<uint8_t>(dm & 0xff); p[3] = static_cast<uint8_t>(dm >> 8);
+      for (int i = 4; i < 176; ++i) p[i] = static_cast<uint8_t>(byte(rng));
+    }
+  } else {
+    M.w.resize(blocks * 208);
+    M.d6.resize(blocks);
+    for (size_t b = 0; b < blocks; ++b) {
+      uint8_t* p = M.w.data() + b * 208;
+      for (int i = 0; i < 192; ++i) p[i] = static_cast<uint8_t>(byte(rng));
+      for (int i = 0; i < 16; ++i) p[192 + i] = static_cast<uint8_t>(static_cast<int8_t>(s8(rng)));
+      M.d6[b] = f2h(0.00002f * ud(rng));
+    }
+  }
+}
+
+template <typename T>
+static T* up(const std::vector<T>& v) {
+  if (v.empty()) return nullptr;
+  T* d;
+  CK(cudaMalloc(&d, v.size() * sizeof(T)));
+  CK(cudaMemcpy(d, v.data(), v.size() * sizeof(T), cudaMemcpyHostToDevice));
+  return d;
+}
+
+static void upload(Mat& M) {
+  M.dw = up(M.w);
+  M.dhdr = up(M.hdr);
+  M.dmask = up(M.mask);
+  M.dhb = up(M.hb);
+  M.dd6 = up(M.d6);
+}
+
+struct Act {
+  int K = 0;
+  std::vector<int> q;
+  std::vector<float> s;
+  std::vector<int> sum;
+  int8_t* dq = nullptr;
+  float* ds = nullptr;
+  int* dsum = nullptr;
+};
+
+static void make_act(Act& A, int K, std::mt19937& rng) {
+  A.K = K;
+  std::normal_distribution<float> nd(0.f, 1.f);
+  std::vector<float> x(static_cast<size_t>(K));
+  for (int b = 0; b < K / 32; ++b) {
+    const float e = std::exp(0.8f * nd(rng));
+    for (int i = 0; i < 32; ++i) x[static_cast<size_t>(b * 32 + i)] = nd(rng) * e;
+  }
+  A.q.assign(static_cast<size_t>(K), 0);
+  A.s.assign(static_cast<size_t>(K / 32), 0.f);
+  A.sum.assign(static_cast<size_t>(K / 32), 0);
+  std::vector<int8_t> q8(static_cast<size_t>(K));
+  for (int b = 0; b < K / 32; ++b) {
+    float m = 0.f;
+    for (int i = 0; i < 32; ++i) m = std::max(m, std::fabs(x[static_cast<size_t>(b * 32 + i)]));
+    const float s = m > 0.f ? m / 127.f : 1.f;
+    A.s[static_cast<size_t>(b)] = s;
+    for (int i = 0; i < 32; ++i) {
+      const int v = std::max(-127, std::min(127, static_cast<int>(std::nearbyint(x[static_cast<size_t>(b * 32 + i)] / s))));
+      A.q[static_cast<size_t>(b * 32 + i)] = v;
+      q8[static_cast<size_t>(b * 32 + i)] = static_cast<int8_t>(v);
+      A.sum[static_cast<size_t>(b)] += v;
+    }
+  }
+  A.dq = up(q8);
+  A.ds = up(A.s);
+  A.dsum = up(A.sum);
+}
+
+// host reference: sum over 32-blocks of scale x (decoded weights . int8 activation), in double
+static std::vector<double> reference(const Mat& M, const Act& A) {
+  const int nB = M.K / 256;
+  std::vector<double> y(static_cast<size_t>(M.n));
+  float w[32];
+  for (int r = 0; r < M.n; ++r) {
+    double acc = 0;
+    for (int B = 0; B < nB; ++B) {
+      const long long rb = static_cast<long long>(r) * nB + B;
+      for (int j = 0; j < 8; ++j) {
+        if (M.fmt == r3::kQ7ZT) r3::q7zt_decode32(M.w.data(), M.hdr.data(), M.mask.data(), M.hb.data(), rb, j, w);
+        else if (M.fmt == r3::kQ4TG2) r3::q4tg2_decode32(M.w.data() + rb * 144, j, w);
+        else if (M.fmt == r3::kQ5K) r3::q5k_decode32(M.w.data() + rb * 176, j, w);
+        else r3::q6k_decode32(M.w.data() + rb * 208, M.d6[static_cast<size_t>(rb)], j, w);
+        double p = 0;
+        for (int i = 0; i < 32; ++i) p += static_cast<double>(w[i]) * A.q[static_cast<size_t>(B * 256 + j * 32 + i)];
+        acc += p * A.s[static_cast<size_t>(B * 8 + j)];
+      }
+    }
+    y[static_cast<size_t>(r)] = acc;
+  }
+  return y;
+}
+
+static Job job_of(const Mat& M, const Act& A, float* y) {
+  Job J{};
+  J.fmt = M.fmt; J.n = M.n; J.K = M.K; J.lpr = M.K / 128;
+  J.ntask = (M.n + 32 / J.lpr - 1) / (32 / J.lpr);
+  J.w = M.dw; J.hdr = M.dhdr; J.mask = M.dmask; J.hb = M.dhb; J.d6 = M.dd6;
+  J.xq = A.dq; J.xs = A.ds; J.xsum = A.dsum; J.y = y;
+  return J;
+}
+
+static void set_grids() {
+  float g[4][16];
+  for (int t = 0; t < 4; ++t)
+    for (int i = 0; i < 16; ++i) g[t][i] = r3::tg2_grid(t, i);
+  CK(cudaMemcpyToSymbol(c_grid, g, sizeof g));
+}
+
+static int sms() {
+  int n = 0;
+  CK(cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, 0));
+  return n;
+}
+
+// ---- check: one matrix of every format and shape, GPU vs the host reference
+static int run_check() {
+  set_grids();
+  std::mt19937 rng(2026);
+  const struct { int fmt, n, K; const char* name; } C[] = {
+      {r3::kQ7ZT, 2048, 2048, "Q7_ZT 2048 x 2048"}, {r3::kQ7ZT, 512, 4096, "Q7_ZT 512 x 4096"}, {r3::kQ7ZT, 2048, 512, "Q7_ZT 2048 x 512"},
+      {r3::kQ4TG2, 512, 2048, "Q4_TG2 512 x 2048 (expert gate/up)"}, {r3::kQ5K, 2048, 512, "Q5_K 2048 x 512 (expert down)"},
+      {r3::kQ6K, 4096, 2048, "Q6_K 4096 x 2048 (output head rows)"}};
+  Act A512, A2048, A4096;
+  make_act(A512, 512, rng);
+  make_act(A2048, 2048, rng);
+  make_act(A4096, 4096, rng);
+  int fails = 0;
+  for (const auto& c : C) {
+    Mat M;
+    make_mat(M, c.fmt, c.n, c.K, rng);
+    upload(M);
+    const Act& A = c.K == 512 ? A512 : (c.K == 2048 ? A2048 : A4096);
+    float* dy;
+    CK(cudaMalloc(&dy, c.n * 4));
+    Job J = job_of(M, A, dy);
+    J.task0 = 0;
+    Job* dj = up(std::vector<Job>{J});
+    r3_stream<<<sms() * 4, 256>>>(dj, 1, 0, J.ntask);
+    CK(cudaDeviceSynchronize());
+    std::vector<float> yg(static_cast<size_t>(c.n));
+    CK(cudaMemcpy(yg.data(), dy, c.n * 4, cudaMemcpyDeviceToHost));
+    const std::vector<double> yr = reference(M, A);
+    double worst = 0, scale = 0;
+    for (int r = 0; r < c.n; ++r) {
+      scale = std::max(scale, std::fabs(yr[static_cast<size_t>(r)]));
+      worst = std::max(worst, std::fabs(yg[static_cast<size_t>(r)] - yr[static_cast<size_t>(r)]));
+    }
+    const bool ok = worst / scale < 2e-5;
+    std::printf("  %-38s max error %.2e of max |y| %.3g (%s)\n", c.name, worst / scale, scale, ok ? "ok" : "FAIL");
+    fails += !ok;
+  }
+  std::printf("%s\n", fails ? "SOME FORMATS FAILED" : "every format matches the host reference");
+  return fails ? 1 : 0;
+}
+
+// ---- stream: one token's weight reads, three ways
+static int run_stream() {
+  set_grids();
+  std::mt19937 rng(7);
+  const int nsm = sms();
+  cudaDeviceProp prop;
+  CK(cudaGetDeviceProperties(&prop, 0));
+  Act A512, A2048, A4096;
+  make_act(A512, 512, rng);
+  make_act(A2048, 2048, rng);
+  make_act(A4096, 4096, rng);
+  // four distinct layers (one attention, three DeltaNet), reused cyclically for 40 (a 4-layer cycle is ~200 MB, far past
+  // the 36 MB L2, so every read is cold); 7 hot experts per layer (Q4_TG2 gate and up, Q5_K down), output head Q6_K
+  struct L { std::vector<Mat> m; std::vector<int> stage; std::vector<const Act*> a; };
+  std::vector<L> layers(4);
+  auto add = [&](L& l, int fmt, int n, int K, int st) {
+    l.m.emplace_back();
+    make_mat(l.m.back(), fmt, n, K, rng);
+    l.stage.push_back(st);
+    l.a.push_back(K == 512 ? &A512 : (K == 2048 ? &A2048 : &A4096));
+  };
+  for (int li = 0; li < 4; ++li) {
+    L& l = layers[static_cast<size_t>(li)];
+    if (li == 0) {  // attention: q (with gate), k, v | o
+      add(l, r3::kQ7ZT, 8192, 2048, 0); add(l, r3::kQ7ZT, 512, 2048, 0); add(l, r3::kQ7ZT, 512, 2048, 0);
+      add(l, r3::kQ7ZT, 2048, 4096, 1);
+    } else {        // DeltaNet: qkv, gate | ssm_out
+      add(l, r3::kQ7ZT, 8192, 2048, 0); add(l, r3::kQ7ZT, 4096, 2048, 0);
+      add(l, r3::kQ7ZT, 2048, 4096, 1);
+    }
+    add(l, r3::kQ7ZT, 512, 2048, 2); add(l, r3::kQ7ZT, 512, 2048, 2);  // shared expert gate, up
+    for (int e = 0; e < 7; ++e) { add(l, r3::kQ4TG2, 512, 2048, 2); add(l, r3::kQ4TG2, 512, 2048, 2); }
+    add(l, r3::kQ7ZT, 2048, 512, 3);  // shared expert down
+    for (int e = 0; e < 7; ++e) add(l, r3::kQ5K, 2048, 512, 3);
+    for (Mat& m : l.m) upload(m);
+  }
+  Mat head;
+  make_mat(head, r3::kQ6K, 248320, 2048, rng);
+  upload(head);
+  // the token's job table: 40 layers in order, 4 stages each, then the head (stage 160)
+  std::vector<Job> jobs;
+  std::vector<int> jstage;
+  float* dy;
+  CK(cudaMalloc(&dy, 248320 * 4));  // every job writes into the same scratch output (timing only)
+  size_t bytes = 0;
+  for (int L = 0; L < 40; ++L) {
+    const auto& l = layers[static_cast<size_t>(L % 4 == 3 ? 0 : 1 + L % 3)];  // attention on every 4th layer
+    for (int st = 0; st < 4; ++st)
+      for (size_t i = 0; i < l.m.size(); ++i)
+        if (l.stage[i] == st) {
+          jobs.push_back(job_of(l.m[i], *l.a[i], dy));
+          jstage.push_back(4 * L + st);
+          bytes += l.m[i].bytes();
+        }
+  }
+  jobs.push_back(job_of(head, A2048, dy));
+  jstage.push_back(160);
+  bytes += head.bytes();
+  long long t = 0;
+  for (Job& J : jobs) { J.task0 = t; t += J.ntask; }
+  const long long total = t;
+  const int nstages = 161;
+  std::vector<long long> stage_end(nstages, 0);
+  for (size_t i = 0; i < jobs.size(); ++i) stage_end[static_cast<size_t>(jstage[i])] = jobs[i].task0 + jobs[i].ntask;
+  Job* dj = up(jobs);
+  long long* dse = up(stage_end);
+  void* flush;
+  CK(cudaMalloc(&flush, kFlush));
+  cudaEvent_t e0, e1;
+  CK(cudaEventCreate(&e0));
+  CK(cudaEventCreate(&e1));
+  auto timed = [&](auto body) {
+    std::vector<float> ts;
+    body();
+    CK(cudaDeviceSynchronize());
+    for (int rep = 0; rep < 7; ++rep) {
+      CK(cudaMemsetAsync(flush, rep & 0xff, kFlush));
+      CK(cudaEventRecord(e0));
+      body();
+      CK(cudaEventRecord(e1));
+      CK(cudaEventSynchronize(e1));
+      float ms = 0;
+      CK(cudaEventElapsedTime(&ms, e0, e1));
+      ts.push_back(ms);
+    }
+    std::sort(ts.begin(), ts.end());
+    return static_cast<double>(ts[ts.size() / 2]);
+  };
+  size_t head_bytes = head.bytes();
+  std::printf("device %s, %d SMs; one token: %zu jobs (40 layers x [dense Q7_ZT, shared expert, 7 experts Q4_TG2 gate/up + Q5_K down] + "
+              "Q6_K head), %.3f GB of weights (head %.3f GB), %lld warp tasks; cold (64 MiB written first), median of 7\n",
+              prop.name, nsm, jobs.size(), bytes / 1e9, head_bytes / 1e9, total);
+  // (a) one launch per matrix, queued back to back
+  const double ta = timed([&] {
+    for (size_t i = 0; i < jobs.size(); ++i) {
+      const long long tasks = jobs[i].ntask;
+      const int grid = static_cast<int>(std::min<long long>((tasks + 7) / 8, nsm * 8LL));
+      r3_stream<<<std::max(grid, 1), 256>>>(dj, static_cast<int>(jobs.size()), jobs[i].task0, jobs[i].task0 + tasks);
+    }
+  });
+  // (b) one launch for the whole table
+  int occ = 0;
+  CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, r3_stream, 256, 0));
+  const double tb = timed([&] { r3_stream<<<nsm * occ, 256>>>(dj, static_cast<int>(jobs.size()), 0, total); });
+  // (c) one cooperative launch, a grid-wide sync after every stage
+  int occc = 0;
+  CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occc, r3_staged, 256, 0));
+  int njobs = static_cast<int>(jobs.size()), nst = nstages;
+  void* args[] = {&dj, &njobs, &dse, &nst};
+  const double tc = timed([&] { CK(cudaLaunchCooperativeKernel(reinterpret_cast<void*>(r3_staged), dim3(nsm * occc), dim3(256), args, 0, nullptr)); });
+  CK(cudaGetLastError());
+  auto row = [&](const char* name, double ms) {
+    std::printf("  %-58s %8.3f ms  %6.1f GB/s\n", name, ms, bytes / (ms * 1e6));
+  };
+  row("(a) one launch per matrix (today's kernels), queued", ta);
+  row("(b) one streaming launch, whole table", tb);
+  row("(c) one cooperative launch, grid sync after each of 161 stages", tc);
+  std::printf("  blocks: (b) %d per SM, (c) %d per SM; (c) - (b) = %.3f ms over 160 syncs = %.2f us per stage boundary\n", occ, occc, tc - tb,
+              (tc - tb) * 1e3 / 160.0);
+  CK(cudaFree(flush));
+  return 0;
+}
+
+int main(int argc, char** argv) {
+  const std::string cmd = argc > 1 ? argv[1] : "";
+  if (cmd == "check") return run_check();
+  if (cmd == "stream") return run_stream();
+  std::fprintf(stderr, "usage: r3 check | stream\n");
+  return 1;
+}
