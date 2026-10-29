@@ -1,6 +1,6 @@
 # Pelias: what we found by thinking outside the box, and how it compares
 
-*Draft of 2026-10-28 16:1x. One result is still running (the live H gate, step 1 of the 1-bit decoder); its line is marked. A second update follows when the 1-bit decoder runs as a real kernel.*
+*Updated 2026-10-29 00:1x: the 1-bit decoder now runs as a real GPU kernel and through a whole model, exact. Previous version: 2026-10-28 16:1x.*
 
 ## Plain-language summary
 
@@ -11,8 +11,20 @@ Three things made the difference:
 1. **We rotate the numbers before storing them.** A simple mathematical shuffle (Walsh-Hadamard, in groups of 32) spreads out the few extreme values that make rounding hard. It cut the file's error by about 9 %, and it makes the 8-bit maths the graphics card is fastest at cost nothing in accuracy.
 2. **We store 7 bits and add the 8th only where it matters.** Computers like 8 bits; 7 is "odd" and normally awkward. We keep a 7-bit base everywhere and save the 8th bit only on the quarter of each block where it removes the most error. When the computer calculates, every number becomes an exact 8-bit number again, so the fast hardware sees what it expects.
 3. **We put idle parts of the chip to work.** The extra bit can be added with a simple "count the ones" instruction that the processor's integer units can do while the main maths units are busy, on either the CPU or the graphics card, and the base and the extra bit can even live in different memory.
+4. **The 1-bit decoder works.** On the graphics card, the 7-bit file now runs 5.7-6.9 % faster than the 8-bit one on the large matrices, with every result exact. Across a whole model, adding the 8th bit by counting ones gives exactly the same numbers as rebuilding full 8-bit values. Filling the 7 bits back to 8 is what recovers the accuracy: pure 7-bit costs about 8x more error than 7 bits plus the gated 8th.
 
-**Where it stands:** our 7.53-bit file is **236 MB smaller than Unsloth's and slightly more accurate** (0.012536 against 0.012864; not yet a statistically settled win), and it is **as accurate as our own 8-bit file**. The speed is the part still to be measured in the engine.
+**Where it stands:** our 7.53-bit file is **236 MB smaller than Unsloth's and slightly more accurate** (0.012536 against 0.012864; not yet a statistically settled win), and it is **as accurate as our own 8-bit file**. On the author's own chat text the order holds (0.021198 against Unsloth's 0.022368, not yet settled). The speed of the whole engine is still to be measured.
+
+## New for consumer PCs (what we have not seen done elsewhere)
+
+| What | Why it matters on a home PC | Status |
+|---|---|---|
+| A 7-bit file that the 8-bit hardware reads as exact 8-bit, 236 MB smaller | More of the model fits on a 12 GB card at the same accuracy | MEASURED |
+| The 8th bit stored separately and added back by counting ones (1-bit decoder) | Base and extra bit can sit in different memory (card, RAM) and be added by idle units; exact | MEASURED (GPU kernel, whole model) |
+| A 7-bit GPU kernel faster than the 8-bit one | Fewer bytes per token, the limit on a consumer card | MEASURED (5.7-6.9 % on large matrices) |
+| The miss map (the author's accuracy-assisted miss map) | The hard tokens repeat across every file tested (47-66 % shared, 1 % by chance) and hold a quarter to a half of the error; logging them tells the system where to spend extra bits | MEASURED (pattern); map PLAN |
+| Bit tags per 8 values (the author's bit-tag matrix) with a 0 level | Same bytes as Q4_K, about 11 % less weighted error on real experts in the sandbox | MEASURED (sandbox); whole model next |
+| CPU and GPU reading RAM at once | 93 % of the memory's rated speed on a consumer desktop | MEASURED (probe) |
 
 ## Scoreboard (whole model, measured)
 
@@ -26,7 +38,11 @@ Paired runs over the same 25,500 tokens, 8-bit activations as the engine uses th
 | urm_Q7 | Q7_Z, pure 7-bit, 7.25 bits | 0.013524 | +0.000660, **resolved worse** | -305.1 MB |
 | urm_ZT (first version, weighted levels) | Q7_ZT, 7.53 bits | 0.012870 | -0.000006, exact tie | -236.4 MB |
 | **urm_ZT2 (fixed)** | **Q7_ZT, 7.53 bits** | **0.012536** | **-0.000328, not resolved** | **-236.4 MB** |
-| urm_Z with the live H gate (25 %) | Q8_Z stored, ~7.5 bits read | *running* | *at chunk 20: 0.01213 vs urm_Z 0.01189 (partial)* | -61.0 MB stored |
+| urm_Z with the live H gate (25 %) | Q8_Z stored, ~7.5 bits read | 0.012919 | +0.000055, tie | -61.0 MB stored |
+| urm_ZT2 through the 1-bit decoder (run D) | Q7_ZT, 8th bit by counting ones | 0.012923 | +0.000059, tie (vs the float path: +0.000387, not resolved; int8 rounding flips, see A) | -236.4 MB |
+| urm_TG (expert gate/up as Q4_TG, bit tags) | Q7_ZT dense | 0.012876 | +0.000012, tie | -236.4 MB |
+
+**On the author's own chat text** (run C; 53,334 tokens, never published): urm_Z 0.020977, urm_ZT2 0.021198, Unsloth 0.022368. Ours lower by 0.0012-0.0014, not resolved (chat text swings about 4x more from chunk to chunk).
 
 ## What makes the system possible (the chain)
 
@@ -58,6 +74,10 @@ Labels: **MEASURED (whole model)** = paired run on the PC; **MEASURED (sandbox)*
 | Fused int8 kernel (v10) [4] | 1.39-1.84x the bf16 path, all 20 shapes, quantization fused into RMSNorm | MEASURED (kernel bench) |
 | Grouped int8 launch for all experts (v12) [5] | 2.5-3.0x the bf16 kernel grouped the same way | MEASURED (kernel bench) |
 | Dual bus | CPU and GPU reading RAM at once: 26.56 + 21.06 = 47.62 GB/s, 93 % of the 51.2 GB/s peak | MEASURED (probe) |
+| **1-bit decoder on the GPU (T-decode kernel v2)** | Every route exact; Q7_ZT fold 5.7-6.9 % faster than Q8_Z cold on the large shapes; the 1-bit route tie to +7 % vs fold; the 1-bit tensor path 937.4 T bit-MAC/s, 8.00x int8 | MEASURED (GPU probe) |
+| **1-bit decoder through a whole model** | Bit-identical to the integer fold over a full forward pass (max logit difference 0); against the float path, int8 rounding flips give a noise floor of about +-0.0004 KL on 100 chunks | MEASURED |
+| Live H gate (25 %) | 0.012919: ties Unsloth; the fixed gate (Q7_ZT) stays the choice | MEASURED |
+| Hard tokens repeat across files (C6) | Top-1 % KL tokens shared 47-66 % between files (own text 59-63 %), 1 % by chance; they hold 23-26 % of the KL (own text 52 %); logging them changes nothing (exact) | MEASURED |
 
 ### B. Working in the sandbox
 
@@ -72,7 +92,10 @@ Labels: **MEASURED (whole model)** = paired run on the PC; **MEASURED (sandbox)*
 | J1 split (CPU base + GPU H plane) | Integer-exact | MEASURED (unit test) |
 | fp16 partial sums (texture path) | 0.22 % output error against the format's own 0.54 % | MEASURED (sandbox) |
 | _PT tag bits [6] | Spare word bits used as scale tags: 28-67 % less error than leaving them empty | MEASURED (sandbox) |
-| Live H gate (`--h-gate live:F`) | Built and unit-tested; whole-model run in progress | MEASURED (unit test) / running |
+| Bit tags at 3 bits (C4) | 0.0190 at 3.5 bpw vs the K-quant line's 0.0210 on real experts | MEASURED (sandbox) |
+| Bit tags at 4 bits with a 0 level (Q4_TG v2) | About -11 % weighted error vs imatrix Q4_K at the same bytes | MEASURED (sandbox) |
+| Light vs heavy 8th bit, rotated vs not (author's question) | Rotated + light bit best (by 17 % and 1.5 %); a missing heavy bit collapses (about 300x), a missing light bit falls back to the 7-bit base | MEASURED (sandbox) |
+| Miss map in state space | Nearest logged neighbour of a hard token is hard 3-5x the base rate; the nearest logged state predicts 43-53 % of the experts two layers ahead | MEASURED (sandbox, run B codes) |
 | Cold-expert routing shares | 6.3 unpredicted cold picks per token, 52 % under router weight 0.08; 67 % of cold picks predicted one layer ahead | MEASURED (routing record) |
 
 ### C. Planned, with the math checked
@@ -86,6 +109,9 @@ Labels: **MEASURED (whole model)** = paired run on the PC; **MEASURED (sandbox)*
 | CRC32 prefix store with a DeltaNet checkpoint grid (int8 or rotated int4 + rANS on idle CPU cores) | A repeated 4K-token prompt skips about 1.8 s; a partial hit about -400 ms | PAPER (Fable) |
 | Texture units decoding Q8_Z as RGBA8 | About 10x fewer instructions at decode; prefill depends on the fp16-accumulate rate | PAPER (Fable) |
 | Carry-over to dense models that spill onto CPU/RAM | Bus, J1, planes by need, Q8_Z / Q7_ZT, MTP all apply; prefetch is 100 % predictable there | PAPER |
+| The author's H gate on KV pages (C1) | Sign-plane codes pick the KV pages a token needs: at 128K, KV reads 2.83 -> 0.26-0.52 ms per token | PAPER (Fable checked) |
+| Three drafters, one verify (C5, the author's matrix array) | 1.6-1.9x at acceptance 0.7-0.8, after the bus fixes | PAPER (Fable checked) |
+| RT cores as the miss-map lookup (author) | Hardware nearest-neighbour search beside the SMs, only on a hit; pays once the map reaches millions of entries | PLAN |
 
 ### D. The author's ideas from the int8 v10 / v12 runs (2026-10-26 to 10-28), and where each went
 
@@ -103,7 +129,13 @@ Labels: **MEASURED (whole model)** = paired run on the PC; **MEASURED (sandbox)*
 | "Fill the empty bit so the int8 kernel throws less error" | The 0.5 fill (43 % less error) | MEASURED (sandbox) |
 | "Flood L2 and L3", the unused CPU parts | Measured limits (GPU L2 caches VRAM, not DDR4) and the prefetch rule that does work | PAPER |
 | CRC32 + the video units for the KV cache | CRC32 and the checkpoint grid pay; Fable showed rANS on idle CPU cores beats NVENC here | PAPER |
-| "Keep the 1-bit decode as a path the int8 tensor can still see as 8" | The fold route rebuilds exact int8; the 1-bit route gives the same integers | MEASURED (unit test) |
+| "Keep the 1-bit decode as a path the int8 tensor can still see as 8" | The fold route rebuilds exact int8; the 1-bit route gives the same integers, now across a whole model | MEASURED |
+| "The H gate" for KV pages and drafts (2026-10-28 evening) | C1 and C5 | PAPER |
+| The accuracy-assisted miss map, "the more we look at where it got stuck, the better we know when to look" | C6: logging built, the pattern measured, miss log v1 in the repo | MEASURED (pattern) |
+| The bit-tag matrix (7+7+7+7+4) | Pays at 3 and 4 bits as a tag byte per 32-block (C4, Q4_TG) | MEASURED (sandbox), whole model next |
+| "Does a 0 have more weight?" | A 0 level in the 4-bit tag grids: about -7 % more error | MEASURED (sandbox) |
+| Light vs heavy 8th bit, rotated vs not | Rotated + light bit; the heavy bit collapses when missing | MEASURED (sandbox) |
+| ROPs to flag fragile tokens | Became the near-tie flag (`red.global.or`, no wait) feeding the doorbell | PAPER (Fable) |
 
 ## Proven not to work (kept so nobody retries them)
 
@@ -115,7 +147,10 @@ Labels: **MEASURED (whole model)** = paired run on the PC; **MEASURED (sandbox)*
 | Expert deferral; near-tie expert swap | +0.0042 and +0.0017, resolved worse |
 | Rotating the routed experts | +0.003979 |
 | Video units (NVENC/NVDEC) for the live KV cache | 1.3 s per token |
-| AES / SHA / CLMUL, vector gather, 1 GB pages, L3 as a fixed expert bank | No gain on the math |
+| AES / SHA / CLMUL, vector gather, 1 GB pages, L3 as a fixed expert bank | No gain on the math (AES and CLMUL share the vector pipes on Zen 3) |
+| More rows per GPU lane (kernel v3) | No gain over v2 (331 vs 325 GB/s), slower on smaller shapes |
+| A heavy (range) 8th bit | Ties the light bit when read; collapses when missing |
+| NVENC / NVDEC for the stored-context tier; the SFU as a decoder | No job survives the math (Fable) |
 
 ## Compared with existing frameworks
 
@@ -125,7 +160,7 @@ Limited to what their formats do; we have not tested the other projects themselv
 |---|---|---|
 | Between 6 and 8 bits | llama.cpp goes from Q6_K (6.56 bpw) to Q8_0 (8.5 bpw, 0.5 bpw of it scales); Unsloth keeps sensitive dense tensors at Q8_0, a whole tensor at a time | Q8_Z 8.25 bpw (same accuracy, MEASURED); Q7_ZT 7.53 bpw with the 8th bit per 32-block (no difference from Q8_Z, MEASURED) |
 | Importance matrix | Weighted K-quant search; none for Q8_0 | Used only to rank the gates, square-rooted (ranking by importance: 0.000061 vs 0.000074 plain, MEASURED sandbox); whether a weighted level search hurts is open (our first Q7_ZT's bad chunks were single flipped tokens) |
-| Fragile tokens | — | Chunk 24 holds one token that every rotated file flips hard (KL 2.5-8.1) and Unsloth does not (0.56): a lead, not yet explained |
+| Fragile tokens | — | The hard tokens are a property of the text, shared by every file including Unsloth's; on chat text 1 % of tokens hold 52 % of the error; logged as the miss map's data (C6) |
 | Bits and memory | One tensor, one memory pool, one unit | Base and 8th bit splittable across memories and units, exact (MEASURED); speed PLAN |
 | Rotation | QuaRot, SpinQuant, QuIP# rotate linear layers of the (mostly dense) models they report | Dense tensors only on this MoE model; experts left as stored (MEASURED) |
 | Bit-serial decoding | Exists (T-MAC, Any-Precision LLM) | New here: the per-32-block gate, the 0.5 fill, the split across memories (MEASURED pieces) |
@@ -133,6 +168,7 @@ Limited to what their formats do; we have not tested the other projects themselv
 
 ## Next
 
-1. The live H gate result (running; final about 21:15 UTC).
-2. The 1-bit decoder as a real kernel: the 1-bit mma rate on the 4070, the CPU popcount kernel timed, the GPU T-decode kernel timed against the plain int8 route. **This document gets its next update when that works.**
-3. The PC bench session (the bus clusters), then the engine.
+1. The author's review; Fable's math check of the engine plan (#3).
+2. R3: the per-32 int8 kernel, which the T-decode decode path folds into; first a read-only ceiling kernel (is ~325 GB/s the limit of one cold launch?).
+3. Q4_TG v2 (full importance + the 0 level) on the whole model; the miss map sharpened; more own-text chunks.
+4. The engine, where the speed of all of this is measured end to end.
