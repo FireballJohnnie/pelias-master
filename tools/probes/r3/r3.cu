@@ -555,7 +555,7 @@ static int run_check() {
 }
 
 // ---- stream: one token's weight reads, three ways
-static int run_stream(int soak_s) {
+static int run_stream(int soak_s, bool distinct) {
   set_grids();
   std::mt19937 rng(7);
   const int nsm = sms();
@@ -568,16 +568,18 @@ static int run_stream(int soak_s) {
   // four distinct layers (one attention, three DeltaNet), reused cyclically for 40 (a 4-layer cycle is ~200 MB, far past
   // the 36 MB L2, so every read is cold); 7 hot experts per layer (Q4_TG2 gate and up, Q5_K down), output head Q6_K
   struct L { std::vector<Mat> m; std::vector<int> stage; std::vector<const Act*> a; };
-  std::vector<L> layers(4);
+  // --distinct: 40 distinct layers (about 2.27 GB, fits the 12 GB card), so no weight is read twice in a token (no L2 reuse)
+  const int nl = distinct ? 40 : 4;
+  std::vector<L> layers(static_cast<size_t>(nl));
   auto add = [&](L& l, int fmt, int n, int K, int st) {
     l.m.emplace_back();
     make_mat(l.m.back(), fmt, n, K, rng);
     l.stage.push_back(st);
     l.a.push_back(K == 512 ? &A512 : (K == 2048 ? &A2048 : &A4096));
   };
-  for (int li = 0; li < 4; ++li) {
+  for (int li = 0; li < nl; ++li) {
     L& l = layers[static_cast<size_t>(li)];
-    if (li == 0) {  // attention: q (with gate), k, v | o
+    if (distinct ? li % 4 == 3 : li == 0) {  // attention: q (with gate), k, v | o
       add(l, r3::kQ7ZT, 8192, 2048, 0); add(l, r3::kQ7ZT, 512, 2048, 0); add(l, r3::kQ7ZT, 512, 2048, 0);
       add(l, r3::kQ7ZT, 2048, 4096, 1);
     } else {        // DeltaNet: qkv, gate | ssm_out
@@ -600,7 +602,7 @@ static int run_stream(int soak_s) {
   CK(cudaMalloc(&dy, 248320 * 4));  // every job writes into the same scratch output (timing only)
   size_t bytes = 0;
   for (int L = 0; L < 40; ++L) {
-    const auto& l = layers[static_cast<size_t>(L % 4 == 3 ? 0 : 1 + L % 3)];  // attention on every 4th layer
+    const auto& l = layers[static_cast<size_t>(distinct ? L : (L % 4 == 3 ? 0 : 1 + L % 3))];  // attention on every 4th layer
     for (int st = 0; st < 4; ++st)
       for (size_t i = 0; i < l.m.size(); ++i)
         if (l.stage[i] == st) {
@@ -820,9 +822,13 @@ int main(int argc, char** argv) {
     int soak = 0;
     for (int i = 2; i + 1 < argc; ++i)
       if (std::string(argv[i]) == "--soak") soak = std::atoi(argv[i + 1]);
+    bool distinct = false;
+    for (int i = 2; i < argc; ++i)
+      if (std::string(argv[i]) == "--distinct") distinct = true;
     print_kernels();
-    return run_stream(soak);
+    std::printf("layers: %s\n", distinct ? "40 distinct (no weight read twice per token)" : "4 distinct, cycled over 40");
+    return run_stream(soak, distinct);
   }
-  std::fprintf(stderr, "usage: r3 check | stream [--soak SECONDS]\n");
+  std::fprintf(stderr, "usage: r3 check | stream [--soak SECONDS] [--distinct]\n");
   return 1;
 }
