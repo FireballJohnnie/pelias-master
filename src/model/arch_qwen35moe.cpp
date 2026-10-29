@@ -336,7 +336,7 @@ void act_round_plain(float* x, int64_t n, ActFmt f) {
   const int qs = f == ActFmt::q8_1 ? 4 : 2;  // q8_1 carries d and s (2 x fp16) before the values; Q8_0 only d
   for (int64_t i = 0; i < n; i += 32) {
     if (f == ActFmt::q8_1) quant::quantize_q8_1(x + i, b, 32);
-    else quant::quantize_q8_0(x + i, b, 32);
+    else quant::quantize_q8_0_x86_act(x + i, b, 32);  // the CPU path's activation form (ties to even, 127 / max)
     std::uint16_t dh;
     std::memcpy(&dh, b, 2);
     const float d = quant::fp16_to_fp32(dh);

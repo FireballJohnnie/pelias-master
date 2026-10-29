@@ -293,6 +293,24 @@ void quantize_q8_0(const float* x, std::uint8_t* out, std::int64_t n) {
   }
 }
 
+// The activation form llama.cpp's x86 CPU path uses (READ-SRC 2ca15f5 ggml/src/ggml-cpu/arch/x86/quants.c quantize_row_q8_0,
+// the AVX / AVX2 branch): the multiplier is 127 / max (not 1 / (max / 127)) and values round to nearest, ties to even
+// (_mm256_round_ps with _MM_ROUND_NEAREST). Weights keep quantize_q8_0 above (the reference form llama-quantize uses).
+void quantize_q8_0_x86_act(const float* x, std::uint8_t* out, std::int64_t n) {
+  const std::int64_t nb = n / kQK8;
+  for (std::int64_t i = 0; i < nb; ++i, x += kQK8, out += kQ8_0Bytes) {
+    float amax = 0.0f;
+    for (int j = 0; j < kQK8; ++j) amax = std::max(amax, std::fabs(x[j]));
+    const float d = amax / 127.0f;
+    const float id = amax != 0.0f ? 127.0f / amax : 0.0f;
+    put_u16(out, fp32_to_fp16(d));
+    for (int j = 0; j < kQK8; ++j) {
+      const auto q = static_cast<std::int8_t>(std::nearbyint(x[j] * id));  // default rounding mode: nearest, ties to even
+      std::memcpy(out + 2 + j, &q, 1);
+    }
+  }
+}
+
 void quantize_q8_1(const float* x, std::uint8_t* out, std::int64_t n) {
   const std::int64_t nb = n / kQK8;
   for (std::int64_t i = 0; i < nb; ++i, x += kQK8, out += kQ8_1Bytes) {

@@ -51,6 +51,8 @@ Status quantize_rows(Type t, const float* x, std::uint8_t* out, std::int64_t nro
 
 // ---- per type, for tests and for callers that already checked the type (n a multiple of the block)
 void quantize_q8_0(const float* x, std::uint8_t* out, std::int64_t n);
+// Q8_0 as llama.cpp's x86 CPU path rounds activations (127 / max, ties to even); weights use quantize_q8_0.
+void quantize_q8_0_x86_act(const float* x, std::uint8_t* out, std::int64_t n);
 // Q8_Z (Pelias-only, 256 per block, 264 bytes = 8.25 bits per weight): fp16 d, then eight 6-bit levels lv (1..63) packed
 // little-endian (level j in bits 6j..6j+5 of the 6 bytes), then 256 int8 values q (-127..127). Value = s_j * q with
 // s_j = (d * lv_j) / 63 in fp32, exactly as written (the kernels must compute the same). The quantizer searches each
