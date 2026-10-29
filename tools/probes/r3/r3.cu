@@ -336,7 +336,7 @@ static void make_mat(Mat& M, int fmt, int n, int K, std::mt19937& rng) {
       uint8_t* p = M.w.data() + b * 208;
       for (int i = 0; i < 192; ++i) p[i] = static_cast<uint8_t>(byte(rng));
       for (int i = 0; i < 16; ++i) p[192 + i] = static_cast<uint8_t>(static_cast<int8_t>(s8(rng)));
-      M.d6[b] = f2h(0.00002f * ud(rng));
+      M.d6[b] = f2h(0.0002f * ud(rng));  // fp16 normal range (0.00002 rounded to 0 and made every output 0: run 07:35)
     }
   }
 }
@@ -476,7 +476,7 @@ static int run_check() {
       scale = std::max(scale, std::fabs(yr[static_cast<size_t>(r)]));
       worst = std::max(worst, std::fabs(yg[static_cast<size_t>(r)] - yr[static_cast<size_t>(r)]));
     }
-    const bool ok = worst / scale < 2e-5;
+    const bool ok = scale > 0 && worst / scale < 2e-5;  // an all-zero output is a failed test, not a pass
     std::printf("  %-38s max error %.2e of max |y| %.3g (%s)\n", c.name, worst / scale, scale, ok ? "ok" : "FAIL");
     fails += !ok;
   }
