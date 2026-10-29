@@ -1,0 +1,7 @@
+PELQK001: 4 chunks, 10 attention layers, 2 kv heads x 256; queries t >= 64
+store    bits |    key error     attention TV   attention KL | code entropy (rANS bits per value)
+q8_0      8.5 |    4.739e-05           0.488%       8.37e-05 | -
+int4      4.5 |    1.540e-02           8.676%       2.66e-02 | 3.34 of 4 (+0.5 scale)
+int4r     4.5 |    8.908e-03           6.209%       1.36e-02 | 3.65 of 4 (+0.5 scale)
+
+[exited with code 0]

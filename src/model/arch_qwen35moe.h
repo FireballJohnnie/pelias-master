@@ -120,6 +120,17 @@ struct ForwardOptions {
   // act_bits 4: with act_int8 on the gpu path, round to 4 bits per 32 values (symmetric, -7..7, fp16 scale) instead of
   // q8_1 (W4A4 with rotation, QuaRot-style).
   int act_bits = 8;
+  // Lossy storage of the context state, to measure what a smaller cache or checkpoint costs (author 2026-10-29, the
+  // DeltaNet-checkpoint trick applied to the active state). Each stored vector is rounded per 32 values and read back:
+  // StateStore::q8 = 8-bit, fp16 scale per 32 (as q8_0); int4 = 4-bit (-7..7), fp16 scale per 32; int4r = int4 after a
+  // fixed sign diagonal and a Walsh-Hadamard per 32 (rotated back after reading); int8row = 8-bit, fp32 scale per 128.
+  // kv_store: every key and value head of the full-attention layers (keys after norm and rope), at every position.
+  // state_store: each DeltaNet layer's recurrent state and its last conv inputs, once, just before position state_at
+  // (a checkpoint taken there and restored); state_at < 0 means the middle of the chunk (the first scored position).
+  enum class StateStore { exact, q8, int4, int4r, int8row };
+  StateStore kv_store = StateStore::exact;
+  StateStore state_store = StateStore::exact;
+  std::int64_t state_at = -1;
   // neuron_skip f in (0, 1): in every routed expert, the fraction f of its hidden values (silu(gate) * up) smallest in
   // magnitude are set to zero for each token: the oracle upper bound of skipping neurons (their gate and up rows and
   // their down column would not be read).
@@ -155,6 +166,8 @@ struct ForwardOptions {
 // The orthonormal Walsh-Hadamard transform of every 32-value block of x[0..n) in place (n a multiple of 32). It is its
 // own inverse: applying it twice gives x back (to rounding).
 void act_rotate32(float* x, std::int64_t n);
+// ForwardOptions::kv_store / state_store: round x (n values, a multiple of 32; 128 for int8row) as stored and read back.
+void state_store_roundtrip(float* x, std::int64_t n, ForwardOptions::StateStore kind);
 // one row to the Pelias int8 kernel's activation format and back (ForwardOptions::act_gpu256); n a multiple of 256
 void act_round_q8_256(float* x, std::int64_t n);
 // The live H gate (ForwardOptions::h_gate) on rows of a Q8_Z matrix: y[t][r] holds the full dot products on entry; on

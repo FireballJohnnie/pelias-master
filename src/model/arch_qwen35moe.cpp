@@ -548,6 +548,10 @@ void full_attention(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, floa
       rope_apply(kk, cs, s.n_rot);
     }
   });
+  if (c.opt.kv_store != ForwardOptions::StateStore::exact) {
+    state_store_roundtrip(k.data(), n * kv_w, c.opt.kv_store);
+    state_store_roundtrip(v.data(), n * kv_w, c.opt.kv_store);
+  }
   if (c.opt.qk_dump) {
     const int64_t row = (nh + nkv) * hd;
     std::uint16_t* dst = c.opt.qk_dump + static_cast<int64_t>(c.ai) * n * row;
@@ -602,6 +606,16 @@ void delta_net(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* ou
       beta[z(t * nv + h)] = sigmoid(beta[z(t * nv + h)]);
       alpha[z(t * nv + h)] = softplus(alpha[z(t * nv + h) ] + l.ssm_dt[z(h)]) * l.ssm_a[z(h)];
     }
+  // ForwardOptions::state_store: a checkpoint taken just before position at and restored: the conv inputs it holds (the
+  // last taps-1 positions) and the recurrent state are read back from their lossy form for every later position
+  const bool ckpt = c.opt.state_store != ForwardOptions::StateStore::exact;
+  const int64_t at = c.opt.state_at >= 0 ? c.opt.state_at : n / 2;
+  std::vector<float> mixed_ck;
+  if (ckpt && at > 0 && at < n) {
+    const int64_t r0 = std::max<int64_t>(0, at - (taps - 1));
+    mixed_ck.assign(mixed.begin() + r0 * ch, mixed.begin() + at * ch);
+    state_store_roundtrip(mixed_ck.data(), static_cast<int64_t>(mixed_ck.size()), c.opt.state_store);
+  }
   // causal depthwise conv over [taps-1 zeros, tokens], then SiLU
   std::vector<float> conv(z(n * ch));
   parallel_items((ch + 255) / 256, c.threads, [&](int64_t blk, int) {
@@ -611,7 +625,8 @@ void delta_net(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* ou
         float sum = 0.0f;
         for (int64_t kk = 0; kk < taps; ++kk) {
           const int64_t src = t + kk - (taps - 1);
-          const float xv = src >= 0 ? mixed[z(src * ch + cc)] : 0.0f;
+          float xv = src >= 0 ? mixed[z(src * ch + cc)] : 0.0f;
+          if (!mixed_ck.empty() && t >= at && src >= 0 && src < at) xv = mixed_ck[z((src - (at - (taps - 1) < 0 ? 0 : at - (taps - 1))) * ch + cc)];
           sum += xv * l.conv1d[z(cc * taps + kk)];
         }
         conv[z(t * ch + cc)] = silu(sum);
@@ -631,6 +646,7 @@ void delta_net(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* ou
     float* delta = sc.delta.data();
     const int64_t hk = hv % nk;
     for (int64_t t = 0; t < n; ++t) {
+      if (ckpt && t == at) state_store_roundtrip(m, ds * ds, c.opt.state_store);  // the restored checkpoint
       const float* q = conv.data() + t * ch + hk * ds;
       const float* kk = conv.data() + t * ch + nk * ds + hk * ds;
       const float* vv = conv.data() + t * ch + 2 * nk * ds + hv * ds;
@@ -841,6 +857,38 @@ void moe(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* out, flo
 }  // namespace
 
 void act_rotate32(float* x, std::int64_t n) { quant::hadamard32(x, n); }
+
+void state_store_roundtrip(float* x, std::int64_t n, ForwardOptions::StateStore kind) {
+  using K = ForwardOptions::StateStore;
+  if (kind == K::exact) return;
+  if (kind == K::int8row) {
+    for (std::int64_t r = 0; r < n; r += 128) {
+      float amax = 0.0f;
+      for (std::int64_t i = r; i < r + 128; ++i) amax = std::max(amax, std::fabs(x[i]));
+      const float sc = amax > 0.0f ? amax / 127.0f : 1.0f;
+      for (std::int64_t i = r; i < r + 128; ++i) x[i] = sc * std::min(127.0f, std::max(-127.0f, std::nearbyint(x[i] / sc)));
+    }
+    return;
+  }
+  static const float sign[32] = {1, -1, -1, 1, -1, 1, 1, -1, -1, -1, 1, 1, 1, -1, 1, -1,
+                                 -1, 1, -1, -1, 1, 1, -1, 1, 1, -1, 1, -1, -1, -1, 1, 1};
+  const float top = kind == K::q8 ? 127.0f : 7.0f;
+  for (std::int64_t b = 0; b < n; b += 32) {
+    float* v = x + b;
+    if (kind == K::int4r) {
+      for (int i = 0; i < 32; ++i) v[i] *= sign[i];
+      quant::hadamard32(v, 32);
+    }
+    float amax = 0.0f;
+    for (int i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(v[i]));
+    const float sc = quant::fp16_to_fp32(quant::fp32_to_fp16(amax > 0.0f ? amax / top : 1.0f));
+    for (int i = 0; i < 32; ++i) v[i] = sc * std::min(top, std::max(-top, std::nearbyint(v[i] / sc)));
+    if (kind == K::int4r) {
+      quant::hadamard32(v, 32);  // orthonormal and its own inverse
+      for (int i = 0; i < 32; ++i) v[i] *= sign[i];
+    }
+  }
+}
 
 Result<Qwen35MoeWeights> bind_qwen35moe(const io::GgufReader& r, const std::uint8_t* base, const Qwen35MoeSpec& s) {
   using R = Result<Qwen35MoeWeights>;

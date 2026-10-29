@@ -1,0 +1,8 @@
+PELQK001: 4 chunks x 512 positions, 10 full-attention layers [3, 7, 11, 15, 19, 23, 27, 31, 35, 39], 16 q heads, 2 kv heads, head dim 256; queries t >= 64
+method       keep 1/8    keep 1/32
+oracle          85.7%        64.6%
+1bit            72.6%        47.1%
+quest           62.0%        45.2%
+recent          42.6%        28.1%
+1bit recall by layer (1/8, 1/32): L3 61.1/37.3, L7 72.7/51.2, L11 81.2/59.6, L15 76.0/49.7, L19 74.5/47.3, L23 77.3/49.1, L27 76.1/48.6, L31 76.3/52.4, L35 65.6/37.0, L39 64.9/38.8
+1bit worst 5 % of queries at 1/32: 9.0%

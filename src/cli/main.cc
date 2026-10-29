@@ -148,11 +148,15 @@ void usage() {
       "                                  --kl-divergence-base, computed by Pelias's fp32 CPU reference forward pass;\n"
       "                                  --expert-stats: per layer and expert, how often it was picked and its routing weight\n"
       "      [--dump-kld OUT.bin] [--act-int8 GROUPS] [--act-int8-path cpu|gpu|gpu256|gpu256x8|gpu256e] [--act-rot h32] [--route-dump OUT.bin] [--dump-codes OUT.bin] [--dump-qk OUT.bin]\n"
+      "      [--kv-store q8|int4|int4r] [--state-store q8|int4|int4r|int8row] [--state-at P]\n"
       "                                  --dump-codes: per scored token and layer, the state code of the layer's normed input\n"
       "                                  (C6 miss map: sign bits after a fixed sign diagonal and Hadamard per 32, plus one\n"
       "                                  log-energy byte per 32-block; quant::state_code)\n"
       "                                  --dump-qk: every position's query and key heads (normed, roped; fp16) in every\n"
       "                                  full-attention layer, for the C1 KV-page check; use a few --chunks (about 47 MB each)\n"
+      "                                  --kv-store / --state-store: store the attention keys and values, or a DeltaNet checkpoint\n"
+      "                                  taken at position P (default: the first scored position) and restored, in a lossy form\n"
+      "                                  (8-bit or 4-bit per 32; int4r rotated per 32; int8row one scale per 128) and read back\n"
       "                                  --route-dump: per scored token and layer, the experts picked, their weights, the\n"
       "                                  margin to the first unpicked one, and the next layer's pre-gating prediction\n"
       "                                  --dump-kld: every scored token's KL, NLLs, delta-p and top-token match (for kld-compare);\n"
@@ -843,6 +847,30 @@ int cmd_kld(const Args& a) {
   std::vector<std::uint8_t> codes_chunk(codes_path.empty() ? 0 : static_cast<std::size_t>(n_ctx) * code_row);
   std::vector<std::uint8_t> codes_all;
   if (!codes_path.empty()) fo.state_codes = codes_chunk.data();
+  {
+    auto parse_store = [](const std::string& v, model::ForwardOptions::StateStore& out) {
+      using K = model::ForwardOptions::StateStore;
+      if (v == "q8") out = K::q8; else if (v == "int4") out = K::int4; else if (v == "int4r") out = K::int4r;
+      else if (v == "int8row") out = K::int8row; else return false;
+      return true;
+    };
+    if (a.has("kv-store") && (!parse_store(a.get("kv-store"), fo.kv_store) || fo.kv_store == model::ForwardOptions::StateStore::int8row)) {
+      std::fprintf(stderr, "pelias: --kv-store needs q8, int4 or int4r\n");
+      return 1;
+    }
+    if (a.has("state-store") && !parse_store(a.get("state-store"), fo.state_store)) {
+      std::fprintf(stderr, "pelias: --state-store needs q8, int4, int4r or int8row\n");
+      return 1;
+    }
+    if (a.has("state-at")) {
+      const Result<std::uint64_t> r = io::parse_whole(a.get("state-at"), static_cast<std::uint64_t>(n_ctx - 1));
+      if (!r.ok()) {
+        std::fprintf(stderr, "pelias: --state-at needs a position from 0 to %d\n", n_ctx - 1);
+        return 1;
+      }
+      fo.state_at = static_cast<std::int64_t>(r.value);
+    }
+  }
   const std::string qk_path = a.get("dump-qk");
   std::vector<std::uint16_t> qk_chunk;
   std::FILE* qk_file = nullptr;

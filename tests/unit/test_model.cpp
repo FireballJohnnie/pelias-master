@@ -406,3 +406,27 @@ TEST(t_decode_q7zt_equals_dequantized_product) {
   std::printf("      T-decode vs dequantized product: max error %.2e of max |y| %.3f\n", worst / scale, scale);
   CHECK(worst / scale < 1e-5);
 }
+
+TEST(state_store_roundtrip_formats) {
+  using K = pelias::model::ForwardOptions::StateStore;
+  std::vector<float> x(256);
+  std::uint32_t seed = 7u;
+  auto rnd = [&seed]() { seed = seed * 1664525u + 1013904223u; return (static_cast<float>(seed >> 8) / 16777216.0f) - 0.5f; };
+  for (std::size_t i = 0; i < x.size(); ++i) x[i] = rnd() + (i % 32 == 5 ? 8.0f : 0.0f);  // one outlier per 32-block
+  auto err = [&](K kind) {
+    std::vector<float> y(x);
+    pelias::model::state_store_roundtrip(y.data(), static_cast<std::int64_t>(y.size()), kind);
+    double e = 0, r = 0;
+    for (std::size_t i = 0; i < x.size(); ++i) { e += (x[i] - y[i]) * (x[i] - y[i]); r += x[i] * x[i]; }
+    return e / r;
+  };
+  const double e8 = err(K::q8), e4 = err(K::int4), e4r = err(K::int4r), erow = err(K::int8row);
+  std::printf("      store error: q8 %.2e, int4 %.2e, int4r %.2e, int8row %.2e\n", e8, e4, e4r, erow);
+  CHECK(err(K::exact) == 0.0);
+  CHECK(e8 < 1e-3);  // an 8.0 outlier per block sets the 8-bit step (about 3e-4 here, by step^2 / 12)
+  CHECK(e4r < e4);  // rotation spreads the outlier, so the 4-bit scale is finer
+  CHECK(erow < 1e-3);
+  std::vector<float> zero(64, 0.0f);
+  pelias::model::state_store_roundtrip(zero.data(), 64, K::int4r);
+  for (float v : zero) CHECK(v == 0.0f);
+}
