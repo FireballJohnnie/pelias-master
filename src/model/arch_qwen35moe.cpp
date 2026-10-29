@@ -13,6 +13,7 @@
 #include <thread>
 
 #include "quant/block_types.h"
+#include "quant/planes.h"
 #include "quant/quant_cpu.h"
 #include "quant/tdecode.h"
 
@@ -104,6 +105,7 @@ struct Scratch {
   std::vector<float> xe, ge, ue, ye;     // expert inputs and intermediates
   std::vector<float> scores;             // attention scores of one query
   std::vector<float> state, delta;       // DeltaNet state and its per-token update
+  bool planes = true;                    // ForwardOptions::planes for this call
 };
 
 void load_tile(const WeightView& w, uint64_t first_row, int nr, int64_t k, Scratch& sc) {
@@ -114,6 +116,8 @@ void load_tile(const WeightView& w, uint64_t first_row, int nr, int64_t k, Scrat
     // the type and the row length were checked when the tensor was bound
     (void)quant::dequantize_row(static_cast<quant::Type>(w.type), w.data + (first_row + static_cast<uint64_t>(r)) * w.row_bytes,
                                 sc.row.data(), k);
+    if (sc.planes && w.planes)  // residual sign planes: the row as the original weights, to the planes read
+      quant::plane_add_row(w.planes + (first_row + static_cast<uint64_t>(r)) * w.plane_row_bytes, k, w.plane_k_stored, w.plane_k, sc.row.data());
     const float* src = sc.row.data();
     for (int64_t i = 0; i < k; ++i) wt[z(i * kTile + r)] = src[z(i)];
   }
@@ -1008,6 +1012,68 @@ Result<Qwen35MoeWeights> bind_qwen35moe(const io::GgufReader& r, const std::uint
   return R::good(std::move(w));
 }
 
+Result<int> attach_planes(const io::GgufReader& pr, const std::uint8_t* pb, Qwen35MoeWeights& w, int k_use) {
+  using R = Result<int>;
+  bool found = false;
+  const uint64_t k = pr.get_uint("pelias.planes.k", &found);
+  if (!found || k < 1 || k > static_cast<uint64_t>(quant::kPlaneMaxK))
+    return R::fail(Status::fail(Code::corrupt, "not a plane side file (pelias.planes.k missing or out of range)"));
+  if (pr.get_uint("pelias.planes.block", &found) != static_cast<uint64_t>(quant::kPlaneBlock) || !found)
+    return R::fail(Status::fail(Code::unsupported, "the plane side file uses another block size"));
+  if (k_use < 0 || static_cast<uint64_t>(k_use) > k)
+    return R::fail(Status::fail(Code::invalid_argument, "more planes asked for than the side file stores (" + std::to_string(k) + ")"));
+  const int ku = k_use == 0 ? static_cast<int>(k) : k_use;
+  std::vector<std::int64_t> types;
+  const io::GgufValue* tv = pr.find("pelias.planes.types");
+  if (!tv || tv->type != io::GgufValueType::array) return R::fail(Status::fail(Code::corrupt, "the plane side file names no source types"));
+  if (Status st = pr.array_ints(*tv, types); !st) return R::fail(st);
+  const bool tied = w.output.data == w.tok_embd.data;
+  std::vector<WeightView*> views{&w.output, &w.tok_embd};  // a tied output layer shares the embedding's planes (below)
+  for (Qwen35MoeLayer& l : w.layers)
+    for (WeightView* p : {&l.wq, &l.wk, &l.wv, &l.wo, &l.wqkv, &l.wgate, &l.wbeta, &l.walpha, &l.ssm_out, &l.up_exps, &l.gate_exps, &l.down_exps,
+                          &l.up_shexp, &l.gate_shexp, &l.down_shexp})
+      views.push_back(p);
+  int n = 0;
+  size_t ti = 0;
+  for (const io::GgufTensor& t : pr.tensors()) {
+    if (t.name == "output.weight.exact") {
+      if (t.type != static_cast<uint32_t>(quant::Type::bf16) || t.ne[0] != w.output.ne[0] || t.ne[1] != w.output.ne[1] || t.ne[2] != 1)
+        return R::fail(Status::fail(Code::corrupt, "the exact output rows are not BF16 rows of the output layer's shape", 0, t.name));
+      w.output_exact.data = pb + t.file_offset;
+      w.output_exact.type = t.type;
+      w.output_exact.ne[0] = t.ne[0];
+      w.output_exact.ne[1] = t.ne[1];
+      w.output_exact.row_bytes = quant::row_bytes(t.type, t.ne[0]);
+      w.output_exact.name = t.name;
+      continue;
+    }
+    if (ti >= types.size()) return R::fail(Status::fail(Code::corrupt, "the plane side file names fewer source types than it has plane tensors"));
+    const std::int64_t src_type = types[ti++];
+    WeightView* hit = nullptr;
+    for (WeightView* p : views)
+      if (p->present() && p->name == t.name) hit = p;
+    if (!hit) continue;  // a block the reference does not run (MTP), or a tensor that is not a product here
+    if (src_type != static_cast<std::int64_t>(hit->type))
+      return R::fail(Status::fail(Code::invalid_argument, "the plane side file was built for another type of this tensor (another model file)", 0, t.name));
+    const uint64_t prb = static_cast<uint64_t>(quant::plane_row_bytes(static_cast<int64_t>(hit->ne[0]), static_cast<int>(k)));
+    if (hit->ne[0] % quant::kPlaneBlock != 0 || t.type != static_cast<uint32_t>(quant::Type::i8) || t.ne[0] != prb || t.ne[1] != hit->ne[1] * hit->ne[2] ||
+        t.ne[2] != 1)
+      return R::fail(Status::fail(Code::corrupt, "a plane tensor does not match its weight's rows", 0, t.name));
+    hit->planes = pb + t.file_offset;
+    hit->plane_row_bytes = prb;
+    hit->plane_k_stored = static_cast<int>(k);
+    hit->plane_k = ku;
+    ++n;
+  }
+  if (tied && w.tok_embd.planes) {
+    w.output.planes = w.tok_embd.planes;
+    w.output.plane_row_bytes = w.tok_embd.plane_row_bytes;
+    w.output.plane_k_stored = w.tok_embd.plane_k_stored;
+    w.output.plane_k = w.tok_embd.plane_k;
+  }
+  return R::good(n);
+}
+
 namespace {
 Status forward_impl(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, const std::int32_t* tokens, int n_tokens, int out_begin, int out_end,
                     float* logits, const ForwardOptions& opt, DecodeState* st);
@@ -1062,6 +1128,15 @@ Status forward_impl(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, const std
     return Status::fail(Code::invalid_argument, "the near-tie swap needs a hot set of n_layer x n_expert entries");
   if (opt.defer_experts < 0 || opt.defer_experts >= static_cast<int>(s.n_expert_used))
     return Status::fail(Code::invalid_argument, "expert deferral must keep at least one expert immediate");
+  if (opt.planes && opt.t_decode) {
+    bool any = w.output.planes != nullptr;
+    for (const Qwen35MoeLayer& l : w.layers)
+      for (const WeightView* p : {&l.wq, &l.wk, &l.wv, &l.wo, &l.wqkv, &l.wgate, &l.wbeta, &l.walpha, &l.ssm_out, &l.up_exps, &l.gate_exps, &l.down_exps,
+                                  &l.up_shexp, &l.gate_shexp, &l.down_shexp})
+        any = any || p->planes != nullptr;
+    if (any) return Status::fail(Code::unsupported, "residual planes with the T-decode route are not built yet (the dequantized path reads them)");
+  }
+  if (opt.head_rescore < 0) return Status::fail(Code::invalid_argument, "the exact head re-score takes a count of 0 or more");
   if (opt.route && (s.n_expert_used > 8 || s.n_expert > 32767))
     return Status::fail(Code::unsupported, "the routing record holds at most 8 picked experts of at most 32767");
   if (opt.imatrix) {  // rotated dense weights are collected in the rotated basis (mm); rotated routed experts are not built
@@ -1072,6 +1147,7 @@ Status forward_impl(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, const std
   const int threads = opt.threads > 0 ? opt.threads : static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
   const int64_t n = n_tokens, e = s.n_embd;
   std::vector<Scratch> sc(z(threads));
+  for (Scratch& x : sc) x.planes = opt.planes;
   Ctx c{s, threads, sc, n, opt};
   c.st = dst;
   c.pos0 = dst ? dst->pos : 0;
@@ -1084,6 +1160,9 @@ Status forward_impl(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, const std
     if (tok < 0 || static_cast<uint64_t>(tok) >= s.n_vocab) return Status::fail(Code::invalid_argument, "a token id is outside the vocabulary");
     (void)quant::dequantize_row(static_cast<quant::Type>(w.tok_embd.type), w.tok_embd.data + static_cast<uint64_t>(tok) * w.tok_embd.row_bytes,
                                 x.data() + t * e, e);
+    if (opt.planes && w.tok_embd.planes)
+      quant::plane_add_row(w.tok_embd.planes + static_cast<uint64_t>(tok) * w.tok_embd.plane_row_bytes, e, w.tok_embd.plane_k_stored, w.tok_embd.plane_k,
+                           x.data() + t * e);
   }
   for (std::uint32_t il = 0; il < s.n_layer; ++il) {
     const Qwen35MoeLayer& l = w.layers[il];
@@ -1132,6 +1211,27 @@ Status forward_impl(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, const std
   const int64_t m = out_end - out_begin;
   for (int64_t t = 0; t < m; ++t) rms_norm(x.data() + (out_begin + t) * e, w.output_norm.data(), xn.data() + t * e, e, s.rms_eps);
   mm(c, w.output, xn.data(), m, e, logits, s.n_vocab);  // through mm(), so --act-int8 reaches the output layer too
+  if (opt.planes && opt.head_rescore > 0 && w.output_exact.present()) {
+    // the largest logits again, exactly: the original rows (BF16) times the unrounded fp32 input
+    const int64_t nv = s.n_vocab, kk = std::min<int64_t>(opt.head_rescore, nv);
+    parallel_items(m, threads, [&](int64_t t, int tid) {
+      Scratch& hs = sc[z(tid)];
+      float* lg = logits + t * nv;
+      std::vector<int32_t> ord(z(nv));
+      for (int64_t i = 0; i < nv; ++i) ord[z(i)] = static_cast<int32_t>(i);
+      std::partial_sort(ord.begin(), ord.begin() + kk, ord.end(), [lg](int32_t a, int32_t b) { return lg[a] > lg[b] || (lg[a] == lg[b] && a < b); });
+      if (hs.row.size() < z(e)) hs.row.resize(z(e));
+      const float* h = xn.data() + t * e;
+      for (int64_t j = 0; j < kk; ++j) {
+        const int32_t v = ord[z(j)];
+        (void)quant::dequantize_row(static_cast<quant::Type>(w.output_exact.type), w.output_exact.data + static_cast<uint64_t>(v) * w.output_exact.row_bytes,
+                                    hs.row.data(), e);
+        double acc = 0.0;
+        for (int64_t i = 0; i < e; ++i) acc += static_cast<double>(hs.row[z(i)]) * h[i];
+        lg[v] = static_cast<float>(acc);
+      }
+    });
+  }
   return Status::good();
 }
 }  // namespace

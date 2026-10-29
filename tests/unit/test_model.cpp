@@ -8,7 +8,12 @@
 #include <string>
 #include <vector>
 
+#include <filesystem>
+#include <unistd.h>
+
 #include "gguf_builder.h"
+#include "io/planes_build.h"
+#include "io/requantize.h"
 #include "io/gguf_reader.h"
 #include "model/arch_qwen35moe.h"
 #include "quant/block_types.h"
@@ -574,4 +579,121 @@ TEST(decode_incremental_equals_the_fresh_pass) {
   CHECK(!pelias::model::forward_decode(tm.spec, tm.w, st, tok.data(), 1, one.data(), true, bad).ok());
   pelias::model::DecodeState empty;
   CHECK(!pelias::model::forward_decode(tm.spec, tm.w, empty, tok.data(), 1, one.data(), true, opt).ok());
+}
+
+// Residual planes end to end on the tiny model: its F32 file is the original, a Q4_K_M copy of it (Pelias's quantizer) is
+// the model file; `pelias planes` (build_planes) fits 2 planes per row, attach_planes reads them, and the forward pass
+// with 1 then 2 planes comes closer to the original's logits each time; planes off gives the file alone back exactly;
+// the exact head re-score changes only the largest logits. Files go to a fresh temporary folder (nothing is removed).
+TEST(planes_bring_a_quantized_file_toward_its_original) {
+  TinyModel tm;
+  tiny_model(tm);
+  CHECK(tm.ok);
+  if (!tm.ok) return;
+  namespace fs = std::filesystem;
+  static int run = 0;
+  const fs::path dir = fs::temp_directory_path() / ("pelias_planes_test_" + std::to_string(::getpid()) + "_" + std::to_string(run++));
+  std::error_code ec;
+  fs::create_directories(dir, ec);
+  const std::string q4 = (dir / "tiny_Q4_K_M.gguf").string(), pl = (dir / "tiny_Q4_K_M.planes2.gguf").string();
+  pelias::io::RequantOptions ro;
+  ro.ftype = pelias::quant::FileType::q4_k_m;
+  ro.threads = 2;
+  const auto rq = pelias::io::requantize(tm.map, tm.reader, q4, ro);
+  CHECK(rq.ok());
+  if (!rq.ok()) return;
+  pelias::os::FileMap qm;
+  pelias::io::GgufReader qr;
+  CHECK(qm.open(q4).ok() && qr.parse(qm).ok());
+  pelias::io::PlaneBuildOptions po;
+  po.k = 2;
+  po.threads = 2;
+  po.exact_head = true;
+  const auto rep = pelias::io::build_planes(qm, qr, tm.map, tm.reader, pl, po);
+  CHECK(rep.ok());
+  if (!rep.ok()) {
+    std::printf("      %s\n", rep.status.text().c_str());
+    return;
+  }
+  std::printf("    planes for %zu weights, %llu bytes; residual %.4g -> %.4g\n", rep.value.tensors, static_cast<unsigned long long>(rep.value.bytes),
+              rep.value.err_before, rep.value.err_after);
+  CHECK(rep.value.err_after < 0.2 * rep.value.err_before);
+  auto qw = pelias::model::bind_qwen35moe(qr, qm.data(), tm.spec);
+  CHECK(qw.ok());
+  if (!qw.ok()) return;
+  pelias::os::FileMap pm;
+  pelias::io::GgufReader pr;
+  CHECK(pm.load(pl).ok() && pr.parse(pm).ok());
+  const std::vector<std::int32_t> tok{11, 427, 3, 999, 58, 58, 0, 731, 210, 64, 5, 300, 17};
+  const int n = static_cast<int>(tok.size()), v = static_cast<int>(tm.spec.n_vocab);
+  pelias::model::ForwardOptions opt;
+  opt.threads = 2;
+  auto logits = [&](const pelias::model::Qwen35MoeWeights& w, const pelias::model::ForwardOptions& o) {
+    std::vector<float> lg(static_cast<std::size_t>(n) * static_cast<std::size_t>(v));
+    CHECK(pelias::model::forward_reference(tm.spec, w, tok.data(), n, 0, n, lg.data(), o).ok());
+    return lg;
+  };
+  auto kl = [&](const std::vector<float>& p, const std::vector<float>& q) {  // mean KL(p || q) over positions
+    double total = 0.0;
+    for (int t = 0; t < n; ++t) {
+      const float* a = p.data() + static_cast<std::ptrdiff_t>(t) * v;
+      const float* b = q.data() + static_cast<std::ptrdiff_t>(t) * v;
+      double ma = a[0], mb = b[0], sa = 0.0, sb = 0.0;
+      for (int i = 1; i < v; ++i) ma = std::max(ma, static_cast<double>(a[i])), mb = std::max(mb, static_cast<double>(b[i]));
+      for (int i = 0; i < v; ++i) sa += std::exp(a[i] - ma), sb += std::exp(b[i] - mb);
+      for (int i = 0; i < v; ++i) {
+        const double la = a[i] - ma - std::log(sa), lb = b[i] - mb - std::log(sb);
+        total += std::exp(la) * (la - lb);
+      }
+    }
+    return total / n;
+  };
+  const std::vector<float> ref = logits(tm.w, opt);
+  const std::vector<float> l0 = logits(qw.value, opt);
+  pelias::model::Qwen35MoeWeights w1 = qw.value, w2 = qw.value;
+  const auto a1 = pelias::model::attach_planes(pr, pm.data(), w1, 1);
+  const auto a2 = pelias::model::attach_planes(pr, pm.data(), w2, 0);
+  CHECK(a1.ok() && a2.ok());
+  if (!a1.ok() || !a2.ok()) return;
+  CHECK_EQ(static_cast<std::size_t>(a2.value), rep.value.tensors);
+  const std::vector<float> l1 = logits(w1, opt), l2 = logits(w2, opt);
+  // the tiny model's random weights give near-flat distributions (KL about 1e-15), so the logits themselves are compared
+  auto mse = [&](const std::vector<float>& a, const std::vector<float>& b) {
+    double e = 0.0;
+    for (std::size_t i = 0; i < a.size(); ++i) e += static_cast<double>(a[i] - b[i]) * (a[i] - b[i]);
+    return e / static_cast<double>(a.size());
+  };
+  const double k0 = mse(ref, l0), k1 = mse(ref, l1), k2 = mse(ref, l2);
+  std::printf("    logit error to the original: file %.4g, + 1 plane %.4g (%.3f), + 2 planes %.4g (%.3f); KL %.3g / %.3g / %.3g\n", k0, k1, k1 / k0, k2,
+              k2 / k0, kl(ref, l0), kl(ref, l1), kl(ref, l2));
+  CHECK(k1 < 0.6 * k0);
+  CHECK(k2 < 0.6 * k1);
+  pelias::model::ForwardOptions off = opt;
+  off.planes = false;
+  CHECK(logits(w2, off) == l0);
+  // more planes than stored, and a side file built for another model file, are refused
+  pelias::model::Qwen35MoeWeights w3 = qw.value;
+  CHECK(!pelias::model::attach_planes(pr, pm.data(), w3, 3).ok());
+  pelias::model::Qwen35MoeWeights wf = tm.w;
+  CHECK(!pelias::model::attach_planes(pr, pm.data(), wf, 0).ok());
+  // the exact head re-score: only the largest logits of each row change
+  CHECK(w2.output_exact.present());
+  pelias::model::ForwardOptions hr = opt;
+  hr.head_rescore = 8;
+  const std::vector<float> lh = logits(w2, hr);
+  int worst = 0;
+  for (int t = 0; t < n; ++t) {
+    int changed = 0;
+    for (int i = 0; i < v; ++i) {
+      const std::size_t at = static_cast<std::size_t>(t) * static_cast<std::size_t>(v) + static_cast<std::size_t>(i);
+      changed += lh[at] != l2[at];
+    }
+    worst = std::max(worst, changed);
+  }
+  CHECK(worst <= 8);
+  // every row re-scored exactly: no worse than the planed output layer (here the tied embedding, planed too)
+  hr.head_rescore = v;
+  const double kall = mse(ref, logits(w2, hr));
+  std::printf("    exact head re-score: 8 rows %.4g, all rows %.4g (%.3f of the file alone)\n", mse(ref, lh), kall, kall / k0);
+  CHECK(kall <= k2);
 }

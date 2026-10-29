@@ -168,12 +168,13 @@ build/host/pelias generate --model model.gguf --prompt "The capital of France is
 | Command | Does |
 |---|---|
 | `pelias inspect --model F`, `pelias device`, `pelias plan --model F`, `pelias key --model F` | Read a model, list the devices, plan a fit, key a file |
-| `pelias generate --model F --prompt TEXT` | Text from the CPU reference pass: prefill, then one token per step on the carried KV cache and DeltaNet state. `--temp 0` is greedy; `--top-k`, `--top-p`, `--min-p`, the penalties and `--seed` follow the parameter dictionary; `--ids-out` writes the token ids |
+| `pelias generate --model F --prompt TEXT` | Text from the CPU reference pass: prefill, then one token per step on the carried KV cache and DeltaNet state. `--temp 0` is greedy; `--top-k`, `--top-p`, `--min-p`, the penalties and `--seed` follow the parameter dictionary; `--ids-out` writes the token ids; `--no-mmap` reads the model into RAM first |
 | `pelias tokenize --model F --text TEXT` | The model's tokenizer (equal to llama.cpp's, token for token, on the P-D1 test files; `logs/BUILD_LOG.md`) |
 | `pelias quantize --model IN --out OUT [--recipe R.tsv] [--imatrix M.gguf] [--rotate32 GROUPS]` | Quantize with Pelias's own formats (incl. Q8_Z, Q7_ZT, Q4_TG2) |
 | `pelias imatrix --model F --file TEXT --out M.gguf` | Importance matrix from the fp32 reference pass |
 | `pelias kld --model F --base BASE.bin` | Score a file against the original. `--dump-kld`, `--route-dump`, `--dump-codes` and `--dump-qk` write per-token data; `--kv-store` / `--state-store` test KV and DeltaNet-state compaction |
 | `pelias kld-compare --a A.bin --b B.bin` | Paired comparison of two scored files (difference, interval, verdict) |
+| `pelias planes --model F --base ORIGINAL.gguf --out P.gguf [--k 2] [--exact-head]` | Residual sign planes of any model file against its original weights (each plane cuts the weight error about 3x); `kld` and `generate` read them with `--planes P.gguf`, `--plane-k K`, `--head-rescore N`, and `generate --planes-mode all\|prefill\|start:N` |
 | `pelias membw` | System RAM read rate by threads, page size and prefetch, and the lag the user would feel |
 
 **GPU probes** (stand-alone, one `.cu` each; the build line is at the top of each file):

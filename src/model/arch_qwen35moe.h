@@ -47,6 +47,11 @@ struct WeightView {
   // The file stores this weight rotated (pelias.rot32.tensors): every row was multiplied by the 32-value Walsh-Hadamard
   // transform before quantization, so each input row is rotated the same way before the product.
   bool rot32 = false;
+  // Residual sign planes from a side file (attach_planes, quant/planes.h): one row of plane_row_bytes per weight row, in the
+  // same space as the stored row (rotated if rot32); plane_k of the plane_k_stored planes are added to each row as it is read.
+  const std::uint8_t* planes = nullptr;
+  std::uint64_t plane_row_bytes = 0;
+  int plane_k = 0, plane_k_stored = 0;
   [[nodiscard]] bool present() const { return data != nullptr; }
 };
 
@@ -67,6 +72,9 @@ struct Qwen35MoeLayer {
 
 struct Qwen35MoeWeights {
   WeightView tok_embd, output;
+  // the output layer's original rows (BF16, never rotated) from a plane side file, for the exact re-score of the top
+  // candidates (ForwardOptions::head_rescore); absent unless attached
+  WeightView output_exact;
   std::vector<float> output_norm;
   std::vector<Qwen35MoeLayer> layers;  // the trunk only (spec.n_layer)
 };
@@ -75,6 +83,13 @@ struct Qwen35MoeWeights {
 // dequantize, and converts the small vectors (norms, conv taps, dt, A) to fp32. `file_base` is the start of the mapped
 // file the reader parsed.
 Result<Qwen35MoeWeights> bind_qwen35moe(const io::GgufReader& r, const std::uint8_t* file_base, const Qwen35MoeSpec& s);
+
+// Attaches the residual sign planes of a side file (`pelias planes`; its reader `pr` over the mapped bytes `planes_base`)
+// to every product weight it covers (and to the embedding table, which a tied output layer then shares): each plane tensor must have the weight's name, its row count, and the row length
+// the weight's type and the file's plane count give, and the side file must name the weight's type. k_use: planes read
+// per row (1 .. the stored count; 0 = all stored). Also binds output.weight.exact when the side file has it. Returns the
+// number of weights that got planes.
+Result<int> attach_planes(const io::GgufReader& pr, const std::uint8_t* planes_base, Qwen35MoeWeights& w, int k_use);
 
 struct ForwardOptions {
   int threads = 0;  // 0: every hardware thread
@@ -161,6 +176,12 @@ struct ForwardOptions {
   // counters for the above (may be null, 6 entries): [0] swaps made, [1] token-layers whose last pick was not resident,
   // [2] hidden values zeroed, [3] hidden values seen, [4] expert rows (token, expert) computed cold, [5] all expert rows
   std::uint64_t* m_stats = nullptr;
+  // Residual planes (attach_planes): read them in this call. The caller turns them off per call (pelias generate
+  // --planes-mode: all tokens, the prompt only, or the prompt and the first N decoded tokens).
+  bool planes = true;
+  // With the output layer's original rows attached (Qwen35MoeWeights::output_exact) and planes on: the head_rescore
+  // largest logits of each output row are recomputed exactly from the original rows and the unrounded fp32 input.
+  int head_rescore = 0;
 };
 
 // The orthonormal Walsh-Hadamard transform of every 32-value block of x[0..n) in place (n a multiple of 32). It is its

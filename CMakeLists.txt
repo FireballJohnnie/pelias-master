@@ -34,7 +34,7 @@ configure_file(include/pelias/version.h.in ${CMAKE_BINARY_DIR}/generated/pelias/
 pelias_add_module(pelias_os
   SOURCES src/os/status.cpp src/os/log.cpp src/os/file_map.cpp src/os/clock.cpp src/os/dynlib.cpp src/os/membw.cpp)
 pelias_add_module(pelias_quant
-  SOURCES src/quant/block_types.cpp src/quant/quant_cpu.cpp src/quant/tdecode.cpp src/quant/dequant_more.cpp src/quant/quant_weighted.cpp src/quant/iq_tables.cpp src/quant/type_rules.cpp
+  SOURCES src/quant/block_types.cpp src/quant/quant_cpu.cpp src/quant/tdecode.cpp src/quant/planes.cpp src/quant/dequant_more.cpp src/quant/quant_weighted.cpp src/quant/iq_tables.cpp src/quant/type_rules.cpp
   DEPENDS pelias_os)
 # The reference quantizers must round exactly as the reference does: plain float arithmetic, no fused multiply-add
 # (contraction) and no reassociation, whatever architecture flags the rest of the build gets later (P-E6).
@@ -62,7 +62,7 @@ if(NOT WIN32)
   target_link_libraries(pelias_os PRIVATE ${CMAKE_DL_LIBS})
 endif()
 pelias_add_module(pelias_io
-  SOURCES src/io/sha256.cpp src/io/json.cpp src/io/gguf_reader.cpp src/io/safetensors.cpp src/io/number_text.cpp src/io/gguf_writer.cpp src/io/requantize.cpp src/io/imatrix_weights.cpp src/io/gguf_compare.cpp src/io/text_file.cpp
+  SOURCES src/io/sha256.cpp src/io/json.cpp src/io/gguf_reader.cpp src/io/safetensors.cpp src/io/number_text.cpp src/io/gguf_writer.cpp src/io/requantize.cpp src/io/imatrix_weights.cpp src/io/gguf_compare.cpp src/io/text_file.cpp src/io/planes_build.cpp
   DEPENDS pelias_os pelias_hal pelias_quant)
 pelias_add_module(pelias_ingest
   SOURCES src/ingest/hf_metadata.cpp src/ingest/hf_vocab.cpp src/ingest/qwen35moe.cpp src/ingest/stage_a.cpp
@@ -100,7 +100,7 @@ target_link_libraries(pelias PRIVATE pelias_model pelias_verify pelias_tok pelia
 if(PELIAS_BUILD_TESTS)
   enable_testing()
   add_executable(pelias_unit tests/unit/main.cpp tests/unit/test_sha256.cpp tests/unit/test_json.cpp tests/unit/test_gguf.cpp
-                 tests/unit/test_safetensors.cpp tests/unit/test_plan.cpp tests/unit/test_block_types.cpp tests/unit/test_number_text.cpp tests/unit/test_nvml_pick.cpp tests/unit/test_quant.cpp tests/unit/test_tdecode.cpp tests/unit/test_type_rules.cpp tests/unit/test_requantize.cpp tests/unit/test_ingest.cpp tests/unit/test_tok.cpp tests/unit/test_model.cpp tests/unit/test_sampler.cpp tests/unit/test_membw.cpp tests/unit/synth_hf.cpp tests/unit/synth_model.cpp tests/unit/gguf_builder.cpp)
+                 tests/unit/test_safetensors.cpp tests/unit/test_plan.cpp tests/unit/test_block_types.cpp tests/unit/test_number_text.cpp tests/unit/test_nvml_pick.cpp tests/unit/test_quant.cpp tests/unit/test_tdecode.cpp tests/unit/test_planes.cpp tests/unit/test_type_rules.cpp tests/unit/test_requantize.cpp tests/unit/test_ingest.cpp tests/unit/test_tok.cpp tests/unit/test_model.cpp tests/unit/test_sampler.cpp tests/unit/test_membw.cpp tests/unit/synth_hf.cpp tests/unit/synth_model.cpp tests/unit/gguf_builder.cpp)
   pelias_apply_flags(pelias_unit)
   target_include_directories(pelias_unit PRIVATE tests)
   target_link_libraries(pelias_unit PRIVATE pelias_model pelias_verify pelias_tok pelias_plan pelias_ingest pelias_io pelias_hal pelias_quant pelias_os)

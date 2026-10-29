@@ -27,6 +27,24 @@ Copyright (c) 2026 John Lipka and the Pelias contributors
 
 ---
 
+## PRIORITY (author 2026-10-29 18:44): near-tie accuracy first; every other step waits until it is solved
+
+**Problem.** The GP3-07 gate (v8, Pelias's own format, no wormhole) split from llama.cpp on 11 of 20 prompts: 8 at near-ties, 3 at end-of-text setup (MEASURED); 4 of the 11 splits are in the first 5 output tokens. The KL drift sits in few tokens: the top 1 % hold 23-52 % of it (MEASURED). Better or worse is decided by KL against the original model (scoreboard); agreement is the gate.
+
+**What the offline checks settled (2026-10-29, MEASURED; D:\pelias-tests\gp\c3c6_pretoken):**
+- A pre-token flag (C6 map keyed on the state codes of step t-1) works but weakly: 10 % flagged catches 30 % of stuck tokens (layer 30, 16-nearest vote).
+- fp32 activations on stuck tokens: no gain (dropped from the careful path).
+- Expert picks: the router is already F32; stuck tokens carry no extra flips vs bf16; pick sensitivity is spread over all tokens. Not the lever.
+- **Weight error is the lever, mostly in the experts** (their weight error 20-75x the dense part's).
+
+**Solution: residual sign planes on the 1-bit path** (author 18:26-18:52; `pelias planes`, quant/planes.h, io/planes_build.h). Per 256 values: K fp16 scales and K sign bits per value, fitted against the original weights (plane by plane, then refitted together); added to the stored row as it is read. Any model file (ours, Unsloth's, stock) given its original weights once. Each plane cuts the weight error about 3x (MEASURED, blk.20 attn_qkv / gate_exps / down_exps); two planes beat storing one whole type up; rotating the residual first is worse (dropped). In the engine: planes on every token, on the prompt only, or on the prompt and the first N tokens (`--planes-mode`), and the exact re-score of the top output candidates from the original head rows (`--head-rescore`). Later (GP3-14): the planes on the GPU 1-bit path and the CPU bus, read per token by the flag / dual predict as a graded dial (0, 1 or 2 planes; author 19:03: proofreading in proportion to the uncertainty).
+
+**Run order:** (1) build the side file from the original BF16 model against the Unsloth MTP file (and urm_ZT2); (2) `pelias kld` with 0 / 1 / 2 planes and with the head re-score; (3) the 20-prompt decode again with planes; (4) score against the original model's own greedy output.
+
+**Parked until after Pelias-master 1.0 (author):** the wormhole DAX tail test (don't serve ~22 GB models through a DAX daemon; plain virtiofs loaded the model in 25 s).
+
+---
+
 ## Status on 2026-10-27 (15:0x): what is settled, what is open
 
 ### Where we are

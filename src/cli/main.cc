@@ -31,6 +31,7 @@
 #include "io/gguf_compare.h"
 #include "io/gguf_reader.h"
 #include "io/number_text.h"
+#include "io/planes_build.h"
 #include "io/requantize.h"
 #include "io/safetensors.h"
 #include "io/sha256.h"
@@ -177,6 +178,7 @@ void usage() {
       "                                  F of each routed expert's hidden values (oracle); --defer-experts D: the D lowest\n"
       "                                  experts added one layer later; --swap-near-tie M: use the first unpicked expert when\n"
       "                                  the last pick is not in the hot set, it is, and their probabilities differ by < M\n"
+      "      [--planes FILE] [--plane-k K] [--head-rescore N]   (residual planes; see planes and generate)\n"
       "  kld-compare --a A.bin --b B.bin [--name-a S] [--name-b S]\n"
       "                                  paired comparison of two --dump-kld files scored on the same base: mean difference,\n"
       "                                  chunk-clustered standard error, 95 % interval, top-token disagreements, verdict\n"
@@ -193,6 +195,19 @@ void usage() {
       "                                  DeltaNet state. --temp 0 is greedy; the draw is Philox4x32-10 keyed by --seed.\n"
       "                                  Defaults are the parameter dictionary's. --ids-out writes the prompt and output ids\n"
       "                                  and each step's top-1 minus top-2 raw logit (tools/greedy_compare.py reads it)\n"      "                                  --no-mmap reads the whole file into RAM first (for mounts that do not cache it)\n"
+      "      [--planes FILE] [--plane-k K] [--planes-mode all|prefill|start:N] [--head-rescore N]\n"
+      "                                  residual sign planes (`pelias planes`): read on every token (all), on the prompt only\n"
+      "                                  (prefill), or on the prompt and the first N output tokens (start:N); --plane-k reads\n"
+      "                                  the first K stored planes; --head-rescore N recomputes the N largest logits exactly from\n"
+      "                                  the original output rows (a plane file built with --exact-head)\n"
+      "  planes --model FILE --base ORIGINAL.gguf --out PLANES.gguf [--k 2] [--refit 8] [--imatrix IMATRIX.gguf] [--exact-head]\n"
+      "         [--threads N] [--keep-mtp]\n"
+      "                                  residual sign planes of any model file against its original weights (F32/F16/BF16, same\n"
+      "                                  tensor names): per 256 values, K fp16 scales and K sign bits per value, fitted plane by\n"
+      "                                  plane then together (--refit rounds); weighted per column by an importance matrix when\n"
+      "                                  given. --exact-head also stores the original output rows (BF16) for --head-rescore.\n"
+      "                                  The output must not exist; the model file's types are recorded so it is only read\n"
+      "                                  with that file.\n"
       "  probe | train | export | serve | bench | web   not built yet (later steps)\n"
       "options: --log debug|info|warn|error (default info)");
 }
@@ -736,6 +751,57 @@ bool act_options(const Args& a, model::ForwardOptions& fo) {
   return true;
 }
 
+// --planes FILE [--plane-k K] [--head-rescore N]: residual sign planes from `pelias planes`, read into RAM and attached to
+// the weights (model::attach_planes). Returns 0, or the exit code after printing why.
+int plane_options(const Args& a, os::FileMap& pm, io::GgufReader& pg, model::Qwen35MoeWeights& w, model::ForwardOptions& fo, const char* who) {
+  if (!a.has("planes")) {
+    if (a.has("plane-k") || a.has("head-rescore") || a.has("planes-mode")) {
+      std::fprintf(stderr, "pelias: --plane-k, --head-rescore and --planes-mode need --planes FILE\n");
+      return 1;
+    }
+    return 0;
+  }
+  int k = 0;
+  if (a.has("plane-k")) {
+    const Result<std::uint64_t> r = io::parse_whole(a.get("plane-k"), 4);
+    if (!r.ok() || r.value == 0) {
+      std::fprintf(stderr, "pelias: --plane-k needs a whole number from 1 to 4\n");
+      return 1;
+    }
+    k = static_cast<int>(r.value);
+  }
+  if (a.has("head-rescore")) {
+    const Result<std::uint64_t> r = io::parse_whole(a.get("head-rescore"), 1u << 20);
+    if (!r.ok()) {
+      std::fprintf(stderr, "pelias: --head-rescore needs a whole number (0 = off)\n");
+      return 1;
+    }
+    fo.head_rescore = static_cast<int>(r.value);
+  }
+  Timer tl;
+  Status s = pm.load(a.get("planes"));
+  if (!s) return fail_input(s);
+  if (pm.unread_from() < pm.size()) {
+    std::fprintf(stderr, "pelias: the mount refused the end of the plane file; copy it to another drive\n");
+    return 2;
+  }
+  s = pg.parse(pm);
+  if (!s) return fail_input(s);
+  const Result<int> n = model::attach_planes(pg, pm.data(), w, k);
+  if (!n.ok()) return fail_input(n.status);
+  int stored = 0;
+  for (const model::Qwen35MoeLayer& l : w.layers)
+    if (l.down_exps.planes) stored = l.down_exps.plane_k_stored;
+  std::fprintf(stderr, "pelias %s: residual planes on %d weights (%d of %d stored per row) from %s, %.2f GB in %.1f s; exact head re-score %s\n", who,
+               n.value, k > 0 ? k : stored, stored, a.get("planes").c_str(), static_cast<double>(pm.size()) / 1e9, tl.seconds(),
+               fo.head_rescore > 0 && w.output_exact.present() ? std::to_string(fo.head_rescore).c_str() : "off");
+  if (fo.head_rescore > 0 && !w.output_exact.present()) {
+    std::fprintf(stderr, "pelias: --head-rescore needs a plane file built with --exact-head\n");
+    return 1;
+  }
+  return 0;
+}
+
 int cmd_kld(const Args& a) {
   const std::string path = a.get("model"), base_path = a.get("base");
   if (path.empty() || base_path.empty()) {
@@ -759,8 +825,12 @@ int cmd_kld(const Args& a) {
   if (!s) return fail_input(s);
   const Result<model::Qwen35MoeSpec> spec = model::read_qwen35moe_spec(g);
   if (!spec.ok()) return fail_input(spec.status);
-  const Result<model::Qwen35MoeWeights> w = model::bind_qwen35moe(g, m.data(), spec.value);
+  Result<model::Qwen35MoeWeights> w = model::bind_qwen35moe(g, m.data(), spec.value);
   if (!w.ok()) return fail_input(w.status);
+  model::ForwardOptions plane_fo;
+  os::FileMap pm;
+  io::GgufReader pg;
+  if (const int rc = plane_options(a, pm, pg, w.value, plane_fo, "kld"); rc != 0) return rc;
   {
     std::size_t nrot = w.value.output.rot32 ? 1 : 0;
     for (const model::Qwen35MoeLayer& l : w.value.layers)
@@ -803,6 +873,7 @@ int cmd_kld(const Args& a) {
   verify::KlStats stats;
   model::ForwardOptions fo;
   fo.threads = threads;
+  fo.head_rescore = plane_fo.head_rescore;
   if (!act_options(a, fo)) return 1;
   // Block M: speed ideas, each measured for its accuracy cost
   std::uint64_t m_stats[6] = {0, 0, 0, 0, 0, 0};
@@ -1248,6 +1319,80 @@ bool float_option(const Args& a, const char* k, float lo, float hi, float& v) {
 
 // GP3-07: text generation on the CPU reference pass. The prompt runs once (prefill), then one token per step against the
 // carried KV cache and DeltaNet state; the sampler picks each token (temperature 0 = greedy).
+int cmd_planes(const Args& a) {
+  const std::string path = a.get("model"), base_path = a.get("base"), out_path = a.get("out");
+  if (path.empty() || base_path.empty() || out_path.empty()) {
+    usage();
+    return 1;
+  }
+  if (std::ifstream(out_path, std::ios::binary)) {
+    std::fprintf(stderr, "pelias: %s already exists (nothing is overwritten)\n", out_path.c_str());
+    return 1;
+  }
+  io::PlaneBuildOptions po;
+  if (a.has("k")) {
+    const Result<std::uint64_t> r = io::parse_whole(a.get("k"), 4);
+    if (!r.ok() || r.value == 0) {
+      std::fprintf(stderr, "pelias: --k needs a whole number from 1 to 4\n");
+      return 1;
+    }
+    po.k = static_cast<int>(r.value);
+  }
+  if (a.has("refit")) {
+    const Result<std::uint64_t> r = io::parse_whole(a.get("refit"), 64);
+    if (!r.ok()) {
+      std::fprintf(stderr, "pelias: --refit needs a whole number from 0 to 64\n");
+      return 1;
+    }
+    po.refit_rounds = static_cast<int>(r.value);
+  }
+  if (a.has("threads")) {
+    const Result<std::uint64_t> r = io::parse_whole(a.get("threads"), 4096);
+    if (!r.ok() || r.value == 0) {
+      std::fprintf(stderr, "pelias: --threads needs a whole number from 1 to 4096\n");
+      return 1;
+    }
+    po.threads = static_cast<int>(r.value);
+  }
+  po.imatrix = a.get("imatrix");
+  po.exact_head = a.has("exact-head");
+  po.skip_mtp = !a.has("keep-mtp");
+  os::FileMap mm, bm;
+  Status s = mm.open(path);
+  if (!s) return fail_input(s);
+  s = bm.open(base_path);
+  if (!s) return fail_input(s);
+  io::GgufReader mg, bg;
+  s = mg.parse(mm);
+  if (!s) return fail_input(s);
+  s = bg.parse(bm);
+  if (!s) return fail_input(s);
+  std::fprintf(stderr, "pelias planes: %s against %s: %d plane(s) per row, %d refit round(s), importance %s%s\n", path.c_str(), base_path.c_str(), po.k,
+               po.refit_rounds, po.imatrix.empty() ? "none" : po.imatrix.c_str(), po.exact_head ? ", exact output rows" : "");
+  Timer t;
+  std::size_t last_pct = 0;
+  const auto prog = [&](std::size_t done, std::size_t total, const std::string& name) {
+    const std::size_t pct = done * 100 / total;
+    if (pct / 10 != last_pct / 10 || done == total) {
+      std::fprintf(stderr, "pelias planes: %3zu %% (%zu of %zu weights, %s) %.0f s\n", pct, done, total, name.c_str(), t.seconds());
+      last_pct = pct;
+    }
+  };
+  const Result<io::PlaneBuildReport> rep = io::build_planes(mm, mg, bm, bg, out_path, po, prog);
+  if (!rep.ok()) {
+    std::fprintf(stderr, "pelias: %s (a partial %s may be left; it is not removed)\n", rep.status.text().c_str(), out_path.c_str());
+    return rep.status.code == Code::invalid_argument ? 1 : 2;
+  }
+  for (const std::string& x : rep.value.skipped) std::fprintf(stderr, "pelias planes: left out %s\n", x.c_str());
+  if (rep.value.imatrix_basis_skips)
+    std::fprintf(stderr, "pelias planes: %zu weights fitted without importance (the matrix was collected rotated and the file is not, or the reverse)\n",
+                 rep.value.imatrix_basis_skips);
+  std::fprintf(stderr, "pelias planes: %zu weights, %.2f GB of planes in %.0f s; residual (importance-weighted sum) %.6g -> %.6g (%.4f)\n",
+               rep.value.tensors, static_cast<double>(rep.value.bytes) / 1e9, t.seconds(), rep.value.err_before, rep.value.err_after,
+               rep.value.err_before > 0 ? rep.value.err_after / rep.value.err_before : 0.0);
+  return 0;
+}
+
 int cmd_generate(const Args& a) {
   const std::string path = a.get("model");
   if (path.empty() || (a.has("prompt") == a.has("prompt-file"))) {
@@ -1356,8 +1501,32 @@ int cmd_generate(const Args& a) {
         return 2;
       }
   }
-  const Result<model::Qwen35MoeWeights> w = model::bind_qwen35moe(g, m.data(), spec.value);
+  Result<model::Qwen35MoeWeights> w = model::bind_qwen35moe(g, m.data(), spec.value);
   if (!w.ok()) return fail_input(w.status);
+  // --planes-mode: all (every token), prefill (the prompt only), start:N (the prompt and the first N output tokens)
+  int planes_until = -1;  // output tokens whose step reads the planes; -1 = all
+  if (a.has("planes-mode")) {
+    const std::string pmode = a.get("planes-mode");
+    if (pmode == "all") planes_until = -1;
+    else if (pmode == "prefill") planes_until = 1;  // output token 0 comes from the prompt pass
+    else if (pmode.rfind("start:", 0) == 0) {
+      const Result<std::uint64_t> r = io::parse_whole(pmode.substr(6), 1u << 20);
+      if (!r.ok() || r.value == 0) {
+        std::fprintf(stderr, "pelias: --planes-mode start:N needs N from 1\n");
+        return 1;
+      }
+      planes_until = static_cast<int>(r.value);
+    } else {
+      std::fprintf(stderr, "pelias: --planes-mode is all, prefill or start:N\n");
+      return 1;
+    }
+  }
+  os::FileMap pm;
+  io::GgufReader pg;
+  if (const int rc = plane_options(a, pm, pg, w.value, fo, "generate"); rc != 0) return rc;
+  if (a.has("planes"))
+    std::fprintf(stderr, "pelias generate: planes read on %s\n",
+                 planes_until < 0 ? "every token" : planes_until == 1 ? "the prompt only" : ("the prompt and the first " + std::to_string(planes_until) + " output tokens").c_str());
   Result<tok::Tokenizer> tk = tok::Tokenizer::from_gguf(g);
   if (!tk.ok()) return fail_input(tk.status);
   std::string text;
@@ -1435,6 +1604,7 @@ int cmd_generate(const Args& a) {
       std::fflush(stdout);
     }
     if (i + 1 == n_predict) break;
+    fo.planes = planes_until < 0 || i + 1 < planes_until;  // this step gives output token i + 1
     s = model::forward_decode(spec.value, w.value, st, &next, 1, logits.data(), true, fo);
     if (!s) return fail_input(s);
   }
@@ -1492,6 +1662,7 @@ int main(int argc, char** argv) {
   if (cmd == "kld-compare") return cmd_kld_compare(a);
   if (cmd == "imatrix") return cmd_imatrix(a);
   if (cmd == "generate") return cmd_generate(a);
+  if (cmd == "planes") return cmd_planes(a);
   for (const char* later : {"probe", "train", "export", "serve", "bench", "web"})
     if (cmd == later) {
       std::fprintf(stderr, "pelias: '%s' is not built yet (a later step of the order of operations)\n", later);
