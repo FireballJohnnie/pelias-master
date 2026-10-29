@@ -112,6 +112,10 @@ struct ForwardOptions {
   // Optional state codes (C6 accuracy-assisted miss map): n_tokens x n_layer entries (position-major) of
   // quant::state_code_bytes(n_embd) bytes each, the code of each layer's normed input (after attn_norm).
   std::uint8_t* state_codes = nullptr;
+  // Optional q, k record (C1, the H gate on KV pages): for every full-attention layer in order, n_tokens x
+  // (n_head + n_head_kv) x head_dim fp16 values: each token's query heads (per-head normed and roped; the gate half left
+  // out) then its key heads (normed and roped), exactly what the attention scores use.
+  std::uint16_t* qk_dump = nullptr;
   // Speed ideas measured for their accuracy cost (game plan Block M). Each is off by default.
   // act_bits 4: with act_int8 on the gpu path, round to 4 bits per 32 values (symmetric, -7..7, fp16 scale) instead of
   // q8_1 (W4A4 with rotation, QuaRot-style).

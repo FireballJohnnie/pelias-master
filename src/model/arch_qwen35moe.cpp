@@ -265,6 +265,7 @@ struct Ctx {
   int64_t n;  // tokens
   const ForwardOptions& opt;
   std::uint32_t il = 0;  // the layer being run
+  std::uint32_t ai = 0;  // full-attention layers run before this one (ForwardOptions::qk_dump)
 };
 
 // the 8-bit activation format the inputs of `w` are rounded to (ForwardOptions::act_int8), or none; float weights never
@@ -547,6 +548,15 @@ void full_attention(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, floa
       rope_apply(kk, cs, s.n_rot);
     }
   });
+  if (c.opt.qk_dump) {
+    const int64_t row = (nh + nkv) * hd;
+    std::uint16_t* dst = c.opt.qk_dump + static_cast<int64_t>(c.ai) * n * row;
+    for (int64_t t = 0; t < n; ++t) {
+      for (int64_t h = 0; h < nh; ++h)
+        for (int64_t i = 0; i < hd; ++i) dst[t * row + h * hd + i] = quant::fp32_to_fp16(qg[z(t * q_w + h * 2 * hd + i)]);
+      for (int64_t i = 0; i < nkv * hd; ++i) dst[t * row + nh * hd + i] = quant::fp32_to_fp16(k[z(t * kv_w + i)]);
+    }
+  }
   const float scale = s.attn_scale != 0.0f ? s.attn_scale : 1.0f / std::sqrt(static_cast<float>(hd));
   const int64_t group = nh / nkv;
   // causal attention, one (head, query) per item; then the output is gated by sigmoid(gate) of the same head
@@ -971,7 +981,10 @@ Status forward_reference(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, cons
       for (int64_t t = 0; t < n; ++t) quant::state_code(xn.data() + t * e, e, opt.state_codes + (t * static_cast<int64_t>(s.n_layer) + il) * cb);
     }
     if (l.recurrent) delta_net(c, l, xn.data(), y.data());
-    else full_attention(c, l, xn.data(), y.data());
+    else {
+      full_attention(c, l, xn.data(), y.data());
+      ++c.ai;
+    }
     for (int64_t i = 0; i < n * e; ++i) x[z(i)] += y[z(i)];
     for (int64_t t = 0; t < n; ++t) rms_norm(x.data() + t * e, l.post_norm.data(), xn.data() + t * e, e, s.rms_eps);
     if (opt.defer_experts > 0) {  // Block M: this layer's deferred experts wait; the previous layer's arrive now

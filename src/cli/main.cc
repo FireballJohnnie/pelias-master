@@ -147,10 +147,12 @@ void usage() {
       "                                  KL divergence of the model against a base file written by llama-perplexity\n"
       "                                  --kl-divergence-base, computed by Pelias's fp32 CPU reference forward pass;\n"
       "                                  --expert-stats: per layer and expert, how often it was picked and its routing weight\n"
-      "      [--dump-kld OUT.bin] [--act-int8 GROUPS] [--act-int8-path cpu|gpu|gpu256|gpu256x8|gpu256e] [--act-rot h32] [--route-dump OUT.bin] [--dump-codes OUT.bin]\n"
+      "      [--dump-kld OUT.bin] [--act-int8 GROUPS] [--act-int8-path cpu|gpu|gpu256|gpu256x8|gpu256e] [--act-rot h32] [--route-dump OUT.bin] [--dump-codes OUT.bin] [--dump-qk OUT.bin]\n"
       "                                  --dump-codes: per scored token and layer, the state code of the layer's normed input\n"
       "                                  (C6 miss map: sign bits after a fixed sign diagonal and Hadamard per 32, plus one\n"
       "                                  log-energy byte per 32-block; quant::state_code)\n"
+      "                                  --dump-qk: every position's query and key heads (normed, roped; fp16) in every\n"
+      "                                  full-attention layer, for the C1 KV-page check; use a few --chunks (about 47 MB each)\n"
       "                                  --route-dump: per scored token and layer, the experts picked, their weights, the\n"
       "                                  margin to the first unpicked one, and the next layer's pre-gating prediction\n"
       "                                  --dump-kld: every scored token's KL, NLLs, delta-p and top-token match (for kld-compare);\n"
@@ -841,6 +843,36 @@ int cmd_kld(const Args& a) {
   std::vector<std::uint8_t> codes_chunk(codes_path.empty() ? 0 : static_cast<std::size_t>(n_ctx) * code_row);
   std::vector<std::uint8_t> codes_all;
   if (!codes_path.empty()) fo.state_codes = codes_chunk.data();
+  const std::string qk_path = a.get("dump-qk");
+  std::vector<std::uint16_t> qk_chunk;
+  std::FILE* qk_file = nullptr;
+  bool qk_ok = true;
+  if (!qk_path.empty()) {
+    if (std::ifstream(qk_path, std::ios::binary)) {
+      std::fprintf(stderr, "pelias: %s already exists (nothing is overwritten)\n", qk_path.c_str());
+      return 1;
+    }
+    std::vector<std::uint32_t> attn_layers;
+    for (std::uint32_t il = 0; il < spec.value.n_layer; ++il)
+      if (!w.value.layers[il].recurrent) attn_layers.push_back(il);
+    const std::size_t qk_row = static_cast<std::size_t>(spec.value.n_head + spec.value.n_head_kv) * spec.value.head_dim;
+    qk_chunk.assign(attn_layers.size() * static_cast<std::size_t>(n_ctx) * qk_row, 0);
+    fo.qk_dump = qk_chunk.data();
+    // PELQK001: magic, u32 n_ctx, chunks, n_attn_layers, n_head, n_head_kv, head_dim, u64 token hash (as --dump-kld),
+    // u32 layer index per full-attention layer; then per chunk, per full-attention layer, per position (all n_ctx):
+    // n_head query heads then n_head_kv key heads, head_dim fp16 each
+    qk_file = std::fopen(qk_path.c_str(), "wb");
+    qk_ok = qk_file != nullptr;
+    const std::uint32_t hdr[6] = {static_cast<std::uint32_t>(n_ctx), static_cast<std::uint32_t>(n_chunk), static_cast<std::uint32_t>(attn_layers.size()),
+                                  spec.value.n_head, spec.value.n_head_kv, spec.value.head_dim};
+    const std::uint64_t hash = verify::kl_token_hash(base.tokens().data(), static_cast<std::size_t>(n_chunk) * static_cast<std::size_t>(n_ctx));
+    qk_ok = qk_ok && std::fwrite("PELQK001", 1, 8, qk_file) == 8 && std::fwrite(hdr, 4, 6, qk_file) == 6 && std::fwrite(&hash, 8, 1, qk_file) == 1 &&
+            std::fwrite(attn_layers.data(), 4, attn_layers.size(), qk_file) == attn_layers.size();
+    if (!qk_ok) {
+      std::fprintf(stderr, "pelias: %s could not be written\n", qk_path.c_str());
+      return 6;
+    }
+  }
   std::vector<model::RouteRecord> route_chunk(route_path.empty() ? 0 : static_cast<std::size_t>(n_ctx) * spec.value.n_layer);
   std::vector<model::RouteRecord> route_all;
   if (!route_path.empty()) fo.route = route_chunk.data();
@@ -878,6 +910,7 @@ int cmd_kld(const Args& a) {
     if (!route_path.empty())  // the scored positions only, in the order of the KL records
       route_all.insert(route_all.end(), route_chunk.begin() + static_cast<std::ptrdiff_t>(first) * spec.value.n_layer,
                        route_chunk.begin() + static_cast<std::ptrdiff_t>(first + scored) * spec.value.n_layer);
+    if (qk_file) qk_ok = qk_ok && std::fwrite(qk_chunk.data(), 2, qk_chunk.size(), qk_file) == qk_chunk.size();
     if (!codes_path.empty())  // the scored positions only, in the order of the KL records
       codes_all.insert(codes_all.end(), codes_chunk.begin() + static_cast<std::ptrdiff_t>(first) * static_cast<std::ptrdiff_t>(code_row),
                        codes_chunk.begin() + static_cast<std::ptrdiff_t>(first + scored) * static_cast<std::ptrdiff_t>(code_row));
@@ -926,6 +959,14 @@ int cmd_kld(const Args& a) {
       return 6;
     }
     std::fprintf(stderr, "pelias kld: routing record written (%zu token-layers)\n", route_all.size());
+  }
+  if (qk_file) {
+    qk_ok = std::fclose(qk_file) == 0 && qk_ok;
+    if (!qk_ok) {
+      std::fprintf(stderr, "pelias: the q, k record could not be written\n");
+      return 6;
+    }
+    std::fprintf(stderr, "pelias kld: q, k record written (%d chunks)\n", n_chunk);
   }
   if (!codes_path.empty()) {
     // PELCODE1: magic, u32 n_ctx, chunks, scored, n_layer, n_embd, bytes per layer, u64 token hash (as --dump-kld), then
