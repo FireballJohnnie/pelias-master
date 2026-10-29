@@ -187,12 +187,12 @@ void usage() {
       "  generate --model FILE (--prompt TEXT | --prompt-file F) [--n-predict 128] [--ctx 32768] [--threads N]\n"
       "      [--temp 1.0] [--top-k 20] [--top-p 0.95] [--min-p 0] [--repeat-penalty 1] [--repeat-last-n 64]\n"
       "      [--presence-penalty 0] [--frequency-penalty 0] [--seed 20261019 | -1] [--ignore-eos] [--show-special]\n"
-      "      [--ids-out FILE] [--no-nfc] [--no-special] [--act-int8 GROUPS] [--act-int8-path ...] [--act-rot h32]\n"
+      "      [--ids-out FILE] [--no-nfc] [--no-special] [--act-int8 GROUPS] [--act-int8-path ...] [--act-rot h32] [--no-mmap]\n"
       "                                  text from the fp32 reference pass on the CPU (slow; a correctness reference, not the\n"
       "                                  engine): the prompt once, then one token per step on the carried KV cache and\n"
       "                                  DeltaNet state. --temp 0 is greedy; the draw is Philox4x32-10 keyed by --seed.\n"
       "                                  Defaults are the parameter dictionary's. --ids-out writes the prompt and output ids\n"
-      "                                  and each step's top-1 minus top-2 raw logit (tools/greedy_compare.py reads it)\n"
+      "                                  and each step's top-1 minus top-2 raw logit (tools/greedy_compare.py reads it)\n"      "                                  --no-mmap reads the whole file into RAM first (for mounts that do not cache it)\n"
       "  probe | train | export | serve | bench | web   not built yet (later steps)\n"
       "options: --log debug|info|warn|error (default info)");
 }
@@ -1330,13 +1330,32 @@ int cmd_generate(const Args& a) {
     return 1;
   }
   os::FileMap m;
-  Status s = m.open(path);
-  if (!s) return fail_input(s);
+  Status s;
+  if (a.has("no-mmap")) {
+    Timer tl;
+    s = m.load(path);
+    if (!s) return fail_input(s);
+    std::fprintf(stderr, "pelias generate: model read into RAM (--no-mmap): %.2f GB in %.1f s\n", static_cast<double>(m.size()) / 1e9, tl.seconds());
+    if (m.unread_from() < m.size())
+      std::fprintf(stderr, "pelias generate: the mount refused the file's last %llu bytes (from byte %llu); they are left zero and checked below\n",
+                   static_cast<unsigned long long>(m.size() - m.unread_from()), static_cast<unsigned long long>(m.unread_from()));
+  } else {
+    s = m.open(path);
+    if (!s) return fail_input(s);
+  }
   io::GgufReader g;
   s = g.parse(m);
   if (!s) return fail_input(s);
   const Result<model::Qwen35MoeSpec> spec = model::read_qwen35moe_spec(g);
   if (!spec.ok()) return fail_input(spec.status);
+  if (m.unread_from() < m.size()) {  // only tensors the reference pass does not run (the MTP block) may lie in the unread bytes
+    const std::string mtp = "blk." + std::to_string(spec.value.n_layer) + ".";
+    for (const io::GgufTensor& t : g.tensors())
+      if (t.file_offset + t.bytes > m.unread_from() && t.name.rfind(mtp, 0) != 0) {
+        std::fprintf(stderr, "pelias: tensor %s lies in the bytes the mount refused; run without --no-mmap or from another drive\n", t.name.c_str());
+        return 2;
+      }
+  }
   const Result<model::Qwen35MoeWeights> w = model::bind_qwen35moe(g, m.data(), spec.value);
   if (!w.ok()) return fail_input(w.status);
   Result<tok::Tokenizer> tk = tok::Tokenizer::from_gguf(g);
