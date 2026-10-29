@@ -42,6 +42,6 @@ for c in range(n_chunk):
                 if np.array_equal(T[e - n + 1:e + 1], suf): hit = e; break
             if hit is not None:
                 R['copy_n%d' % n][i] = True; R['copy_ok_n%d' % n][i] = T[hit + 1] == nxt
-    if c % 10 == 9: print('chunk %d/%d, %.0f s' % (c + 1, n_chunk, time.time() - t0), flush=True)
+    if c < 3 or c % 10 == 9: print('chunk %d/%d, %.0f s' % (c + 1, n_chunk, time.time() - t0), flush=True)
 np.savez_compressed(out, n_ctx=n_ctx, n_vocab=n_vocab, n_chunk=n_chunk, **R)
 print('wrote %s: %d tokens, %.0f s' % (out, N, time.time() - t0))

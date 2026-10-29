@@ -1,0 +1,22 @@
+== blk.20.ffn_gate_exps.weight (4 experts, 128 rows each)
+  3-bit uniform, zip scales       3.254 bpw  plain 0.029902  weighted 0.031521  | K-line at this bpw 0.029842 -> ties
+  Q3_K                            3.438 bpw  plain 0.023035  weighted 0.024463  | K-line at this bpw 0.023035 -> ties
+  C4 LUT grids, tag byte          3.504 bpw  plain 0.019040  weighted 0.019837  | K-line at this bpw 0.020976 -> BEATS
+  C4 additive grids, tag byte     3.504 bpw  plain 0.020113  weighted 0.021098  | K-line at this bpw 0.020976 -> BEATS
+  3-bit uniform + H gate 2/8      3.535 bpw  plain 0.022301  weighted 0.023308  | K-line at this bpw 0.020071 -> above
+  C4 LUT grids + H gate 2/8       3.785 bpw  plain 0.014914  weighted 0.015492  | K-line at this bpw 0.014108 -> above
+  C4 additive + H gate 2/8        3.785 bpw  plain 0.015568  weighted 0.016318  | K-line at this bpw 0.014108 -> above
+  4-bit uniform, zip scales       4.254 bpw  plain 0.007479  weighted 0.007948  | K-line at this bpw 0.007284 -> above
+  Q4_K                            4.500 bpw  plain 0.005148  weighted 0.005450  | K-line at this bpw 0.005148 -> ties
+  C4-4 LUT grids, tag byte        4.504 bpw  plain 0.004814  weighted 0.005038  | K-line at this bpw 0.005120 -> BEATS
+== blk.20.ffn_down_exps.weight (4 experts, 512 rows each)
+  3-bit uniform, zip scales       3.254 bpw  plain 0.029500  weighted 0.029493  | K-line at this bpw 0.029518 -> ties
+  Q3_K                            3.438 bpw  plain 0.022792  weighted 0.022802  | K-line at this bpw 0.022792 -> ties
+  C4 LUT grids, tag byte          3.504 bpw  plain 0.018916  weighted 0.018932  | K-line at this bpw 0.020756 -> BEATS
+  C4 additive grids, tag byte     3.504 bpw  plain 0.019959  weighted 0.019950  | K-line at this bpw 0.020756 -> BEATS
+  3-bit uniform + H gate 2/8      3.535 bpw  plain 0.022036  weighted 0.022045  | K-line at this bpw 0.019862 -> above
+  C4 LUT grids + H gate 2/8       3.785 bpw  plain 0.014846  weighted 0.014867  | K-line at this bpw 0.013967 -> above
+  C4 additive + H gate 2/8        3.785 bpw  plain 0.015475  weighted 0.015490  | K-line at this bpw 0.013967 -> above
+  4-bit uniform, zip scales       4.254 bpw  plain 0.007362  weighted 0.007378  | K-line at this bpw 0.007217 -> above
+  Q4_K                            4.500 bpw  plain 0.005103  weighted 0.005101  | K-line at this bpw 0.005103 -> ties
+  C4-4 LUT grids, tag byte        4.504 bpw  plain 0.004778  weighted 0.004786  | K-line at this bpw 0.005075 -> BEATS

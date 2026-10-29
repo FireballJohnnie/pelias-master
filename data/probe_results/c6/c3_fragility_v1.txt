@@ -1,0 +1,24 @@
+check: reference NLL from the base file vs the .kld nll_base: max |diff| 0.00e+00, mean 0.00e+00
+tokens 25500; hard 255 (consensus 143, overlap 112)
+
+1) Signals (AUROC on chunks 50-99; 0.5 = no signal, 1.0 = perfect)
+  small margin (-margin)                         hard 0.631   consensus 0.632
+  high entropy                                   hard 0.606   consensus 0.646
+  low top-1 prob (-p1)                           hard 0.610   consensus 0.638
+  reference NLL of the true token (oracle-ish)   hard 0.589   consensus 0.613
+
+2) Flag the riskiest share of tokens by small margin (threshold from chunks 0-49), scored on 50-99:
+  flag    2 % of tokens -> catches   2.2 % of hard tokens,   1.3 % of consensus hard,   3.1 % of all KL
+  flag    5 % of tokens -> catches   9.0 % of hard tokens,   7.9 % of consensus hard,   7.9 % of all KL
+  flag   11 % of tokens -> catches  16.4 % of hard tokens,  11.8 % of consensus hard,  15.3 % of all KL
+  flag   21 % of tokens -> catches  29.1 % of hard tokens,  26.3 % of consensus hard,  30.6 % of all KL
+
+3) Copyable n-grams (an earlier occurrence of the last n tokens exists in the chunk)
+  n=1: copy available 64.7 % of tokens; copy right 14.5 %; P(hard | copy right) 0.60 %, P(hard | copy wrong) 1.16 %, P(hard | no copy) 0.94 % (base 1.00 %)
+  n=2: copy available 26.8 % of tokens; copy right  9.5 %; P(hard | copy right) 0.45 %, P(hard | copy wrong) 1.64 %, P(hard | no copy) 0.92 % (base 1.00 %)
+  n=3: copy available 12.0 % of tokens; copy right  5.2 %; P(hard | copy right) 0.38 %, P(hard | copy wrong) 2.01 %, P(hard | no copy) 0.96 % (base 1.00 %)
+  n=3 copy right but the reference top-1 is something else: 70 tokens, P(hard) 2.9 %
+  share of hard tokens with a right n=3 copy: 2.0 %; with a wrong n=3 copy: 13.7 %
+
+4) Combined: small margin (flag 10 %) OR a wrong n=2 copy, scored on 50-99
+  flags 25.6 % of tokens -> 37.3 % of hard, 26.3 % of consensus hard, 33.8 % of KL
