@@ -21,7 +21,8 @@
 //   int8 -> float done by the magic number (path 2); path 0 is v1. Every check case runs all three paths; the stream rows add
 //   (b) and (c) for the new paths and the Q4_TG2-only rows for paths 1 and 2.
 //   v2 fix 6 (Fable item 6): (c) with a per-stage counter waited per warp (c1), and with the next stage's weights prefetched into
-//   L2 before the wait (c2); the check runs the counted kernel over two stages (path 3).
+//   L2 before the wait (c2), and with the warp's whole next-stage share prefetched (c3); the check runs the counted kernel with
+//   the whole-share prefetch over two stages (path 3).
 // Build (WSL): nvcc -std=c++17 -O3 -arch=sm_89 r3.cu -o r3     (Windows: the same with -o r3.exe, from a VS x64 prompt)
 #include <cooperative_groups.h>
 #include <cuda_fp16.h>
@@ -354,7 +355,9 @@ __device__ __forceinline__ void prefetch_task(const Job* __restrict__ jobs, int 
   }
 }
 
-template <int Q4V, bool PF>
+// PF: 0 = no prefetch, 1 = the warp's first next-stage task, 2 = the warp's whole next-stage share (stages are 6-24 MB, the L2
+// is 36 MB, so the next stage is mostly in L2 when its loads issue; DRAM keeps streaming through the tail and the wait)
+template <int Q4V, int PF>
 __global__ void __launch_bounds__(256) r3_counted(const Job* __restrict__ jobs, int njobs, const long long* __restrict__ stage_end, int nstages,
                                                   unsigned long long* done, unsigned long long epoch) {
   R3_LUT_SETUP(Q4V)
@@ -375,9 +378,11 @@ __global__ void __launch_bounds__(256) r3_counted(const Job* __restrict__ jobs, 
       __threadfence();  // this warp's outputs are visible before its count is
       if (mine) atomicAdd(done + s, mine);
     }
-    if (PF) {
+    if (PF == 1) {
       const long long tn = end + w0;
       if (tn < stage_end[s + 1]) prefetch_task(jobs, njobs, tn);
+    } else if (PF == 2) {
+      for (long long tn = end + w0; tn < stage_end[s + 1]; tn += warps) prefetch_task(jobs, njobs, tn);
     }
     if (lane == 0) {
       const unsigned long long target = epoch * static_cast<unsigned long long>(end - begin);
@@ -614,7 +619,7 @@ static int run_check() {
       else if (v == 2) r3_stream<2><<<sms() * 4, 256, kLutBytes>>>(dj, 1, 0, J.ntask, nullptr);
       else {
         int oc = 0;
-        CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&oc, r3_counted<2, true>, 256, kLutBytes));
+        CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&oc, r3_counted<2, 2>, 256, kLutBytes));
         std::vector<long long> se{J.ntask / 2, J.ntask};
         long long* dse = up(se);
         unsigned long long* ddone;
@@ -623,7 +628,7 @@ static int run_check() {
         int nj = 1, ns = 2;
         unsigned long long ep = 1;
         void* a3[] = {&dj, &nj, &dse, &ns, &ddone, &ep};
-        CK(cudaLaunchCooperativeKernel(reinterpret_cast<void*>(r3_counted<2, true>), dim3(sms() * oc), dim3(256), a3, kLutBytes, nullptr));
+        CK(cudaLaunchCooperativeKernel(reinterpret_cast<void*>(r3_counted<2, 2>), dim3(sms() * oc), dim3(256), a3, kLutBytes, nullptr));
       }
       CK(cudaDeviceSynchronize());
       std::vector<float> yg(static_cast<size_t>(c.n));
@@ -788,18 +793,25 @@ static int run_stream(int soak_s, bool distinct) {
   const double tc2 = timed([&] { CK(cudaLaunchCooperativeKernel(reinterpret_cast<void*>(r3_staged<2>), dim3(nsm * occc2), dim3(256), args, kLutBytes, nullptr)); });
   // v2 fix 6: the counter barrier (c1) and the counter barrier with the next stage's weights prefetched before the wait (c2)
   int occk1 = 0, occk2 = 0;
-  CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occk1, r3_counted<2, false>, 256, kLutBytes));
-  CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occk2, r3_counted<2, true>, 256, kLutBytes));
+  CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occk1, r3_counted<2, 0>, 256, kLutBytes));
+  CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occk2, r3_counted<2, 1>, 256, kLutBytes));
   unsigned long long* ddone;
   CK(cudaMalloc(&ddone, nstages * sizeof(unsigned long long)));
   unsigned long long ep1 = 0, ep2 = 0;
   CK(cudaMemset(ddone, 0, nstages * sizeof(unsigned long long)));
   void* ak1[] = {&dj, &njobs, &dse, &nst, &ddone, &ep1};
-  const double tk1 = timed([&] { ++ep1; CK(cudaLaunchCooperativeKernel(reinterpret_cast<void*>(r3_counted<2, false>), dim3(nsm * occk1), dim3(256), ak1, kLutBytes, nullptr)); });
+  const double tk1 = timed([&] { ++ep1; CK(cudaLaunchCooperativeKernel(reinterpret_cast<void*>(r3_counted<2, 0>), dim3(nsm * occk1), dim3(256), ak1, kLutBytes, nullptr)); });
   CK(cudaDeviceSynchronize());
   CK(cudaMemset(ddone, 0, nstages * sizeof(unsigned long long)));
   void* ak2[] = {&dj, &njobs, &dse, &nst, &ddone, &ep2};
-  const double tk2 = timed([&] { ++ep2; CK(cudaLaunchCooperativeKernel(reinterpret_cast<void*>(r3_counted<2, true>), dim3(nsm * occk2), dim3(256), ak2, kLutBytes, nullptr)); });
+  const double tk2 = timed([&] { ++ep2; CK(cudaLaunchCooperativeKernel(reinterpret_cast<void*>(r3_counted<2, 1>), dim3(nsm * occk2), dim3(256), ak2, kLutBytes, nullptr)); });
+  CK(cudaDeviceSynchronize());
+  int occk3 = 0;
+  CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occk3, r3_counted<2, 2>, 256, kLutBytes));
+  unsigned long long ep3 = 0;
+  CK(cudaMemset(ddone, 0, nstages * sizeof(unsigned long long)));
+  void* ak3[] = {&dj, &njobs, &dse, &nst, &ddone, &ep3};
+  const double tk3 = timed([&] { ++ep3; CK(cudaLaunchCooperativeKernel(reinterpret_cast<void*>(r3_counted<2, 2>), dim3(nsm * occk3), dim3(256), ak3, kLutBytes, nullptr)); });
   CK(cudaGetLastError());
   auto row = [&](const char* name, double ms, size_t by) {
     std::printf("  %-62s %8.3f ms  %6.1f GB/s\n", name, ms, by / (ms * 1e6));
@@ -821,8 +833,9 @@ static int run_stream(int soak_s, bool distinct) {
   std::printf("v2 fix 6 (path 2; per-stage counter waited per warp instead of a grid sync):\n");
   row("(c1) counter barrier", tk1, bytes);
   row("(c2) counter barrier + next stage's weights prefetched before the wait", tk2, bytes);
-  std::printf("  per stage boundary over (b) path 2: grid sync %.2f us, counter %.2f us, counter + prefetch %.2f us; blocks per SM %d / %d\n",
-              (tc2 - tb2) * 1e3 / 160.0, (tk1 - tb2) * 1e3 / 160.0, (tk2 - tb2) * 1e3 / 160.0, occk1, occk2);
+  row("(c3) counter barrier + the whole next-stage share prefetched", tk3, bytes);
+  std::printf("  per stage boundary over (b) path 2: grid sync %.2f us, counter %.2f us, + one-task prefetch %.2f us, + whole-share prefetch %.2f us; blocks per SM %d / %d / %d\n",
+              (tc2 - tb2) * 1e3 / 160.0, (tk1 - tb2) * 1e3 / 160.0, (tk2 - tb2) * 1e3 / 160.0, (tk3 - tb2) * 1e3 / 160.0, occk1, occk2, occk3);
 
   // ---- per-format (b) rows (Fable item 1): one format per table, real shapes, >= 256 MiB of distinct matrices (one
   // allocation, jobs are row slices of it; nothing is read twice, so nothing is served from the 36 MB L2)
@@ -903,8 +916,9 @@ static void print_kernels() {
                                                            {reinterpret_cast<const void*>(r3_stream<2>), "r3_stream<2>", kLutBytes},
                                                            {reinterpret_cast<const void*>(r3_staged<0>), "r3_staged<0>", 0},
                                                            {reinterpret_cast<const void*>(r3_staged<2>), "r3_staged<2>", kLutBytes},
-                                                           {reinterpret_cast<const void*>(r3_counted<2, false>), "r3_counted<2,0>", kLutBytes},
-                                                           {reinterpret_cast<const void*>(r3_counted<2, true>), "r3_counted<2,1>", kLutBytes},
+                                                           {reinterpret_cast<const void*>(r3_counted<2, 0>), "r3_counted<2,0>", kLutBytes},
+                                                           {reinterpret_cast<const void*>(r3_counted<2, 1>), "r3_counted<2,1>", kLutBytes},
+                                                           {reinterpret_cast<const void*>(r3_counted<2, 2>), "r3_counted<2,2>", kLutBytes},
                                                            {reinterpret_cast<const void*>(r3_sync_only), "r3_sync_only", 0}};
   for (const auto& k : K) {
     cudaFuncAttributes fa;
