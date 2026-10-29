@@ -1,0 +1,8 @@
+{
+ "files": [
+  "z_x8",
+  "zt2_x8",
+  "mtp_a8"
+ ],
+ "what": "per-token KL of the own-text runs (run C); token positions only, no text (the text stays on the author PC); stuck = top 1 % KL per file"
+}
