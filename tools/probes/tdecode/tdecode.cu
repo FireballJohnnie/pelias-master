@@ -13,6 +13,10 @@
 //   tdecode prep   : activation quantization per 32 + the 8 bit planes by warp ballot, checked against the host
 //   tdecode gemv2  : version 2 kernels (lanes split each row), cold L2 (64 MiB written between launches), median of 50
 //   tdecode gemv3  : versions 2 and 3 (v3: 2 or 4 rows per lane, every load issued before any arithmetic), cold L2
+//   tdecode ceil   : read-only ceiling (Fable 2026-10-29, test 1): how fast one cold launch can read N bytes at all, for
+//                    the GEMV shapes' byte counts and large buffers, over blocks per SM x loads in flight; plus the cost
+//                    of an empty launch. If the read-only kernel also stops near 325 GB/s at 17 MB, that is the limit of
+//                    one cold launch of that size; if it reaches 430+, the GEMV kernels leave bandwidth on the table.
 // Device layouts are the engine's (repacked at load from the GGUF blocks): headers and H bits in their own arrays.
 // Build (WSL): nvcc -std=c++17 -O3 -arch=sm_89 tdecode.cu -o tdecode
 #include <cuda_fp16.h>
@@ -901,9 +905,100 @@ static int run_shape(int n, std::mt19937& rng) {
   return fails;
 }
 
+// ------------------------------------------------------------------------------------------------ read-only ceiling
+template <int UNROLL>
+__global__ void read_ceiling(const int4* __restrict__ p, size_t n16, unsigned* sink) {
+  size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
+  unsigned acc = 0;
+  for (; i + (UNROLL - 1) * stride < n16; i += UNROLL * stride) {
+    int4 v[UNROLL];
+#pragma unroll
+    for (int u = 0; u < UNROLL; ++u) v[u] = ld_cs4(p + i + u * stride);  // every load issued before any use
+#pragma unroll
+    for (int u = 0; u < UNROLL; ++u) acc ^= static_cast<unsigned>(v[u].x ^ v[u].y ^ v[u].z ^ v[u].w);
+  }
+  for (; i < n16; i += stride) {
+    const int4 v = ld_cs4(p + i);
+    acc ^= static_cast<unsigned>(v.x ^ v.y ^ v.z ^ v.w);
+  }
+  if (acc == 0x9e3779b9u) atomicAdd(sink, 1u);  // keeps the loads alive
+}
+__global__ void empty_kernel() {}
+
+static int run_ceiling() {
+  int sms = 0;
+  CK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0));
+  cudaDeviceProp prop;
+  CK(cudaGetDeviceProperties(&prop, 0));
+  std::printf("device %s, %d SMs, L2 %d MB; cold = 64 MiB written between launches, median of 50\n", prop.name, sms, prop.l2CacheSize >> 20);
+  const size_t maxb = 256ull << 20;
+  int4* buf = nullptr;
+  unsigned* sink = nullptr;
+  void* flush = nullptr;
+  CK(cudaMalloc(&buf, maxb));
+  CK(cudaMemset(buf, 0x5a, maxb));
+  CK(cudaMalloc(&sink, 4));
+  CK(cudaMalloc(&flush, kFlushBytes));
+  cudaEvent_t e0, e1;
+  CK(cudaEventCreate(&e0));
+  CK(cudaEventCreate(&e1));
+  auto cold_us = [&](auto launch) {
+    const int reps = 50;
+    std::vector<float> t(reps);
+    launch();
+    CK(cudaDeviceSynchronize());
+    for (int i = 0; i < reps; ++i) {
+      CK(cudaMemsetAsync(flush, i & 0xff, kFlushBytes));
+      CK(cudaEventRecord(e0));
+      launch();
+      CK(cudaEventRecord(e1));
+      CK(cudaEventSynchronize(e1));
+      CK(cudaEventElapsedTime(&t[static_cast<size_t>(i)], e0, e1));
+    }
+    std::sort(t.begin(), t.end());
+    return t[reps / 2] * 1e3;
+  };
+  const double empty = cold_us([] { empty_kernel<<<1, 32>>>(); });
+  std::printf("empty launch (cold, event to event): %.2f us\n", empty);
+  // byte counts: Q8_Z rows of the GEMV shapes (8.25 bits per weight) and two large buffers
+  const struct { const char* name; size_t bytes; } sizes[] = {
+      {"2048 x 512 Q8_Z (1.08 MB)", 2048ull * 512 * 33 / 32},
+      {"4096 x 2048 Q8_Z (8.65 MB)", 4096ull * 2048 * 33 / 32},
+      {"8192 x 2048 Q8_Z (17.3 MB)", 8192ull * 2048 * 33 / 32},
+      {"64 MiB", 64ull << 20},
+      {"256 MiB", 256ull << 20}};
+  const int bpsm[] = {1, 2, 4, 8, 16, 32};
+  for (const auto& sz : sizes) {
+    const size_t n16 = sz.bytes / 16;
+    double best = 1e30, def = 0;
+    int bb = 0, bu = 0;
+    for (int b : bpsm)
+      for (int u : {1, 4, 8}) {
+        const int grid = b * sms;
+        double us = 0;
+        if (u == 1) us = cold_us([&] { read_ceiling<1><<<grid, 256>>>(buf, n16, sink); });
+        if (u == 4) us = cold_us([&] { read_ceiling<4><<<grid, 256>>>(buf, n16, sink); });
+        if (u == 8) us = cold_us([&] { read_ceiling<8><<<grid, 256>>>(buf, n16, sink); });
+        if (us < best) { best = us; bb = b; bu = u; }
+        if (b == 8 && u == 4) def = us;
+      }
+    CK(cudaGetLastError());
+    std::printf("  %-28s best %8.2f us  %7.1f GB/s (%2d blocks/SM, %d loads in flight per thread)  | 8 blocks/SM x 4: %7.1f GB/s  | "
+                "minus the empty launch: %7.1f GB/s\n",
+                sz.name, best, static_cast<double>(sz.bytes) / (best * 1e3), bb, bu, static_cast<double>(sz.bytes) / (def * 1e3),
+                static_cast<double>(sz.bytes) / (std::max(best - empty, 0.01) * 1e3));
+  }
+  CK(cudaFree(buf));
+  CK(cudaFree(sink));
+  CK(cudaFree(flush));
+  return 0;
+}
+
 int main(int argc, char** argv) {
   const std::string cmd = argc > 1 ? argv[1] : "";
   if (cmd == "mma") return run_mma();
+  if (cmd == "ceil") return run_ceiling();
   if (cmd == "gemv" || cmd == "prep" || cmd == "gemv2" || cmd == "gemv3") {
     if (cmd == "gemv3") {  // versions 2 and 3, cold L2, median of 50 (run A)
       g_v1 = false;
@@ -928,6 +1023,6 @@ int main(int argc, char** argv) {
     std::printf("%s\n", fails ? "SOME ROUTES FAILED" : "all routes match the host reference");
     return fails ? 1 : 0;
   }
-  std::fprintf(stderr, "usage: tdecode mma | gemv | gemv2 | gemv3\n");
+  std::fprintf(stderr, "usage: tdecode mma | gemv | gemv2 | gemv3 | ceil\n");
   return 1;
 }
