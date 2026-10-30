@@ -905,11 +905,17 @@ TEST(planes_on_tiered_files_select_blocks_and_picks) {
   if (!tw.ok() || !tw2.ok()) return;
   const std::vector<std::int32_t> tok{11, 427, 3, 999, 58, 58, 0, 731, 210, 64, 5, 300, 17};
   const int n = static_cast<int>(tok.size()), v = static_cast<int>(tm.spec.n_vocab);
-  auto logits = [&](const pelias::model::Qwen35MoeWeights& w, int picks, bool fast = false) {
+  auto logits = [&](const pelias::model::Qwen35MoeWeights& w, int picks, bool fast = false, bool int8 = false) {
     pelias::model::ForwardOptions o;
     o.threads = 2;
     o.plane_picks = picks;
     o.fast_cpu = fast;
+    if (int8) {  // the engine's activation format, every quantized weight (--act-int8 all --act-int8-path gpu256x8)
+      o.act_int8 = {"all"};
+      o.act_int8_gpu = true;
+      o.act_gpu256 = true;
+      o.act_gpu256_sub = 1;
+    }
     std::vector<float> lg(static_cast<std::size_t>(n) * static_cast<std::size_t>(v));
     CHECK(pelias::model::forward_reference(tm.spec, w, tok.data(), n, 0, n, lg.data(), o).ok());
     return lg;
@@ -997,6 +1003,14 @@ TEST(planes_on_tiered_files_select_blocks_and_picks) {
               d0, d1, d3, d4, dp, dr);
   for (const double d : {d0, d1, d3, d4, dp}) CHECK(d < 1e-4 * e1);
   CHECK(dr < 1e-4 * e1);
+  // the int8-activation path: the same rounded inputs as the reference with gpu256x8 rounding, integer products
+  const double i0 = mse(logits(tw.value, 0, true, true), logits(tw.value, 0, false, true)),
+               i1 = mse(logits(a1.w, 0, true, true), logits(a1.w, 0, false, true)), i3 = mse(logits(a3.w, 1, true, true), logits(a3.w, 1, false, true));
+  std::printf("    int8-activation path vs the reference with the same rounding (logit mse): tiered %.3g, + planes %.3g, half blocks top 1 %.3g\n", i0, i1, i3);
+  // Per row the integer path is within 2e-7 of fp64 (tests/unit/test_cpu_dot.cpp); through the model, a value that lands on
+  // a rounding boundary of the 8-bit activations can round one step the other way when an earlier sum differs in its last
+  // bit, so a position can differ by one activation step. That stays far below the weights' own error.
+  for (const double d : {i0, i1, i3}) CHECK(d < 2e-2 * e1);
   // (6) the same planes on another allocation are refused
   Attached a5;
   CHECK(!attach(p1, tw2.value, a5));

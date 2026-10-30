@@ -6,6 +6,7 @@
 // tolerance; dense and block-selective planes, fewer planes read than stored, and rows that are not whole segments.
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 #include "kern/cpu_dot.h"
@@ -180,4 +181,90 @@ TEST(cpu_dot_reads_every_readable_type) {
   std::printf("    cpu_dot: %d readable types checked, %d with an AVX2 dequantizer of their own\n", types, fast);
   CHECK(types >= 30);
   CHECK(fast == types);
+}
+
+// The int8-activation path (GP3-10 item 5): activations rounded per 32 values (the engine's gpu256x8 format); every type
+// with an integer form sums integer products per block. AVX2 = portable bit for bit; both within the rung-1 tolerance of
+// fp64 over the same rounded inputs (the row as dequantize_row gives it, planes added, times s_b q); recovering the
+// integers from rounded values gives the same integers.
+namespace {
+bool run_q8(std::uint32_t id, std::int64_t k, const kn::RowPlanes* pl, std::uint32_t seed, int* checked) {
+  const q::Type t = static_cast<q::Type>(id);
+  std::vector<std::uint8_t> row(q::row_bytes(id, static_cast<std::uint64_t>(k)));
+  if (row.empty()) return true;
+  if (q::can_quantize(t)) {
+    const std::vector<float> src = noise(k, seed, 0.05f);
+    if (!q::quantize_row(t, src.data(), row.data(), k)) return false;
+  } else {
+    std::uint32_t r = seed;
+    for (std::uint8_t& b : row) {
+      r = r * 1664525u + 1013904223u;
+      b = static_cast<std::uint8_t>((r >> 24) & 0xBF);
+    }
+  }
+  std::vector<kn::ActQ8x32> acts(4);
+  for (int tt = 0; tt < 4; ++tt) {
+    const std::vector<float> x = noise(k, seed * 3u + static_cast<std::uint32_t>(tt), 2.0f);
+    kn::act_q8x32_quantize(x.data(), k, acts[static_cast<std::size_t>(tt)]);
+    kn::ActQ8x32 back;  // the same integers recovered from the rounded values
+    kn::act_q8x32_from_rounded(acts[static_cast<std::size_t>(tt)].x.data(), k, back);
+    if (back.q != acts[static_cast<std::size_t>(tt)].q) return false;
+  }
+  const kn::ActQ8x32* ap[4] = {&acts[0], &acts[1], &acts[2], &acts[3]};
+  bool ok = true;
+  for (int nt = 1; nt <= 4; ++nt) {
+    float port[4] = {}, fast[4] = {};
+    kn::force_isa(kn::Isa::portable);
+    kn::dot_row_q8(t, row.data(), k, pl, ap, nt, port);
+    kn::force_isa(kn::Isa::avx2);
+    kn::dot_row_q8(t, row.data(), k, pl, ap, nt, fast);
+    for (int tt = 0; tt < nt; ++tt) {
+      double ref, mag;
+      reference(t, row, k, pl, acts[static_cast<std::size_t>(tt)].x.data(), &ref, &mag);
+      const bool same = kn::best_isa() != kn::Isa::avx2 || port[tt] == fast[tt];
+      const bool close = std::isfinite(ref) && std::fabs(static_cast<double>(port[tt]) - ref) <= 2e-6 * mag + 1e-30;
+      if (!same || !close) {
+        std::printf("  dot_q8: type %u (%s) k=%lld nt=%d: avx2 %.9g portable %.9g reference %.9g (sum|wx| %.3g)\n", id, q::type_info(id).name,
+                    static_cast<long long>(k), nt, static_cast<double>(fast[tt]), static_cast<double>(port[tt]), ref, mag);
+        ok = false;
+      }
+    }
+  }
+  ++*checked;
+  return ok;
+}
+}  // namespace
+
+TEST(cpu_dot_int8_activation_path_on_every_type) {
+  int checked = 0, ints = 0;
+  for (std::uint32_t id = 0; id < 256; ++id) {
+    if (!q::can_dequantize(static_cast<q::Type>(id))) continue;
+    if (kn::dot_q8_has_int_path(static_cast<q::Type>(id))) ++ints;
+    for (std::int64_t k : {256, 2048}) CHECK(run_q8(id, k, nullptr, id * 31u + static_cast<std::uint32_t>(k), &checked));
+  }
+  std::printf("    dot_q8: %d type/length cases, %d types with an integer form\n", checked, ints);
+  CHECK(ints >= 10);
+  // planes: dense k 1..3 (fewer read than stored) and block-selective, on the main types
+  const std::int64_t k = 2048;
+  const std::vector<float> r = noise(k, 77, 0.004f);
+  for (q::Type t : {q::Type::q4_k, q::Type::q6_k, q::Type::q8_0, q::Type::iq4_xs, q::Type::q5_k, q::Type::q4_tg2})
+    for (int ks : {1, 3}) {
+      std::vector<std::uint8_t> pl(static_cast<std::size_t>(q::plane_row_bytes(k, ks)));
+      (void)q::plane_fit_row(r.data(), nullptr, k, ks, 4, pl.data());
+      for (int ku : {1, ks}) {
+        kn::RowPlanes dense{pl.data(), nullptr, ks, ku};
+        CHECK(run_q8(static_cast<std::uint32_t>(t), k, &dense, 9u + static_cast<std::uint32_t>(ku), &checked));
+      }
+      const std::uint8_t mask[1] = {0x5A};
+      const std::size_t blk = static_cast<std::size_t>(34 * ks);
+      std::vector<std::uint8_t> sp(4 * blk);  // blocks 1, 3, 4, 6
+      std::size_t at = 0;
+      for (int b = 0; b < 8; ++b)
+        if ((mask[0] >> b) & 1) {
+          std::memcpy(sp.data() + at, pl.data() + static_cast<std::size_t>(b) * blk, blk);
+          at += blk;
+        }
+      kn::RowPlanes sparse{sp.data(), mask, ks, ks};
+      CHECK(run_q8(static_cast<std::uint32_t>(t), k, &sparse, 13u, &checked));
+    }
 }

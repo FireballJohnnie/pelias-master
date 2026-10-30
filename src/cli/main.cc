@@ -132,7 +132,7 @@ void usage() {
       "  device [--index N]              what the GPU reports (CUDA and NVML), and the VRAM ceiling\n"
       "  mtp-logits --model FILE --ids 1,2,3 --out OUT.bin [--threads N] [--fast-cpu]\n"
       "                                  GP3-08 gate: the MTP block's logits and hidden for each position (format of tools/oracle/mtp_oracle)\n"
-      "  bench-dot [--type Q4_TG2] [--mb 1024] [--k 2048] [--threads N] [--reps 5] [--planes K] [--reference] [--portable]\n"
+      "  bench-dot [--type Q4_TG2] [--mb 1024] [--k 2048] [--threads N] [--reps 5] [--planes K] [--int8] [--reference] [--portable]\n"
       "                                  GP3-10 CPU kernels: GB/s of one type's rows (+ dense planes), decode (one activation row)\n"
       "  membw [--mib N] [--threads 1,2,4,6,8,12,16] [--reps N]\n"
       "                                  probe: RAM read speed by thread count, 4 KB vs 2 MB pages, prefetch on / off,\n"
@@ -321,10 +321,10 @@ int cmd_bench_dot(const Args& a) {
   const std::uint64_t rb = quant::row_bytes(static_cast<std::uint32_t>(id), k);
   const std::uint64_t pb = kp ? static_cast<std::uint64_t>(quant::plane_row_bytes(static_cast<std::int64_t>(k), static_cast<int>(kp))) : 0;
   const std::uint64_t rows = std::max<std::uint64_t>(1, (mb * 1000000ull) / (rb + pb));
-  std::printf("bench-dot: %s, k %llu, %llu rows (%llu bytes a row + %llu of planes, %d plane(s)), %.1f MB, %llu threads, path %s\n", tn.c_str(),
+  std::printf("bench-dot: %s, k %llu, %llu rows (%llu bytes a row + %llu of planes, %d plane(s)), %.1f MB, %llu threads, path %s%s\n", tn.c_str(),
               static_cast<unsigned long long>(k), static_cast<unsigned long long>(rows), static_cast<unsigned long long>(rb),
               static_cast<unsigned long long>(pb), static_cast<int>(kp), static_cast<double>(rows * (rb + pb)) / 1e6,
-              static_cast<unsigned long long>(threads), kern::active_isa() == kern::Isa::avx2 ? "AVX2" : "portable");
+              static_cast<unsigned long long>(threads), kern::active_isa() == kern::Isa::avx2 ? "AVX2" : "portable", a.has("int8") ? ", int8 activations" : "");
   // 64 distinct rows, repeated to fill the buffer (the bytes read are what is timed, not their variety)
   const std::uint64_t distinct = std::min<std::uint64_t>(64, rows);
   std::vector<std::uint8_t> w(rows * rb), pl(rows * pb);
@@ -350,6 +350,10 @@ int cmd_bench_dot(const Args& a) {
   std::vector<float> x(k), y(rows);
   for (float& v : x) v = nd(rng) * 50.0f;
   const float* xs[1] = {x.data()};
+  kern::ActQ8x32 act;  // --int8: the engine's int8 activation format, integer products per 32-block
+  kern::act_q8x32_quantize(x.data(), static_cast<std::int64_t>(k), act);
+  const kern::ActQ8x32* as[1] = {&act};
+  const bool int8 = a.has("int8");
   auto pass = [&](bool reference) {
     std::vector<std::thread> pool;
     const Timer tm;
@@ -366,7 +370,8 @@ int cmd_bench_dot(const Args& a) {
             y[r] = acc;
           } else {
             kern::RowPlanes rp{kp ? pl.data() + r * pb : nullptr, nullptr, static_cast<int>(kp), static_cast<int>(kp)};
-            kern::dot_row(t, w.data() + r * rb, static_cast<std::int64_t>(k), kp ? &rp : nullptr, xs, 1, &y[r]);
+            if (int8) kern::dot_row_q8(t, w.data() + r * rb, static_cast<std::int64_t>(k), kp ? &rp : nullptr, as, 1, &y[r]);
+            else kern::dot_row(t, w.data() + r * rb, static_cast<std::int64_t>(k), kp ? &rp : nullptr, xs, 1, &y[r]);
           }
         }
       });

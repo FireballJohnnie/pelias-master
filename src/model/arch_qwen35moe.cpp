@@ -175,6 +175,10 @@ struct Scratch {
   std::vector<float> state, delta;       // DeltaNet state and its per-token update
   bool planes = true;                    // ForwardOptions::planes for this call
   bool fast = false;                     // ForwardOptions::fast_cpu: rows through kern::dot_row
+  // with fast: the inputs of this product in the engine's int8 format (gpu256x8, no simulated rotation), one per input row;
+  // the rows then go through kern::dot_row_q8 (integer products per 32-block)
+  const std::vector<kern::ActQ8x32>* acts = nullptr;
+  std::vector<kern::ActQ8x32> own_acts;  // the per-thread inputs of an expert group
 };
 
 void load_tile(const WeightView& w, uint64_t first_row, int nr, int64_t k, Scratch& sc) {
@@ -251,9 +255,16 @@ void fast_rows(const WeightView& w, uint64_t e, int64_t o_begin, int64_t o_end, 
     }
     for (int64_t t0 = 0; t0 < n_tok; t0 += 4) {
       const int nt = static_cast<int>(std::min<int64_t>(4, n_tok - t0));
+      float out[4];
+      if (sc.acts && static_cast<int64_t>(sc.acts->size()) == n_tok) {
+        const kern::ActQ8x32* as[4];
+        for (int tt = 0; tt < 4; ++tt) as[tt] = &(*sc.acts)[z(std::min(t0 + tt, n_tok - 1))];
+        kern::dot_row_q8(t, p, k, pp, as, nt, out);
+        for (int tt = 0; tt < nt; ++tt) y[(t0 + tt) * ldy + o] = out[tt];
+        continue;
+      }
       const float* xs[4];
       for (int tt = 0; tt < 4; ++tt) xs[tt] = x + std::min(t0 + tt, n_tok - 1) * ldx;
-      float out[4];
       kern::dot_row(t, p, k, pp, xs, nt, out);
       for (int tt = 0; tt < nt; ++tt) y[(t0 + tt) * ldy + o] = out[tt];
     }
@@ -641,7 +652,14 @@ void mm(const Ctx& c, const WeightView& w, const float* x, int64_t n_tok, int64_
       std::memcpy(xr.data() + t * k, x + t * ldx, z(k) * sizeof(float));
       prep_row(xr.data() + t * k, k, f, w.rot32, c.opt.act_rot32);
     }
+    std::vector<kern::ActQ8x32> acts;
+    if (c.opt.fast_cpu && f == ActFmt::q8_256x8 && !c.opt.act_rot32) {  // the engine's int8 path
+      acts.resize(z(n_tok));
+      for (int64_t t = 0; t < n_tok; ++t) kern::act_q8x32_from_rounded(xr.data() + t * k, k, acts[z(t)]);
+      for (Scratch& sx : c.sc) sx.acts = &acts;
+    }
     matmul(w, xr.data(), n_tok, k, y, ldy, c.threads, c.sc);
+    for (Scratch& sx : c.sc) sx.acts = nullptr;
     if (c.opt.h_gate > 0.0 && static_cast<quant::Type>(w.type) == quant::Type::q8_z)
       h_gate_impl(w.data, w.row_bytes, static_cast<int64_t>(w.ne[1]), k, xr.data(), n_tok, k, y, ldy, c.opt.h_gate, c.threads);
     return;
@@ -963,8 +981,16 @@ void moe(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* out, flo
     }
     if (fgu != ActFmt::none || l.gate_exps.rot32)
       for (int64_t r = 0; r < m; ++r) prep_row(sc.xe.data() + r * e, e, fgu, l.gate_exps.rot32, c.opt.act_rot32);
+    const bool int8_in = c.opt.fast_cpu && !c.opt.act_rot32;  // the engine's int8 path for gpu256x8 inputs
+    auto own = [&](const float* xr, int64_t kk) {
+      sc.own_acts.resize(z(m));
+      for (int64_t r = 0; r < m; ++r) kern::act_q8x32_from_rounded(xr + r * kk, kk, sc.own_acts[z(r)]);
+      sc.acts = &sc.own_acts;
+    };
+    if (int8_in && fgu == ActFmt::q8_256x8) own(sc.xe.data(), e);
     matmul_rows(l.gate_exps, static_cast<uint64_t>(ex), 0, ff, sc.xe.data(), m, e, sc.ge.data(), ff, sc);
     matmul_rows(l.up_exps, static_cast<uint64_t>(ex), 0, ff, sc.xe.data(), m, e, sc.ue.data(), ff, sc);
+    sc.acts = nullptr;
     for (int64_t i = 0; i < m * ff; ++i) sc.ge[z(i)] = silu(sc.ge[z(i)]) * sc.ue[z(i)];
     if (c.opt.neuron_skip > 0.0) {  // Block M: oracle neuron skipping, the smallest |h| per token set to zero
       const auto kz = static_cast<int64_t>(c.opt.neuron_skip * static_cast<double>(ff));
@@ -991,7 +1017,9 @@ void moe(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* out, flo
     if (cold && fd != ActFmt::none) fd = ActFmt::q8_256;
     if (fd != ActFmt::none || l.down_exps.rot32)
       for (int64_t r = 0; r < m; ++r) prep_row(sc.ge.data() + r * ff, ff, fd, l.down_exps.rot32, c.opt.act_rot32);
+    if (int8_in && fd == ActFmt::q8_256x8) own(sc.ge.data(), ff);
     matmul_rows(l.down_exps, static_cast<uint64_t>(ex), 0, e, sc.ge.data(), m, ff, sc.ye.data(), e, sc);
+    sc.acts = nullptr;
     for (int64_t r = 0; r < m; ++r) {
       const int64_t slot = list[z(r)];
       const float wgt = wsel[z(slot)];

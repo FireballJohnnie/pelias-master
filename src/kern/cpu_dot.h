@@ -16,6 +16,7 @@
 // quant::dequantize_row for its segment and the same summation. Rows whose length is not a multiple of 256 are
 // dequantized whole.
 #include <cstdint>
+#include <vector>
 
 #include "quant/block_types.h"
 
@@ -42,5 +43,32 @@ bool dot_has_fast_path(quant::Type t);   // an AVX2 dequantizer of its own
 // k values per row; nt activation rows (1..4); planes may be null.
 void dot_row(quant::Type t, const std::uint8_t* row, std::int64_t k, const RowPlanes* planes, const float* const* xs, int nt,
              float* out);
+
+// ---- the int8-activation path (GP3-10 item 5; the engine's activation format, ForwardOptions gpu256x8)
+//
+// Activations rounded per 32 values to an fp32 scale s_b and integers q in -127..127 (round half to even, as
+// model::act_round_q8_256x8). For every weight type whose values are integers times per-16 scales (minus per-16 mins)
+// the products inside a 32-block are integers, summed exactly (AVX2: maddubs + madd, 8 lanes of 4 values each), then
+// scaled: y = sum_b s_b (sum_j sw_j isum_j - sum_h mw_h A_h) with A_h the activation sums per 16. Planes add
+// s_p s_b (2 sum_{sign set} q - A_b) per plane and block, also in integers. Same quantities as the float path's
+// products; another order of the sum (the rung-1 tolerance against fp64 of the same rounded inputs). The AVX2 and portable
+// paths agree bit for bit. Types without an integer form (Q4_TG, Q4_TG2, IQ1_M, F16, BF16, F32) take the float path on the
+// rounded values.
+struct ActQ8x32 {
+  std::int64_t k = 0;
+  std::vector<std::int8_t> q;      // k
+  std::vector<float> s;            // k / 32
+  std::vector<std::int32_t> sum16; // k / 16
+  std::vector<float> x;            // k: s_b * q, the rounded values (the float path's input)
+};
+// From unrounded values, with act_round_q8_256x8's rule (scale amax / 127, 1 when amax is 0; q = clamp(nearbyint(x / s))).
+void act_q8x32_quantize(const float* x, std::int64_t k, ActQ8x32& a);
+// From values already rounded that way (the forward pass rounds before the product): the scale is recovered as max |x| /
+// 127 and q = nearbyint(x / s) (exactly the integers; the scale to within one rounding).
+void act_q8x32_from_rounded(const float* xr, std::int64_t k, ActQ8x32& a);
+bool dot_q8_has_int_path(quant::Type t);
+// k a multiple of 32; nt rows (1..4) of acts, each acts[i]->k == k.
+void dot_row_q8(quant::Type t, const std::uint8_t* row, std::int64_t k, const RowPlanes* planes, const ActQ8x32* const* acts, int nt,
+                float* out);
 
 }  // namespace pelias::kern
