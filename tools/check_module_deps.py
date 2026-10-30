@@ -22,7 +22,8 @@ EXTS = ('.h', '.hpp', '.cc', '.cpp', '.cu', '.cuh')
 # 14.3, allowed includes per module (a module may always include itself and include/pelias)
 ALLOWED = {
     'os': set(), 'hal': {'os'}, 'quant': {'hal'}, 'plan': {'hal', 'io'}, 'bank': {'hal'}, 'bus': {'os', 'hal', 'quant'},
-    'io': {'os', 'hal', 'quant'}, 'tok': {'io'}, 'kern': {'hal', 'quant'}, 'model': {'hal', 'quant', 'io'},
+    'io': {'os', 'hal', 'quant'}, 'tok': {'io'}, 'kern': {'hal', 'quant'}, 'model': {'hal', 'quant', 'io', 'kern'},  # model -> kern: GP3-10 fast CPU kernels
+   
     'ingest': {'hal', 'quant', 'io'}, 'data': {'io', 'tok'}, 'stream': {'hal', 'bus', 'model'},
     'sched': {'hal', 'kern', 'model', 'stream'}, 'train': {'hal', 'data', 'model', 'sched'},
     'export': {'hal', 'quant', 'io', 'model', 'bank'}, 'verify': {'hal', 'io', 'quant'}, 'cpu': {'os', 'hal', 'quant', 'bus'},

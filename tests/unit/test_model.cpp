@@ -10,7 +10,13 @@
 #include <vector>
 
 #include <filesystem>
+#if defined(_WIN32)
+#include <process.h>
+#define PELIAS_TEST_GETPID _getpid
+#else
 #include <unistd.h>
+#define PELIAS_TEST_GETPID getpid
+#endif
 
 #include "gguf_builder.h"
 #include "io/planes_build.h"
@@ -656,7 +662,7 @@ TEST(planes_bring_a_quantized_file_toward_its_original) {
   if (!tm.ok) return;
   namespace fs = std::filesystem;
   static int run = 0;
-  const fs::path dir = fs::temp_directory_path() / ("pelias_planes_test_" + std::to_string(::getpid()) + "_" + std::to_string(run++));
+  const fs::path dir = fs::temp_directory_path() / ("pelias_planes_test_" + std::to_string(PELIAS_TEST_GETPID()) + "_" + std::to_string(run++));
   std::error_code ec;
   fs::create_directories(dir, ec);
   const std::string q4 = (dir / "tiny_Q4_K_M.gguf").string(), pl = (dir / "tiny_Q4_K_M.planes2.gguf").string();
@@ -774,7 +780,7 @@ TEST(tiered_experts_read_each_expert_in_its_own_type) {
   namespace fs = std::filesystem;
   namespace q = pelias::quant;
   static int run = 0;
-  const fs::path dir = fs::temp_directory_path() / ("pelias_tier_test_" + std::to_string(::getpid()) + "_" + std::to_string(run++));
+  const fs::path dir = fs::temp_directory_path() / ("pelias_tier_test_" + std::to_string(PELIAS_TEST_GETPID()) + "_" + std::to_string(run++));
   std::error_code ec;
   fs::create_directories(dir, ec);
   const std::string q4 = (dir / "tiny_Q4_K_M.gguf").string();
@@ -911,7 +917,7 @@ TEST(planes_on_tiered_files_select_blocks_and_picks) {
   namespace fs = std::filesystem;
   namespace q = pelias::quant;
   static int run = 0;
-  const fs::path dir = fs::temp_directory_path() / ("pelias_tierplanes_test_" + std::to_string(::getpid()) + "_" + std::to_string(run++));
+  const fs::path dir = fs::temp_directory_path() / ("pelias_tierplanes_test_" + std::to_string(PELIAS_TEST_GETPID()) + "_" + std::to_string(run++));
   std::error_code ec;
   fs::create_directories(dir, ec);
   const std::string q4 = (dir / "tiny_Q4_K_M.gguf").string();

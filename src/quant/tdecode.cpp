@@ -9,8 +9,8 @@
 
 #include "quant/quant_cpu.h"
 
-#if defined(__x86_64__) || defined(_M_X64)
-#include <immintrin.h>
+#include "hal/cpuid.h"
+#if defined(PELIAS_HAL_X86)
 #define PELIAS_TDECODE_X86 1
 #endif
 
@@ -25,7 +25,7 @@ void act_planes_32(const std::int8_t* q, std::uint32_t plane[8]) {
 }
 
 #ifdef PELIAS_TDECODE_X86
-__attribute__((target("avx2"))) static void planes_avx2(const std::int8_t* q, std::uint32_t plane[8]) {
+PELIAS_TARGET_AVX2_FN static void planes_avx2(const std::int8_t* q, std::uint32_t plane[8]) {
   // xu = x + 128 is x with its top bit flipped; shifting each 16-bit lane left by 7 - k puts bit k of both bytes at
   // their bit 7 (bit 15 for the high byte), and pmovmskb collects bit 7 of all 32 bytes: one plane per shift.
   __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q));
@@ -43,7 +43,8 @@ __attribute__((target("avx2"))) static void planes_avx2(const std::int8_t* q, st
 
 bool act_planes_32_fast(const std::int8_t* q, std::uint32_t plane[8]) {
 #ifdef PELIAS_TDECODE_X86
-  if (__builtin_cpu_supports("avx2")) {
+  static const bool avx2 = hal::cpu_has_avx2();
+  if (avx2) {
     planes_avx2(q, plane);
     return true;
   }

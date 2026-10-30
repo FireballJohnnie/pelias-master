@@ -24,6 +24,12 @@
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #define PELIAS_MEMBW_X86 1
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+#define PELIAS_TARGET_AVX2_FN  // MSVC compiles AVX2 intrinsics in any function
+#else
+#define PELIAS_TARGET_AVX2_FN __attribute__((target("avx2")))
+#endif
 #endif
 
 namespace pelias::os {
@@ -78,7 +84,7 @@ void pin_to(int cpu) {
 }
 
 #if defined(PELIAS_MEMBW_X86)
-__attribute__((target("avx2"))) std::uint64_t read_avx2(const unsigned char* p, std::size_t n, bool pf) {
+PELIAS_TARGET_AVX2_FN std::uint64_t read_avx2(const unsigned char* p, std::size_t n, bool pf) {
   __m256i a0 = _mm256_setzero_si256(), a1 = a0, a2 = a0, a3 = a0;
   for (std::size_t i = 0; i + 128 <= n; i += 128) {
     if (pf) _mm_prefetch(reinterpret_cast<const char*>(p + i + 1024), _MM_HINT_T0);
@@ -106,9 +112,28 @@ std::uint64_t read_plain(const unsigned char* p, std::size_t n) {
   return a ^ b;
 }
 
+#if defined(PELIAS_MEMBW_X86)
+// AVX2 usable (the os layer depends on nothing, so this is its own copy of hal/cpuid.h's check)
+bool cpu_has_avx2() {
+#if defined(_MSC_VER) && !defined(__clang__)
+  int r[4];
+  __cpuid(r, 0);
+  if (r[0] < 7) return false;
+  __cpuid(r, 1);
+  if (!((r[2] >> 27) & 1) || !((r[2] >> 28) & 1) || (_xgetbv(0) & 6) != 6) return false;
+  __cpuidex(r, 7, 0);
+  return (r[1] >> 5) & 1;
+#else
+  __builtin_cpu_init();
+  return __builtin_cpu_supports("avx2");
+#endif
+}
+#endif
+
 std::uint64_t read_slice(const unsigned char* p, std::size_t n, bool pf) {
 #if defined(PELIAS_MEMBW_X86)
-  if (__builtin_cpu_supports("avx2")) return read_avx2(p, n, pf);
+  static const bool avx2 = cpu_has_avx2();
+  if (avx2) return read_avx2(p, n, pf);
 #endif
   (void)pf;
   return read_plain(p, n);

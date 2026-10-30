@@ -2,6 +2,7 @@
 // provenance: original
 // T-decode on Q7_ZT: the 1-bit route equals the int8 fold route exactly; the missing-H route is the 0.5 fill; the split
 // storage round-trips; the activation bit planes reproduce the values (portable and AVX2).
+#include <bit>
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -109,8 +110,8 @@ TEST(tdecode_state_code_signs_and_energy) {
   int flips = 0, zero_bits = 0;
   for (int i = 0; i < n / 8; ++i) {
     CHECK(a[static_cast<std::size_t>(i)] == b[static_cast<std::size_t>(i)]);
-    if (i / 4 == 2) { zero_bits += __builtin_popcount(a[static_cast<std::size_t>(i)]) + __builtin_popcount(c[static_cast<std::size_t>(i)]); continue; }
-    flips += __builtin_popcount(static_cast<unsigned>(a[static_cast<std::size_t>(i)] ^ c[static_cast<std::size_t>(i)]));
+    if (i / 4 == 2) { zero_bits += std::popcount(static_cast<unsigned>(a[static_cast<std::size_t>(i)])) + std::popcount(static_cast<unsigned>(c[static_cast<std::size_t>(i)])); continue; }
+    flips += std::popcount(static_cast<unsigned>(a[static_cast<std::size_t>(i)] ^ c[static_cast<std::size_t>(i)]));
   }
   CHECK(zero_bits == 0);                // an all-zero block has no positive value either way
   CHECK(flips == n - 32);               // every other value flips sign (no exact zeros after the rotation here)
