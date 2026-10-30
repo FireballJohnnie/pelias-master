@@ -1355,6 +1355,15 @@ Each PC run first matches the reference to our code's exact format (docs/PELIAS_
 
 **Gates:** E4–E9, G3 (≥ 55.0 tok/s at 12 k), K3 (GP2-01).
 
+### GP3-14c Infinite context loop (author 2026-10-30 12:01-12:15; after the first engine build)
+
+**Idea (author):** a document or an agent's history of any length is read once and kept; the model is never stuck at its window. MEASURED from the served file: context_length 262,144; RoPE on 64 of each attention head's 256 key dims (rope.dimension_count 64, sections 11/11/10/0, freq_base 1e7); 30 of the 41 blocks are DeltaNet (fixed-size state, no positions); KV grows only in the 10 full-attention trunk layers (2 KV heads x 256): about 10.9 KB per token at q8 (DERIVED).
+- **Tiers (author 12:15: RAM first, NVMe as overflow):** VRAM holds the 1-bit key codes' page summaries and a bank of hot pages; RAM holds every KV page (q8) and the DeltaNet checkpoints until the RAM budget the probe sets is full; only then do the oldest / coldest pages overflow to NVMe (U11 prefix store, CRC32 keys). The DeltaNet state never overflows (fixed size); its checkpoints are what make a restore possible.
+- **Each step:** score the page summaries (VRAM), then the 1-bit codes of the candidate pages, pull the top pages' q8 KV RAM -> VRAM (or NVMe -> RAM -> VRAM) on a copy engine, attend exactly.
+- **Positions (way 1, the default):** keys are stored before RoPE; a pulled page is placed at fresh positions inside the trained window, so the stream is unbounded and the model stays in its trained range. Way 2 (a toggle): RoPE scaling at load (YaRN / NTK) for a longer raw window. Way 3 (trainer roadmap): fine-tune at longer lengths.
+- **Sizes (DERIVED):** 1M tokens = about 10.9 GB of q8 KV (RAM, or NVMe beyond the budget), codes about 0.8 GB, page summaries about 12.5 MB; a cold pull of 64 pages of 64 tokens about 45 MB, about 15 ms from NVMe at 3 GB/s (MEASURED disk rate), under 2 ms from RAM.
+- **Tests, in order:** C1 page recall (sandbox, existing q/k dumps: share of attention mass in the top 1/8 and 1/32 of pages); re-placed pages vs full attention, paired KL on text that fits the window; YaRN x2 kld at short context; needle tests past 262,144 (PG7 needles extended).
+
 ### GP3-15 Masterwork step 11: the server on 8062 and the web interface
 
 **Gates:**
