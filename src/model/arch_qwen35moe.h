@@ -67,8 +67,9 @@ struct WeightView {
   const std::uint8_t* plane_mask = nullptr;
   const std::uint32_t* plane_off = nullptr;
   std::uint64_t plane_mask_bytes = 0;
-  // I2_S (BitNet b1.58): the rows hold ternary values only; every product of this weight is multiplied by its one
-  // per-tensor scale (the fp32 after the tensor's rows). 1 for every other type.
+  // A per-tensor output scale: every product of this weight is multiplied by it. I2_S (BitNet b1.58): the rows hold ternary
+  // values only and the scale is the fp32 after the rows; any type: a <name>.scale tensor beside the weight (NVFP4 files
+  // converted from compressed-tensors / ModelOpt). 1 otherwise.
   float tensor_scale = 1.0f;
   // BitNet b1.58: a BitLinear weight; each input row is rounded to int8 per token (absmax) before the product
   bool bitlinear = false;

@@ -64,11 +64,24 @@ Status bind_view(const io::GgufReader& r, const std::uint8_t* base, const std::s
   out.ne[2] = ne[2];
   out.row_bytes = quant::row_bytes(t->type, ne[0]);
   out.name = name;
+  // a per-tensor output scale stored beside the weight as <base>.scale (F32, one value): the reference multiplies the
+  // product by it (llama.cpp build_lora_mm with w_s, READ-SRC src/llama-graph.cpp); NVFP4 files converted from
+  // compressed-tensors / ModelOpt carry one per weight (MEASURED: Qwen3-1.7B-NVFP4, 196 of them)
+  if (name.size() > 7 && name.compare(name.size() - 7, 7, ".weight") == 0) {
+    const std::string sn = name.substr(0, name.size() - 7) + ".scale";
+    if (const io::GgufTensor* st = r.find_tensor(sn)) {
+      if (st->type != 0 || st->elements() != 1) return Status::fail(Code::unsupported, "a weight scale that is not one F32 value", 0, sn);
+      float sc = 0.0f;
+      std::memcpy(&sc, base + st->file_offset, sizeof sc);
+      if (!std::isfinite(sc) || sc == 0.0f) return Status::fail(Code::corrupt, "the weight scale is not a finite non-zero number", 0, sn);
+      out.tensor_scale = sc;
+    }
+  }
   if (type == quant::Type::i2_s) {  // the scale after the rows (the reader counted those 32 bytes into the tensor)
     float sc = 0.0f;
     std::memcpy(&sc, out.data + out.row_bytes * ne[1] * ne[2], sizeof sc);
     if (!std::isfinite(sc) || sc <= 0.0f) return Status::fail(Code::corrupt, "the I2_S scale is not a positive number", 0, name);
-    out.tensor_scale = sc;
+    out.tensor_scale *= sc;
   }
   return Status::good();
 }

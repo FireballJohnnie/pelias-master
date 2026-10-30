@@ -4,7 +4,7 @@
 # real vocabulary of llama.cpp's vocab-only test file for that family (models/ggml-vocab-<pre>.gguf), written with the
 # gguf-py package that ships with llama.cpp (its writer only; the weights and shapes are Pelias's own). Both engines run
 # the same file: Pelias's reference and fast paths against the reference library's logits (logits_oracle.cpp).
-#   PYTHONPATH=<llama.cpp>/gguf-py python3 make_tiny_dense.py FAMILY VOCAB.gguf OUT.gguf [--rope-freqs] [--type NVFP4|Q8_0 [--deq]]
+#   PYTHONPATH=<llama.cpp>/gguf-py python3 make_tiny_dense.py FAMILY VOCAB.gguf OUT.gguf [--rope-freqs] [--type NVFP4|Q8_0 [--deq]] [--scales]
 # --type: the projection weights stored in that type: Q8_0 by gguf-py's own quantizer; NVFP4 (which gguf-py does not
 # quantize) by a plain encoder here: per 16 values the UE4M3 scale nearest amax / 6 (doubled grid: x 2), codes the nearest
 # E2M1 value; any valid block will do, the gate is the two engines reading the same bytes.
@@ -89,7 +89,10 @@ def nvfp4(arr):
                 out[r, 36 * b + 4 + 8 * s : 36 * b + 12 + 8 * s] = codes[:8] | (codes[8:] << 4)
     return out
 deq = "--deq" in sys.argv  # store the reference library's own dequantization (gguf-py) of the --type bytes, as F32
+scales = "--scales" in sys.argv  # a <name>.scale F32 [1] tensor per projection (as converted NVFP4 files carry)
 def proj(name, arr):
+    if scales:
+        w.add_tensor(name[: -len(".weight")] + ".scale", np.array([0.25 + 1.5 * rng.uniform()], np.float32))
     if qtype is not None and deq:
         q = nvfp4(arr) if qtype == gguf.GGMLQuantizationType.NVFP4 else gguf.quants.quantize(arr, qtype)
         w.add_tensor(name, gguf.quants.dequantize(q, qtype).astype(np.float32).reshape(arr.shape))
