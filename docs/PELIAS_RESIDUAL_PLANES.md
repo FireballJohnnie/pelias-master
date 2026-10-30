@@ -570,8 +570,9 @@ Chain gp/block_tierplanes_v1.sh on the 22.65 GB tiered file (100 WikiText chunks
 |---|---|---|---|---|---|---|---|
 | A1, every pick | 1,157,315,040 bytes | 29,411,764 (23.4 %) | 0.008963 ± 0.000330 | 95.847 % | -0.000441 (-4.7 %), 95 % [-0.000828, -0.000054], t -2.26 | -0.003846 (-30.0 %), t -12.27 | about 0.0088 (0.0082-0.0093): in range, above the point |
 | A2, every pick | 2,157,315,360 bytes | 58,823,529 (46.7 %) | 0.008747 ± 0.000385 | 96.106 % | -0.000656 (-7.0 %), 95 % [-0.000975, -0.000338], t -4.09 | -0.004061 (-31.7 %), t -12.81 | about 0.0083 (0.0077-0.0089): in range, above the point |
+| A2, top 4 of 8 picks (`--plane-picks 4`) | same as A2 | same as A2 | 0.008800 ± 0.000355 | 96.027 % | -0.000604 (-6.4 %), 95 % [-0.001019, -0.000188], t -2.88 | -0.004008 (-31.3 %), t -11.18 | about 0.0085 (0.0079-0.0091): in range, above the point |
 
-A2: mean PPL ratio 1.003082; tokens where A2 has lower KL than the tiered file 53.51 %; top token right only in A2 416, only in the tiered file 338 (z 2.84). A1: PPL ratio 1.003742; lower KL than the tiered file on 52.01 % of tokens; top token right only in A1 384, only in the tiered file 372 (z 0.44, no top-token gain). Per GB (DERIVED): the first GB buys -0.000441 (-4.7 %), the second -0.000216 (-2.3 %), about half. A2 top-4 to follow. The planes add 2.16 GB of RAM (no VRAM) for a further -7.0 % KL on top of the tiered file's -26.6 %.
+A2: mean PPL ratio 1.003082; tokens where A2 has lower KL than the tiered file 53.51 %; top token right only in A2 416, only in the tiered file 338 (z 2.84). A1: PPL ratio 1.003742; lower KL than the tiered file on 52.01 % of tokens; top token right only in A1 384, only in the tiered file 372 (z 0.44, no top-token gain). Per GB (DERIVED): the first GB buys -0.000441 (-4.7 %), the second -0.000216 (-2.3 %), about half. A2 top-4: half the plane reads keep 92 % of A2's gain (0.000604 of 0.000656, DERIVED; 80.8 % was projected from the router weights); top token z 2.15 vs the tiered file. Default for the GUI: planes on the top 4 picks. The planes add 2.16 GB of RAM (no VRAM) for a further -7.0 % KL on top of the tiered file's -26.6 %.
 
 ## 7. Status
 
