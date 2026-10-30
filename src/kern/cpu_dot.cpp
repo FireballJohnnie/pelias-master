@@ -9,6 +9,7 @@
 #include <cstring>
 #include <vector>
 
+#include "quant/iq_tables.h"
 #include "quant/planes.h"
 #include "quant/quant_cpu.h"
 
@@ -60,7 +61,9 @@ bool is_fast(q::Type t) {
     case q::Type::q8_0: case q::Type::q4_k: case q::Type::q5_k: case q::Type::q6_k: case q::Type::iq4_xs:
     case q::Type::q4_tg: case q::Type::q4_tg2: case q::Type::q4_0: case q::Type::q4_1: case q::Type::q5_0:
     case q::Type::q5_1: case q::Type::iq4_nl: case q::Type::mxfp4: case q::Type::q2_k: case q::Type::q3_k:
-    case q::Type::q8_z: case q::Type::f16: case q::Type::bf16: case q::Type::f32:
+    case q::Type::q8_z: case q::Type::f16: case q::Type::bf16: case q::Type::f32: case q::Type::iq2_xxs: case q::Type::iq2_xs:
+    case q::Type::iq2_s: case q::Type::iq3_xxs: case q::Type::iq3_s: case q::Type::iq1_s: case q::Type::iq1_m: case q::Type::tq1_0:
+    case q::Type::tq2_0: case q::Type::q7_z: case q::Type::q7_zt:
       return true;
     default:
       return false;
@@ -401,6 +404,213 @@ PELIAS_TARGET_AVX2 void deq_bf16(const std::uint8_t* p, float* y) {
                                 _mm256_cvtepu16_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p + 2 * i))), 16)));
 }
 
+// ---- the grid types (IQ1 / IQ2 / IQ3): 8 values per grid entry, with sign bits
+
+// the 8 bytes of a grid entry as floats (unsigned, or signed for the IQ1 grid)
+PELIAS_TARGET_AVX2 inline __m256 grid8u(std::uint64_t g) {
+  return _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_cvtsi64_si128(static_cast<long long>(g))));
+}
+PELIAS_TARGET_AVX2 inline __m256 grid8s(std::uint64_t g) {
+  return _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_cvtsi64_si128(static_cast<long long>(g))));
+}
+PELIAS_TARGET_AVX2 inline __m256 grid4x2(std::uint32_t g1, std::uint32_t g2) {  // two 4-byte entries (IQ3)
+  return grid8u(static_cast<std::uint64_t>(g1) | (static_cast<std::uint64_t>(g2) << 32));
+}
+// bit j of `signs` set: value j negative. x * (+/-1) is exact, so flipping the sign bit equals the reference's product.
+PELIAS_TARGET_AVX2 inline __m256 apply_signs(__m256 v, std::uint8_t signs) {
+  const __m256i bit = _mm256_setr_epi32(1, 2, 4, 8, 16, 32, 64, 128);
+  const __m256i set = _mm256_cmpeq_epi32(_mm256_and_si256(_mm256_set1_epi32(signs), bit), bit);
+  return _mm256_xor_ps(v, _mm256_and_ps(_mm256_castsi256_ps(set), _mm256_set1_ps(-0.0f)));
+}
+
+PELIAS_TARGET_AVX2 void deq_iq2_xxs(const std::uint8_t* p, float* y) {  // d, 8 bytes per 32: 4 grid indices, u32 (4 x 7 sign bits, 4-bit scale)
+  const float d = h2f(p);
+  for (int ib = 0; ib < 8; ++ib) {
+    const std::uint8_t* qq = p + 2 + 8 * ib;
+    const std::uint32_t aux1 = u32le(qq + 4);
+    const __m256 db = _mm256_set1_ps(d * (0.5f + static_cast<float>(aux1 >> 28)) * 0.25f);
+    for (int l = 0; l < 4; ++l, y += 8)
+      _mm256_storeu_ps(y, apply_signs(_mm256_mul_ps(db, grid8u(q::iq::kIq2xxsGrid[qq[l]])), q::iq::kSigns[(aux1 >> 7 * l) & 127]));
+  }
+}
+
+PELIAS_TARGET_AVX2 void deq_iq2_xs(const std::uint8_t* p, float* y) {  // d, qs u16[32], scales[8]
+  const float d = h2f(p);
+  const std::uint8_t* sc = p + 66;
+  for (int ib = 0; ib < 8; ++ib) {
+    const float db[2] = {d * (0.5f + static_cast<float>(sc[ib] & 0xf)) * 0.25f, d * (0.5f + static_cast<float>(sc[ib] >> 4)) * 0.25f};
+    for (int l = 0; l < 4; ++l, y += 8) {
+      const std::uint16_t qv = u16(p + 2 + 2 * (4 * ib + l));
+      _mm256_storeu_ps(y, apply_signs(_mm256_mul_ps(_mm256_set1_ps(db[l / 2]), grid8u(q::iq::kIq2xsGrid[qv & 511])), q::iq::kSigns[qv >> 9]));
+    }
+  }
+}
+
+PELIAS_TARGET_AVX2 void deq_iq2_s(const std::uint8_t* p, float* y) {  // d, qs[32] + signs[32], qh[8], scales[8]
+  const float d = h2f(p);
+  const std::uint8_t* qs = p + 2;
+  const std::uint8_t* signs = qs + 32;
+  const std::uint8_t* qh = p + 66;
+  const std::uint8_t* sc = p + 74;
+  for (int ib = 0; ib < 8; ++ib, qs += 4, signs += 4) {
+    const float db[2] = {d * (0.5f + static_cast<float>(sc[ib] & 0xf)) * 0.25f, d * (0.5f + static_cast<float>(sc[ib] >> 4)) * 0.25f};
+    for (int l = 0; l < 4; ++l, y += 8) {
+      const std::uint64_t g = q::iq::kIq2sGrid[qs[l] | ((qh[ib] << (8 - 2 * l)) & 0x300)];
+      _mm256_storeu_ps(y, apply_signs(_mm256_mul_ps(_mm256_set1_ps(db[l / 2]), grid8u(g)), signs[l]));
+    }
+  }
+}
+
+PELIAS_TARGET_AVX2 void deq_iq3_xxs(const std::uint8_t* p, float* y) {  // d, qs[64] grid indices, then 32 bytes of scales and signs
+  const float d = h2f(p);
+  const std::uint8_t* qs = p + 2;
+  const std::uint8_t* ss = p + 2 + 64;
+  for (int ib = 0; ib < 8; ++ib, qs += 8) {
+    const std::uint32_t aux = u32le(ss + 4 * ib);
+    const __m256 db = _mm256_set1_ps(d * (0.5f + static_cast<float>(aux >> 28)) * 0.5f);
+    for (int l = 0; l < 4; ++l, y += 8)
+      _mm256_storeu_ps(y, apply_signs(_mm256_mul_ps(db, grid4x2(q::iq::kIq3xxsGrid[qs[2 * l]], q::iq::kIq3xxsGrid[qs[2 * l + 1]])),
+                                      q::iq::kSigns[(aux >> 7 * l) & 127]));
+  }
+}
+
+PELIAS_TARGET_AVX2 void deq_iq3_s(const std::uint8_t* p, float* y) {  // d, qs[64], qh[8], signs[32], scales[4]
+  const float d = h2f(p);
+  const std::uint8_t* qs = p + 2;
+  const std::uint8_t* qh = p + 66;
+  const std::uint8_t* signs = p + 74;
+  const std::uint8_t* sc = p + 106;
+  for (int ib = 0; ib < 8; ib += 2, qh += 2) {
+    const float dbs[2] = {d * static_cast<float>(1 + 2 * (sc[ib / 2] & 0xf)), d * static_cast<float>(1 + 2 * (sc[ib / 2] >> 4))};
+    for (int half = 0; half < 2; ++half, qs += 8, signs += 4) {
+      const __m256 db = _mm256_set1_ps(dbs[half]);
+      for (int l = 0; l < 4; ++l, y += 8) {
+        const std::uint32_t g1 = q::iq::kIq3sGrid[qs[2 * l + 0] | ((qh[half] << (8 - 2 * l)) & 256)];
+        const std::uint32_t g2 = q::iq::kIq3sGrid[qs[2 * l + 1] | ((qh[half] << (7 - 2 * l)) & 256)];
+        _mm256_storeu_ps(y, apply_signs(_mm256_mul_ps(db, grid4x2(g1, g2)), signs[l]));
+      }
+    }
+  }
+}
+
+constexpr float kIq1Delta = 0.125f;
+
+PELIAS_TARGET_AVX2 void deq_iq1_s(const std::uint8_t* p, float* y) {  // d, qs[32], qh u16[8]; dl * (grid + delta)
+  const float d = h2f(p);
+  const std::uint8_t* qs = p + 2;
+  for (int ib = 0; ib < 8; ++ib, qs += 4) {
+    const std::uint16_t qh = u16(p + 34 + 2 * ib);
+    const __m256 dl = _mm256_set1_ps(d * static_cast<float>(2 * ((qh >> 12) & 7) + 1));
+    const __m256 delta = _mm256_set1_ps((qh & 0x8000) ? -kIq1Delta : kIq1Delta);
+    for (int l = 0; l < 4; ++l, y += 8)
+      _mm256_storeu_ps(y, _mm256_mul_ps(dl, _mm256_add_ps(grid8s(q::iq::kIq1sGrid[qs[l] | (((qh >> 3 * l) & 7) << 8)]), delta)));
+  }
+}
+
+PELIAS_TARGET_AVX2 void deq_iq1_m(const std::uint8_t* p, float* y) {  // qs[32], qh[16], scales[8] (fp16 scale in the top nibbles)
+  const std::uint8_t* qs = p;
+  const std::uint8_t* qh = p + 32;
+  std::uint16_t sc[4];
+  for (int k = 0; k < 4; ++k) sc[k] = u16(p + 48 + 2 * k);
+  const std::uint16_t s16 = static_cast<std::uint16_t>((sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000));
+  const float d = q::fp16_to_fp32(s16);
+  for (int ib = 0; ib < 8; ++ib, qs += 4, qh += 2) {
+    const float dl1 = d * static_cast<float>(2 * ((sc[ib / 2] >> (6 * (ib % 2) + 0)) & 0x7) + 1);
+    const float dl2 = d * static_cast<float>(2 * ((sc[ib / 2] >> (6 * (ib % 2) + 3)) & 0x7) + 1);
+    const int idx[4] = {qs[0] | ((qh[0] << 8) & 0x700), qs[1] | ((qh[0] << 4) & 0x700), qs[2] | ((qh[1] << 8) & 0x700), qs[3] | ((qh[1] << 4) & 0x700)};
+    const float delta[4] = {(qh[0] & 0x08) ? -kIq1Delta : kIq1Delta, (qh[0] & 0x80) ? -kIq1Delta : kIq1Delta,
+                            (qh[1] & 0x08) ? -kIq1Delta : kIq1Delta, (qh[1] & 0x80) ? -kIq1Delta : kIq1Delta};
+    for (int l = 0; l < 4; ++l, y += 8)
+      _mm256_storeu_ps(y, _mm256_mul_ps(_mm256_set1_ps(l < 2 ? dl1 : dl2),
+                                        _mm256_add_ps(grid8s(q::iq::kIq1sGrid[idx[l]]), _mm256_set1_ps(delta[l]))));
+  }
+}
+
+// ---- ternary (TQ1_0, TQ2_0): float(q - 1) * d with q in 0..2
+
+PELIAS_TARGET_AVX2 void deq_tq2_0(const std::uint8_t* p, float* y) {  // qs[64] (2 bits each), d
+  const float d = h2f(p + 64);
+  const __m256i m3 = _mm256_set1_epi8(3), one = _mm256_set1_epi8(1);
+  for (int j = 0; j < 64; j += 32) {
+    const __m256i q = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + j));
+    for (int l = 0; l < 4; ++l, y += 32) dq32_s(_mm256_sub_epi8(_mm256_and_si256(_mm256_srli_epi16(q, 2 * l), m3), one), d, 0.0f, false, y);
+  }
+}
+
+// TQ1_0: 5 trits per byte (qs) and 4 per byte (qh), read as trit(x) = (x * 3) >> 8 of x = (q * 3^k) mod 256
+PELIAS_TARGET_AVX2 inline __m256i tq1_trits16(__m256i q16, int pw) {  // 16 bytes widened to u16: (((q * pw) & 255) * 3 >> 8) - 1
+  const __m256i v = _mm256_and_si256(_mm256_mullo_epi16(q16, _mm256_set1_epi16(static_cast<short>(pw))), _mm256_set1_epi16(255));
+  return _mm256_sub_epi16(_mm256_srli_epi16(_mm256_mullo_epi16(v, _mm256_set1_epi16(3)), 8), _mm256_set1_epi16(1));
+}
+PELIAS_TARGET_AVX2 inline void tq1_store16(__m256i t16, float d, float* y) {  // 16 int16 trits as float(t) * d
+  const __m256 dv = _mm256_set1_ps(d);
+  _mm256_storeu_ps(y, _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_castsi256_si128(t16))), dv));
+  _mm256_storeu_ps(y + 8, _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_extracti128_si256(t16, 1))), dv));
+}
+PELIAS_TARGET_AVX2 void deq_tq1_0(const std::uint8_t* p, float* y) {  // qs[48], qh[4], d
+  const float d = h2f(p + 52);
+  static const int pow3[5] = {1, 3, 9, 27, 81};
+  const __m256i a0 = _mm256_cvtepu8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p)));       // qs[0..16)
+  const __m256i a1 = _mm256_cvtepu8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p + 16)));  // qs[16..32)
+  const __m256i b0 = _mm256_cvtepu8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p + 32)));  // qs[32..48)
+  for (int nn = 0; nn < 5; ++nn, y += 32) {
+    tq1_store16(tq1_trits16(a0, pow3[nn]), d, y);
+    tq1_store16(tq1_trits16(a1, pow3[nn]), d, y + 16);
+  }
+  for (int nn = 0; nn < 5; ++nn, y += 16) tq1_store16(tq1_trits16(b0, pow3[nn]), d, y);
+  for (int nn = 0; nn < 4; ++nn)
+    for (int j = 0; j < 4; ++j) {
+      const std::uint8_t x = static_cast<std::uint8_t>(p[48 + j] * pow3[nn]);
+      *y++ = static_cast<float>(static_cast<int>((static_cast<std::uint16_t>(x) * 3) >> 8) - 1) * d;
+    }
+}
+
+// ---- Q7_Z / Q7_ZT (Pelias research types): eight 7-bit values per 7 bytes
+
+PELIAS_TARGET_AVX2 inline __m256i unpack7(const std::uint8_t* g) {  // the 8 values of one group as int32 (0..127)
+  // value k sits at bits 7k..7k+6 of the 7 bytes: values 0-3 from bytes 0-3, values 4-7 from bytes 3-6 (bit 24 on), so
+  // exactly the group's 7 bytes are read
+  std::uint32_t lo, hi;
+  std::memcpy(&lo, g, 4);
+  std::memcpy(&hi, g + 3, 4);
+  const __m256i v = _mm256_setr_epi32(static_cast<int>(lo), static_cast<int>(lo), static_cast<int>(lo), static_cast<int>(lo), static_cast<int>(hi),
+                                      static_cast<int>(hi), static_cast<int>(hi), static_cast<int>(hi));
+  return _mm256_and_si256(_mm256_srlv_epi32(v, _mm256_setr_epi32(0, 7, 14, 21, 4, 11, 18, 25)), _mm256_set1_epi32(127));
+}
+
+PELIAS_TARGET_AVX2 void deq_q7_z(const std::uint8_t* p, float* y) {  // d, 8 levels, 32 groups of 7 bytes; float(u - 64) * s
+  const float d = h2f(p);
+  std::uint64_t packed = 0;
+  for (int b = 0; b < 6; ++b) packed |= static_cast<std::uint64_t>(p[2 + b]) << (8 * b);
+  const __m256i o64 = _mm256_set1_epi32(64);
+  for (int j = 0; j < 8; ++j) {
+    const __m256 s = _mm256_set1_ps(q::q7_z_scale(d, static_cast<int>((packed >> (6 * j)) & 63u)));
+    for (int g = 4 * j; g < 4 * j + 4; ++g, y += 8)
+      _mm256_storeu_ps(y, _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(unpack7(p + 8 + 7 * g), o64)), s));
+  }
+}
+
+PELIAS_TARGET_AVX2 void deq_q7_zt(const std::uint8_t* p, float* y) {  // d, 8 levels, gate mask, 32 groups of 7 bytes, H words
+  const float d = h2f(p);
+  std::uint64_t packed = 0;
+  for (int b = 0; b < 6; ++b) packed |= static_cast<std::uint64_t>(p[2 + b]) << (8 * b);
+  const std::uint8_t mask = p[8];
+  const __m256i o127 = _mm256_set1_epi32(127), one = _mm256_set1_epi32(1), lane = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+  int hslot = 0;
+  for (int j = 0; j < 8; ++j) {
+    const __m256 s = _mm256_set1_ps(q::q8_z_scale(d, static_cast<int>((packed >> (6 * j)) & 63u)));
+    const bool gated = (mask >> j) & 1u;
+    std::uint32_t hb = 0;
+    if (gated) hb = u32le(p + 233 + 4 * hslot++);
+    for (int g = 0; g < 4; ++g, y += 8) {
+      __m256i qv = _mm256_sub_epi32(_mm256_slli_epi32(unpack7(p + 9 + 7 * (4 * j + g)), 1), o127);  // 2 b - 127
+      if (gated)
+        qv = _mm256_add_epi32(qv, _mm256_and_si256(_mm256_srlv_epi32(_mm256_set1_epi32(static_cast<int>(hb)), _mm256_add_epi32(lane, _mm256_set1_epi32(8 * g))), one));
+      _mm256_storeu_ps(y, _mm256_mul_ps(_mm256_cvtepi32_ps(qv), s));
+    }
+  }
+}
+
 PELIAS_TARGET_AVX2 void planes_seg_avx2(const std::uint8_t* o, int k_stored, int k_use, float* w) {
   const std::uint8_t* bits = o + 2 * k_stored;
   const __m256i bitsel = _mm256_setr_epi32(1, 2, 4, 8, 16, 32, 64, 128);
@@ -464,6 +674,17 @@ PELIAS_TARGET_AVX2 void dot_row_avx2(q::Type t, const std::uint8_t* row, std::in
       case q::Type::f16: deq_f16(p, w); break;
       case q::Type::bf16: deq_bf16(p, w); break;
       case q::Type::f32: std::memcpy(w, p, sizeof w); break;
+      case q::Type::iq2_xxs: deq_iq2_xxs(p, w); break;
+      case q::Type::iq2_xs: deq_iq2_xs(p, w); break;
+      case q::Type::iq2_s: deq_iq2_s(p, w); break;
+      case q::Type::iq3_xxs: deq_iq3_xxs(p, w); break;
+      case q::Type::iq3_s: deq_iq3_s(p, w); break;
+      case q::Type::iq1_s: deq_iq1_s(p, w); break;
+      case q::Type::iq1_m: deq_iq1_m(p, w); break;
+      case q::Type::tq1_0: deq_tq1_0(p, w); break;
+      case q::Type::tq2_0: deq_tq2_0(p, w); break;
+      case q::Type::q7_z: deq_q7_z(p, w); break;
+      case q::Type::q7_zt: deq_q7_zt(p, w); break;
       default: (void)q::dequantize_row(t, p, w, kSeg); break;
     }
     if (pd) {

@@ -291,7 +291,7 @@ int cmd_bench_dot(const Args& a) {
     for (char& ch : n) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
     if (!n.empty() && n == tn) id = static_cast<int>(i);
   }
-  if (id < 0 || !kern::dot_supported(static_cast<quant::Type>(id)) || !quant::can_quantize(static_cast<quant::Type>(id))) {
+  if (id < 0 || !kern::dot_supported(static_cast<quant::Type>(id))) {
     std::fprintf(stderr, "pelias bench-dot: unknown or unsupported --type %s\n", tn.c_str());
     return 1;
   }
@@ -332,8 +332,12 @@ int cmd_bench_dot(const Args& a) {
   std::normal_distribution<float> nd(0.0f, 0.02f);
   std::vector<float> src(k), res(k);
   for (std::uint64_t r = 0; r < distinct; ++r) {
-    for (float& v : src) v = nd(rng);
-    (void)quant::quantize_row(t, src.data(), w.data() + r * rb, static_cast<std::int64_t>(k));
+    if (quant::can_quantize(t)) {
+      for (float& v : src) v = nd(rng);
+      (void)quant::quantize_row(t, src.data(), w.data() + r * rb, static_cast<std::int64_t>(k));
+    } else {  // a type Pelias reads but does not write: random bytes with no Inf / NaN scale (bit 6 of each byte cleared)
+      for (std::uint64_t i = 0; i < rb; ++i) w[r * rb + i] = static_cast<std::uint8_t>(rng() & 0xBF);
+    }
     if (kp) {
       for (float& v : res) v = 0.1f * nd(rng);
       (void)quant::plane_fit_row(res.data(), nullptr, static_cast<std::int64_t>(k), static_cast<int>(kp), 2, pl.data() + r * pb);

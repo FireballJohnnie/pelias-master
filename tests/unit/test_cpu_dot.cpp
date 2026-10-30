@@ -129,8 +129,9 @@ TEST(cpu_dot_rows_that_are_not_whole_segments) {
 TEST(cpu_dot_reports_its_paths) {
   CHECK(kn::dot_has_fast_path(q::Type::q4_tg2));
   CHECK(kn::dot_has_fast_path(q::Type::q6_k));
-  CHECK(!kn::dot_has_fast_path(q::Type::q7_z));
-  CHECK(kn::dot_supported(q::Type::q7_z));
+  for (std::uint32_t id = 0; id < 256; ++id)  // every readable type has its own AVX2 dequantizer (author 11:20: all 30)
+    if (q::can_dequantize(static_cast<q::Type>(id))) CHECK(kn::dot_has_fast_path(static_cast<q::Type>(id)));
+  CHECK(!kn::dot_supported(static_cast<q::Type>(250)));
   kn::force_isa(kn::Isa::portable);
   CHECK(kn::active_isa() == kn::Isa::portable);
   kn::force_isa(kn::Isa::avx2);
@@ -178,4 +179,5 @@ TEST(cpu_dot_reads_every_readable_type) {
   }
   std::printf("    cpu_dot: %d readable types checked, %d with an AVX2 dequantizer of their own\n", types, fast);
   CHECK(types >= 30);
+  CHECK(fast == types);
 }
