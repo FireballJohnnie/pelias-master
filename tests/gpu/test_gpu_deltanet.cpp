@@ -289,6 +289,104 @@ TEST(rung1_deltanet_variants_side_by_side) {
   std::printf("    the five kernels in turn on one state (%lld tokens each): %.3e vs fp64; worst of all %.3e (tolerance 1e-4)\n", static_cast<long long>(q5), em, std::max(worst, em));
 }
 
+// Timing spread (C2 follow-up, 2026-10-30 v7): the five kernels timed in 5 rounds, interleaved (round r runs mode 0..4 in
+// turn) so a clock or power state change shows up across all of them rather than in one. Information, not a gate; skipped
+// under PELIAS_GPU_QUICK (the sanitizers). With PELIAS_GPU_POWER_SECS=s (s > 0) each kernel then runs back to back for about
+// s seconds as a prompt loop and as a decode loop; the loop's wall-clock start / end (Unix ms) are printed so a power log
+// (nvidia-smi / HWiNFO) can be sliced by them, and the loop's own average per call is a long-run timing sample.
+namespace {
+
+long long unix_ms() {
+  return static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+}
+
+// m tokens per call (m = 1: decode, walking the window's tokens in a cycle); calls until secs have passed (checked every
+// batch, synchronised); returns calls made and the time per call
+double busy_loop(const Window& W, int mode, std::int64_t m, double secs, long long* calls, long long* t0_ms, long long* t1_ms) {
+  Dev<float> dm(W.mixed), dcw(W.cw), db(W.beta), da(W.alpha), ddt(W.dt), dA(W.a);
+  Dev<float> conv(static_cast<std::size_t>(W.n * kCh)), core(static_cast<std::size_t>(W.n * kDin)), state(static_cast<std::size_t>(kNv * kDs * kDs));
+  CHECK(g::dzero(state.p, state.n * sizeof(float)));
+  CHECK(g::deltanet_gates(db.p, da.p, ddt.p, dA.p, W.n, kNv));
+  CHECK(g::deltanet_conv(dm.p, nullptr, dcw.p, W.n, kCh, kTaps, conv.p, nullptr));
+  CHECK(g::l2_norm(conv.p, kDs, 2 * kNk, kDs, kCh, W.n, kEps));
+  CHECK(recur(mode, conv.p, db.p, da.p, state.p, m, core.p));
+  CHECK(g::sync());
+  const std::int64_t batch = m == 1 ? 256 : 8;
+  long long n = 0;
+  std::int64_t t = 0;
+  *t0_ms = unix_ms();
+  const auto c0 = std::chrono::steady_clock::now();
+  double el = 0.0;
+  while (el < secs) {
+    for (std::int64_t i = 0; i < batch; ++i) {
+      if (m == 1) {
+        t = (t + 1) % W.n;
+        CHECK(recur(mode, conv.p + t * kCh, db.p + t * kNv, da.p + t * kNv, state.p, 1, core.p + t * kDin));
+      } else {
+        CHECK(recur(mode, conv.p, db.p, da.p, state.p, m, core.p));
+      }
+    }
+    CHECK(g::sync());
+    n += batch;
+    el = std::chrono::duration<double>(std::chrono::steady_clock::now() - c0).count();
+  }
+  *t1_ms = unix_ms();
+  *calls = n;
+  return el / static_cast<double>(n);
+}
+
+}  // namespace
+
+TEST(rung1_deltanet_timing_spread) {
+  if (!g::available()) {
+    CHECK(g::available());
+    return;
+  }
+  if (std::getenv("PELIAS_GPU_QUICK") != nullptr) {
+    std::printf("    skipped under PELIAS_GPU_QUICK (timing only)\n");
+    return;
+  }
+  constexpr int kRounds = 5;
+  const std::int64_t nlong = 1000, ndec = 512;
+  const Window W1k(nlong, 90u);
+  double pr[5][kRounds] = {}, de[5][kRounds] = {};
+  for (int r = 0; r < kRounds; ++r) {
+    for (int mode = 0; mode < 5; ++mode) {
+      double t1 = 0.0;
+      (void)run_gpu(W1k, {nlong}, {mode}, &t1);  // cold call of this round
+      double t2 = 0.0;
+      (void)run_gpu(W1k, {nlong}, {mode}, &t2);  // warm
+      pr[mode][r] = t2 * 1e3;
+      de[mode][r] = decode_us(W1k, mode, ndec);
+    }
+    std::printf("    round %d at %lld ms:", r + 1, unix_ms());
+    for (int mode = 0; mode < 5; ++mode) std::printf(" [%d] %.3f ms / %.2f us", mode, pr[mode][r], de[mode][r]);
+    std::printf("\n");
+  }
+  for (int mode = 0; mode < 5; ++mode) {
+    double a[kRounds], b[kRounds];
+    for (int r = 0; r < kRounds; ++r) {
+      a[r] = pr[mode][r];
+      b[r] = de[mode][r];
+    }
+    std::sort(a, a + kRounds);
+    std::sort(b, b + kRounds);
+    std::printf("    %-22s prompt (1,000 tok, warm) min %.3f median %.3f max %.3f ms | decode min %.2f median %.2f max %.2f us (max / min %.2fx)\n",
+                kModeName[mode], a[0], a[kRounds / 2], a[kRounds - 1], b[0], b[kRounds / 2], b[kRounds - 1], b[0] > 0.0 ? b[kRounds - 1] / b[0] : 0.0);
+  }
+  const char* ps = std::getenv("PELIAS_GPU_POWER_SECS");
+  const double secs = ps ? std::atof(ps) : 0.0;
+  if (secs <= 0.0) return;
+  for (int mode = 0; mode < 5; ++mode) {
+    for (int dec = 0; dec < 2; ++dec) {
+      long long calls = 0, s0 = 0, s1 = 0;
+      const double per = busy_loop(W1k, mode, dec ? 1 : nlong, secs, &calls, &s0, &s1);
+      std::printf("    power loop %-22s %-6s start %lld end %lld ms | %lld calls, %.3f %s per call\n", kModeName[mode], dec ? "decode" : "prompt", s0, s1, calls,
+                  dec ? per * 1e6 : per * 1e3, dec ? "us" : "ms");
+    }
+  }
+}
+
 TEST(rung1_deltanet_chunked_refuses_bad_shapes) {
   if (!g::available()) return;
   float dummy = 0.0f;
