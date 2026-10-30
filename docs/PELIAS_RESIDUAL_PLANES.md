@@ -483,6 +483,53 @@ DERIVED: the 2 GB worst-error side file read for the top 4 picks costs about 32 
 read always) and projects KL about 0.0081 / 0.0091 (WikiText / chat+code), against 0.0083 / 0.0096 for the 1 GB file read
 always. This replaces "context-hot" reading (6.7), which tested weaker.
 
+### 6.9 The tiered file, MEASURED (2026-10-30 07:18-08:16)
+
+**Build** (`block_tier_v1.sh tier`, 2,031 s):
+- Expert matrices: Q4_TG2 20,311, Q5_K 9,801, Q6_K 608 (as predicted).
+- Importance used on all 120 tiered weights.
+- File 22,663,406,784 bytes, against Unsloth's 22,663,387,424. The extra 19,360 bytes are the type lists.
+
+**`kld`**: 100 chunks, engine format, no planes, the same base and setup as the Unsloth run.
+
+| File | Mean KLD | Same top | Label |
+|---|---|---|---|
+| Unsloth MTP UD-Q4_K_M | 0.012808 ± 0.000368 | 95.02 % | MEASURED |
+| **Tiered, same size** | **0.009404 ± 0.000370** | **95.80 %** | MEASURED |
+| Unsloth + 2 planes (31.9 GB) | 0.005818 ± 0.000169 | 96.77 % | MEASURED |
+
+- Tiered vs Unsloth: **-0.003405 (-26.6 %)**, 95 % interval [-0.003949, -0.002860], t -12.41, settled.
+- The tiered file has the lower KL on 66.3 % of tokens. The top token is right only with the tiered file 702 times, only with
+  Unsloth 502 (z 5.76).
+- Other statistics of the tiered run: ln(PPL ratio) 0.003129; 99.9 % KLD 0.400.
+- **Prediction:** about 0.0089, range 0.0080-0.0100. Within range, 0.0005 above the point; the two-point line was slightly
+  optimistic.
+
+**Chunks 79-100** (author 08:16: "seemed to make it jump"; `tier_chunks.py`). The jump is the text, not the tiered file:
+
+| Chunks | Tiered | Unsloth | Change | Unsloth + 2 planes |
+|---|---|---|---|---|
+| 1-50 | 0.009407 | 0.012464 | -24.5 % | 0.005884 |
+| 51-78 | 0.008657 | 0.011810 | -26.7 % | 0.005192 |
+| 79-100 | 0.010346 | 0.014862 | **-30.4 %** | 0.006463 |
+
+- Chunk 79 is the hardest chunk for every file: Unsloth 0.0579, tiered 0.0374, planes 0.0122. Chunk 80 is fifth for the tiered
+  file and fourth for Unsloth.
+- The tiered file is lower on 94 of 100 chunks, median ratio 0.69. Where the text is hardest it cuts the most.
+
+**Projections re-based on three measured points** (`kl_recal.py`; DERIVED). The error left maps to KL piecewise-linearly through
+1.0 -> 0.012808, 0.484 -> 0.009404 and 0.098 -> 0.005818. Chat+code still has no measured KL. The previous two-point figure is in
+brackets.
+
+| Option | KL WikiText | KL chat+code |
+|---|---|---|
+| Tiered, 22.65 GB | **0.009404 (MEASURED)** | about 0.0110 (0.0108) |
+| + 1 GB worst-error block planes, read always | about 0.0088 (0.0083) | about 0.0100 (0.0096) |
+| + 2 GB, read always | about 0.0083 (0.0079) | about 0.0092 (0.0087) |
+| + 2 GB, read for the top 4 picks | about 0.0085 (0.0081) | about 0.0096 (0.0091) |
+| Tiered static, 23.65 GB | about 0.0080 (0.0077) | about 0.0097 (0.0093) |
+| Tiered static, 24.65 GB | about 0.0071 (0.0070) | about 0.0085 (0.0081) |
+
 ## 7. Status
 
 - Built and pushed: `pelias planes`; `--planes / --plane-k / --head-rescore` on `kld` and `generate`; `generate
