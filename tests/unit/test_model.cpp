@@ -449,8 +449,11 @@ struct TinyModel {
   bool ok = false;
 };
 
-void tiny_model(TinyModel& tm) {
-  ptest::GgufBuilder b = qwen35moe_meta(4, 0);
+// mtp: a fifth block blk.4 is the MTP block (nextn_predict_layers 1), as the served file has blk.40. mtp_echo: that block
+// is built to give back the trunk's own last prediction (attention and expert outputs zero, eh_proj selecting the hidden,
+// unit norms), so its drafts repeat the last token and a repeating greedy run accepts them (the acceptance path in tests)
+void tiny_model(TinyModel& tm, bool mtp = false, bool mtp_echo = false) {
+  ptest::GgufBuilder b = qwen35moe_meta(mtp ? 5 : 4, mtp ? 1 : 0);
   // a byte-level tokenizer over the 1,000-token vocabulary, so `pelias generate` runs on this file too: ids 0..255 are
   // the bytes (GPT-2 byte-to-character map), a few merges, fillers, then <|endoftext|> <|im_start|> <|im_end|> as control
   {
@@ -503,10 +506,22 @@ void tiny_model(TinyModel& tm) {
     b.tensor(p + "ffn_down_exps.weight", {ff, e, ne}, 0).tensor(p + "ffn_up_shexp.weight", {e, ffs}, 0).tensor(p + "ffn_gate_shexp.weight", {e, ffs}, 0);
     b.tensor(p + "ffn_down_shexp.weight", {ffs, e}, 0).tensor(p + "ffn_gate_inp_shexp.weight", {e}, 0);
   }
+  if (mtp) {
+    const std::string p = "blk.4.";
+    b.tensor(p + "attn_norm.weight", {e}, 0).tensor(p + "post_attention_norm.weight", {e}, 0);
+    b.tensor(p + "attn_q.weight", {e, 2 * hd * nh}, 0).tensor(p + "attn_k.weight", {e, hd * nkv}, 0).tensor(p + "attn_v.weight", {e, hd * nkv}, 0);
+    b.tensor(p + "attn_output.weight", {hd * nh, e}, 0).tensor(p + "attn_q_norm.weight", {hd}, 0).tensor(p + "attn_k_norm.weight", {hd}, 0);
+    b.tensor(p + "ffn_gate_inp.weight", {e, ne}, 0).tensor(p + "ffn_up_exps.weight", {e, ff, ne}, 0).tensor(p + "ffn_gate_exps.weight", {e, ff, ne}, 0);
+    b.tensor(p + "ffn_down_exps.weight", {ff, e, ne}, 0).tensor(p + "ffn_up_shexp.weight", {e, ffs}, 0).tensor(p + "ffn_gate_shexp.weight", {e, ffs}, 0);
+    b.tensor(p + "ffn_down_shexp.weight", {ffs, e}, 0).tensor(p + "ffn_gate_inp_shexp.weight", {e}, 0);
+    b.tensor(p + "nextn.eh_proj.weight", {2 * e, e}, 0).tensor(p + "nextn.enorm.weight", {e}, 0).tensor(p + "nextn.hnorm.weight", {e}, 0);
+    b.tensor(p + "nextn.shared_head_norm.weight", {e}, 0);
+  }
   std::vector<std::uint8_t> bytes = b.build();
   pelias::os::FileMap m0;
   pelias::io::GgufReader r0;
-  if (!ptest::write_and_map(ptest::data_dir() + "/decode_tiny_layout.gguf", bytes, m0) || !r0.parse(m0).ok()) return;
+  const std::string stem = mtp ? (mtp_echo ? "/decode_tiny_mtp_echo" : "/decode_tiny_mtp") : "/decode_tiny";
+  if (!ptest::write_and_map(ptest::data_dir() + stem + "_layout.gguf", bytes, m0) || !r0.parse(m0).ok()) return;
   std::uint32_t h = 20261019u;
   auto unit = [&h]() {  // xorshift, uniform in [-1, 1)
     h ^= h << 13;
@@ -526,10 +541,15 @@ void tiny_model(TinyModel& tm) {
       else if (nm.find("ssm_dt") != std::string::npos) v = 0.1f * u;
       else if (nm.find("conv1d") != std::string::npos) v = 0.3f * u;
       else if (nm == "token_embd.weight") v = 0.5f * u;
+      if (mtp_echo && nm.rfind("blk.4.", 0) == 0) {
+        if (nm == "blk.4.attn_output.weight" || nm == "blk.4.ffn_down_exps.weight" || nm == "blk.4.ffn_down_shexp.weight") v = 0.0f;
+        if (nm == "blk.4.nextn.hnorm.weight" || nm == "blk.4.nextn.shared_head_norm.weight") v = 1.0f;
+        if (nm == "blk.4.nextn.eh_proj.weight") v = (i % (2 * e) == e + i / (2 * e)) ? 1.0f : 0.0f;  // row o reads input e + o
+      }
       std::memcpy(d + i, &v, 4);
     }
   }
-  if (!ptest::write_and_map(ptest::data_dir() + "/decode_tiny.gguf", bytes, tm.map) || !tm.reader.parse(tm.map).ok()) return;
+  if (!ptest::write_and_map(ptest::data_dir() + stem + ".gguf", bytes, tm.map) || !tm.reader.parse(tm.map).ok()) return;
   auto s = pelias::model::read_qwen35moe_spec(tm.reader);
   if (!s.ok()) return;
   tm.spec = s.value;
@@ -982,3 +1002,173 @@ TEST(planes_on_tiered_files_select_blocks_and_picks) {
   CHECK(!attach(p1, tw2.value, a5));
 }
 
+
+// GP3-08: the MTP block. Bound from the file; one call over n tokens equals n one-token calls; greedy decoding with drafting
+// gives exactly the tokens of plain greedy decoding for every draft length, on the reference and the fast CPU path; the
+// drafts are counted and, on a block built to echo the trunk, accepted; a file without the block refuses to draft.
+namespace {
+std::vector<std::int32_t> plain_greedy(const TinyModel& tm, const std::vector<std::int32_t>& prompt, int n, std::int32_t eos,
+                                       const pelias::model::ForwardOptions& o) {
+  const int v = static_cast<int>(tm.spec.n_vocab);
+  pelias::model::DecodeState st;
+  pelias::model::decode_state_reset(tm.spec, st);
+  std::vector<float> lg(static_cast<std::size_t>(v));
+  std::vector<std::int32_t> out;
+  if (!pelias::model::forward_decode(tm.spec, tm.w, st, prompt.data(), static_cast<int>(prompt.size()), lg.data(), true, o).ok()) return out;
+  while (static_cast<int>(out.size()) < n) {
+    int best = 0;
+    for (int i = 1; i < v; ++i)
+      if (lg[static_cast<std::size_t>(i)] > lg[static_cast<std::size_t>(best)]) best = i;
+    out.push_back(best);
+    if (best == eos || static_cast<int>(out.size()) == n) break;
+    if (!pelias::model::forward_decode(tm.spec, tm.w, st, &out.back(), 1, lg.data(), true, o).ok()) return {};
+  }
+  return out;
+}
+}  // namespace
+
+TEST(mtp_block_drafts_and_greedy_equals_plain) {
+  for (int echo = 0; echo < 2; ++echo) {
+    TinyModel tm;
+    tiny_model(tm, true, echo == 1);
+    CHECK(tm.ok);
+    if (!tm.ok) return;
+    CHECK(tm.w.mtp.present);
+    CHECK(tm.spec.n_layer == 4 && tm.spec.n_layer_all == 5);
+    const std::size_t e = tm.spec.n_embd, v = tm.spec.n_vocab;
+    const auto pe = static_cast<std::ptrdiff_t>(e);
+    pelias::model::ForwardOptions o;
+    o.threads = 2;
+    const std::vector<std::int32_t> tok{11, 427, 3, 999, 58, 58, 0, 731, 210, 64, 5};
+    const int n = static_cast<int>(tok.size());
+    // the trunk's hidden rows, then the block over all tokens at once and one at a time
+    std::vector<float> lg(static_cast<std::size_t>(n) * v), hid(static_cast<std::size_t>(n) * e), hp(static_cast<std::size_t>(n) * e, 0.0f);
+    pelias::model::ForwardOptions oh = o;
+    oh.hidden_out = hid.data();
+    CHECK(pelias::model::forward_reference(tm.spec, tm.w, tok.data(), n, 0, n, lg.data(), oh).ok());
+    std::copy(hid.begin(), hid.end() - pe, hp.begin() + pe);
+    pelias::model::MtpState a, b;
+    pelias::model::mtp_state_reset(a);
+    pelias::model::mtp_state_reset(b);
+    std::vector<float> la(static_cast<std::size_t>(n) * v), lb(la.size()), ha(hid.size()), hb(hid.size());
+    CHECK(pelias::model::mtp_forward(tm.spec, tm.w, a, tok.data(), hp.data(), n, la.data(), ha.data(), o).ok());
+    for (int t = 0; t < n; ++t)
+      CHECK(pelias::model::mtp_forward(tm.spec, tm.w, b, tok.data() + t, hp.data() + static_cast<std::size_t>(t) * e, 1,
+                                       lb.data() + static_cast<std::size_t>(t) * v, hb.data() + static_cast<std::size_t>(t) * e, o).ok());
+    CHECK(a.pos == n && b.pos == n);
+    CHECK(la == lb);
+    CHECK(ha == hb);
+    bool finite = true;
+    for (float x : la) finite = finite && std::isfinite(x);
+    CHECK(finite);
+    // truncation drops cached positions: run the last 3 again from position n - 3 and get the same rows
+    pelias::model::mtp_state_truncate(tm.spec, b, n - 3);
+    std::vector<float> lc(3 * v);
+    CHECK(pelias::model::mtp_forward(tm.spec, tm.w, b, tok.data() + n - 3, hp.data() + static_cast<std::size_t>(n - 3) * e, 3, lc.data(), nullptr, o).ok());
+    CHECK(std::equal(lc.begin(), lc.end(), la.begin() + static_cast<std::ptrdiff_t>(static_cast<std::size_t>(n - 3) * v)));
+    // greedy with drafting = plain greedy, for every draft length, reference and fast path, with and without an end token
+    for (int fast = 0; fast < 2; ++fast) {
+      pelias::model::ForwardOptions of = o;
+      of.fast_cpu = fast == 1;
+      for (std::int32_t eos : {-1, 5}) {
+        const std::vector<std::int32_t> want = plain_greedy(tm, tok, 24, eos, of);
+        CHECK(!want.empty());
+        for (int nd : {0, 1, 2, 4}) {
+          std::vector<std::int32_t> got;
+          pelias::model::MtpStats ms;
+          CHECK(pelias::model::generate_greedy_mtp(tm.spec, tm.w, tok, 24, nd, eos >= 0 ? std::vector<std::int32_t>{eos} : std::vector<std::int32_t>{}, got, &ms, of).ok());
+          CHECK(got == want);
+          if (got != want) {
+            std::printf("    mtp: echo %d fast %d eos %d draft %d differs from plain greedy\n", echo, fast, eos, nd);
+          }
+          if (fast == 0 && eos == -1 && nd == 4)
+            std::printf("    mtp (%s block): 24 tokens, %lld steps, %lld drafted, %lld accepted\n", echo ? "echo" : "random",
+                        static_cast<long long>(ms.steps), static_cast<long long>(ms.drafted), static_cast<long long>(ms.accepted));
+          if (echo == 1 && fast == 0 && eos == -1 && nd > 0) CHECK(ms.accepted > 0);
+          if (nd == 0) CHECK(ms.drafted == 0);
+        }
+      }
+    }
+  }
+  // a file without the block refuses to draft, and still decodes plainly
+  TinyModel plain;
+  tiny_model(plain);
+  CHECK(plain.ok && !plain.w.mtp.present);
+  std::vector<std::int32_t> got;
+  const std::vector<std::int32_t> tok{11, 427, 3};
+  CHECK(!pelias::model::generate_greedy_mtp(plain.spec, plain.w, tok, 8, 2, {}, got, nullptr).ok());
+  CHECK(pelias::model::generate_greedy_mtp(plain.spec, plain.w, tok, 8, 0, {}, got, nullptr).ok() && got.size() == 8);
+}
+
+// Newer converters fuse tensors: a full-attention layer's q/k/v into one attn_qkv ([query | gate] per head, then keys, then
+// values) and each layer's expert gate and up into one ffn_gate_up_exps (per expert, its gate rows then its up rows). A
+// copy of the tiny model written that way binds and gives the same logits, bit for bit, on both CPU paths.
+TEST(fused_qkv_and_gate_up_files_read_the_same) {
+  TinyModel tm;
+  tiny_model(tm);
+  CHECK(tm.ok);
+  if (!tm.ok) return;
+  ptest::GgufBuilder b = qwen35moe_meta(4, 0);
+  auto is_split = [](const std::string& nm) {
+    return nm.find("ffn_gate_exps") != std::string::npos || nm.find("ffn_up_exps") != std::string::npos ||
+           (nm.rfind("blk.3.", 0) == 0 && (nm.find("attn_q.weight") != std::string::npos || nm.find("attn_k.weight") != std::string::npos ||
+                                           nm.find("attn_v.weight") != std::string::npos));
+  };
+  for (const pelias::io::GgufTensor& t : tm.reader.tensors()) {
+    if (t.name == "token_embd.weight" || is_split(t.name)) continue;  // the meta builder adds the embedding table
+    std::vector<std::uint64_t> ne(t.ne, t.ne + t.n_dims);
+    b.tensor(t.name, ne, t.type);
+  }
+  const auto* q = tm.reader.find_tensor("blk.3.attn_q.weight");
+  const auto* k = tm.reader.find_tensor("blk.3.attn_k.weight");
+  const auto* v = tm.reader.find_tensor("blk.3.attn_v.weight");
+  b.tensor("blk.3.attn_qkv.weight", {q->ne[0], q->ne[1] + k->ne[1] + v->ne[1]}, 0);
+  for (int il = 0; il < 4; ++il) {
+    const auto* g = tm.reader.find_tensor("blk." + std::to_string(il) + ".ffn_gate_exps.weight");
+    b.tensor("blk." + std::to_string(il) + ".ffn_gate_up_exps.weight", {g->ne[0], 2 * g->ne[1], g->ne[2]}, 0);
+  }
+  std::vector<std::uint8_t> bytes = b.build();
+  pelias::os::FileMap m0;
+  pelias::io::GgufReader r0;
+  CHECK(ptest::write_and_map(ptest::data_dir() + "/decode_tiny_fused_layout.gguf", bytes, m0) && r0.parse(m0).ok());
+  auto src = [&](const std::string& nm) { return tm.map.data() + tm.reader.find_tensor(nm)->file_offset; };
+  for (const pelias::io::GgufTensor& t : r0.tensors()) {
+    std::uint8_t* d = bytes.data() + t.file_offset;
+    if (t.name == "blk.3.attn_qkv.weight") {
+      std::memcpy(d, src("blk.3.attn_q.weight"), q->bytes);
+      std::memcpy(d + q->bytes, src("blk.3.attn_k.weight"), k->bytes);
+      std::memcpy(d + q->bytes + k->bytes, src("blk.3.attn_v.weight"), v->bytes);
+    } else if (t.name.find("ffn_gate_up_exps") != std::string::npos) {
+      const std::string p = t.name.substr(0, t.name.find("ffn_gate_up_exps"));
+      const auto* g = tm.reader.find_tensor(p + "ffn_gate_exps.weight");
+      const std::uint64_t per = g->bytes / g->ne[2];  // one expert's gate (or up) bytes
+      for (std::uint64_t ex = 0; ex < g->ne[2]; ++ex) {
+        std::memcpy(d + 2 * ex * per, src(p + "ffn_gate_exps.weight") + ex * per, per);
+        std::memcpy(d + (2 * ex + 1) * per, src(p + "ffn_up_exps.weight") + ex * per, per);
+      }
+    } else {
+      std::memcpy(d, src(t.name), t.bytes);
+    }
+  }
+  pelias::os::FileMap fm;
+  pelias::io::GgufReader fr;
+  CHECK(ptest::write_and_map(ptest::data_dir() + "/decode_tiny_fused.gguf", bytes, fm) && fr.parse(fm).ok());
+  auto fw = pelias::model::bind_qwen35moe(fr, fm.data(), tm.spec);
+  CHECK(fw.ok());
+  if (!fw.ok()) {
+    std::printf("      %s\n", fw.status.text().c_str());
+    return;
+  }
+  const std::vector<std::int32_t> tok{11, 427, 3, 999, 58, 58, 0, 731, 210, 64, 5};
+  const int n = static_cast<int>(tok.size());
+  const std::size_t nv = tm.spec.n_vocab;
+  for (int fast = 0; fast < 2; ++fast) {
+    pelias::model::ForwardOptions o;
+    o.threads = 2;
+    o.fast_cpu = fast == 1;
+    std::vector<float> a(static_cast<std::size_t>(n) * nv), c(a.size());
+    CHECK(pelias::model::forward_reference(tm.spec, tm.w, tok.data(), n, 0, n, a.data(), o).ok());
+    CHECK(pelias::model::forward_reference(tm.spec, fw.value, tok.data(), n, 0, n, c.data(), o).ok());
+    CHECK(a == c);
+  }
+}

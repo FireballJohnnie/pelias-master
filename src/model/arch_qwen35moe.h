@@ -284,12 +284,14 @@ Status mtp_forward(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, MtpState& 
 // tokens from the last kept token, the trunk runs the last token and the drafts as one batch, and a draft is kept only
 // while it equals the trunk's own greedy choice; the trunk's choice after the last kept draft is kept too. The result
 // equals plain greedy decoding (the trunk's batch rows are the same numbers as one-token steps). Stops after n_predict
-// tokens or at `eos` (>= 0). out receives the generated ids; drafted / accepted count the drafts.
+// tokens or at any of the `stops` ids (kept as the last token). out receives the generated ids; drafted / accepted count
+// the drafts.
 struct MtpStats {
   std::int64_t steps = 0, drafted = 0, accepted = 0;
 };
 Status generate_greedy_mtp(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, const std::vector<std::int32_t>& prompt, int n_predict, int n_draft,
-                           std::int32_t eos, std::vector<std::int32_t>& out, MtpStats* stats, const ForwardOptions& opt = {});
+                           const std::vector<std::int32_t>& stops, std::vector<std::int32_t>& out, MtpStats* stats,
+                           const ForwardOptions& opt = {});
 
 // Runs tokens[0..n_tokens) and writes the logits of positions [out_begin, out_end) to `logits`
 // ((out_end - out_begin) rows of spec.n_vocab floats). With `logits` null the output layer is skipped.

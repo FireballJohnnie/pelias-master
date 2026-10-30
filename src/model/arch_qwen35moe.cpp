@@ -1453,8 +1453,10 @@ std::int32_t argmax_row(const float* lg, int64_t nv) {  // the first of equal la
 }  // namespace
 
 Status generate_greedy_mtp(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, const std::vector<std::int32_t>& prompt, int n_predict, int n_draft,
-                           std::int32_t eos, std::vector<std::int32_t>& out, MtpStats* stats, const ForwardOptions& opt) {
+                           const std::vector<std::int32_t>& stops, std::vector<std::int32_t>& out, MtpStats* stats,
+                           const ForwardOptions& opt) {
   out.clear();
+  const auto is_stop = [&stops](std::int32_t t) { return std::find(stops.begin(), stops.end(), t) != stops.end(); };
   if (prompt.empty()) return Status::fail(Code::invalid_argument, "an empty prompt");
   if (n_predict <= 0) return Status::good();
   if (n_draft < 0) return Status::fail(Code::invalid_argument, "the draft length is 0 or more");
@@ -1479,7 +1481,7 @@ Status generate_greedy_mtp(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, co
   }
   std::int32_t last = argmax_row(lg.data(), nv);
   out.push_back(last);
-  while (static_cast<int>(out.size()) < n_predict && last != eos) {
+  while (static_cast<int>(out.size()) < n_predict && !is_stop(last)) {
     ++stt.steps;
     // draft up to n_draft tokens from `last` (never more than the tokens still wanted after the trunk's own next one)
     const int room = n_predict - static_cast<int>(out.size()) - 1;
@@ -1507,8 +1509,8 @@ Status generate_greedy_mtp(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, co
     o.hidden_out = bh.data();
     if (Status st = forward_decode(s, w, ts, batch.data(), nb, bl.data(), false, o); !st) return st;
     int a = 0;  // drafts kept: each must equal the trunk's own choice at the row before it
-    while (a < k && argmax_row(bl.data() + a * nv, nv) == drafts[z(a)] && drafts[z(a)] != eos) ++a;
-    if (a < k && drafts[z(a)] == eos && argmax_row(bl.data() + a * nv, nv) == eos) ++a;  // a kept end-of-text ends the run
+    while (a < k && argmax_row(bl.data() + a * nv, nv) == drafts[z(a)] && !is_stop(drafts[z(a)])) ++a;
+    if (a < k && is_stop(drafts[z(a)]) && argmax_row(bl.data() + a * nv, nv) == drafts[z(a)]) ++a;  // a kept stop token ends the run
     const std::int32_t next = argmax_row(bl.data() + a * nv, nv);
     if (a < k) {  // the trunk's state must not hold the rejected drafts: back to before the batch, then the kept rows again
       ts = saved;
@@ -1525,7 +1527,7 @@ Status generate_greedy_mtp(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, co
     }
     pending.assign(bh.begin() + a * e, bh.begin() + (a + 1) * e);
     for (int i = 0; i < a && static_cast<int>(out.size()) < n_predict; ++i) out.push_back(drafts[z(i)]);
-    if (!out.empty() && out.back() == eos) break;
+    if (!out.empty() && is_stop(out.back())) break;
     if (static_cast<int>(out.size()) < n_predict) out.push_back(next);
     last = next;
   }

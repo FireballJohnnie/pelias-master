@@ -130,6 +130,8 @@ void usage() {
       "pelias <command> [options]\n"
       "  version                         build version and backends\n"
       "  device [--index N]              what the GPU reports (CUDA and NVML), and the VRAM ceiling\n"
+      "  mtp-logits --model FILE --ids 1,2,3 --out OUT.bin [--threads N] [--fast-cpu]\n"
+      "                                  GP3-08 gate: the MTP block's logits and hidden for each position (format of tools/oracle/mtp_oracle)\n"
       "  bench-dot [--type Q4_TG2] [--mb 1024] [--k 2048] [--threads N] [--reps 5] [--planes K] [--reference] [--portable]\n"
       "                                  GP3-10 CPU kernels: GB/s of one type's rows (+ dense planes), decode (one activation row)\n"
       "  membw [--mib N] [--threads 1,2,4,6,8,12,16] [--reps N]\n"
@@ -184,6 +186,7 @@ void usage() {
       "                                  format for each weight type (Q8_K / Q8_0 / Q8_1), gpu = q8_1\n"
       "                                  --act-rot h32: rotate each 32-value block (Walsh-Hadamard) before rounding, back after\n"      "      [--h-gate live:F]   (Q8_Z weights: the 8th bit read on the fraction F of 32-blocks with the largest expected loss per token)\n"
       "      [--t-decode]        (Q7_ZT weights with --act-int8-path gpu256x8: the 1-bit route, 8th bit by AND + popcount)\n"
+      "      [--mtp-draft N]     (generate, greedy: the MTP block drafts N tokens per step, the trunk keeps those it agrees with)\n"
       "      [--fast-cpu]        (GP3-10 kernels: every row read straight from its storage, AVX2 when the CPU has it; same\n"
       "                           products as the reference, another order of the sum)\n"
 "      [--act-bits 4] [--neuron-skip F] [--defer-experts D] [--swap-near-tie M --hot-set FILE] [--act-cold-path gpu256 --hot-set FILE]   (game plan Block M)\n"
@@ -1761,6 +1764,71 @@ int cmd_teacher(const Args& a) {
   return 0;
 }
 
+// pelias mtp-logits: GP3-08's gate against the reference library (tools/oracle/mtp_oracle.cpp writes the same format):
+// the trunk runs the ids, the MTP block runs id p with the trunk's post-norm hidden of p - 1 (zeros before the first), and
+// every position's MTP logits and post-norm hidden are written: int32 n, n_vocab, n_embd; n x n_vocab; n x n_embd (fp32).
+int cmd_mtp_logits(const Args& a) {
+  const std::string path = a.get("model"), out = a.get("out"), idt = a.get("ids");
+  if (path.empty() || out.empty() || idt.empty()) {
+    std::fprintf(stderr, "usage: pelias mtp-logits --model FILE --ids 1,2,3 --out OUT.bin [--threads N] [--fast-cpu]\n");
+    return 1;
+  }
+  if (std::ifstream(out, std::ios::binary)) {
+    std::fprintf(stderr, "pelias: %s already exists (nothing is overwritten)\n", out.c_str());
+    return 1;
+  }
+  std::vector<std::int32_t> ids;
+  for (std::size_t p = 0; p <= idt.size();) {
+    const std::size_t q = std::min(idt.find(',', p), idt.size());
+    const Result<std::uint64_t> r = io::parse_whole(idt.substr(p, q - p), 1u << 30);
+    if (!r.ok()) {
+      std::fprintf(stderr, "pelias: --ids takes comma-separated token ids\n");
+      return 1;
+    }
+    ids.push_back(static_cast<std::int32_t>(r.value));
+    p = q + 1;
+  }
+  model::ForwardOptions fo;
+  if (a.has("threads")) {
+    const Result<std::uint64_t> r = io::parse_whole(a.get("threads"), 4096);
+    if (!r.ok() || r.value == 0) {
+      std::fprintf(stderr, "pelias: --threads needs a whole number from 1\n");
+      return 1;
+    }
+    fo.threads = static_cast<int>(r.value);
+  }
+  if (!act_options(a, fo)) return 1;
+  os::FileMap m;
+  if (Status s = m.open(path); !s) return fail_input(s);
+  io::GgufReader g;
+  if (Status s = g.parse(m); !s) return fail_input(s);
+  const Result<model::Qwen35MoeSpec> spec = model::read_qwen35moe_spec(g);
+  if (!spec.ok()) return fail_input(spec.status);
+  Result<model::Qwen35MoeWeights> w = model::bind_qwen35moe(g, m.data(), spec.value);
+  if (!w.ok()) return fail_input(w.status);
+  const int n = static_cast<int>(ids.size());
+  const std::size_t e = spec.value.n_embd, nv = spec.value.n_vocab;
+  std::vector<float> hid(static_cast<std::size_t>(n) * e), hp(hid.size(), 0.0f), lg(static_cast<std::size_t>(n) * nv), ho(hid.size());
+  model::ForwardOptions oh = fo;
+  oh.hidden_out = hid.data();
+  if (Status s = model::forward_reference(spec.value, w.value, ids.data(), n, n - 1, n, nullptr, oh); !s) return fail_input(s);
+  std::copy(hid.begin(), hid.end() - static_cast<std::ptrdiff_t>(e), hp.begin() + static_cast<std::ptrdiff_t>(e));
+  model::MtpState ms;
+  model::mtp_state_reset(ms);
+  if (Status s = model::mtp_forward(spec.value, w.value, ms, ids.data(), hp.data(), n, lg.data(), ho.data(), fo); !s) return fail_input(s);
+  std::ofstream f(out, std::ios::binary);
+  const std::int32_t hdr[3] = {n, static_cast<std::int32_t>(nv), static_cast<std::int32_t>(e)};
+  f.write(reinterpret_cast<const char*>(hdr), sizeof hdr);
+  f.write(reinterpret_cast<const char*>(lg.data()), static_cast<std::streamsize>(lg.size() * sizeof(float)));
+  f.write(reinterpret_cast<const char*>(ho.data()), static_cast<std::streamsize>(ho.size() * sizeof(float)));
+  if (!f) {
+    std::fprintf(stderr, "pelias: could not write %s\n", out.c_str());
+    return 6;
+  }
+  std::fprintf(stderr, "pelias mtp-logits: %d positions, MTP logits and hidden written to %s\n", n, out.c_str());
+  return 0;
+}
+
 int cmd_generate(const Args& a) {
   const std::string path = a.get("model");
   const int prompt_sources = (a.has("prompt") ? 1 : 0) + (a.has("prompt-file") ? 1 : 0) + (a.has("prompt-list") ? 1 : 0);
@@ -1987,6 +2055,49 @@ int cmd_generate(const Args& a) {
   }
   model::DecodeState st;
   model::decode_state_reset(spec.value, st);
+  if (a.has("mtp-draft")) {  // GP3-08: greedy decoding with MTP drafting (the same tokens as plain greedy decoding)
+    const Result<std::uint64_t> r = io::parse_whole(a.get("mtp-draft"), 16);
+    if (!r.ok()) {
+      std::fprintf(stderr, "pelias: --mtp-draft takes 0 to 16 drafted tokens per step\n");
+      return 1;
+    }
+    if (sc.temperature > 0.0f || planes_until >= 0) {
+      std::fprintf(stderr, "pelias: --mtp-draft is built for greedy decoding (--temp 0) with --planes-mode all\n");
+      return 1;
+    }
+    model::MtpStats ms;
+    std::vector<std::int32_t> out;
+    Timer tg;
+    s = model::generate_greedy_mtp(spec.value, w.value, ids, n_predict, static_cast<int>(r.value), stop, out, &ms, fo);
+    if (!s) return fail_input(s);
+    const double gen_s = tg.seconds();
+    for (const std::int32_t id : out)
+      if (std::find(stop.begin(), stop.end(), id) == stop.end() && (show_special || tk.value.type(id) != tok::TokenType::control)) {
+        const std::string piece = tk.value.piece(id);
+        std::fwrite(piece.data(), 1, piece.size(), tout);
+      }
+    std::fputs("\n", tout);
+    std::fflush(tout);
+    if (tout != stdout) std::fclose(tout);
+    std::fprintf(stderr, "pelias generate: MTP drafting (%llu per step): %zu tokens out in %.2f s including the prefill (%.3f tok/s); %lld steps, %lld drafted, %lld kept (%.1f %%)\n",
+                 static_cast<unsigned long long>(r.value), out.size(), gen_s, static_cast<double>(out.size()) / std::max(gen_s, 1e-9),
+                 static_cast<long long>(ms.steps), static_cast<long long>(ms.drafted), static_cast<long long>(ms.accepted),
+                 ms.drafted > 0 ? 100.0 * static_cast<double>(ms.accepted) / static_cast<double>(ms.drafted) : 0.0);
+    if (!ids_path.empty()) {
+      std::ofstream f(ids_path, std::ios::binary);
+      std::string line = "prompt:";
+      for (std::int32_t id : ids) line += " " + std::to_string(id);
+      line += "\noutput:";
+      for (std::int32_t id : out) line += " " + std::to_string(id);
+      line += "\ngap:\n";  // not recorded on the drafting path
+      f << line;
+      if (!f) {
+        std::fprintf(stderr, "pelias: could not write %s\n", ids_path.c_str());
+        return 6;
+      }
+    }
+    continue;
+  }
   model::Sampler sampler(sc);
   const auto nv = static_cast<std::int64_t>(spec.value.n_vocab);
   std::vector<float> logits(static_cast<std::size_t>(nv));
@@ -2073,6 +2184,7 @@ int main(int argc, char** argv) {
   if (cmd == "device") return cmd_device(a);
   if (cmd == "membw") return cmd_membw(a);
   if (cmd == "bench-dot") return cmd_bench_dot(a);
+  if (cmd == "mtp-logits") return cmd_mtp_logits(a);
   if (cmd == "inspect") return cmd_inspect(a);
   if (cmd == "key") return cmd_key(a);
   if (cmd == "plan") return cmd_plan(a);
