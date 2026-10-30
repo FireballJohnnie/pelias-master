@@ -374,6 +374,27 @@ projected KL. Script: `alloc_cross.py`.
 - The best scalar per expert is 0.998-1.0003 and removes 0.00-0.06 % of the error.
 - The shrink is noise, not a gain error, so a scalar cannot undo it.
 
+**Projections before any PC run (author 06:06; DERIVED, Q4_TG2 floor, mix ranking).** Scripts: `context_planes.py`,
+`alloc_bigger.py`.
+- Context-hot planes: one plane per expert on disk (4.28 GB), read only for the top 32 experts per layer by routing weight
+  so far in the context, from token 32 on.
+- On WikiText 55 % of picks get their plane.
+- The chat+code figure for that row assumes the same relative cut as WikiText; it is UNMEASURED (no per-token routes).
+
+| Option | On disk | Expert MB read per token | KL WikiText | KL chat+code |
+|---|---|---|---|---|
+| Unsloth Q4_K_M | 22.65 GB | about 610 | 0.0128 (MEASURED) | UNMEASURED (about 0.0129 by the line) |
+| Tiered | 22.65 GB | 641-689 | 0.0088 (-31 %) | 0.0107 (-17 %) |
+| Tiered + context-hot planes | 26.93 GB | about 760 | 0.0075 (-41 %) | about 0.0091 (ASSUMED) |
+| Tiered, the 4.28 GB put in the file | 26.93 GB | 786-838 | 0.0060 (-53 %) | 0.0065 (-50 %) |
+| Unsloth + 2 planes | 31.9 GB | about 1,000 | 0.0058 (MEASURED) | — |
+
+**Reading:**
+- At the same disk size, putting bytes in the file beats context planes on accuracy; context planes read about 10 % fewer
+  bytes per token.
+- The +4.3 GB tiered file matches Unsloth's own finding for a traditional step up (+4 GB halves KLD), and also holds on
+  chat+code.
+
 **Still open: per-layer and gate/up-vs-down weighting.**
 - These need gate, up and down from every layer; only blk.20 gate and down are in the sandbox.
 - Next input: experts 0-1 of all 40 layers from the BF16 file, read only, with the existing `gp/M/extract_slice.py`
