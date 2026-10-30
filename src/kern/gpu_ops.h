@@ -102,6 +102,17 @@ bool deltanet_recurrent(const float* conv, std::int64_t ch, const float* beta, c
 // Not bit for bit equal to deltanet_recurrent (other summation order); checked against fp64 and against it (rung 1).
 bool deltanet_chunked(const float* conv, std::int64_t ch, const float* beta, const float* alpha, float* state, std::int64_t n,
                       std::int64_t nk, std::int64_t nv, std::int64_t ds, float* core, Stream s = nullptr);
+// Variants under measurement (game plan C2: the first chunked kernel ran at 0.94x of the per-token one; both used one block
+// per value head, 32 blocks on a 46-SM card). Same arguments, results and state layout as above, so any mix works.
+//   deltanet_recurrent_reg: per token, the state in registers: 4 threads per state row (32 values each), 32 rows per block,
+//     so a head spans d_state / 32 blocks (128 blocks at 32 heads x 128); no shared memory for the state. d_state a power of
+//     two from 32 to 1024.
+//   deltanet_chunked_rows: chunked, each head split over d_state / 32 blocks of 32 state rows, the decays computed once per
+//     chunk; chunk 16 or 32 tokens. d_state a multiple of 32, at most 256.
+bool deltanet_recurrent_reg(const float* conv, std::int64_t ch, const float* beta, const float* alpha, float* state, std::int64_t n,
+                            std::int64_t nk, std::int64_t nv, std::int64_t ds, float* core, Stream s = nullptr);
+bool deltanet_chunked_rows(const float* conv, std::int64_t ch, const float* beta, const float* alpha, float* state, std::int64_t n,
+                           std::int64_t nk, std::int64_t nv, std::int64_t ds, int chunk, float* core, Stream s = nullptr);
 // per value head: o = rms_norm(o) * w * silu(z), in place on core (n rows of nv * ds), z alike
 bool gated_norm(float* core, const float* z, const float* w, std::int64_t n, std::int64_t nv, std::int64_t ds, float eps,
                 Stream s = nullptr);

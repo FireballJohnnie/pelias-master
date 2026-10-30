@@ -556,6 +556,161 @@ __global__ void __launch_bounds__(256) k_dn_chunked(const float* __restrict__ co
   for (std::int64_t x = tid; x < ds * ds; x += nth) gst[x] = S[(x / ds) * P + x % ds];
 }
 
+// variant: the per-token recurrence with the state in registers (C2). Block = 32 state rows x tpr threads (tpr = ds / 32);
+// thread l of a row owns columns c * tpr + l (c < 32), so neighbouring lanes read neighbouring q / k words (no bank conflicts).
+__global__ void __launch_bounds__(1024) k_dn_rec_reg(const float* __restrict__ conv, std::int64_t ch, const float* __restrict__ beta,
+                                                     const float* __restrict__ alpha, float* __restrict__ state, std::int64_t n, std::int64_t nk,
+                                                     std::int64_t nv, std::int64_t ds, int tpr, float qscale, float* __restrict__ core) {
+  extern __shared__ float smem[];
+  float* qv = smem;
+  float* kv = smem + ds;
+  const std::int64_t hv = blockIdx.x, hk = hv % nk;
+  const int tid = static_cast<int>(threadIdx.x), nth = static_cast<int>(blockDim.x);
+  const int l = tid % tpr;
+  const std::int64_t j = static_cast<std::int64_t>(blockIdx.y) * 32 + tid / tpr;  // state row (value index)
+  float* grow = state + hv * ds * ds + j * ds;
+  float M[32];
+#pragma unroll
+  for (int c = 0; c < 32; ++c) M[c] = grow[c * tpr + l];
+  const std::int64_t d_inner = nv * ds;
+  for (std::int64_t t = 0; t < n; ++t) {
+    const float* row = conv + t * ch;
+    for (std::int64_t i = tid; i < ds; i += nth) {
+      qv[i] = row[hk * ds + i];
+      kv[i] = row[nk * ds + hk * ds + i];
+    }
+    __syncthreads();
+    const float decay = expf(alpha[t * nv + hv]), b = beta[t * nv + hv];
+    float sum = 0.0f;
+#pragma unroll
+    for (int c = 0; c < 32; ++c) {
+      M[c] *= decay;
+      sum += M[c] * kv[c * tpr + l];
+    }
+    for (int o = tpr / 2; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o, tpr);
+    const float delta = (row[2 * nk * ds + hv * ds + j] - sum) * b;
+    float out = 0.0f;
+#pragma unroll
+    for (int c = 0; c < 32; ++c) {
+      M[c] += kv[c * tpr + l] * delta;
+      out += M[c] * qv[c * tpr + l];
+    }
+    for (int o = tpr / 2; o > 0; o >>= 1) out += __shfl_xor_sync(0xffffffffu, out, o, tpr);
+    if (l == 0) core[t * d_inner + hv * ds + j] = out * qscale;
+    __syncthreads();
+  }
+#pragma unroll
+  for (int c = 0; c < 32; ++c) grow[c * tpr + l] = M[c];
+}
+
+// variant: chunked, each head split over ds / 32 blocks of 32 state rows (C2); decays once per chunk
+constexpr int kDnRows = 32;
+template <int C>
+__global__ void __launch_bounds__(256) k_dn_chunked_rows(const float* __restrict__ conv, std::int64_t ch, const float* __restrict__ beta,
+                                                         const float* __restrict__ alpha, float* __restrict__ state, std::int64_t n, std::int64_t nk,
+                                                         std::int64_t nv, std::int64_t ds, float qscale, float* __restrict__ core) {
+  extern __shared__ float smem[];
+  constexpr int R = kDnRows;
+  const std::int64_t hv = blockIdx.x, hk = hv % nk, P = ds + 1, j0 = static_cast<std::int64_t>(blockIdx.y) * R;
+  const int tid = static_cast<int>(threadIdx.x), nth = static_cast<int>(blockDim.x);
+  float* S = smem;            // R x P: rows j0 .. j0 + R - 1 of the head's state
+  float* Kc = S + R * P;      // C x ds
+  float* Qc = Kc + C * ds;    // C x ds
+  float* Uc = Qc + C * ds;    // C x R (v, then u)
+  float* Oc = Uc + C * R;     // C x R: e^l_t S0 q_t
+  float* L = Oc + C * R;      // C x C
+  float* Pm = L + C * C;      // C x C
+  float* lg = Pm + C * C;     // C
+  float* bt = lg + C;         // C
+  float* ew = bt + C;         // C: e^(l_last - l_s)
+  float* et = ew + C;         // C: e^l_t
+  float* gst = state + hv * ds * ds;
+  for (std::int64_t x = tid; x < R * ds; x += nth) S[(x / ds) * P + x % ds] = gst[(j0 + x / ds) * ds + x % ds];
+  const std::int64_t d_inner = nv * ds, cds = C * ds;
+  for (std::int64_t c0 = 0; c0 < n; c0 += C) {
+    const int m = static_cast<int>(n - c0 < C ? n - c0 : C);
+    for (std::int64_t x = tid; x < cds; x += nth) {
+      const int t = static_cast<int>(x / ds);
+      const std::int64_t i = x % ds;
+      const float* row = conv + (c0 + t) * ch;
+      Qc[x] = t < m ? row[hk * ds + i] : 0.0f;
+      Kc[x] = t < m ? row[nk * ds + hk * ds + i] : 0.0f;
+    }
+    for (int x = tid; x < C * R; x += nth) {
+      const int t = x / R, jl = x % R;
+      Uc[x] = t < m ? conv[(c0 + t) * ch + 2 * nk * ds + hv * ds + j0 + jl] : 0.0f;
+    }
+    if (tid == 0) {
+      float cum = 0.0f;
+      for (int t = 0; t < C; ++t) {
+        if (t < m) {
+          cum += alpha[(c0 + t) * nv + hv];
+          bt[t] = beta[(c0 + t) * nv + hv];
+        } else {
+          bt[t] = 0.0f;
+        }
+        lg[t] = cum;
+      }
+    }
+    __syncthreads();
+    if (tid < C) {
+      ew[tid] = tid < m ? expf(lg[m - 1] - lg[tid]) : 0.0f;
+      et[tid] = expf(lg[tid]);
+    }
+    for (int x = tid; x < C * C; x += nth) {
+      const int t = x / C, s = x % C;
+      float kk = 0.0f, qk = 0.0f;
+      if (t < m && s <= t) {
+        for (std::int64_t i = 0; i < ds; ++i) {
+          kk += Kc[t * ds + i] * Kc[s * ds + i];
+          qk += Qc[t * ds + i] * Kc[s * ds + i];
+        }
+      }
+      const float w = (t < m && s <= t) ? expf(lg[t] - lg[s]) : 0.0f;
+      L[x] = s < t ? bt[t] * w * kk : 0.0f;
+      Pm[x] = w * qk;
+    }
+    __syncthreads();
+    for (int x = tid; x < C * R; x += nth) {  // S0 k_t, S0 q_t for this block's rows
+      const int t = x / R, jl = x % R;
+      float sk = 0.0f, sqv = 0.0f;
+      if (t < m) {
+        for (std::int64_t i = 0; i < ds; ++i) {
+          const float sv = S[jl * P + i];
+          sk += sv * Kc[t * ds + i];
+          sqv += sv * Qc[t * ds + i];
+        }
+      }
+      Oc[x] = et[t] * sqv;
+      Uc[x] = t < m ? bt[t] * (Uc[x] - et[t] * sk) : 0.0f;
+    }
+    __syncthreads();
+    if (tid < R)  // forward substitution, one column per thread
+      for (int t = 1; t < m; ++t) {
+        float acc = Uc[t * R + tid];
+        for (int s = 0; s < t; ++s) acc -= L[t * C + s] * Uc[s * R + tid];
+        Uc[t * R + tid] = acc;
+      }
+    __syncthreads();
+    for (int x = tid; x < C * R; x += nth) {
+      const int t = x / R, jl = x % R;
+      if (t >= m) continue;
+      float o = Oc[x];
+      for (int s = 0; s <= t; ++s) o += Pm[t * C + s] * Uc[s * R + jl];
+      core[(c0 + t) * d_inner + hv * ds + j0 + jl] = o * qscale;
+    }
+    const float el = et[m - 1];
+    for (std::int64_t x = tid; x < R * ds; x += nth) {
+      const std::int64_t jl = x / ds, i = x % ds;
+      float v = el * S[jl * P + i];
+      for (int s = 0; s < m; ++s) v += ew[s] * Uc[s * R + jl] * Kc[s * ds + i];
+      S[jl * P + i] = v;
+    }
+    __syncthreads();
+  }
+  for (std::int64_t x = tid; x < R * ds; x += nth) gst[(j0 + x / ds) * ds + x % ds] = S[(x / ds) * P + x % ds];
+}
+
 __global__ void __launch_bounds__(128) k_gated_norm(float* core, const float* __restrict__ z, const float* __restrict__ w, std::int64_t nv,
                                                     std::int64_t ds, float eps) {
   __shared__ double sh[33];
@@ -830,6 +985,49 @@ bool deltanet_chunked(const float* conv, std::int64_t ch, const float* beta, con
   const float qscale = 1.0f / std::sqrt(static_cast<float>(ds));  // as the reference, on the host
   k_dn_chunked<<<static_cast<unsigned>(nv), 256, smem, st(s)>>>(conv, ch, beta, alpha, state, n, nk, nv, ds, qscale, core);
   return launched("deltanet chunked");
+}
+
+bool deltanet_recurrent_reg(const float* conv, std::int64_t ch, const float* beta, const float* alpha, float* state, std::int64_t n,
+                            std::int64_t nk, std::int64_t nv, std::int64_t ds, float* core, Stream s) {
+  const bool pow2 = ds >= 32 && ds <= 1024 && (ds & (ds - 1)) == 0;
+  if (nk <= 0 || nv <= 0 || nv % nk != 0 || !pow2 || ch < (2 * nk + nv) * ds || !conv || !beta || !alpha || !state || !core)
+    return fail("deltanet_recurrent_reg: bad shape or pointer (d_state a power of two, 32 to 1024)");
+  if (n <= 0) return true;
+  if (nv > 2147483647) return fail("deltanet_recurrent_reg: too many heads");
+  const int tpr = static_cast<int>(ds / 32);
+  const float qscale = 1.0f / std::sqrt(static_cast<float>(ds));
+  const dim3 grid(static_cast<unsigned>(nv), static_cast<unsigned>(ds / 32));
+  k_dn_rec_reg<<<grid, static_cast<unsigned>(32 * tpr), static_cast<std::size_t>(2 * ds) * sizeof(float), st(s)>>>(conv, ch, beta, alpha, state, n, nk, nv, ds,
+                                                                                                                   tpr, qscale, core);
+  return launched("deltanet recurrent (registers)");
+}
+
+template <int C>
+bool launch_chunked_rows(const float* conv, std::int64_t ch, const float* beta, const float* alpha, float* state, std::int64_t n, std::int64_t nk,
+                         std::int64_t nv, std::int64_t ds, float* core, Stream s) {
+  const std::size_t smem =
+      static_cast<std::size_t>(kDnRows * (ds + 1) + 2 * C * ds + 2 * C * kDnRows + 2 * C * C + 4 * C) * sizeof(float);
+  int dev = 0, optin = 0;
+  if (!ck(cudaGetDevice(&dev), "cudaGetDevice") || !ck(cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev), "shared memory limit"))
+    return false;
+  if (smem > static_cast<std::size_t>(optin))
+    return fail("deltanet_chunked_rows: a chunk needs " + std::to_string(smem) + " bytes of shared memory, this card offers " + std::to_string(optin));
+  if (!ck(cudaFuncSetAttribute(k_dn_chunked_rows<C>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)), "shared memory opt-in"))
+    return false;
+  const float qscale = 1.0f / std::sqrt(static_cast<float>(ds));
+  const dim3 grid(static_cast<unsigned>(nv), static_cast<unsigned>(ds / kDnRows));
+  k_dn_chunked_rows<C><<<grid, 256, smem, st(s)>>>(conv, ch, beta, alpha, state, n, nk, nv, ds, qscale, core);
+  return launched("deltanet chunked (rows)");
+}
+
+bool deltanet_chunked_rows(const float* conv, std::int64_t ch, const float* beta, const float* alpha, float* state, std::int64_t n,
+                           std::int64_t nk, std::int64_t nv, std::int64_t ds, int chunk, float* core, Stream s) {
+  if (nk <= 0 || nv <= 0 || nv % nk != 0 || ds < 32 || ds > 256 || ds % 32 != 0 || ch < (2 * nk + nv) * ds || !conv || !beta || !alpha || !state || !core)
+    return fail("deltanet_chunked_rows: bad shape or pointer (d_state a multiple of 32, at most 256)");
+  if (chunk != 16 && chunk != 32) return fail("deltanet_chunked_rows: chunk must be 16 or 32");
+  if (n <= 0) return true;
+  return chunk == 16 ? launch_chunked_rows<16>(conv, ch, beta, alpha, state, n, nk, nv, ds, core, s)
+                     : launch_chunked_rows<32>(conv, ch, beta, alpha, state, n, nk, nv, ds, core, s);
 }
 
 bool gated_norm(float* core, const float* z, const float* w, std::int64_t n, std::int64_t nv, std::int64_t ds, float eps, Stream s) {

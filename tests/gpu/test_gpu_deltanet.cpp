@@ -6,10 +6,12 @@
 // (deltanet_recurrent) checked the same way; the two mixed across calls on one state (recurrent for the first 300 tokens,
 // chunked for the rest) must agree with the whole run. Both kernels are timed on the 1,000-token prompt (information, not a
 // gate). Gate 1e-4 relative L2 per layer window (masterwork 16.2).
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -83,6 +85,19 @@ struct Window {
   }
 };
 
+// the recurrence kernels: 0 per token (shared memory), 1 chunked, 2 per token with the state in registers, 3 chunked with
+// the head split over row blocks (16-token chunks), 4 the same with 32-token chunks
+const char* const kModeName[5] = {"recurrent", "chunked", "recurrent, registers", "chunked rows, C16", "chunked rows, C32"};
+bool recur(int mode, const float* conv, const float* beta, const float* alpha, float* state, std::int64_t m, float* core) {
+  switch (mode) {
+    case 0: return g::deltanet_recurrent(conv, kCh, beta, alpha, state, m, kNk, kNv, kDs, core);
+    case 1: return g::deltanet_chunked(conv, kCh, beta, alpha, state, m, kNk, kNv, kDs, core);
+    case 2: return g::deltanet_recurrent_reg(conv, kCh, beta, alpha, state, m, kNk, kNv, kDs, core);
+    case 3: return g::deltanet_chunked_rows(conv, kCh, beta, alpha, state, m, kNk, kNv, kDs, 16, core);
+    default: return g::deltanet_chunked_rows(conv, kCh, beta, alpha, state, m, kNk, kNv, kDs, 32, core);
+  }
+}
+
 // the GPU layer window in parts; mode[p] = 0 recurrent, 1 chunked for part p; seconds = time of the recurrence calls only
 std::vector<float> run_gpu(const Window& W, const std::vector<std::int64_t>& parts, const std::vector<int>& mode, double* seconds = nullptr) {
   const std::int64_t n = W.n;
@@ -101,8 +116,7 @@ std::vector<float> run_gpu(const Window& W, const std::vector<std::int64_t>& par
     CHECK(g::l2_norm(conv.p + t0 * kCh, kDs, 2 * kNk, kDs, kCh, m, kEps));
     CHECK(g::sync());
     const auto c0 = std::chrono::steady_clock::now();
-    if (mode[pi] == 0) CHECK(g::deltanet_recurrent(conv.p + t0 * kCh, kCh, db.p + t0 * kNv, da.p + t0 * kNv, state.p, m, kNk, kNv, kDs, core.p + t0 * kDin));
-    else CHECK(g::deltanet_chunked(conv.p + t0 * kCh, kCh, db.p + t0 * kNv, da.p + t0 * kNv, state.p, m, kNk, kNv, kDs, core.p + t0 * kDin));
+    CHECK(recur(mode[pi], conv.p + t0 * kCh, db.p + t0 * kNv, da.p + t0 * kNv, state.p, m, core.p + t0 * kDin));
     CHECK(g::sync());
     secs += std::chrono::duration<double>(std::chrono::steady_clock::now() - c0).count();
     t0 += m;
@@ -177,6 +191,23 @@ std::vector<double> run_fp64(const Window& W) {
 
 constexpr double kTol = 1e-4;
 
+// decode timing: n_calls single-token calls back to back on one state (conv prepared once), synchronised at the end;
+// returns microseconds per call (what one DeltaNet layer's recurrence costs per decoded token)
+double decode_us(const Window& W, int mode, std::int64_t n_calls) {
+  Dev<float> dm(W.mixed), dcw(W.cw), db(W.beta), da(W.alpha), ddt(W.dt), dA(W.a);
+  Dev<float> conv(static_cast<std::size_t>(W.n * kCh)), core(static_cast<std::size_t>(W.n * kDin)), state(static_cast<std::size_t>(kNv * kDs * kDs));
+  CHECK(g::dzero(state.p, state.n * sizeof(float)));
+  CHECK(g::deltanet_gates(db.p, da.p, ddt.p, dA.p, W.n, kNv));
+  CHECK(g::deltanet_conv(dm.p, nullptr, dcw.p, W.n, kCh, kTaps, conv.p, nullptr));
+  CHECK(g::l2_norm(conv.p, kDs, 2 * kNk, kDs, kCh, W.n, kEps));
+  CHECK(recur(mode, conv.p, db.p, da.p, state.p, 1, core.p));  // first call: opt-in and first-launch costs outside the timing
+  CHECK(g::sync());
+  const auto c0 = std::chrono::steady_clock::now();
+  for (std::int64_t t = 1; t <= n_calls; ++t) CHECK(recur(mode, conv.p + t * kCh, db.p + t * kNv, da.p + t * kNv, state.p, 1, core.p + t * kDin));
+  CHECK(g::sync());
+  return std::chrono::duration<double>(std::chrono::steady_clock::now() - c0).count() * 1e6 / static_cast<double>(n_calls);
+}
+
 }  // namespace
 
 TEST(rung1_deltanet_chunked_against_fp64) {
@@ -219,6 +250,43 @@ TEST(rung1_deltanet_chunked_against_fp64) {
     std::printf("    1,000 tokens x 32 value heads, the recurrence alone: recurrent %.3f ms (warm %.3f), chunked %.3f ms (warm %.3f); warm ratio %.2fx\n",
                 ts_rec * 1e3, tr2 * 1e3, ts_chk * 1e3, tc2 * 1e3, tc2 > 0.0 ? tr2 / tc2 : 0.0);
   }
+}
+
+TEST(rung1_deltanet_variants_side_by_side) {
+  if (!g::available()) {
+    CHECK(g::available());
+    return;
+  }
+  // accuracy: every variant on the 40-token window (incl. 25 + 15) and the long prompt, against fp64. Under the sanitizers
+  // (PELIAS_GPU_QUICK set by the PC script) the long prompt is 120 tokens (7 chunks of 16 + 8) and decode 16 calls, so the
+  // tools finish; the timings that count come from the plain run.
+  const bool quick = std::getenv("PELIAS_GPU_QUICK") != nullptr;
+  const std::int64_t nlong = quick ? 120 : 1000, ndec = quick ? 16 : 512;
+  const Window W40(40, 80u), W1k(nlong, 90u);
+  const std::vector<double> r40 = run_fp64(W40), r1k = run_fp64(W1k);
+  double worst = 0.0;
+  for (int mode = 0; mode < 5; ++mode) {
+    const std::vector<float> a = run_gpu(W40, {40}, {mode}), b = run_gpu(W40, {25, 15}, {mode, mode});
+    double t1 = 0.0;
+    const std::vector<float> c = run_gpu(W1k, {nlong}, {mode}, &t1);
+    double t2 = 0.0;
+    (void)run_gpu(W1k, {nlong}, {mode}, &t2);  // warm
+    const double ea = rel_l2(a, r40), eb = rel_l2(b, r40), ec = rel_l2(c, r1k);
+    worst = std::max(worst, std::max(ea, std::max(eb, ec)));
+    CHECK(all_finite(c));
+    CHECK(ea <= kTol);
+    CHECK(eb <= kTol);
+    CHECK(ec <= kTol);
+    const double dus = decode_us(W1k, mode, ndec);
+    std::printf("    %-22s vs fp64: 40 tok %.3e, 25 + 15 %.3e, %lld tok %.3e | %lld-token prompt %.3f ms (warm) | decode %.2f us / token\n",
+                kModeName[mode], ea, eb, static_cast<long long>(nlong), ec, static_cast<long long>(nlong), t2 * 1e3, dus);
+  }
+  // all five on one state, in turn (200 tokens each)
+  const std::int64_t q5 = nlong / 5;
+  const std::vector<float> mix = run_gpu(W1k, {q5, q5, q5, q5, nlong - 4 * q5}, {0, 1, 2, 3, 4});
+  const double em = rel_l2(mix, r1k);
+  CHECK(em <= kTol);
+  std::printf("    the five kernels in turn on one state (%lld tokens each): %.3e vs fp64; worst of all %.3e (tolerance 1e-4)\n", static_cast<long long>(q5), em, std::max(worst, em));
 }
 
 TEST(rung1_deltanet_chunked_refuses_bad_shapes) {
