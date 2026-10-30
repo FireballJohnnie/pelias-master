@@ -8,6 +8,7 @@
 
 #include "pelias_test.h"
 #include "quant/planes.h"
+#include "quant/quant_cpu.h"
 
 namespace q = pelias::quant;
 
@@ -69,4 +70,26 @@ TEST(planes_refit_never_worse_and_importance_weighted) {
   (void)q::plane_fit_row(r.data(), zero.data(), n, 1, 0, p.data());
   (void)q::plane_fit_row(r.data(), nullptr, n, 1, 0, p1.data());
   CHECK(p == p1);
+}
+
+TEST(planes_add_matches_value_by_value) {
+  // the table-driven add gives exactly the sums of the plain definition: y += s_p x (bit ? +1 : -1), plane by plane
+  const int n = 1024;
+  const std::vector<float> r = residual(n, 23);
+  for (int k = 1; k <= 3; ++k) {
+    std::vector<std::uint8_t> p(static_cast<std::size_t>(q::plane_row_bytes(n, k)));
+    (void)q::plane_fit_row(r.data(), nullptr, n, k, 8, p.data());
+    for (int use = 1; use <= k; ++use) {
+      std::vector<float> fast(r), plain(r);
+      q::plane_add_row(p.data(), n, k, use, fast.data());
+      for (int b0 = 0; b0 < n; b0 += 256) {
+        const std::uint8_t* o = p.data() + (b0 / 256) * 34 * k;
+        for (int pl = 0; pl < use; ++pl) {
+          const float s = q::fp16_to_fp32(static_cast<std::uint16_t>(o[2 * pl] | (o[2 * pl + 1] << 8)));
+          for (int i = 0; i < 256; ++i) plain[static_cast<std::size_t>(b0 + i)] += ((o[2 * k + 32 * pl + i / 8] >> (i % 8)) & 1) ? s : -s;
+        }
+      }
+      CHECK(fast == plain);
+    }
+  }
 }

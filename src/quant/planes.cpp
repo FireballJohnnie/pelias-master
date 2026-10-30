@@ -10,6 +10,17 @@
 namespace pelias::quant {
 
 namespace {
+// kSign8[b][j] = +1 when bit j of b is set, else -1
+struct Sign8 {
+  alignas(32) float v[256][8];
+  constexpr Sign8() : v{} {
+    for (int b = 0; b < 256; ++b)
+      for (int j = 0; j < 8; ++j) v[b][j] = ((b >> j) & 1) ? 1.0f : -1.0f;
+  }
+};
+constexpr Sign8 kSign8Table{};
+constexpr const float (&kSign8)[256][8] = kSign8Table.v;
+
 float round_f16(double v) { return fp16_to_fp32(fp32_to_fp16(static_cast<float>(v))); }
 
 // weighted error of one block for signs sg[k][i] (+1/-1) and scales s[k]
@@ -130,7 +141,13 @@ void plane_add_row(const std::uint8_t* in, std::int64_t n, int k_stored, int k_u
     for (int p = 0; p < k_use; ++p) {
       const float s = fp16_to_fp32(static_cast<std::uint16_t>(o[2 * p] | (o[2 * p + 1] << 8)));
       const std::uint8_t* bp = bits + 32 * p;
-      for (int i = 0; i < kPlaneBlock; ++i) yb[i] += ((bp[i / 8] >> (i % 8)) & 1) ? s : -s;
+      // 8 values per sign byte from the +/-1 table: no branch per value (random signs mispredict half the time), and the
+      // same sums as value by value (s x +/-1 is exact, added in the same order)
+      for (int k = 0; k < kPlaneBlock / 8; ++k) {
+        const float* t = kSign8[bp[k]];
+        float* yk = yb + 8 * k;
+        for (int j = 0; j < 8; ++j) yk[j] += s * t[j];
+      }
     }
   }
 }
