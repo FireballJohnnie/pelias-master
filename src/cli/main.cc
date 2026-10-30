@@ -132,7 +132,7 @@ void usage() {
       "  device [--index N]              what the GPU reports (CUDA and NVML), and the VRAM ceiling\n"
       "  mtp-logits --model FILE --ids 1,2,3 --out OUT.bin [--threads N] [--fast-cpu]\n"
       "                                  GP3-08 gate: the MTP block's logits and hidden for each position (format of tools/oracle/mtp_oracle)\n"
-      "  bench-dot [--type Q4_TG2] [--mb 1024] [--k 2048] [--threads N] [--reps 5] [--planes K] [--int8] [--reference] [--portable]\n"
+      "  bench-dot [--type Q4_TG2] [--mb 1024] [--k 2048] [--threads N] [--reps 5] [--planes K] [--int8] [--tokens N [--groups]] [--reference] [--portable]\n"
       "                                  GP3-10 CPU kernels: GB/s of one type's rows (+ dense planes), decode (one activation row)\n"
       "  membw [--mib N] [--threads 1,2,4,6,8,12,16] [--reps N]\n"
       "                                  probe: RAM read speed by thread count, 4 KB vs 2 MB pages, prefetch on / off,\n"
@@ -282,6 +282,8 @@ int cmd_device(const Args& a) {
 // pelias bench-dot: the GP3-10 CPU gate's throughput half. Rows of one type (and optional dense planes) filling --mb
 // megabytes, one activation row (decode), every thread on its own share of rows; prints GB/s of weight (+ plane) bytes read.
 // With --reference also the reference path (dequantize_row, then a plain sum) on the same rows, for the speedup.
+// --tokens N: N activation rows per weight row (a batch: prefill, the MTP verify step), through dot_row_n / dot_row_q8_n
+// (each row decoded once); with --groups the rows go through dot_row / dot_row_q8 four tokens at a time instead.
 int cmd_bench_dot(const Args& a) {
   std::string tn = a.has("type") ? a.get("type") : "Q4_TG2";
   for (char& ch : tn) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
@@ -313,6 +315,9 @@ int cmd_bench_dot(const Args& a) {
   if (!num("mb", 1024, 16, 65536, &mb) || !num("k", 2048, 256, 65536, &k) || !num("threads", hw, 1, 1024, &threads) ||
       !num("reps", 5, 1, 100, &reps) || !num("planes", 0, 0, quant::kPlaneMaxK, &kp))
     return 1;
+  std::uint64_t ntok;
+  if (!num("tokens", 1, 1, 512, &ntok))
+    return 1;
   if (k % 256 != 0) {
     std::fprintf(stderr, "pelias bench-dot: --k must be a multiple of 256\n");
     return 1;
@@ -325,6 +330,7 @@ int cmd_bench_dot(const Args& a) {
               static_cast<unsigned long long>(k), static_cast<unsigned long long>(rows), static_cast<unsigned long long>(rb),
               static_cast<unsigned long long>(pb), static_cast<int>(kp), static_cast<double>(rows * (rb + pb)) / 1e6,
               static_cast<unsigned long long>(threads), kern::active_isa() == kern::Isa::avx2 ? "AVX2" : "portable", a.has("int8") ? ", int8 activations" : "");
+  if (ntok > 1) std::printf("  %llu tokens per row, %s\n", static_cast<unsigned long long>(ntok), a.has("groups") ? "groups of four" : "the row decoded once");
   // 64 distinct rows, repeated to fill the buffer (the bytes read are what is timed, not their variety)
   const std::uint64_t distinct = std::min<std::uint64_t>(64, rows);
   std::vector<std::uint8_t> w(rows * rb), pl(rows * pb);
@@ -347,13 +353,17 @@ int cmd_bench_dot(const Args& a) {
     std::memcpy(w.data() + r * rb, w.data() + (r % distinct) * rb, rb);
     if (kp) std::memcpy(pl.data() + r * pb, pl.data() + (r % distinct) * pb, pb);
   }
-  std::vector<float> x(k), y(rows);
+  std::vector<float> x(k * ntok), y(rows * ntok);
   for (float& v : x) v = nd(rng) * 50.0f;
-  const float* xs[1] = {x.data()};
-  kern::ActQ8x32 act;  // --int8: the engine's int8 activation format, integer products per 32-block
-  kern::act_q8x32_quantize(x.data(), static_cast<std::int64_t>(k), act);
-  const kern::ActQ8x32* as[1] = {&act};
-  const bool int8 = a.has("int8");
+  std::vector<const float*> xs(ntok);
+  std::vector<kern::ActQ8x32> acts(ntok);  // --int8: the engine's int8 activation format, integer products per 32-block
+  std::vector<const kern::ActQ8x32*> as(ntok);
+  for (std::uint64_t i = 0; i < ntok; ++i) {
+    xs[i] = x.data() + i * k;
+    kern::act_q8x32_quantize(xs[i], static_cast<std::int64_t>(k), acts[i]);
+    as[i] = &acts[i];
+  }
+  const bool int8 = a.has("int8"), groups = a.has("groups");
   auto pass = [&](bool reference) {
     std::vector<std::thread> pool;
     const Timer tm;
@@ -365,13 +375,25 @@ int cmd_bench_dot(const Args& a) {
           if (reference) {
             (void)quant::dequantize_row(t, w.data() + r * rb, row.data(), static_cast<std::int64_t>(k));
             if (kp) quant::plane_add_row(pl.data() + r * pb, static_cast<std::int64_t>(k), static_cast<int>(kp), static_cast<int>(kp), row.data());
-            float acc = 0.0f;
-            for (std::uint64_t i = 0; i < k; ++i) acc += row[i] * x[i];
-            y[r] = acc;
+            for (std::uint64_t tt = 0; tt < ntok; ++tt) {
+              float acc = 0.0f;
+              for (std::uint64_t i = 0; i < k; ++i) acc += row[i] * xs[tt][i];
+              y[r * ntok + tt] = acc;
+            }
           } else {
             kern::RowPlanes rp{kp ? pl.data() + r * pb : nullptr, nullptr, static_cast<int>(kp), static_cast<int>(kp)};
-            if (int8) kern::dot_row_q8(t, w.data() + r * rb, static_cast<std::int64_t>(k), kp ? &rp : nullptr, as, 1, &y[r]);
-            else kern::dot_row(t, w.data() + r * rb, static_cast<std::int64_t>(k), kp ? &rp : nullptr, xs, 1, &y[r]);
+            const std::int64_t kk = static_cast<std::int64_t>(k);
+            float* yo = &y[r * ntok];
+            if (ntok > 1 && !groups) {
+              if (int8) kern::dot_row_q8_n(t, w.data() + r * rb, kk, kp ? &rp : nullptr, acts.data(), static_cast<std::int64_t>(ntok), yo, 1);
+              else kern::dot_row_n(t, w.data() + r * rb, kk, kp ? &rp : nullptr, xs.data(), static_cast<std::int64_t>(ntok), yo, 1);
+            } else {
+              for (std::uint64_t t0 = 0; t0 < ntok; t0 += 4) {
+                const int nt = static_cast<int>(std::min<std::uint64_t>(4, ntok - t0));
+                if (int8) kern::dot_row_q8(t, w.data() + r * rb, kk, kp ? &rp : nullptr, as.data() + t0, nt, yo + t0);
+                else kern::dot_row(t, w.data() + r * rb, kk, kp ? &rp : nullptr, xs.data() + t0, nt, yo + t0);
+              }
+            }
           }
         }
       });
@@ -385,8 +407,8 @@ int cmd_bench_dot(const Args& a) {
     for (std::uint64_t i = 0; i < reps; ++i) ts.push_back(pass(reference));
     std::sort(ts.begin(), ts.end());
     const double best = ts.front(), med = ts[ts.size() / 2];
-    std::printf("  %-9s best %.2f GB/s (%.1f ms), median %.2f GB/s; %.2f G weights/s\n", name, bytes / best / 1e9, best * 1e3, bytes / med / 1e9,
-                static_cast<double>(rows * k) / best / 1e9);
+    std::printf("  %-9s best %.2f GB/s (%.1f ms), median %.2f GB/s; %.2f G weights/s; %.2f G multiply-adds/s\n", name, bytes / best / 1e9,
+                best * 1e3, bytes / med / 1e9, static_cast<double>(rows * k) / best / 1e9, static_cast<double>(rows * k * ntok) / best / 1e9);
     return best;
   };
   const double tf = report("kernels", false);

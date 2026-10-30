@@ -4,6 +4,7 @@
 // in the same order, as quant/quant_cpu.cpp's dequantize_* (read there, not copied from elsewhere); the summation is ours.
 #include "kern/cpu_dot.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstring>
@@ -991,19 +992,58 @@ PELIAS_TARGET_AVX2 void planes_seg_avx2(const std::uint8_t* o, int k_stored, int
   }
 }
 
-PELIAS_TARGET_AVX2 inline void fma_seg_avx2(const float* w, const float* x, __m256* acc) {  // acc[4] = lanes 0-31
-  for (int i = 0; i < kSeg; i += 32) {
-    acc[0] = _mm256_fmadd_ps(_mm256_loadu_ps(w + i), _mm256_loadu_ps(x + i), acc[0]);
-    acc[1] = _mm256_fmadd_ps(_mm256_loadu_ps(w + i + 8), _mm256_loadu_ps(x + i + 8), acc[1]);
-    acc[2] = _mm256_fmadd_ps(_mm256_loadu_ps(w + i + 16), _mm256_loadu_ps(x + i + 16), acc[2]);
-    acc[3] = _mm256_fmadd_ps(_mm256_loadu_ps(w + i + 24), _mm256_loadu_ps(x + i + 24), acc[3]);
-  }
+// One segment's products for nt tokens: each 8 weights loaded once for every token. Token tt's lanes (acc[tt][0..3] = lanes
+// 0-31, value i to lane i mod 32) take the segment's fused multiply-adds in value order, as fma_seg_portable gives them, so
+// the bits do not depend on nt or on which tokens share the call.
+PELIAS_TARGET_AVX2 inline void fma_seg_nt_avx2(const float* w, const float* const* xs, std::int64_t off, int nt, __m256 (*acc)[4]) {
+  for (int i = 0; i < kSeg; i += 32)
+    for (int r = 0; r < 4; ++r) {
+      const __m256 wv = _mm256_loadu_ps(w + i + 8 * r);
+      for (int tt = 0; tt < nt; ++tt) acc[tt][r] = _mm256_fmadd_ps(wv, _mm256_loadu_ps(xs[tt] + off + i + 8 * r), acc[tt][r]);
+    }
 }
 
 PELIAS_TARGET_AVX2 float reduce_avx2(const __m256* acc) {
   alignas(32) float l[32];
   for (int r = 0; r < 4; ++r) _mm256_store_ps(l + 8 * r, acc[r]);
   return reduce_portable(l);
+}
+
+// one 256-value segment through its AVX2 dequantizer (every value bit-identical to quant::dequantize_row's)
+PELIAS_TARGET_AVX2 void deq_seg_avx2(q::Type t, const std::uint8_t* p, float* w) {
+  switch (t) {
+    case q::Type::q8_0: deq_q8_0(p, w); break;
+    case q::Type::q4_k: deq_q4_k(p, w); break;
+    case q::Type::q5_k: deq_q5_k(p, w); break;
+    case q::Type::q6_k: deq_q6_k(p, w); break;
+    case q::Type::iq4_xs: deq_iq4_xs(p, w); break;
+    case q::Type::q4_tg: deq_q4_tg(p, w, 1); break;
+    case q::Type::q4_tg2: deq_q4_tg(p, w, 2); break;
+    case q::Type::q4_0: deq_q4_0(p, w); break;
+    case q::Type::q4_1: deq_q4_1(p, w); break;
+    case q::Type::q5_0: deq_q5_0(p, w); break;
+    case q::Type::q5_1: deq_q5_1(p, w); break;
+    case q::Type::iq4_nl: deq_iq4_nl(p, w); break;
+    case q::Type::mxfp4: deq_mxfp4(p, w); break;
+    case q::Type::q2_k: deq_q2_k(p, w); break;
+    case q::Type::q3_k: deq_q3_k(p, w); break;
+    case q::Type::q8_z: deq_q8_z(p, w); break;
+    case q::Type::f16: deq_f16(p, w); break;
+    case q::Type::bf16: deq_bf16(p, w); break;
+    case q::Type::f32: std::memcpy(w, p, kSeg * sizeof(float)); break;
+    case q::Type::iq2_xxs: deq_iq2_xxs(p, w); break;
+    case q::Type::iq2_xs: deq_iq2_xs(p, w); break;
+    case q::Type::iq2_s: deq_iq2_s(p, w); break;
+    case q::Type::iq3_xxs: deq_iq3_xxs(p, w); break;
+    case q::Type::iq3_s: deq_iq3_s(p, w); break;
+    case q::Type::iq1_s: deq_iq1_s(p, w); break;
+    case q::Type::iq1_m: deq_iq1_m(p, w); break;
+    case q::Type::tq1_0: deq_tq1_0(p, w); break;
+    case q::Type::tq2_0: deq_tq2_0(p, w); break;
+    case q::Type::q7_z: deq_q7_z(p, w); break;
+    case q::Type::q7_zt: deq_q7_zt(p, w); break;
+    default: (void)q::dequantize_row(t, p, w, kSeg); break;
+  }
 }
 
 PELIAS_TARGET_AVX2 void dot_row_avx2(q::Type t, const std::uint8_t* row, std::int64_t k, const RowPlanes* pl, const float* const* xs,
@@ -1026,39 +1066,7 @@ PELIAS_TARGET_AVX2 void dot_row_avx2(q::Type t, const std::uint8_t* row, std::in
       fused_q4_tg_seg(p, t == q::Type::q4_tg2 ? 2 : 1, xo, nt, acc);
       continue;
     }
-    switch (t) {
-      case q::Type::q8_0: deq_q8_0(p, w); break;
-      case q::Type::q4_k: deq_q4_k(p, w); break;
-      case q::Type::q5_k: deq_q5_k(p, w); break;
-      case q::Type::q6_k: deq_q6_k(p, w); break;
-      case q::Type::iq4_xs: deq_iq4_xs(p, w); break;
-      case q::Type::q4_tg: deq_q4_tg(p, w, 1); break;
-      case q::Type::q4_tg2: deq_q4_tg(p, w, 2); break;
-      case q::Type::q4_0: deq_q4_0(p, w); break;
-      case q::Type::q4_1: deq_q4_1(p, w); break;
-      case q::Type::q5_0: deq_q5_0(p, w); break;
-      case q::Type::q5_1: deq_q5_1(p, w); break;
-      case q::Type::iq4_nl: deq_iq4_nl(p, w); break;
-      case q::Type::mxfp4: deq_mxfp4(p, w); break;
-      case q::Type::q2_k: deq_q2_k(p, w); break;
-      case q::Type::q3_k: deq_q3_k(p, w); break;
-      case q::Type::q8_z: deq_q8_z(p, w); break;
-      case q::Type::f16: deq_f16(p, w); break;
-      case q::Type::bf16: deq_bf16(p, w); break;
-      case q::Type::f32: std::memcpy(w, p, sizeof w); break;
-      case q::Type::iq2_xxs: deq_iq2_xxs(p, w); break;
-      case q::Type::iq2_xs: deq_iq2_xs(p, w); break;
-      case q::Type::iq2_s: deq_iq2_s(p, w); break;
-      case q::Type::iq3_xxs: deq_iq3_xxs(p, w); break;
-      case q::Type::iq3_s: deq_iq3_s(p, w); break;
-      case q::Type::iq1_s: deq_iq1_s(p, w); break;
-      case q::Type::iq1_m: deq_iq1_m(p, w); break;
-      case q::Type::tq1_0: deq_tq1_0(p, w); break;
-      case q::Type::tq2_0: deq_tq2_0(p, w); break;
-      case q::Type::q7_z: deq_q7_z(p, w); break;
-      case q::Type::q7_zt: deq_q7_zt(p, w); break;
-      default: (void)q::dequantize_row(t, p, w, kSeg); break;
-    }
+    deq_seg_avx2(t, p, w);
     if (pd) {
       if (!pl->mask) {
         planes_seg_avx2(pd + sgi * pbytes, pl->k_stored, pl->k_use, w);
@@ -1067,7 +1075,7 @@ PELIAS_TARGET_AVX2 void dot_row_avx2(q::Type t, const std::uint8_t* row, std::in
         pd += pbytes;
       }
     }
-    for (int tt = 0; tt < nt; ++tt) fma_seg_avx2(w, xs[tt] + sgi * kSeg, acc[tt]);
+    fma_seg_nt_avx2(w, xs, sgi * kSeg, nt, acc);
   }
   for (int tt = 0; tt < nt; ++tt) out[tt] = reduce_avx2(acc[tt]);
 }
@@ -1196,6 +1204,104 @@ PELIAS_TARGET_AVX2 void dot_row_q8_avx2(q::Type t, const std::uint8_t* row, std:
     alignas(32) float l[8];
     _mm256_store_ps(l, acc[tt]);
     out[tt] = reduce8(l) + accp[tt];
+  }
+}
+
+// ---- many tokens per row (GP3-10 batch fix, 2026-10-30): the row decoded once, then each group of four tokens summed
+// exactly as dot_row / dot_row_q8 sum it (the same per-token sequence of operations, so the same bits)
+
+PELIAS_TARGET_AVX2 void dot_row_n_avx2(q::Type t, const std::uint8_t* row, std::int64_t k, const RowPlanes* pl, const float* const* xs,
+                                       std::int64_t n, float* out, std::int64_t ldo) {
+  thread_local std::vector<float> wbuf;
+  if (wbuf.size() < static_cast<std::size_t>(k)) wbuf.resize(static_cast<std::size_t>(k));
+  float* w = wbuf.data();
+  const std::uint64_t seg_bytes = q::row_bytes(static_cast<std::uint32_t>(t), kSeg);
+  const std::int64_t nseg = k / kSeg;
+  const std::uint8_t* pd = pl ? pl->data : nullptr;
+  const std::int64_t pbytes = pl ? 34 * static_cast<std::int64_t>(pl->k_stored) : 0;
+  for (std::int64_t sgi = 0; sgi < nseg; ++sgi) {
+    float* ws = w + sgi * kSeg;
+    deq_seg_avx2(t, row + static_cast<std::uint64_t>(sgi) * seg_bytes, ws);
+    if (pd) {
+      if (!pl->mask) {
+        planes_seg_avx2(pd + sgi * pbytes, pl->k_stored, pl->k_use, ws);
+      } else if ((pl->mask[sgi / 8] >> (sgi % 8)) & 1) {
+        planes_seg_avx2(pd, pl->k_stored, pl->k_use, ws);
+        pd += pbytes;
+      }
+    }
+  }
+  for (std::int64_t t0 = 0; t0 < n; t0 += 4) {
+    const int nt = static_cast<int>(std::min<std::int64_t>(4, n - t0));
+    __m256 acc[4][4];
+    for (int tt = 0; tt < nt; ++tt)
+      for (int r = 0; r < 4; ++r) acc[tt][r] = _mm256_setzero_ps();
+    for (std::int64_t sgi = 0; sgi < nseg; ++sgi) fma_seg_nt_avx2(w + sgi * kSeg, xs + t0, sgi * kSeg, nt, acc);
+    for (int tt = 0; tt < nt; ++tt) out[(t0 + tt) * ldo] = reduce_avx2(acc[tt]);
+  }
+}
+
+PELIAS_TARGET_AVX2 void dot_row_q8_n_avx2(q::Type t, const std::uint8_t* row, std::int64_t k, const RowPlanes* pl, const ActQ8x32* acts,
+                                          std::int64_t n, float* out, std::int64_t ldo) {
+  thread_local std::vector<Seg8> segs;
+  thread_local std::vector<const std::uint8_t*> po;
+  const std::int64_t nseg = k / kSeg;
+  if (segs.size() < static_cast<std::size_t>(nseg)) segs.resize(static_cast<std::size_t>(nseg));
+  if (po.size() < static_cast<std::size_t>(nseg)) po.resize(static_cast<std::size_t>(nseg));
+  const bool mins = has_mins(t);
+  const std::uint64_t seg_bytes = q::row_bytes(static_cast<std::uint32_t>(t), kSeg);
+  const std::uint8_t* pd = pl ? pl->data : nullptr;
+  const std::int64_t pbytes = pl ? 34 * static_cast<std::int64_t>(pl->k_stored) : 0;
+  const bool vi = avx_ints(t);
+  for (std::int64_t sgi = 0; sgi < nseg; ++sgi) {
+    const std::uint8_t* p = row + static_cast<std::uint64_t>(sgi) * seg_bytes;
+    Seg8& o = segs[static_cast<std::size_t>(sgi)];
+    seg8_portable(t, p, o, !vi);
+    if (vi) ints_avx2(t, p, o.q);
+    const std::uint8_t* pp = nullptr;
+    if (pd) {
+      if (!pl->mask) pp = pd + sgi * pbytes;
+      else if ((pl->mask[sgi / 8] >> (sgi % 8)) & 1) {
+        pp = pd;
+        pd += pbytes;
+      }
+    }
+    po[static_cast<std::size_t>(sgi)] = pp;
+  }
+  const __m256i ones = _mm256_set1_epi16(1);
+  for (std::int64_t t0 = 0; t0 < n; t0 += 4) {
+    const int nt = static_cast<int>(std::min<std::int64_t>(4, n - t0));
+    __m256 acc[4];
+    float accp[4] = {};
+    for (int tt = 0; tt < nt; ++tt) acc[tt] = _mm256_setzero_ps();
+    for (std::int64_t sgi = 0; sgi < nseg; ++sgi) {
+      const Seg8& o = segs[static_cast<std::size_t>(sgi)];
+      if (const std::uint8_t* pp = po[static_cast<std::size_t>(sgi)])
+        for (int tt = 0; tt < nt; ++tt) accp[tt] += planes_q8_seg(pp, pl->k_stored, pl->k_use, acts[t0 + tt], sgi);
+      for (int b = 0; b < 8; ++b) {
+        const __m256i w = _mm256_load_si256(reinterpret_cast<const __m256i*>(o.q + 32 * b));
+        const __m256i aw = _mm256_abs_epi8(w);
+        for (int tt = 0; tt < nt; ++tt) {
+          const ActQ8x32& a = acts[t0 + tt];
+          const std::size_t i0 = static_cast<std::size_t>(sgi * kSeg + 32 * b);
+          const __m256i qa = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a.q.data() + i0));
+          const __m256i p32 = _mm256_madd_epi16(_mm256_maddubs_epi16(aw, _mm256_sign_epi8(qa, w)), ones);
+          const float sb = a.s[i0 / 32];
+          const __m256 scl = _mm256_set_m128(_mm_set1_ps(o.sw[2 * b + 1] * sb), _mm_set1_ps(o.sw[2 * b] * sb));
+          acc[tt] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p32), scl, acc[tt]);
+          if (mins) {
+            const float m0 = -(sb * (o.mw[2 * b] * static_cast<float>(a.sum16[i0 / 16])));
+            const float m1 = -(sb * (o.mw[2 * b + 1] * static_cast<float>(a.sum16[i0 / 16 + 1])));
+            acc[tt] = _mm256_add_ps(acc[tt], _mm256_setr_ps(m0, 0.0f, 0.0f, 0.0f, m1, 0.0f, 0.0f, 0.0f));
+          }
+        }
+      }
+    }
+    for (int tt = 0; tt < nt; ++tt) {
+      alignas(32) float l[8];
+      _mm256_store_ps(l, acc[tt]);
+      out[(t0 + tt) * ldo] = reduce8(l) + accp[tt];
+    }
   }
 }
 
@@ -1349,6 +1455,61 @@ void dot_row_q8(q::Type t, const std::uint8_t* row, std::int64_t k, const RowPla
   }
 #endif
   dot_row_q8_portable(t, row, k, planes, acts, nt, out);
+}
+
+void dot_row_n(q::Type t, const std::uint8_t* row, std::int64_t k, const RowPlanes* planes, const float* const* xs, std::int64_t n, float* out,
+               std::int64_t ldo) {
+  if (planes && !planes->data) planes = nullptr;
+  RowPlanes c;
+  if (planes && planes->k_use > planes->k_stored) {
+    c = *planes;
+    c.k_use = c.k_stored;
+    planes = &c;
+  }
+#if defined(PELIAS_KERN_X86)
+  if (active_isa() == Isa::avx2 && k % kSeg == 0 && q::row_bytes(static_cast<std::uint32_t>(t), kSeg) != 0) {
+    dot_row_n_avx2(t, row, k, planes, xs, n, out, ldo);
+    return;
+  }
+#endif
+  for (std::int64_t t0 = 0; t0 < n; t0 += 4) {
+    const int nt = static_cast<int>(std::min<std::int64_t>(4, n - t0));
+    float o[4];
+    dot_row(t, row, k, planes, xs + t0, nt, o);
+    for (int tt = 0; tt < nt; ++tt) out[(t0 + tt) * ldo] = o[tt];
+  }
+}
+
+void dot_row_q8_n(q::Type t, const std::uint8_t* row, std::int64_t k, const RowPlanes* planes, const ActQ8x32* acts, std::int64_t n, float* out,
+                  std::int64_t ldo) {
+  if (planes && !planes->data) planes = nullptr;
+  RowPlanes c;
+  if (planes && planes->k_use > planes->k_stored) {
+    c = *planes;
+    c.k_use = c.k_stored;
+    planes = &c;
+  }
+  if (!int_path(t) || k % kSeg != 0) {  // the float path on the rounded values, as dot_row_q8 takes it
+    thread_local std::vector<const float*> xs;
+    xs.resize(static_cast<std::size_t>(n));
+    for (std::int64_t i = 0; i < n; ++i) xs[static_cast<std::size_t>(i)] = acts[i].x.data();
+    dot_row_n(t, row, k, planes, xs.data(), n, out, ldo);
+    return;
+  }
+#if defined(PELIAS_KERN_X86)
+  if (active_isa() == Isa::avx2) {
+    dot_row_q8_n_avx2(t, row, k, planes, acts, n, out, ldo);
+    return;
+  }
+#endif
+  for (std::int64_t t0 = 0; t0 < n; t0 += 4) {
+    const int nt = static_cast<int>(std::min<std::int64_t>(4, n - t0));
+    const ActQ8x32* as[4];
+    for (int tt = 0; tt < nt; ++tt) as[tt] = acts + t0 + tt;
+    float o[4];
+    dot_row_q8(t, row, k, planes, as, nt, o);
+    for (int tt = 0; tt < nt; ++tt) out[(t0 + tt) * ldo] = o[tt];
+  }
 }
 
 namespace {

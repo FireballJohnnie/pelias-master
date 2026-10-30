@@ -7,6 +7,9 @@
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <atomic>
 #include <cmath>
 #include <cstring>
@@ -253,10 +256,22 @@ void fast_rows(const WeightView& w, uint64_t e, int64_t o_begin, int64_t o_end, 
         rp = {w.planes + row * w.plane_row_bytes, nullptr, w.plane_k_stored, w.plane_k};
       pp = &rp;
     }
+    const bool q8 = sc.acts && static_cast<int64_t>(sc.acts->size()) == n_tok;
+    if (n_tok > 4) {  // a batch: the row decoded once (the same bits as the groups of four below)
+      if (q8) {
+        kern::dot_row_q8_n(t, p, k, pp, sc.acts->data(), n_tok, y + o, ldy);
+      } else {
+        thread_local std::vector<const float*> xs;
+        xs.resize(z(n_tok));
+        for (int64_t i = 0; i < n_tok; ++i) xs[z(i)] = x + i * ldx;
+        kern::dot_row_n(t, p, k, pp, xs.data(), n_tok, y + o, ldy);
+      }
+      continue;
+    }
     for (int64_t t0 = 0; t0 < n_tok; t0 += 4) {
       const int nt = static_cast<int>(std::min<int64_t>(4, n_tok - t0));
       float out[4];
-      if (sc.acts && static_cast<int64_t>(sc.acts->size()) == n_tok) {
+      if (q8) {
         const kern::ActQ8x32* as[4];
         for (int tt = 0; tt < 4; ++tt) as[tt] = &(*sc.acts)[z(std::min(t0 + tt, n_tok - 1))];
         kern::dot_row_q8(t, p, k, pp, as, nt, out);
@@ -405,7 +420,13 @@ struct Ctx {
   std::uint32_t ai = 0;  // full-attention layers run before this one (ForwardOptions::qk_dump)
   int64_t pos0 = 0;               // GP3-07: the position of the first token of this call
   DecodeState* st = nullptr;      // GP3-07: the carried state (null: a fresh sequence from position 0)
+  double* prof = nullptr;         // PELIAS_PROF set: seconds per phase (Prof), added to by the calling thread
 };
+
+// PELIAS_PROF=1 in the environment: forward_impl prints one line per call to stderr, wall seconds per phase
+enum Prof { p_deltanet, p_attn, p_router, p_experts, p_shared, p_head, p_route_pred, p_n };
+using Clock = std::chrono::steady_clock;
+inline double since(Clock::time_point t0) { return std::chrono::duration<double>(Clock::now() - t0).count(); }
 
 // the 8-bit activation format the inputs of `w` are rounded to (ForwardOptions::act_int8), or none; float weights never
 // are, as in the reference
@@ -858,6 +879,7 @@ void moe(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* out, flo
   const int64_t n = c.n, e = s.n_embd, ne = s.n_expert, nu = s.n_expert_used, ff = s.n_ff_exp, ffs = s.n_ff_shexp;
   // routing: softmax over every expert, the top n_expert_used by probability (ties: lower index first), their
   // probabilities renormalized to sum 1 (the sum clamped below at 2^-14)
+  Clock::time_point tp = Clock::now();
   std::vector<float> probs(z(n * ne));
   mm(c, l.gate_inp, xn, n, e, probs.data(), ne);
   std::vector<int32_t> sel(z(n * nu));
@@ -958,6 +980,10 @@ void moe(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* out, flo
     if (cnt & 1) group_ex.push_back(x);
     if (cnt & 2) group_ex.push_back(x);
   }
+  if (c.prof) {
+    c.prof[p_router] += since(tp);
+    tp = Clock::now();
+  }
   parallel_items(static_cast<int64_t>(groups.size()), c.threads, [&](int64_t bi, int tid) {
     const int64_t ex = group_ex[z(bi)];
     const std::vector<int64_t>& list = groups[z(bi)];
@@ -1034,6 +1060,10 @@ void moe(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* out, flo
     for (int64_t k = 0; k < nu; ++k)
       for (int64_t t = 0; t < n; ++t) ImatrixCollector::add_row(ed, sel[z(t * nu + k)], hs.data() + (t * nu + k) * ff);
   }
+  if (c.prof) {
+    c.prof[p_experts] += since(tp);
+    tp = Clock::now();
+  }
   // shared expert, gated per token by sigmoid(gate_inp_shexp . x)
   std::vector<float> gs(z(n * ffs)), us(z(n * ffs)), sh(z(n * e));
   mm(c, l.gate_shexp, xn, n, e, gs.data(), ffs);
@@ -1065,6 +1095,7 @@ void moe(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* out, flo
     const float* shr = sh.data() + t * e;
     for (int64_t i = 0; i < e; ++i) o[i] += shr[i] * g;
   }
+  if (c.prof) c.prof[p_shared] += since(tp);
 }
 
 }  // namespace
@@ -1609,6 +1640,11 @@ Status forward_impl(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, const std
   Ctx c{s, threads, sc, n, opt};
   c.st = dst;
   c.pos0 = dst ? dst->pos : 0;
+  static const bool prof_on = std::getenv("PELIAS_PROF") != nullptr;
+  double prof[p_n] = {};
+  if (prof_on) c.prof = prof;
+  const Clock::time_point t_call = Clock::now();
+  Clock::time_point tp;
 
   // embedding rows
   std::vector<float> x(z(n * e)), xn(z(n * e)), y(z(n * e));
@@ -1626,11 +1662,13 @@ Status forward_impl(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, const std
       const int64_t cb = quant::state_code_bytes(e);
       for (int64_t t = 0; t < n; ++t) quant::state_code(xn.data() + t * e, e, opt.state_codes + (t * static_cast<int64_t>(s.n_layer) + il) * cb);
     }
+    tp = Clock::now();
     if (l.recurrent) delta_net(c, l, xn.data(), y.data());
     else {
       full_attention(c, l, xn.data(), y.data());
       ++c.ai;
     }
+    if (prof_on) prof[l.recurrent ? p_deltanet : p_attn] += since(tp);
     for (int64_t i = 0; i < n * e; ++i) x[z(i)] += y[z(i)];
     for (int64_t t = 0; t < n; ++t) rms_norm(x.data() + t * e, l.post_norm.data(), xn.data() + t * e, e, s.rms_eps);
     if (opt.defer_experts > 0) {  // Block M: this layer's deferred experts wait; the previous layer's arrive now
@@ -1641,6 +1679,7 @@ Status forward_impl(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, const std
       moe(c, l, xn.data(), y.data());
       for (int64_t i = 0; i < n * e; ++i) x[z(i)] += y[z(i)];
     }
+    tp = Clock::now();
     if (opt.route && il + 1 < s.n_layer) {
       // pre-gating prediction: the next layer's router on this layer's output, through the next layer's norm
       const Qwen35MoeLayer& nl = w.layers[il + 1];
@@ -1657,13 +1696,29 @@ Status forward_impl(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, const std
         for (int64_t k = 0; k < nu; ++k) rr.pred[k] = static_cast<std::int16_t>(ord[z(k)]);
       }
     }
+    if (prof_on) prof[p_route_pred] += since(tp);
   }
   if (opt.defer_experts > 0)  // the last layer's deferred experts arrive before the output norm
     for (int64_t i = 0; i < n * e; ++i) x[z(i)] += ydef_prev[z(i)];
   if (dst) dst->pos += n;
   if (opt.hidden_out)  // GP3-08: every token's post-norm hidden, the MTP block's seed
     for (int64_t t = 0; t < n; ++t) rms_norm(x.data() + t * e, w.output_norm.data(), opt.hidden_out + t * e, e, s.rms_eps);
-  if (!logits) return Status::good();  // the activations were all the caller wanted (importance matrix)
+  auto prof_print = [&]() {
+    if (!prof_on) return;
+    const double total = since(t_call);
+    double known = 0.0;
+    for (double v : prof) known += v;
+    std::fprintf(stderr,
+                 "prof: %lld tokens, %.3f s: deltanet %.3f, attention %.3f, router %.3f, experts %.3f, shared %.3f, head %.3f, route-pred %.3f, "
+                 "other %.3f%s\n",
+                 static_cast<long long>(n), total, prof[p_deltanet], prof[p_attn], prof[p_router], prof[p_experts], prof[p_shared], prof[p_head],
+                 prof[p_route_pred], total - known, opt.fast_cpu ? " (fast cpu)" : "");
+  };
+  if (!logits) {  // the activations were all the caller wanted (importance matrix)
+    prof_print();
+    return Status::good();
+  }
+  tp = Clock::now();
   const int64_t m = out_end - out_begin;
   for (int64_t t = 0; t < m; ++t) rms_norm(x.data() + (out_begin + t) * e, w.output_norm.data(), xn.data() + t * e, e, s.rms_eps);
   mm(c, w.output, xn.data(), m, e, logits, s.n_vocab);  // through mm(), so --act-int8 reaches the output layer too
@@ -1688,6 +1743,8 @@ Status forward_impl(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, const std
       }
     });
   }
+  if (prof_on) prof[p_head] += since(tp);
+  prof_print();
   return Status::good();
 }
 }  // namespace

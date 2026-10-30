@@ -12,8 +12,7 @@
 // so results agree with the reference forward within the rung-1 tolerance, not bit for bit. The AVX2 path and the
 // portable path use the same lanes, the same fused multiply-adds and the same tree, so they agree bit for bit.
 //
-// AVX2 dequantizers: Q8_0, Q4_K, Q5_K, Q6_K, IQ4_XS, Q4_TG, Q4_TG2. Any other readable type goes through
-// quant::dequantize_row for its segment and the same summation. Rows whose length is not a multiple of 256 are
+// AVX2 dequantizers for all 30 readable types (dot_has_fast_path). Rows whose length is not a multiple of 256 are
 // dequantized whole.
 #include <cstdint>
 #include <vector>
@@ -44,6 +43,11 @@ bool dot_has_fast_path(quant::Type t);   // an AVX2 dequantizer of its own
 void dot_row(quant::Type t, const std::uint8_t* row, std::int64_t k, const RowPlanes* planes, const float* const* xs, int nt,
              float* out);
 
+// n tokens at once (batches: prefill, the MTP verify step, kld): out[t * ldo] is exactly what dot_row gives token t (bit for
+// bit), the row decoded once instead of once per four tokens.
+void dot_row_n(quant::Type t, const std::uint8_t* row, std::int64_t k, const RowPlanes* planes, const float* const* xs, std::int64_t n,
+               float* out, std::int64_t ldo);
+
 // ---- the int8-activation path (GP3-10 item 5; the engine's activation format, ForwardOptions gpu256x8)
 //
 // Activations rounded per 32 values to an fp32 scale s_b and integers q in -127..127 (round half to even, as
@@ -70,5 +74,9 @@ bool dot_q8_has_int_path(quant::Type t);
 // k a multiple of 32; nt rows (1..4) of acts, each acts[i]->k == k.
 void dot_row_q8(quant::Type t, const std::uint8_t* row, std::int64_t k, const RowPlanes* planes, const ActQ8x32* const* acts, int nt,
                 float* out);
+
+// n tokens at once (acts[0..n)): out[t * ldo] exactly what dot_row_q8 gives token t, the row decoded once.
+void dot_row_q8_n(quant::Type t, const std::uint8_t* row, std::int64_t k, const RowPlanes* planes, const ActQ8x32* acts, std::int64_t n,
+                  float* out, std::int64_t ldo);
 
 }  // namespace pelias::kern

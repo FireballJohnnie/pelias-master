@@ -603,6 +603,39 @@ TEST(decode_incremental_equals_the_fresh_pass) {
   CHECK(!pelias::model::forward_decode(tm.spec, tm.w, empty, tok.data(), 1, one.data(), true, opt).ok());
 }
 
+// The same on the fast CPU path (GP3-10): a batch of 11 (rows decoded once, kern::dot_row_n) against the same tokens fed
+// 4 + 1 + 3 + 1 + 1 + 1; batches of four or fewer take the per-group path, so the two must agree within the rounding of
+// the attention and recurrence (the matrix products are the same bits per token).
+TEST(decode_incremental_equals_the_fresh_pass_on_the_fast_path) {
+  TinyModel tm;
+  tiny_model(tm);
+  CHECK(tm.ok);
+  if (!tm.ok) return;
+  const std::vector<std::int32_t> tok{11, 427, 3, 999, 58, 58, 0, 731, 210, 64, 5};
+  const int n = static_cast<int>(tok.size()), v = static_cast<int>(tm.spec.n_vocab);
+  pelias::model::ForwardOptions opt;
+  opt.threads = 3;
+  opt.fast_cpu = true;
+  std::vector<float> full(static_cast<std::size_t>(n) * static_cast<std::size_t>(v));
+  CHECK(pelias::model::forward_reference(tm.spec, tm.w, tok.data(), n, 0, n, full.data(), opt).ok());
+  float amax = 0.0f;
+  for (float x : full) amax = std::max(amax, std::fabs(x));
+  pelias::model::DecodeState st;
+  pelias::model::decode_state_reset(tm.spec, st);
+  std::vector<float> got(full.size(), 0.0f);
+  const int chunks[][2] = {{0, 4}, {4, 1}, {5, 3}, {8, 1}, {9, 1}, {10, 1}};
+  for (const auto& ck : chunks) {
+    std::vector<float> lg(static_cast<std::size_t>(ck[1]) * static_cast<std::size_t>(v));
+    CHECK(pelias::model::forward_decode(tm.spec, tm.w, st, tok.data() + ck[0], ck[1], lg.data(), false, opt).ok());
+    std::copy(lg.begin(), lg.end(), got.begin() + static_cast<std::ptrdiff_t>(ck[0]) * v);
+  }
+  double worst = 0.0;
+  for (std::size_t i = 0; i < full.size(); ++i) worst = std::max(worst, static_cast<double>(std::fabs(full[i] - got[i])));
+  std::printf("    fast path, batch of 11 vs pieces: max |diff| %.3g of max |logit| %.3g\n", worst, static_cast<double>(amax));
+  CHECK(amax > 1e-3f);
+  CHECK(worst <= 1e-5 * static_cast<double>(amax));
+}
+
 // Residual planes end to end on the tiny model: its F32 file is the original, a Q4_K_M copy of it (Pelias's quantizer) is
 // the model file; `pelias planes` (build_planes) fits 2 planes per row, attach_planes reads them, and the forward pass
 // with 1 then 2 planes comes closer to the original's logits each time; planes off gives the file alone back exactly;
