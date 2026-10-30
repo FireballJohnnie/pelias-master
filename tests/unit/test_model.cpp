@@ -885,10 +885,11 @@ TEST(planes_on_tiered_files_select_blocks_and_picks) {
   if (!tw.ok() || !tw2.ok()) return;
   const std::vector<std::int32_t> tok{11, 427, 3, 999, 58, 58, 0, 731, 210, 64, 5, 300, 17};
   const int n = static_cast<int>(tok.size()), v = static_cast<int>(tm.spec.n_vocab);
-  auto logits = [&](const pelias::model::Qwen35MoeWeights& w, int picks) {
+  auto logits = [&](const pelias::model::Qwen35MoeWeights& w, int picks, bool fast = false) {
     pelias::model::ForwardOptions o;
     o.threads = 2;
     o.plane_picks = picks;
+    o.fast_cpu = fast;
     std::vector<float> lg(static_cast<std::size_t>(n) * static_cast<std::size_t>(v));
     CHECK(pelias::model::forward_reference(tm.spec, w, tok.data(), n, 0, n, lg.data(), o).ok());
     return lg;
@@ -965,7 +966,18 @@ TEST(planes_on_tiered_files_select_blocks_and_picks) {
   const double ep = mse(logits(a1.w, 1), ref);
   std::printf("    per-pick planes (tiny model, %d picks): every pick %.4g, top 1 %.4g\n", nu, e1, ep);
   CHECK(ep > e1 && ep < e0);
-  // (5) the same planes on another allocation are refused
+  // (5) the fast CPU kernels (GP3-10): the same products, another order of the sum; tiered types, dense and
+  // block-selective planes, per-tensor plane counts and per-pick reading all agree with the reference forward pass far
+  // below the quantization error
+  const std::vector<float> f0 = logits(tw.value, 0, true), f1 = logits(a1.w, 0, true), f3 = logits(a3.w, 0, true),
+                           f4 = logits(a4.w, 0, true), fp = logits(a1.w, 1, true), fr = logits(tm.w, 0, true);
+  const double d0 = mse(f0, l0), d1 = mse(f1, l1), d3 = mse(f3, l3), d4 = mse(f4, logits(a4.w, 0)), dp = mse(fp, logits(a1.w, 1)),
+               dr = mse(fr, ref);
+  std::printf("    fast CPU kernels vs the reference (logit mse): tiered %.3g, + planes %.3g, + half blocks %.3g, rules %.3g, top 1 %.3g, original %.3g\n",
+              d0, d1, d3, d4, dp, dr);
+  for (const double d : {d0, d1, d3, d4, dp}) CHECK(d < 1e-4 * e1);
+  CHECK(dr < 1e-4 * e1);
+  // (6) the same planes on another allocation are refused
   Attached a5;
   CHECK(!attach(p1, tw2.value, a5));
 }

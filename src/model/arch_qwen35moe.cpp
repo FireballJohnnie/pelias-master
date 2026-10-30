@@ -14,6 +14,7 @@
 #include <thread>
 
 #include "io/tier_build.h"
+#include "kern/cpu_dot.h"
 
 #include "quant/block_types.h"
 #include "quant/planes.h"
@@ -153,6 +154,7 @@ struct Scratch {
   std::vector<float> scores;             // attention scores of one query
   std::vector<float> state, delta;       // DeltaNet state and its per-token update
   bool planes = true;                    // ForwardOptions::planes for this call
+  bool fast = false;                     // ForwardOptions::fast_cpu: rows through kern::dot_row
 };
 
 void load_tile(const WeightView& w, uint64_t first_row, int nr, int64_t k, Scratch& sc) {
@@ -199,10 +201,53 @@ void tile_dot(const float* wt, int64_t k, const float* const* xs, float (&acc)[4
 }
 
 // Y[t][o] = W_e[o] . X[t] for o in [o_begin, o_end) of matrix e, t in [0, n_tok). X rows ldx apart, Y rows ldy apart.
+// The fast CPU path (GP3-10): each row straight from its storage through kern::dot_row, planes included. The same products
+// as load_tile + tile_dot; the sum runs in 32 lanes with fused multiply-adds, so outputs match within the rung-1 tolerance.
+void fast_rows(const WeightView& w, uint64_t e, int64_t o_begin, int64_t o_end, const float* x, int64_t n_tok, int64_t ldx, float* y,
+               int64_t ldy, const Scratch& sc) {
+  const int64_t k = static_cast<int64_t>(w.ne[0]);
+  const uint64_t base_row = e * w.ne[1];
+  for (int64_t o = o_begin; o < o_end; ++o) {
+    const uint64_t row = base_row + static_cast<uint64_t>(o);
+    quant::Type t;
+    const std::uint8_t* p;
+    if (w.slots.empty()) {
+      t = static_cast<quant::Type>(w.type);
+      p = w.data + row * w.row_bytes;
+    } else {
+      const ExpertSlot& s = w.slots[row / w.ne[1]];
+      t = static_cast<quant::Type>(s.type);
+      p = s.data + (row % w.ne[1]) * s.row_bytes;
+    }
+    kern::RowPlanes rp;
+    const kern::RowPlanes* pp = nullptr;
+    if (sc.planes && w.planes) {
+      if (w.plane_mask)
+        rp = {w.planes + static_cast<uint64_t>(w.plane_off[row]) * 34u * static_cast<uint64_t>(w.plane_k_stored),
+              w.plane_mask + row * w.plane_mask_bytes, w.plane_k_stored, w.plane_k};
+      else
+        rp = {w.planes + row * w.plane_row_bytes, nullptr, w.plane_k_stored, w.plane_k};
+      pp = &rp;
+    }
+    for (int64_t t0 = 0; t0 < n_tok; t0 += 4) {
+      const int nt = static_cast<int>(std::min<int64_t>(4, n_tok - t0));
+      const float* xs[4];
+      for (int tt = 0; tt < 4; ++tt) xs[tt] = x + std::min(t0 + tt, n_tok - 1) * ldx;
+      float out[4];
+      kern::dot_row(t, p, k, pp, xs, nt, out);
+      for (int tt = 0; tt < nt; ++tt) y[(t0 + tt) * ldy + o] = out[tt];
+    }
+  }
+}
+
 void matmul_rows(const WeightView& w, uint64_t e, int64_t o_begin, int64_t o_end, const float* x, int64_t n_tok, int64_t ldx, float* y,
                  int64_t ldy, Scratch& sc) {
   const int64_t k = static_cast<int64_t>(w.ne[0]);
   const uint64_t base_row = e * w.ne[1];
+  if (sc.fast) {
+    fast_rows(w, e, o_begin, o_end, x, n_tok, ldx, y, ldy, sc);
+    return;
+  }
   for (int64_t o0 = o_begin; o0 < o_end; o0 += kTile) {
     const int nr = static_cast<int>(std::min<int64_t>(kTile, o_end - o0));
     load_tile(w, base_row + static_cast<uint64_t>(o0), nr, k, sc);
@@ -1276,7 +1321,10 @@ Status forward_impl(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, const std
   const int threads = opt.threads > 0 ? opt.threads : static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
   const int64_t n = n_tokens, e = s.n_embd;
   std::vector<Scratch> sc(z(threads));
-  for (Scratch& x : sc) x.planes = opt.planes;
+  for (Scratch& x : sc) {
+    x.planes = opt.planes;
+    x.fast = opt.fast_cpu;
+  }
   Ctx c{s, threads, sc, n, opt};
   c.st = dst;
   c.pos0 = dst ? dst->pos : 0;

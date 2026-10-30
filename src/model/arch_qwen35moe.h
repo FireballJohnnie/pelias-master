@@ -194,6 +194,9 @@ struct ForwardOptions {
   // Residual planes (attach_planes): read them in this call. The caller turns them off per call (pelias generate
   // --planes-mode: all tokens, the prompt only, or the prompt and the first N decoded tokens).
   bool planes = true;
+  // Fast CPU kernels (kern/cpu_dot.h, GP3-10): every weight row read straight from its storage by kern::dot_row (AVX2 when
+  // the CPU has it), planes included. Same products as the reference; the sum runs in another order (rung-1 tolerance).
+  bool fast_cpu = false;
   // With the output layer's original rows attached (Qwen35MoeWeights::output_exact) and planes on: the head_rescore
   // largest logits of each output row are recomputed exactly from the original rows and the unrounded fp32 input.
   int head_rescore = 0;

@@ -43,6 +43,15 @@ if(MSVC)
 else()
   target_compile_options(pelias_quant PRIVATE -ffp-contract=off -fno-fast-math)
 endif()
+# Fast CPU kernels (GP3-10): row dot products straight from quantized storage. AVX2 + FMA functions carry their own target
+# attribute and are chosen at run time, so the build runs on any x86-64 / ARM64 machine. No contraction: the dequantized
+# values must equal the reference's bit for bit (only the explicit fused multiply-adds of the sum are fused).
+pelias_add_module(pelias_kern SOURCES src/kern/cpu_dot.cpp DEPENDS pelias_quant)
+if(MSVC)
+  target_compile_options(pelias_kern PRIVATE /fp:precise)
+else()
+  target_compile_options(pelias_kern PRIVATE -ffp-contract=off -fno-fast-math)
+endif()
 set(PELIAS_HAL_SOURCES src/hal/device.cpp src/hal/nvml.cpp src/hal/vram_governor.cpp)
 if(PELIAS_CUDA)
   list(APPEND PELIAS_HAL_SOURCES src/hal/backend_cuda/cuda_device.cpp)
@@ -75,7 +84,7 @@ pelias_add_module(pelias_plan
   DEPENDS pelias_hal pelias_io)
 pelias_add_module(pelias_model
   SOURCES src/model/spec.cpp src/model/arch_qwen35moe.cpp src/model/imatrix.cpp src/model/sampler.cpp
-  DEPENDS pelias_io pelias_quant pelias_hal)
+  DEPENDS pelias_io pelias_kern pelias_quant pelias_hal)
 if(NOT WIN32)
   find_package(Threads REQUIRED)
   target_link_libraries(pelias_model PUBLIC Threads::Threads)
@@ -94,16 +103,16 @@ pelias_add_module(pelias_verify
 # ---- the program
 add_executable(pelias src/cli/main.cc)
 pelias_apply_flags(pelias)
-target_link_libraries(pelias PRIVATE pelias_model pelias_verify pelias_tok pelias_plan pelias_ingest pelias_io pelias_hal pelias_quant pelias_os)
+target_link_libraries(pelias PRIVATE pelias_model pelias_kern pelias_verify pelias_tok pelias_plan pelias_ingest pelias_io pelias_hal pelias_quant pelias_os)
 
 # ---- tests (own harness, no framework)
 if(PELIAS_BUILD_TESTS)
   enable_testing()
   add_executable(pelias_unit tests/unit/main.cpp tests/unit/test_sha256.cpp tests/unit/test_json.cpp tests/unit/test_gguf.cpp
-                 tests/unit/test_safetensors.cpp tests/unit/test_plan.cpp tests/unit/test_block_types.cpp tests/unit/test_number_text.cpp tests/unit/test_nvml_pick.cpp tests/unit/test_quant.cpp tests/unit/test_tdecode.cpp tests/unit/test_planes.cpp tests/unit/test_type_rules.cpp tests/unit/test_requantize.cpp tests/unit/test_ingest.cpp tests/unit/test_tok.cpp tests/unit/test_model.cpp tests/unit/test_sampler.cpp tests/unit/test_membw.cpp tests/unit/synth_hf.cpp tests/unit/synth_model.cpp tests/unit/gguf_builder.cpp)
+                 tests/unit/test_safetensors.cpp tests/unit/test_plan.cpp tests/unit/test_block_types.cpp tests/unit/test_number_text.cpp tests/unit/test_nvml_pick.cpp tests/unit/test_quant.cpp tests/unit/test_tdecode.cpp tests/unit/test_planes.cpp tests/unit/test_cpu_dot.cpp tests/unit/test_type_rules.cpp tests/unit/test_requantize.cpp tests/unit/test_ingest.cpp tests/unit/test_tok.cpp tests/unit/test_model.cpp tests/unit/test_sampler.cpp tests/unit/test_membw.cpp tests/unit/synth_hf.cpp tests/unit/synth_model.cpp tests/unit/gguf_builder.cpp)
   pelias_apply_flags(pelias_unit)
   target_include_directories(pelias_unit PRIVATE tests)
-  target_link_libraries(pelias_unit PRIVATE pelias_model pelias_verify pelias_tok pelias_plan pelias_ingest pelias_io pelias_hal pelias_quant pelias_os)
+  target_link_libraries(pelias_unit PRIVATE pelias_model pelias_kern pelias_verify pelias_tok pelias_plan pelias_ingest pelias_io pelias_hal pelias_quant pelias_os)
   add_test(NAME unit COMMAND pelias_unit --data ${CMAKE_CURRENT_SOURCE_DIR}/tests/data)
   add_executable(pelias_mutate tests/unit/mutate.cpp tests/unit/gguf_builder.cpp)
   pelias_apply_flags(pelias_mutate)
