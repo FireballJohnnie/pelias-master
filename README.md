@@ -169,6 +169,8 @@ build/host/pelias generate --model model.gguf --prompt "The capital of France is
 |---|---|
 | `pelias inspect --model F`, `pelias device`, `pelias plan --model F`, `pelias key --model F` | Read a model, list the devices, plan a fit, key a file |
 | `pelias generate --model F --prompt TEXT` | Text from the CPU reference pass: prefill, then one token per step on the carried KV cache and DeltaNet state. `--temp 0` is greedy; `--top-k`, `--top-p`, `--min-p`, the penalties and `--seed` follow the parameter dictionary; `--ids-out` writes the token ids; `--no-mmap` reads the model into RAM first |
+| `pelias generate --model F --prompt-list P.txt --out-dir DIR` | Every line of P.txt as a prompt, on the model (and planes) loaded once |
+| `pelias teacher --model ORIGINAL.gguf --ids A.ids [--ids B.ids ...] --out-dir DIR` | The original model's own top-1 / top-2 at every position of decoded text; `tools/split_grade.py` grades the GP3-07 splits with it (who is right: Pelias, llama.cpp or neither) |
 | `pelias tokenize --model F --text TEXT` | The model's tokenizer (equal to llama.cpp's, token for token, on the P-D1 test files; `logs/BUILD_LOG.md`) |
 | `pelias quantize --model IN --out OUT [--recipe R.tsv] [--imatrix M.gguf] [--rotate32 GROUPS]` | Quantize with Pelias's own formats (incl. Q8_Z, Q7_ZT, Q4_TG2) |
 | `pelias imatrix --model F --file TEXT --out M.gguf` | Importance matrix from the fp32 reference pass |

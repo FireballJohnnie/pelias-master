@@ -186,7 +186,7 @@ void usage() {
       "                                  importance matrix from a calibration text, by the fp32 reference pass, in the\n"
       "                                  reference's GGUF imatrix format (llama-quantize --imatrix reads it); weights the\n"
       "                                  file stores rotated (quantize --rotate32) are collected on the rotated inputs\n"
-      "  generate --model FILE (--prompt TEXT | --prompt-file F) [--n-predict 128] [--ctx 32768] [--threads N]\n"
+      "  generate --model FILE (--prompt TEXT | --prompt-file F | --prompt-list F --out-dir DIR) [--n-predict 128] [--ctx 32768] [--threads N]\n"
       "      [--temp 1.0] [--top-k 20] [--top-p 0.95] [--min-p 0] [--repeat-penalty 1] [--repeat-last-n 64]\n"
       "      [--presence-penalty 0] [--frequency-penalty 0] [--seed 20261019 | -1] [--ignore-eos] [--show-special]\n"
       "      [--ids-out FILE] [--no-nfc] [--no-special] [--act-int8 GROUPS] [--act-int8-path ...] [--act-rot h32] [--no-mmap]\n"
@@ -196,6 +196,8 @@ void usage() {
       "                                  Defaults are the parameter dictionary's. --ids-out writes the prompt and output ids\n"
       "                                  and each step's top-1 minus top-2 raw logit (tools/greedy_compare.py reads it)\n"      "                                  --no-mmap reads the whole file into RAM first (for mounts that do not cache it)\n"
       "      [--planes FILE] [--plane-k K] [--planes-mode all|prefill|start:N] [--head-rescore N]\n"
+      "                                  --prompt-list: every line a prompt, all run on the model loaded once; line NN's text and\n"
+      "                                  ids go to DIR/pelias_NN.txt and DIR/pelias_NN.ids (nothing is overwritten)\n"
       "                                  residual sign planes (`pelias planes`): read on every token (all), on the prompt only\n"
       "                                  (prefill), or on the prompt and the first N output tokens (start:N); --plane-k reads\n"
       "                                  the first K stored planes; --head-rescore N recomputes the N largest logits exactly from\n"
@@ -208,6 +210,10 @@ void usage() {
       "                                  given. --exact-head also stores the original output rows (BF16) for --head-rescore.\n"
       "                                  The output must not exist; the model file's types are recorded so it is only read\n"
       "                                  with that file.\n"
+      "  teacher --model ORIGINAL.gguf --ids A.ids [--ids B.ids ...] --out-dir DIR [--threads N]\n"
+      "                                  the original model's view of decoded text (generate --ids-out files): for every output\n"
+      "                                  position its own top-1 and top-2 and the held token's logit and log-probability, to\n"
+      "                                  DIR/teacher_<name>.tsv; the model is opened once for every file\n"
       "  probe | train | export | serve | bench | web   not built yet (later steps)\n"
       "options: --log debug|info|warn|error (default info)");
 }
@@ -1393,9 +1399,125 @@ int cmd_planes(const Args& a) {
   return 0;
 }
 
+// pelias teacher: the original model's view of decoded text (the split-token grader, author 2026-10-29 20:01-20:46). For
+// every --ids file (pelias generate --ids-out format: a "prompt:" and an "output:" line) the model runs the prompt and the
+// output once, fresh state, and writes, for each output position, what the model itself would pick there: its top-1 and
+// top-2 tokens and logits, and the logit and log-probability of the token the file holds. The model is opened once
+// (memory map) for every file.
+int cmd_teacher(const Args& a) {
+  const std::string path = a.get("model"), dir = a.get("out-dir");
+  std::vector<std::string> files;
+  for (const auto& o : a.opts)
+    if (o.first == "ids") files.push_back(o.second);
+  if (path.empty() || dir.empty() || files.empty()) {
+    usage();
+    return 1;
+  }
+  int threads = static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
+  if (a.has("threads")) {
+    const Result<std::uint64_t> r = io::parse_whole(a.get("threads"), 4096);
+    if (!r.ok() || r.value == 0) {
+      std::fprintf(stderr, "pelias: --threads needs a whole number from 1 to 4096\n");
+      return 1;
+    }
+    threads = static_cast<int>(r.value);
+  }
+  std::vector<std::string> outs;
+  for (const std::string& f : files) {
+    const std::size_t sl = f.find_last_of("/\\");
+    std::string base = sl == std::string::npos ? f : f.substr(sl + 1);
+    if (base.size() > 4 && base.substr(base.size() - 4) == ".ids") base.resize(base.size() - 4);
+    const std::string o = dir + "/teacher_" + base + ".tsv";
+    if (std::ifstream(o, std::ios::binary)) {
+      std::fprintf(stderr, "pelias: %s already exists (nothing is overwritten)\n", o.c_str());
+      return 1;
+    }
+    outs.push_back(o);
+  }
+  os::FileMap m;
+  Status s = m.open(path);
+  if (!s) return fail_input(s);
+  io::GgufReader g;
+  s = g.parse(m);
+  if (!s) return fail_input(s);
+  const Result<model::Qwen35MoeSpec> spec = model::read_qwen35moe_spec(g);
+  if (!spec.ok()) return fail_input(spec.status);
+  const Result<model::Qwen35MoeWeights> w = model::bind_qwen35moe(g, m.data(), spec.value);
+  if (!w.ok()) return fail_input(w.status);
+  const auto nv = static_cast<std::int64_t>(spec.value.n_vocab);
+  model::ForwardOptions fo;
+  fo.threads = threads;
+  std::fprintf(stderr, "pelias teacher: %s, %zu file(s), %d threads, fp32 reference pass\n", path.c_str(), files.size(), threads);
+  for (std::size_t fi = 0; fi < files.size(); ++fi) {
+    Result<std::string> txt = io::read_text_file(files[fi]);
+    if (!txt.ok()) return fail_input(txt.status);
+    std::vector<std::int32_t> prompt, output;
+    std::istringstream in(txt.value);
+    std::string line;
+    while (std::getline(in, line)) {
+      std::vector<std::int32_t>* dst = line.rfind("prompt:", 0) == 0 ? &prompt : line.rfind("output:", 0) == 0 ? &output : nullptr;
+      if (!dst) continue;
+      std::istringstream ls(line.substr(7));
+      long long v = 0;
+      while (ls >> v) {
+        if (v < 0 || v >= nv) {
+          std::fprintf(stderr, "pelias: %s holds a token id outside the vocabulary\n", files[fi].c_str());
+          return 2;
+        }
+        dst->push_back(static_cast<std::int32_t>(v));
+      }
+    }
+    if (prompt.empty() || output.empty()) {
+      std::fprintf(stderr, "pelias: %s has no prompt or no output ids\n", files[fi].c_str());
+      return 2;
+    }
+    std::vector<std::int32_t> seq = prompt;
+    seq.insert(seq.end(), output.begin(), output.end() - 1);  // the last output token is never fed back
+    const int n = static_cast<int>(seq.size()), first = static_cast<int>(prompt.size()) - 1, n_out = static_cast<int>(output.size());
+    std::vector<float> lg(static_cast<std::size_t>(n_out) * static_cast<std::size_t>(nv));
+    Timer t;
+    s = model::forward_reference(spec.value, w.value, seq.data(), n, first, first + n_out, lg.data(), fo);
+    if (!s) return fail_input(s);
+    std::ofstream o(outs[fi], std::ios::binary);
+    o << "pos\ttoken\ttop1\ttop1_logit\ttop2\ttop2_logit\ttoken_logit\ttoken_logprob\n";
+    int agree = 0;
+    double nll = 0.0;
+    for (int i = 0; i < n_out; ++i) {
+      const float* l = lg.data() + static_cast<std::ptrdiff_t>(i) * nv;
+      std::int64_t b1 = 0, b2 = -1;
+      for (std::int64_t v = 1; v < nv; ++v)
+        if (l[v] > l[b1]) {
+          b2 = b1;
+          b1 = v;
+        } else if (b2 < 0 || l[v] > l[b2]) {
+          b2 = v;
+        }
+      if (b2 < 0) b2 = b1 == 0 ? 1 : 0;
+      double mx = l[b1], sum = 0.0;
+      for (std::int64_t v = 0; v < nv; ++v) sum += std::exp(static_cast<double>(l[v]) - mx);
+      const std::int32_t tk = output[static_cast<std::size_t>(i)];
+      const double lp = static_cast<double>(l[tk]) - mx - std::log(sum);
+      agree += b1 == tk;
+      nll -= lp;
+      char buf[256];
+      std::snprintf(buf, sizeof buf, "%d\t%d\t%lld\t%.5f\t%lld\t%.5f\t%.5f\t%.6f\n", i, tk, static_cast<long long>(b1), static_cast<double>(l[b1]),
+                    static_cast<long long>(b2), static_cast<double>(l[b2]), static_cast<double>(l[tk]), lp);
+      o << buf;
+    }
+    if (!o) {
+      std::fprintf(stderr, "pelias: could not write %s\n", outs[fi].c_str());
+      return 6;
+    }
+    std::fprintf(stderr, "pelias teacher: %s: %d tokens, the model's own top-1 on %d of %d, mean NLL %.4f; %.1f s\n", files[fi].c_str(), n, agree, n_out,
+                 nll / n_out, t.seconds());
+  }
+  return 0;
+}
+
 int cmd_generate(const Args& a) {
   const std::string path = a.get("model");
-  if (path.empty() || (a.has("prompt") == a.has("prompt-file"))) {
+  const int prompt_sources = (a.has("prompt") ? 1 : 0) + (a.has("prompt-file") ? 1 : 0) + (a.has("prompt-list") ? 1 : 0);
+  if (path.empty() || prompt_sources != 1 || a.has("prompt-list") != a.has("out-dir") || (a.has("prompt-list") && a.has("ids-out"))) {
     usage();
     return 1;
   }
@@ -1469,9 +1591,9 @@ int cmd_generate(const Args& a) {
   model::ForwardOptions fo;
   fo.threads = threads;
   if (!act_options(a, fo)) return 1;
-  const std::string ids_path = a.get("ids-out");
-  if (!ids_path.empty() && std::ifstream(ids_path, std::ios::binary)) {
-    std::fprintf(stderr, "pelias: %s already exists (nothing is overwritten)\n", ids_path.c_str());
+  const std::string ids_out = a.get("ids-out");
+  if (!ids_out.empty() && std::ifstream(ids_out, std::ios::binary)) {
+    std::fprintf(stderr, "pelias: %s already exists (nothing is overwritten)\n", ids_out.c_str());
     return 1;
   }
   os::FileMap m;
@@ -1529,14 +1651,62 @@ int cmd_generate(const Args& a) {
                  planes_until < 0 ? "every token" : planes_until == 1 ? "the prompt only" : ("the prompt and the first " + std::to_string(planes_until) + " output tokens").c_str());
   Result<tok::Tokenizer> tk = tok::Tokenizer::from_gguf(g);
   if (!tk.ok()) return fail_input(tk.status);
-  std::string text;
-  if (a.has("prompt-file")) {
-    Result<std::string> r = io::read_text_file(a.get("prompt-file"));
+  // the prompts: one (--prompt / --prompt-file, ids to --ids-out, text to stdout), or every line of --prompt-list, each run
+  // on the model and planes loaded once (author 2026-10-29 20:38: split-token tests keep the model in RAM), the text and
+  // ids of line NN to OUT_DIR/pelias_NN.txt and pelias_NN.ids
+  struct Job {
+    std::string text, ids_path, txt_path;
+  };
+  std::vector<Job> jobs;
+  if (a.has("prompt-list")) {
+    Result<std::string> r = io::read_text_file(a.get("prompt-list"));
     if (!r.ok()) return fail_input(r.status);
-    text = std::move(r.value);
+    const std::string dir = a.get("out-dir");
+    std::size_t at = 0;
+    for (int nn = 1; at < r.value.size(); ++nn) {
+      std::size_t eol = r.value.find('\n', at);
+      if (eol == std::string::npos) eol = r.value.size();
+      std::string line = r.value.substr(at, eol - at);
+      at = eol + 1;
+      if (!line.empty() && line.back() == '\r') line.pop_back();
+      if (line.empty()) {
+        std::fprintf(stderr, "pelias: --prompt-list line %d is empty\n", nn);
+        return 1;
+      }
+      char tag[16];
+      std::snprintf(tag, sizeof tag, "%02d", nn);
+      Job j{line, dir + "/pelias_" + tag + ".ids", dir + "/pelias_" + tag + ".txt"};
+      for (const std::string& f : {j.ids_path, j.txt_path})
+        if (std::ifstream(f, std::ios::binary)) {
+          std::fprintf(stderr, "pelias: %s already exists (nothing is overwritten)\n", f.c_str());
+          return 1;
+        }
+      jobs.push_back(j);
+    }
   } else {
-    text = a.get("prompt");
+    std::string text;
+    if (a.has("prompt-file")) {
+      Result<std::string> r = io::read_text_file(a.get("prompt-file"));
+      if (!r.ok()) return fail_input(r.status);
+      text = std::move(r.value);
+    } else {
+      text = a.get("prompt");
+    }
+    jobs.push_back({text, ids_out, ""});
   }
+  for (std::size_t job = 0; job < jobs.size(); ++job) {
+  const std::string& text = jobs[job].text;
+  const std::string& ids_path = jobs[job].ids_path;
+  std::FILE* tout = stdout;
+  if (!jobs[job].txt_path.empty()) {
+    tout = std::fopen(jobs[job].txt_path.c_str(), "wb");
+    if (!tout) {
+      std::fprintf(stderr, "pelias: cannot create %s\n", jobs[job].txt_path.c_str());
+      return 6;
+    }
+  }
+  fo.planes = true;  // every prompt's prefill reads the planes (--planes-mode decides the decode steps)
+  Timer tjob;
   tok::EncodeOptions eo;
   eo.nfc = !a.has("no-nfc");
   eo.parse_special = !a.has("no-special");
@@ -1600,8 +1770,8 @@ int cmd_generate(const Args& a) {
     }
     if (show_special || tk.value.type(next) != tok::TokenType::control) {
       const std::string piece = tk.value.piece(next);
-      std::fwrite(piece.data(), 1, piece.size(), stdout);
-      std::fflush(stdout);
+      std::fwrite(piece.data(), 1, piece.size(), tout);
+      std::fflush(tout);
     }
     if (i + 1 == n_predict) break;
     fo.planes = planes_until < 0 || i + 1 < planes_until;  // this step gives output token i + 1
@@ -1609,8 +1779,9 @@ int cmd_generate(const Args& a) {
     if (!s) return fail_input(s);
   }
   const double decode_s = td.seconds();
-  std::fputs("\n", stdout);
-  std::fflush(stdout);
+  std::fputs("\n", tout);
+  std::fflush(tout);
+  if (tout != stdout) std::fclose(tout);
   const int steps = static_cast<int>(out.size()) - 1;  // forward steps after the prefill (the last token is not run)
   std::fprintf(stderr, "pelias generate: prefill %d tokens in %.2f s (%.2f tok/s); %zu tokens out, stopped by %s; %d decode steps in %.2f s (%.3f tok/s)\n",
                n_prompt, prefill_s, n_prompt / std::max(prefill_s, 1e-9), out.size(), why, steps, decode_s,
@@ -1633,6 +1804,9 @@ int cmd_generate(const Args& a) {
       std::fprintf(stderr, "pelias: could not write %s\n", ids_path.c_str());
       return 6;
     }
+  }
+  if (jobs.size() > 1)
+    std::fprintf(stderr, "pelias generate: prompt %zu of %zu done in %.1f s (model and planes kept loaded)\n", job + 1, jobs.size(), tjob.seconds());
   }
   return 0;
 }
@@ -1663,6 +1837,7 @@ int main(int argc, char** argv) {
   if (cmd == "imatrix") return cmd_imatrix(a);
   if (cmd == "generate") return cmd_generate(a);
   if (cmd == "planes") return cmd_planes(a);
+  if (cmd == "teacher") return cmd_teacher(a);
   for (const char* later : {"probe", "train", "export", "serve", "bench", "web"})
     if (cmd == later) {
       std::fprintf(stderr, "pelias: '%s' is not built yet (a later step of the order of operations)\n", later);
