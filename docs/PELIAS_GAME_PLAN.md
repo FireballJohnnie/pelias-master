@@ -950,6 +950,7 @@ The imatrix or the GPTQ objective adds weight to the router's input space and to
 - AVX2 dot products for Q4_K, Q5_K, Q6_K, Q8_0, IQ4_XS against fp32 and int8 activations, following the GP2-05 policy.
 - Threadpool with 1-thread-per-core pinning (E-A1 A/B).
 - **Gate:** outputs within the rung-1 tolerances against the reference (16.2). Throughput at or above llama.cpp's CPU expert path (about 27 GB/s effective, DERIVED, E4).
+- **Status (2026-10-30, MEASURED on the PC, chain-3, c79229d):** decode (1 token), 16 threads, float / int8 GB/s: Q8_0 35 / 39, Q6_K 38 / 36 (41.7 int8 at 8 threads), Q5_K 31 / 27, Q4_K 22 / 28, IQ4_XS 24 / 29, Q4_TG2 17 / 17, IQ2_XXS 10 / 11; RAM 40-42; reference path Q4_K 8.5. Gate met by Q8_0, Q6_K, Q5_K, Q4_K (int8), IQ4_XS (int8); open for Q4_TG2 and IQ2_XXS (decode-bound: a faster grid lookup is the route to try). MTP block on the real file, reference vs fast: 9.1e-6, top-1 13/13. kld (255-token batches) was not faster (116 vs 117 s): rows were decoded once per four tokens. Fix built (cdfdb72): `kern::dot_row_n` / `dot_row_q8_n` decode a row once per batch, same bits as groups of four; `PELIAS_PROF=1` phase timer. Next: gp/block_cpukern_v3.sh (waiting for the okay) settles where the batch time goes; if the products (not the decode) bound a batch, a blocked int8 GEMM for CPU prefill is the follow-up (prefill normally runs on the GPU).
 
 **GPU (sm_89):**
 - Dequant-in-register GEMV/GEMM for the same types, RMSNorm, IMRoPE, attention, DeltaNet chunked and recurrent, router, top-k.
