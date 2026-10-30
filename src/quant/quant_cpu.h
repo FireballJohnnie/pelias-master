@@ -106,6 +106,10 @@ void dequantize_iq4_nl(const std::uint8_t* in, float* y, std::int64_t n);
 void dequantize_mxfp4(const std::uint8_t* in, float* y, std::int64_t n);
 void dequantize_tq1_0(const std::uint8_t* in, float* y, std::int64_t n);
 void dequantize_tq2_0(const std::uint8_t* in, float* y, std::int64_t n);
+// I2_S (BitNet b1.58, Microsoft's fork; layout and code mapping MEASURED against the BF16 original, tools/oracle/i2s_check.py):
+// per 128 values 32 bytes, byte j holds values j, 32 + j, 64 + j, 96 + j at bit shifts 6, 4, 2, 0; code 0 = -1, 1 = 0,
+// 2 = +1. Gives the ternary values only: the tensor's one scale (fp32 after the data) is applied by the caller.
+void dequantize_i2_s(const std::uint8_t* in, float* y, std::int64_t n);
 void dequantize_iq2_xxs(const std::uint8_t* in, float* y, std::int64_t n);
 void dequantize_iq2_xs(const std::uint8_t* in, float* y, std::int64_t n);
 void dequantize_iq2_s(const std::uint8_t* in, float* y, std::int64_t n);

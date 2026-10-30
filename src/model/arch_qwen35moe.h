@@ -67,6 +67,11 @@ struct WeightView {
   const std::uint8_t* plane_mask = nullptr;
   const std::uint32_t* plane_off = nullptr;
   std::uint64_t plane_mask_bytes = 0;
+  // I2_S (BitNet b1.58): the rows hold ternary values only; every product of this weight is multiplied by its one
+  // per-tensor scale (the fp32 after the tensor's rows). 1 for every other type.
+  float tensor_scale = 1.0f;
+  // BitNet b1.58: a BitLinear weight; each input row is rounded to int8 per token (absmax) before the product
+  bool bitlinear = false;
   [[nodiscard]] bool present() const { return data != nullptr; }
 };
 
@@ -87,6 +92,7 @@ struct Qwen35MoeLayer {
   // (post_norm is then ffn_norm)
   std::vector<float> bq, bk, bv;
   WeightView ffn_gate, ffn_up, ffn_down;
+  std::vector<float> attn_sub_norm, ffn_sub_norm;  // BitNet b1.58
 };
 
 // GP3-08: the MTP block (blk.<n_layer>, nextn_predict_layers = 1), read as llama.cpp's graph runs it (READ-SRC

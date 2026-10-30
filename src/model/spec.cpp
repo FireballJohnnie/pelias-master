@@ -27,7 +27,14 @@ Result<Qwen35MoeSpec> read_dense_spec(const io::GgufReader& r, const std::string
   s.attn_gate = false;
   s.qk_norm = fam == Family::qwen3;
   s.qkv_bias = fam == Family::qwen2;
-  s.rope_neox = fam != Family::llama;  // llama.cpp llama_model_rope_type: LLAMA -> NORM, QWEN2 / QWEN3 -> NEOX
+  // llama.cpp llama_model_rope_type: LLAMA -> NORM, QWEN2 / QWEN3 / BITNET -> NEOX. BitNet b1.58 2B4T: the I2_S file's q/k
+  // rows are in the original's order (MEASURED, tools/oracle/i2s_check.py), so the original's rotate_half pairs: NEOX.
+  s.rope_neox = fam != Family::llama;
+  if (fam == Family::bitnet) {
+    s.sub_norms = true;
+    s.bitlinear_act8 = true;
+    s.ffn_relu2 = arch == "bitnet-b1.58";
+  }
   s.rope_freq_base = 10000.0f;
   const std::string a = arch + ".";
   bool found = false;
@@ -94,8 +101,9 @@ Result<Qwen35MoeSpec> read_qwen35moe_spec(const io::GgufReader& r) {
   if (arch == "qwen3") return read_dense_spec(r, arch, Family::qwen3);
   if (arch == "qwen2") return read_dense_spec(r, arch, Family::qwen2);
   if (arch == "llama") return read_dense_spec(r, arch, Family::llama);
+  if (arch == "bitnet-b1.58" || arch == "bitnet") return read_dense_spec(r, arch, Family::bitnet);
   if (arch != "qwen35moe")
-    return R::fail(Status::fail(Code::unsupported, "the reference pass reads qwen35moe, qwen3, qwen2 and llama (this file is '" + arch + "')", 0, "general.architecture"));
+    return R::fail(Status::fail(Code::unsupported, "the reference pass reads qwen35moe, qwen3, qwen2, llama and bitnet (this file is '" + arch + "')", 0, "general.architecture"));
   s.arch = arch;
   const std::string a = "qwen35moe.";
 

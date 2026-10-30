@@ -136,6 +136,12 @@ void dequantize_tq1_0(const std::uint8_t* in, float* y, std::int64_t n) {  // qs
   }
 }
 
+void dequantize_i2_s(const std::uint8_t* in, float* y, std::int64_t n) {  // 32 bytes per 128 values, 2-bit codes, no scale
+  for (std::int64_t i = 0; i < n / 128; ++i, in += 32, y += 128)
+    for (int g = 0; g < 4; ++g)
+      for (int j = 0; j < 32; ++j) y[32 * g + j] = static_cast<float>(static_cast<int>((in[j] >> (6 - 2 * g)) & 3) - 1);
+}
+
 void dequantize_tq2_0(const std::uint8_t* in, float* y, std::int64_t n) {  // qs[64] (2 bits each), d
   for (std::int64_t i = 0; i < n / kQKK; ++i, in += 66) {
     const float d = h(in + 64);

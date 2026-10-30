@@ -39,6 +39,9 @@ TypeInfo type_info(std::uint32_t id) {
     case 30: return {"BF16", 1, 2, true};
     case 34: return {"TQ1_0", 256, 54, true};   // 2 + 256/64 + (256 - 4*256/64)/5
     case 35: return {"TQ2_0", 256, 66, true};   // 2 + 256/4
+    // I2_S (id 36 in Microsoft's BitNet fork of llama.cpp; unused upstream): ternary weights, 2 bits each, 128 per 32
+    // bytes; one fp32 scale for the whole tensor stored in the 32 bytes after its data (not part of any row)
+    case 36: return {"I2_S", 128, 32, true};
     case 39: return {"MXFP4", 32, 17, true};    // 1 + 32/2
     case 40: return {"NVFP4", 64, 36, true};    // 64/16 + 64/2
     case 41: return {"Q1_0", 128, 18, true};    // 2 + 128/8

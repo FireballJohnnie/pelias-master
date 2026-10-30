@@ -2124,11 +2124,13 @@ int cmd_generate(const Args& a) {
   for (std::size_t job = 0; job < jobs.size(); ++job) {
   // --chat: one user turn in the family's chat format, the assistant's turn opened (READ-SRC: the files' own
   // tokenizer.chat_template, the plain case without a system message or tools). Qwen (qwen35moe, qwen3, qwen2): ChatML;
-  // llama: the Llama 3 header format (its BOS is added below when the file asks for it).
+  // llama: the Llama 3 header format; bitnet: "User: ... <|eot_id|>Assistant: " (BOS added below when the file asks for it).
   std::string chat_text;
   if (a.has("chat")) {
     if (spec.value.family == model::Family::llama)
       chat_text = "<|start_header_id|>user<|end_header_id|>\n\n" + jobs[job].text + "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n";
+    else if (spec.value.family == model::Family::bitnet)  // BitNet b1.58 2B4T's template: "User: " text "<|eot_id|>Assistant: "
+      chat_text = "User: " + jobs[job].text + "<|eot_id|>Assistant: ";
     else
       chat_text = "<|im_start|>user\n" + jobs[job].text + "<|im_end|>\n<|im_start|>assistant\n";
   }

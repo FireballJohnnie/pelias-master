@@ -68,7 +68,8 @@ std::vector<std::uint8_t> GgufBuilder::build(std::uint64_t* data_start) const {
     put<std::uint32_t>(v, t.type);
     put<std::uint64_t>(v, off);
     const pelias::quant::TypeInfo ti = pelias::quant::type_info(t.type);
-    const std::uint64_t bytes = ti.block_elements ? elems / ti.block_elements * ti.block_bytes : 0;
+    std::uint64_t bytes = ti.block_elements ? elems / ti.block_elements * ti.block_bytes : 0;
+    if (t.type == 36) bytes += 32;  // I2_S: the tensor's scale after its rows (as the reader counts it)
     sizes.push_back(bytes);
     off += (bytes + alignment_ - 1) / alignment_ * alignment_;
   }

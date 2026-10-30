@@ -70,7 +70,7 @@ bool is_fast(q::Type t) {
     case q::Type::q5_1: case q::Type::iq4_nl: case q::Type::mxfp4: case q::Type::q2_k: case q::Type::q3_k:
     case q::Type::q8_z: case q::Type::f16: case q::Type::bf16: case q::Type::f32: case q::Type::iq2_xxs: case q::Type::iq2_xs:
     case q::Type::iq2_s: case q::Type::iq3_xxs: case q::Type::iq3_s: case q::Type::iq1_s: case q::Type::iq1_m: case q::Type::tq1_0:
-    case q::Type::tq2_0: case q::Type::q7_z: case q::Type::q7_zt:
+    case q::Type::tq2_0: case q::Type::q7_z: case q::Type::q7_zt: case q::Type::i2_s:
       return true;
     default:
       return false;
@@ -860,6 +860,16 @@ PELIAS_TARGET_AVX2 void deq_iq1_m(const std::uint8_t* p, float* y) {  // qs[32],
 
 // ---- ternary (TQ1_0, TQ2_0): float(q - 1) * d with q in 0..2
 
+// I2_S, one 256-segment = two 128-blocks of 32 bytes: byte j holds values j, 32+j, 64+j, 96+j at shifts 6, 4, 2, 0;
+// value = code - 1 (the tensor's scale is applied outside the row, as quant::dequantize_i2_s leaves it)
+PELIAS_TARGET_AVX2 void deq_i2_s(const std::uint8_t* p, float* y) {
+  const __m256i m3 = _mm256_set1_epi8(3), one = _mm256_set1_epi8(1);
+  for (int b = 0; b < 2; ++b) {
+    const __m256i q = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + 32 * b));
+    for (int g = 0; g < 4; ++g, y += 32) dq32_s(_mm256_sub_epi8(_mm256_and_si256(_mm256_srli_epi16(q, 6 - 2 * g), m3), one), 1.0f, 0.0f, false, y);
+  }
+}
+
 PELIAS_TARGET_AVX2 void deq_tq2_0(const std::uint8_t* p, float* y) {  // qs[64] (2 bits each), d
   const float d = h2f(p + 64);
   const __m256i m3 = _mm256_set1_epi8(3), one = _mm256_set1_epi8(1);
@@ -1057,6 +1067,7 @@ PELIAS_TARGET_AVX2 void deq_seg_avx2(q::Type t, const std::uint8_t* p, float* w)
     case q::Type::iq1_m: deq_iq1_m(p, w); break;
     case q::Type::tq1_0: deq_tq1_0(p, w); break;
     case q::Type::tq2_0: deq_tq2_0(p, w); break;
+    case q::Type::i2_s: deq_i2_s(p, w); break;
     case q::Type::q7_z: deq_q7_z(p, w); break;
     case q::Type::q7_zt: deq_q7_zt(p, w); break;
     default: (void)q::dequantize_row(t, p, w, kSeg); break;

@@ -82,7 +82,10 @@ Result<Tokenizer> Tokenizer::from_gguf(const io::GgufReader& g) {
   const std::string model = g.get_string("tokenizer.ggml.model", &found);
   if (!found) return R::fail(Status::fail(Code::not_found, "no tokenizer in this file", 0, "tokenizer.ggml.model"));
   if (model != "gpt2") return R::fail(Status::fail(Code::unsupported, "tokenizer model not supported: " + model));
-  const std::string pre = g.get_string("tokenizer.ggml.pre", &found);
+  std::string pre = g.get_string("tokenizer.ggml.pre", &found);
+  // Microsoft's BitNet b1.58 2B4T file names no pre-tokenizer; its tokenizer.json splits with the Llama 3 pattern (no
+  // normalizer, ignore_merges true: READ 2026-10-30 from the BF16 original's tokenizer.json)
+  if (!found && g.get_string("general.architecture") == "bitnet-b1.58") pre = "llama-bpe";
   const io::GgufValue* tv = g.find("tokenizer.ggml.tokens");
   const io::GgufValue* yv = g.find("tokenizer.ggml.token_type");
   const io::GgufValue* mv = g.find("tokenizer.ggml.merges");

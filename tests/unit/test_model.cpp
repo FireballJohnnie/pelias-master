@@ -1341,3 +1341,129 @@ TEST(dense_families_run_fast_and_decode_paths) {
     CHECK(!pelias::model::forward_reference(tm.spec, tm.w, tok.data(), n, 0, n, a.data(), bad).ok());
   }
 }
+
+// BitNet b1.58 (pre-build list item 5): a tiny bitnet-b1.58 file whose projections are I2_S (ternary codes + one fp32
+// scale per tensor) and the same model with those weights written out as F32 (t x scale): the two give the same logits
+// within the rung-1 tolerance (the I2_S decode, its code mapping and the per-tensor scale), the fast path agrees with the
+// reference, and the decode path equals the batch. relu^2 FFN, sub-norms and the per-token int8 BitLinear inputs run in
+// both. The code mapping itself was MEASURED against the real model's BF16 original (tools/oracle/i2s_check.py).
+namespace {
+bool bitnet_model(bool i2s, TinyModel& tm) {
+  const std::uint32_t E = 256, H = 4, HKV = 2, HD = 64, FF = 384, L = 2, V = 300;
+  const std::uint32_t wt = i2s ? 36u : 0u;
+  ptest::GgufBuilder b;
+  const std::string a = "bitnet-b1.58.";
+  b.kv_string("general.architecture", "bitnet-b1.58")
+      .kv_u32(a + "block_count", L)
+      .kv_u32(a + "embedding_length", E)
+      .kv_u32(a + "feed_forward_length", FF)
+      .kv_u32(a + "attention.head_count", H)
+      .kv_u32(a + "attention.head_count_kv", HKV)
+      .kv_f32(a + "rope.freq_base", 500000.0f)
+      .kv_f32(a + "attention.layer_norm_rms_epsilon", 1e-5f)
+      .tensor("token_embd.weight", {E, V}, 0)
+      .tensor("output_norm.weight", {E}, 0);
+  for (std::uint32_t il = 0; il < L; ++il) {
+    const std::string p = "blk." + std::to_string(il) + ".";
+    b.tensor(p + "attn_norm.weight", {E}, 0).tensor(p + "attn_q.weight", {E, H * HD}, wt).tensor(p + "attn_k.weight", {E, HKV * HD}, wt);
+    b.tensor(p + "attn_v.weight", {E, HKV * HD}, wt).tensor(p + "attn_output.weight", {H * HD, E}, wt).tensor(p + "attn_sub_norm.weight", {E}, 0);
+    b.tensor(p + "ffn_norm.weight", {E}, 0).tensor(p + "ffn_gate.weight", {E, FF}, wt).tensor(p + "ffn_up.weight", {E, FF}, wt);
+    b.tensor(p + "ffn_down.weight", {FF, E}, wt).tensor(p + "ffn_sub_norm.weight", {FF}, 0);
+  }
+  std::vector<std::uint8_t> bytes = b.build();
+  pelias::os::FileMap m0;
+  pelias::io::GgufReader r0;
+  const std::string stem = ptest::data_dir() + (i2s ? "/bitnet_i2s" : "/bitnet_f32");
+  if (!ptest::write_and_map(stem + "_layout.gguf", bytes, m0) || !r0.parse(m0).ok()) return false;
+  std::uint32_t h = 20261030u;
+  auto unit = [&h]() {
+    h ^= h << 13;
+    h ^= h >> 17;
+    h ^= h << 5;
+    return static_cast<float>(h) / 2147483648.0f - 1.0f;
+  };
+  for (const pelias::io::GgufTensor& t : r0.tensors()) {
+    std::uint8_t* d = bytes.data() + t.file_offset;
+    const bool proj = t.name.find("attn_q.") != std::string::npos || t.name.find("attn_k.") != std::string::npos ||
+                      t.name.find("attn_v.") != std::string::npos || t.name.find("attn_output.") != std::string::npos ||
+                      t.name.find("ffn_gate.") != std::string::npos || t.name.find("ffn_up.") != std::string::npos ||
+                      t.name.find("ffn_down.") != std::string::npos;
+    if (proj) {  // ternary codes from the same stream for both files; scale 1/sqrt(row) per tensor
+      const float scale = 1.5f / std::sqrt(static_cast<float>(t.ne[0]));
+      const std::uint64_t n = t.elements();
+      std::vector<std::uint8_t> codes(n);
+      for (std::uint64_t i = 0; i < n; ++i) {
+        const float u = unit();
+        codes[i] = static_cast<std::uint8_t>(u < -0.33f ? 0 : (u < 0.33f ? 1 : 2));  // 0 = -1, 1 = 0, 2 = +1
+      }
+      if (i2s) {
+        for (std::uint64_t blk = 0; blk < n / 128; ++blk)
+          for (int j = 0; j < 32; ++j) {
+            std::uint8_t by = 0;
+            for (int g = 0; g < 4; ++g) by = static_cast<std::uint8_t>(by | (codes[blk * 128 + 32 * static_cast<std::uint64_t>(g) + static_cast<std::uint64_t>(j)] << (6 - 2 * g)));
+            d[blk * 32 + static_cast<std::uint64_t>(j)] = by;
+          }
+        std::memcpy(d + n / 4, &scale, 4);
+      } else {
+        for (std::uint64_t i = 0; i < n; ++i) {
+          const float v = static_cast<float>(static_cast<int>(codes[i]) - 1) * scale;
+          std::memcpy(d + 4 * i, &v, 4);
+        }
+      }
+      continue;
+    }
+    float* f = reinterpret_cast<float*>(d);
+    for (std::uint64_t i = 0; i < t.elements(); ++i) {
+      const float u = unit();
+      const float v = t.name.find("norm") != std::string::npos ? 1.0f + 0.1f * u : 0.5f * u;
+      std::memcpy(f + i, &v, 4);
+    }
+  }
+  if (!ptest::write_and_map(stem + ".gguf", bytes, tm.map) || !tm.reader.parse(tm.map).ok()) return false;
+  auto s = pelias::model::read_qwen35moe_spec(tm.reader);
+  if (!s.ok()) return false;
+  tm.spec = s.value;
+  auto w = pelias::model::bind_qwen35moe(tm.reader, tm.map.data(), tm.spec);
+  if (!w.ok()) return false;
+  tm.w = std::move(w.value);
+  tm.ok = true;
+  return true;
+}
+}  // namespace
+
+TEST(bitnet_i2s_equals_its_f32_copy_and_runs_every_path) {
+  TinyModel a, f;
+  CHECK(bitnet_model(true, a));
+  CHECK(bitnet_model(false, f));
+  if (!a.ok || !f.ok) return;
+  CHECK(a.spec.family == pelias::model::Family::bitnet && a.spec.ffn_relu2 && a.spec.sub_norms && a.spec.bitlinear_act8 && a.spec.rope_neox);
+  CHECK(a.w.layers[0].wq.type == 36u && a.w.layers[0].wq.tensor_scale > 0.0f && a.w.layers[0].wq.bitlinear);
+  CHECK(a.w.output.data == a.w.tok_embd.data);
+  const std::vector<std::int32_t> tok{11, 27, 3, 299, 58, 58, 0, 131, 210, 64, 5};
+  const int n = static_cast<int>(tok.size()), v = static_cast<int>(a.spec.n_vocab);
+  pelias::model::ForwardOptions ref, fast;
+  ref.threads = fast.threads = 3;
+  fast.fast_cpu = true;
+  std::vector<float> la(static_cast<std::size_t>(n) * static_cast<std::size_t>(v)), lf(la.size()), lfast(la.size()), dec(la.size());
+  CHECK(pelias::model::forward_reference(a.spec, a.w, tok.data(), n, 0, n, la.data(), ref).ok());
+  CHECK(pelias::model::forward_reference(f.spec, f.w, tok.data(), n, 0, n, lf.data(), ref).ok());
+  CHECK(pelias::model::forward_reference(a.spec, a.w, tok.data(), n, 0, n, lfast.data(), fast).ok());
+  pelias::model::DecodeState st;
+  pelias::model::decode_state_reset(a.spec, st);
+  for (int i = 0; i < n; ++i)
+    CHECK(pelias::model::forward_decode(a.spec, a.w, st, tok.data() + i, 1, dec.data() + static_cast<std::ptrdiff_t>(i) * v, true, fast).ok());
+  float amax = 0.0f;
+  double d_f32 = 0.0, d_fast = 0.0, d_dec = 0.0;
+  for (std::size_t i = 0; i < la.size(); ++i) {
+    amax = std::max(amax, std::fabs(la[i]));
+    d_f32 = std::max(d_f32, static_cast<double>(std::fabs(la[i] - lf[i])));
+    d_fast = std::max(d_fast, static_cast<double>(std::fabs(la[i] - lfast[i])));
+    d_dec = std::max(d_dec, static_cast<double>(std::fabs(lfast[i] - dec[i])));
+  }
+  std::printf("    bitnet I2_S: max |logit| %.3g, vs its F32 copy %.3g, fast vs reference %.3g, decode vs batch (fast) %.3g\n", static_cast<double>(amax),
+              d_f32, d_fast, d_dec);
+  CHECK(amax > 1e-3f);
+  CHECK(d_f32 <= 1e-4 * static_cast<double>(amax));
+  CHECK(d_fast <= 1e-4 * static_cast<double>(amax));
+  CHECK(d_dec <= 1e-5 * static_cast<double>(amax));
+}

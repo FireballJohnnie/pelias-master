@@ -20,7 +20,7 @@ namespace pelias::model {
 
 // The architecture families the reference pass runs (GP3-09, author 2026-10-30 11:24: dense families before the first
 // build). qwen35moe is the hybrid MoE; the others are dense decoders: every layer attention + one gated FFN.
-enum class Family { qwen35moe, qwen3, qwen2, llama };
+enum class Family { qwen35moe, qwen3, qwen2, llama, bitnet };
 
 struct Qwen35MoeSpec {
   Family family = Family::qwen35moe;
@@ -31,6 +31,12 @@ struct Qwen35MoeSpec {
   bool attn_gate = true;           // the query projection carries a per-head output gate [query | gate] (qwen35moe)
   bool qk_norm = true;             // per-head RMS norms on q and k (qwen35moe, qwen3)
   bool qkv_bias = false;           // q / k / v biases (qwen2)
+  // BitNet b1.58 (bitnet-b1.58: Microsoft's fork, 2B4T; bitnet: the reference library's name): RMS sub-norms before the
+  // attention output and the FFN down projection; every BitLinear input rounded per token to int8 (absmax, the model's
+  // own training-time activation quantizer); relu^2 FFN for bitnet-b1.58 (config.json hidden_act relu2), SiLU for bitnet
+  bool sub_norms = false;
+  bool bitlinear_act8 = false;
+  bool ffn_relu2 = false;
   std::uint32_t n_ctx_train = 0;   // context_length (informational)
   std::uint32_t n_layer = 0;       // trunk layers run in the main pass (block_count - nextn_predict_layers)
   std::uint32_t n_layer_all = 0;   // block_count (the MTP block(s) included)

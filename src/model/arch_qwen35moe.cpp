@@ -64,6 +64,12 @@ Status bind_view(const io::GgufReader& r, const std::uint8_t* base, const std::s
   out.ne[2] = ne[2];
   out.row_bytes = quant::row_bytes(t->type, ne[0]);
   out.name = name;
+  if (type == quant::Type::i2_s) {  // the scale after the rows (the reader counted those 32 bytes into the tensor)
+    float sc = 0.0f;
+    std::memcpy(&sc, out.data + out.row_bytes * ne[1] * ne[2], sizeof sc);
+    if (!std::isfinite(sc) || sc <= 0.0f) return Status::fail(Code::corrupt, "the I2_S scale is not a positive number", 0, name);
+    out.tensor_scale = sc;
+  }
   return Status::good();
 }
 
@@ -310,8 +316,15 @@ void matmul_rows(const WeightView& w, uint64_t e, int64_t o_begin, int64_t o_end
                  int64_t ldy, Scratch& sc) {
   const int64_t k = static_cast<int64_t>(w.ne[0]);
   const uint64_t base_row = e * w.ne[1];
+  // I2_S: the rows are the ternary values; the tensor's one scale multiplies every output (w x = s (t x))
+  auto scale_out = [&]() {
+    if (w.tensor_scale == 1.0f) return;
+    for (int64_t t = 0; t < n_tok; ++t)
+      for (int64_t o = o_begin; o < o_end; ++o) y[t * ldy + o] *= w.tensor_scale;
+  };
   if (sc.fast) {
     fast_rows(w, e, o_begin, o_end, x, n_tok, ldx, y, ldy, sc);
+    scale_out();
     return;
   }
   for (int64_t o0 = o_begin; o0 < o_end; o0 += kTile) {
@@ -332,6 +345,7 @@ void matmul_rows(const WeightView& w, uint64_t e, int64_t o_begin, int64_t o_end
         for (int j = 0; j < nr; ++j) y[(t + tt) * ldy + o0 + j] = acc[tt][j];
     }
   }
+  scale_out();
 }
 
 // The whole matrix (matrix 0 of the view), output rows split among the threads tile by tile.
@@ -679,6 +693,25 @@ void t_decode_impl(const std::uint8_t* data, std::uint64_t row_bytes, int64_t n_
 
 // matmul over the whole matrix, recording the activations for the importance matrix when asked
 void mm(const Ctx& c, const WeightView& w, const float* x, int64_t n_tok, int64_t ldx, float* y, int64_t ldy) {
+  if (w.bitlinear) {
+    // BitNet b1.58 BitLinear: each input row rounded to int8 per token, s = 127 / max(max |x|, 1e-5), q = clamp(round
+    // half to even(x s), -128, 127), x' = q / s (the model's activation quantizer, READ-SRC transformers
+    // integrations/bitnet.py, read as a specification); then the product as usual
+    const int64_t k = static_cast<int64_t>(w.ne[0]);
+    std::vector<float> xq(z(n_tok * k));
+    for (int64_t t = 0; t < n_tok; ++t) {
+      const float* xr = x + t * ldx;
+      float amax = 0.0f;
+      for (int64_t i = 0; i < k; ++i) amax = std::max(amax, std::fabs(xr[i]));
+      const float sc = 127.0f / std::max(amax, 1e-5f);
+      float* o = xq.data() + t * k;
+      for (int64_t i = 0; i < k; ++i) o[i] = std::min(127.0f, std::max(-128.0f, std::nearbyint(xr[i] * sc))) / sc;
+    }
+    WeightView plain = w;
+    plain.bitlinear = false;
+    mm(c, plain, xq.data(), n_tok, k, y, ldy);
+    return;
+  }
   if (c.opt.imatrix && !w.rot32) c.opt.imatrix->add_dense(w.name, x, n_tok, ldx, static_cast<int64_t>(w.ne[0]));
   if (c.opt.imatrix && w.rot32) {  // stored rotated: the quantizer sees the rotated inputs, so collect those
     const int64_t k = static_cast<int64_t>(w.ne[0]);
@@ -819,6 +852,13 @@ void full_attention(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, floa
       for (int64_t i = 0; i < hd; ++i) o[i] *= sigmoid(gate[i]);
     }
   });
+  if (!l.attn_sub_norm.empty()) {  // BitNet b1.58: RMS norm of the attention output before its projection
+    std::vector<float> tmp(z(hd * nh));
+    for (int64_t t = 0; t < n; ++t) {
+      rms_norm(att.data() + t * hd * nh, l.attn_sub_norm.data(), tmp.data(), hd * nh, s.rms_eps);
+      std::copy(tmp.begin(), tmp.end(), att.begin() + t * hd * nh);
+    }
+  }
   mm(c, l.wo, att.data(), n, hd * nh, out, e);
 }
 
@@ -925,14 +965,28 @@ void delta_net(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* ou
   mm(c, l.ssm_out, core.data(), n, d_inner, out, e);
 }
 
-// GP3-09: a dense decoder's FFN, down(silu(gate x) * up x) (llama.cpp build_ffn, LLM_FFN_SILU + LLM_FFN_PAR)
+// GP3-09: a dense decoder's FFN, down(silu(gate x) * up x) (llama.cpp build_ffn, LLM_FFN_SILU + LLM_FFN_PAR); BitNet
+// b1.58: down(ffn_sub_norm(relu(gate x)^2 * up x)) (transformers BitNetMLP, read as a specification)
 void dense_ffn(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* out) {
   const int64_t n = c.n, e = c.s.n_embd, ff = c.s.n_ff;
   Clock::time_point tp = Clock::now();
   std::vector<float> g(z(n * ff)), u(z(n * ff));
   mm(c, l.ffn_gate, xn, n, e, g.data(), ff);
   mm(c, l.ffn_up, xn, n, e, u.data(), ff);
-  for (int64_t i = 0; i < n * ff; ++i) g[z(i)] = silu(g[z(i)]) * u[z(i)];
+  if (c.s.ffn_relu2)  // BitNet b1.58 2B4T: relu(g)^2 * u
+    for (int64_t i = 0; i < n * ff; ++i) {
+      const float r = std::max(g[z(i)], 0.0f);
+      g[z(i)] = (r * r) * u[z(i)];
+    }
+  else
+    for (int64_t i = 0; i < n * ff; ++i) g[z(i)] = silu(g[z(i)]) * u[z(i)];
+  if (!l.ffn_sub_norm.empty()) {  // BitNet b1.58: RMS norm over the FFN width before the down projection
+    std::vector<float> tmp(z(ff));
+    for (int64_t t = 0; t < n; ++t) {
+      rms_norm(g.data() + t * ff, l.ffn_sub_norm.data(), tmp.data(), ff, c.s.rms_eps);
+      std::copy(tmp.begin(), tmp.end(), g.begin() + t * ff);
+    }
+  }
   mm(c, l.ffn_down, g.data(), n, ff, out, e);
   if (c.prof) c.prof[p_experts] += since(tp);
 }
@@ -1237,8 +1291,14 @@ Status bind_layer(const io::GgufReader& r, const std::uint8_t* base, const Qwen3
     all.push_back(bind_view(r, base, p + "ffn_gate.weight", {e, ff_d}, l.ffn_gate));
     all.push_back(bind_view(r, base, p + "ffn_up.weight", {e, ff_d}, l.ffn_up));
     all.push_back(bind_view(r, base, p + "ffn_down.weight", {ff_d, e}, l.ffn_down));
+    if (s.sub_norms) {
+      all.push_back(bind_vector(r, base, p + "attn_sub_norm.weight", {e}, l.attn_sub_norm));
+      all.push_back(bind_vector(r, base, p + "ffn_sub_norm.weight", {ff_d}, l.ffn_sub_norm));
+    }
     for (const Status& x : all)
       if (!x) return x;
+    if (s.bitlinear_act8)
+      for (WeightView* v : {&l.wq, &l.wk, &l.wv, &l.wo, &l.ffn_gate, &l.ffn_up, &l.ffn_down}) v->bitlinear = true;
     return Status::good();
   }
   all.push_back(bind_vector(r, base, p + "attn_norm.weight", {e}, l.attn_norm));

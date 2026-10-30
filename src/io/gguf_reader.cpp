@@ -227,6 +227,7 @@ Status GgufReader::parse(const os::FileMap& map, bool require_data) {
     const std::uint64_t blocks = elems / ti.block_elements;
     if (blocks != 0 && ti.block_bytes > std::numeric_limits<std::uint64_t>::max() / blocks) return Status::fail(Code::corrupt, "byte size overflows", at, t.name);
     t.bytes = blocks * ti.block_bytes;
+    if (t.type == 36) t.bytes += 32;  // I2_S (BitNet fork): the tensor's fp32 scale in 32 bytes after its rows
     s = c.read(t.data_offset, "the data offset", t.name);
     if (!s) return s;
     tensors_.push_back(std::move(t));
