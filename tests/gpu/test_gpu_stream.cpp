@@ -232,7 +232,7 @@ TEST(rung1_stream_refuses_unsafe_tables) {
   }
   g::StreamWeights w;
   std::vector<std::uint8_t> junk(1024);
-  CHECK(!g::stream_upload(static_cast<std::uint32_t>(q::Type::q4_k), junk.data(), 1, 256, &w));   // not a streaming type
+  CHECK(!g::stream_upload(static_cast<std::uint32_t>(q::Type::q4_0), junk.data(), 1, 256, &w));   // not a streaming type (Q4_K streams since 23bd80e)
   CHECK(!g::stream_upload(static_cast<std::uint32_t>(q::Type::q5_k), junk.data(), 1, 768, &w));   // k not a power of two
   std::printf("    deadlocking, unsignalled, misaligned and uncovered tables refused; unreadable types and widths refused\n");
 }
