@@ -112,9 +112,14 @@ TEST(cpu_dot_with_dense_and_block_selective_planes) {
       }
       // block-selective: blocks 0, 2, 3, 7 of 8 carry planes, stored back to back
       const std::uint8_t mask[1] = {0x8D};
-      std::vector<std::uint8_t> sp;
+      const std::size_t blk = static_cast<std::size_t>(34 * ks);
+      std::vector<std::uint8_t> sp(4 * blk);  // blocks 0, 2, 3, 7 (a plain copy: gcc 15 misreads vector::insert here, -Wfree-nonheap-object)
+      std::size_t at = 0;
       for (int b = 0; b < 8; ++b)
-        if ((mask[0] >> b) & 1) sp.insert(sp.end(), pl.begin() + b * 34 * ks, pl.begin() + (b + 1) * 34 * ks);
+        if ((mask[0] >> b) & 1) {
+          std::memcpy(sp.data() + at, pl.data() + static_cast<std::size_t>(b) * blk, blk);
+          at += blk;
+        }
       kn::RowPlanes sparse{sp.data(), mask, ks, ks};
       CHECK(run(c.t, c.name, k, &sparse, 41u + static_cast<std::uint32_t>(ks)));
     }
