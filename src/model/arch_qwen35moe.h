@@ -85,6 +85,21 @@ struct Qwen35MoeLayer {
   std::vector<float> gate_inp_shexp;
 };
 
+// GP3-08: the MTP block (blk.<n_layer>, nextn_predict_layers = 1), read as llama.cpp's graph runs it (READ-SRC
+// src/models/qwen35moe.cpp graph_mtp and common/speculative.cpp draft-mtp, read as a specification): the token's embedding
+// and the trunk's post-norm hidden of the position before it, each RMS-normed, concatenated [embedding | hidden] and
+// projected by eh_proj to n_embd; then one full-attention decoder block with the routed and the gated shared experts (its
+// own attention cache); then the head norm and the output layer give the logits of the token after next.
+struct Qwen35MoeMtp {
+  bool present = false;
+  Qwen35MoeLayer layer;          // attn_norm, q/k/v/o with the q/k norms, post_attention_norm, router, experts, shared expert
+  WeightView eh_proj;            // [2 n_embd -> n_embd]
+  std::vector<float> enorm, hnorm;
+  WeightView embed_tokens;       // nextn.embed_tokens if the file has it, else the model's token_embd
+  WeightView head;               // nextn.shared_head_head if the file has it, else the model's output layer
+  std::vector<float> head_norm;  // nextn.shared_head_norm if the file has it, else output_norm
+};
+
 struct Qwen35MoeWeights {
   WeightView tok_embd, output;
   // the output layer's original rows (BF16, never rotated) from a plane side file, for the exact re-score of the top
@@ -92,6 +107,7 @@ struct Qwen35MoeWeights {
   WeightView output_exact;
   std::vector<float> output_norm;
   std::vector<Qwen35MoeLayer> layers;  // the trunk only (spec.n_layer)
+  Qwen35MoeMtp mtp;                    // the MTP block, when the file has one (spec.n_layer_all = n_layer + 1)
 };
 
 // Binds every trunk tensor by name, checks its shape against the spec and its type against what the reference can
@@ -197,6 +213,9 @@ struct ForwardOptions {
   // Fast CPU kernels (kern/cpu_dot.h, GP3-10): every weight row read straight from its storage by kern::dot_row (AVX2 when
   // the CPU has it), planes included. Same products as the reference; the sum runs in another order (rung-1 tolerance).
   bool fast_cpu = false;
+  // GP3-08: n_tokens x n_embd floats, filled with every token's post-norm hidden (output_norm of the last layer's output):
+  // the MTP block's seed for the position after it. May be null.
+  float* hidden_out = nullptr;
   // With the output layer's original rows attached (Qwen35MoeWeights::output_exact) and planes on: the head_rescore
   // largest logits of each output row are recomputed exactly from the original rows and the unrounded fp32 input.
   int head_rescore = 0;
@@ -244,6 +263,33 @@ void decode_state_reset(const Qwen35MoeSpec& s, DecodeState& st);
 // the whole sequence (tests/unit/test_model.cpp). Options that need a whole chunk (state_store, qk_dump) are refused.
 Status forward_decode(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, DecodeState& st, const std::int32_t* tokens, int n_new, float* logits,
                       bool last_only, const ForwardOptions& opt = {});
+
+// GP3-08: the MTP block's own attention cache (one full-attention layer) and the next position it runs at.
+struct MtpState {
+  std::int64_t pos = 0;
+  DecodeState kv;  // k / v of one layer
+};
+void mtp_state_reset(MtpState& st);
+// Drops the cached positions from `pos` on (drafted tokens that were not kept); pos <= st.pos.
+void mtp_state_truncate(const Qwen35MoeSpec& s, MtpState& st, std::int64_t pos);
+// Runs the MTP block on tokens[0..n) at positions st.pos .. st.pos + n - 1, token t paired with the hidden row h_prev + t
+// x n_embd (the trunk's post-norm hidden of the position before it; zeros before the first token; when drafting, the MTP
+// block's own h_out of the step before). Extends the cache; writes the logits (n x n_vocab, may be null) and the block's
+// post-norm hidden (n x n_embd, may be null). Options that record per-layer data (routes, statistics, importance, hot set,
+// deferral) are not applied here.
+Status mtp_forward(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, MtpState& st, const std::int32_t* tokens, const float* h_prev, int n,
+                   float* logits, float* h_out, const ForwardOptions& opt = {});
+
+// GP3-08 / masterwork 15.2 step 10: greedy decoding with MTP drafting. Each step the MTP block drafts up to n_draft
+// tokens from the last kept token, the trunk runs the last token and the drafts as one batch, and a draft is kept only
+// while it equals the trunk's own greedy choice; the trunk's choice after the last kept draft is kept too. The result
+// equals plain greedy decoding (the trunk's batch rows are the same numbers as one-token steps). Stops after n_predict
+// tokens or at `eos` (>= 0). out receives the generated ids; drafted / accepted count the drafts.
+struct MtpStats {
+  std::int64_t steps = 0, drafted = 0, accepted = 0;
+};
+Status generate_greedy_mtp(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, const std::vector<std::int32_t>& prompt, int n_predict, int n_draft,
+                           std::int32_t eos, std::vector<std::int32_t>& out, MtpStats* stats, const ForwardOptions& opt = {});
 
 // Runs tokens[0..n_tokens) and writes the logits of positions [out_begin, out_end) to `logits`
 // ((out_end - out_begin) rows of spec.n_vocab floats). With `logits` null the output layer is skipped.

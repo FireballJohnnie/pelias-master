@@ -64,6 +64,26 @@ Status bind_view(const io::GgufReader& r, const std::uint8_t* base, const std::s
   return Status::good();
 }
 
+// Routed experts stored with gate and up fused (newer converters, [n_embd, 2 n_ff, n_expert]: each expert's n_ff gate rows,
+// then its n_ff up rows): two views whose experts are slots into the one tensor.
+Status bind_gate_up_exps(const io::GgufReader& r, const std::uint8_t* base, const std::string& name, uint64_t ne0, uint64_t ff, uint64_t n_exp,
+                         WeightView& gate, WeightView& up) {
+  WeightView f;
+  if (Status st = bind_view(r, base, name, {ne0, 2 * ff, n_exp}, f); !st) return st;
+  for (WeightView* v : {&gate, &up}) {
+    *v = f;
+    v->ne[1] = ff;
+    v->slots.resize(static_cast<std::size_t>(n_exp));
+  }
+  for (uint64_t ex = 0; ex < n_exp; ++ex) {
+    const std::uint8_t* d = f.data + ex * 2 * ff * f.row_bytes;
+    gate.slots[static_cast<std::size_t>(ex)] = {d, f.type, f.row_bytes};
+    up.slots[static_cast<std::size_t>(ex)] = {d + ff * f.row_bytes, f.type, f.row_bytes};
+  }
+  up.data = f.data + ff * f.row_bytes;  // expert 0's up rows (the slots carry every expert)
+  return Status::good();
+}
+
 // Routed experts: the stock tensor, or a usage-tiered weight (io/tier_build.h) read as one view whose experts each keep
 // their own type and rows.
 Status bind_experts(const io::GgufReader& r, const std::uint8_t* base, const std::string& name, uint64_t ne0, uint64_t ne1, uint64_t n_exp,
@@ -1055,6 +1075,65 @@ void state_store_roundtrip(float* x, std::int64_t n, ForwardOptions::StateStore 
   }
 }
 
+namespace {
+// one decoder block's tensors under prefix p ("blk.N."): attention (full or DeltaNet), norms, router, experts, shared expert
+Status bind_layer(const io::GgufReader& r, const std::uint8_t* base, const Qwen35MoeSpec& s, const std::string& p, bool recurrent,
+                  Qwen35MoeLayer& l) {
+  const uint64_t e = s.n_embd, hd = s.head_dim, nh = s.n_head, nkv = s.n_head_kv;
+  const uint64_t ch = s.conv_channels(), di = s.ssm_d_inner, ds = s.ssm_d_state, nvh = s.ssm_dt_rank;
+  const uint64_t ne = s.n_expert, ff = s.n_ff_exp, ffs = s.n_ff_shexp;
+  l.recurrent = recurrent;
+  std::vector<Status> all;
+  all.push_back(bind_vector(r, base, p + "attn_norm.weight", {e}, l.attn_norm));
+  all.push_back(bind_vector(r, base, p + "post_attention_norm.weight", {e}, l.post_norm));
+  if (!l.recurrent) {
+    if (r.find_tensor(p + "attn_qkv.weight")) {
+      // a fused projection (newer converters): the rows are [query | gate] per head, then the keys, then the values, so
+      // the three views are consecutive row ranges of one tensor
+      WeightView f;
+      if (Status fs = bind_view(r, base, p + "attn_qkv.weight", {e, 2 * hd * nh + 2 * hd * nkv}, f); !fs) return fs;
+      l.wq = l.wk = l.wv = f;
+      l.wq.ne[1] = 2 * hd * nh;
+      l.wk.ne[1] = l.wv.ne[1] = hd * nkv;
+      l.wk.data = f.data + 2 * hd * nh * f.row_bytes;
+      l.wv.data = l.wk.data + hd * nkv * f.row_bytes;
+    } else {
+      all.push_back(bind_view(r, base, p + "attn_q.weight", {e, 2 * hd * nh}, l.wq));
+      all.push_back(bind_view(r, base, p + "attn_k.weight", {e, hd * nkv}, l.wk));
+      all.push_back(bind_view(r, base, p + "attn_v.weight", {e, hd * nkv}, l.wv));
+    }
+    all.push_back(bind_view(r, base, p + "attn_output.weight", {hd * nh, e}, l.wo));
+    all.push_back(bind_vector(r, base, p + "attn_q_norm.weight", {hd}, l.q_norm));
+    all.push_back(bind_vector(r, base, p + "attn_k_norm.weight", {hd}, l.k_norm));
+  } else {
+    all.push_back(bind_view(r, base, p + "attn_qkv.weight", {e, ch}, l.wqkv));
+    all.push_back(bind_view(r, base, p + "attn_gate.weight", {e, di}, l.wgate));
+    all.push_back(bind_view(r, base, p + "ssm_beta.weight", {e, nvh}, l.wbeta));
+    all.push_back(bind_view(r, base, p + "ssm_alpha.weight", {e, nvh}, l.walpha));
+    all.push_back(bind_view(r, base, p + "ssm_out.weight", {di, e}, l.ssm_out));
+    all.push_back(bind_vector(r, base, p + "ssm_conv1d.weight", {s.ssm_d_conv, ch}, l.conv1d));
+    all.push_back(bind_vector(r, base, p + "ssm_dt.bias", {nvh}, l.ssm_dt));
+    all.push_back(bind_vector(r, base, p + "ssm_a", {nvh}, l.ssm_a));
+    all.push_back(bind_vector(r, base, p + "ssm_norm.weight", {ds}, l.ssm_norm));
+  }
+  all.push_back(bind_view(r, base, p + "ffn_gate_inp.weight", {e, ne}, l.gate_inp));
+  if (r.find_tensor(p + "ffn_gate_up_exps.weight")) {
+    all.push_back(bind_gate_up_exps(r, base, p + "ffn_gate_up_exps.weight", e, ff, ne, l.gate_exps, l.up_exps));
+  } else {
+    all.push_back(bind_experts(r, base, p + "ffn_up_exps.weight", e, ff, ne, l.up_exps));
+    all.push_back(bind_experts(r, base, p + "ffn_gate_exps.weight", e, ff, ne, l.gate_exps));
+  }
+  all.push_back(bind_experts(r, base, p + "ffn_down_exps.weight", ff, e, ne, l.down_exps));
+  all.push_back(bind_view(r, base, p + "ffn_up_shexp.weight", {e, ffs}, l.up_shexp));
+  all.push_back(bind_view(r, base, p + "ffn_gate_shexp.weight", {e, ffs}, l.gate_shexp));
+  all.push_back(bind_view(r, base, p + "ffn_down_shexp.weight", {ffs, e}, l.down_shexp));
+  all.push_back(bind_vector(r, base, p + "ffn_gate_inp_shexp.weight", {e}, l.gate_inp_shexp));
+  for (const Status& x : all)
+    if (!x) return x;
+  return Status::good();
+}
+}  // namespace
+
 Result<Qwen35MoeWeights> bind_qwen35moe(const io::GgufReader& r, const std::uint8_t* base, const Qwen35MoeSpec& s) {
   using R = Result<Qwen35MoeWeights>;
   Qwen35MoeWeights w;
@@ -1066,49 +1145,32 @@ Result<Qwen35MoeWeights> bind_qwen35moe(const io::GgufReader& r, const std::uint
   if (!w.output.present()) w.output = w.tok_embd;  // tied embeddings
   st = bind_vector(r, base, "output_norm.weight", {e}, w.output_norm);
   if (!st) return R::fail(st);
-  const uint64_t hd = s.head_dim, nh = s.n_head, nkv = s.n_head_kv;
-  const uint64_t ch = s.conv_channels(), di = s.ssm_d_inner, ds = s.ssm_d_state, nvh = s.ssm_dt_rank;
-  const uint64_t ne = s.n_expert, ff = s.n_ff_exp, ffs = s.n_ff_shexp;
   w.layers.resize(s.n_layer);
-  for (std::uint32_t il = 0; il < s.n_layer; ++il) {
-    Qwen35MoeLayer& l = w.layers[il];
-    l.recurrent = s.is_recurrent(il);
-    const std::string p = "blk." + std::to_string(il) + ".";
-    std::vector<Status> all;
-    all.push_back(bind_vector(r, base, p + "attn_norm.weight", {e}, l.attn_norm));
-    all.push_back(bind_vector(r, base, p + "post_attention_norm.weight", {e}, l.post_norm));
-    if (!l.recurrent) {
-      if (r.find_tensor(p + "attn_qkv.weight"))
-        return R::fail(Status::fail(Code::unsupported, "a fused q/k/v projection on a full-attention layer is not read yet", 0, p + "attn_qkv.weight"));
-      all.push_back(bind_view(r, base, p + "attn_q.weight", {e, 2 * hd * nh}, l.wq));
-      all.push_back(bind_view(r, base, p + "attn_k.weight", {e, hd * nkv}, l.wk));
-      all.push_back(bind_view(r, base, p + "attn_v.weight", {e, hd * nkv}, l.wv));
-      all.push_back(bind_view(r, base, p + "attn_output.weight", {hd * nh, e}, l.wo));
-      all.push_back(bind_vector(r, base, p + "attn_q_norm.weight", {hd}, l.q_norm));
-      all.push_back(bind_vector(r, base, p + "attn_k_norm.weight", {hd}, l.k_norm));
-    } else {
-      all.push_back(bind_view(r, base, p + "attn_qkv.weight", {e, ch}, l.wqkv));
-      all.push_back(bind_view(r, base, p + "attn_gate.weight", {e, di}, l.wgate));
-      all.push_back(bind_view(r, base, p + "ssm_beta.weight", {e, nvh}, l.wbeta));
-      all.push_back(bind_view(r, base, p + "ssm_alpha.weight", {e, nvh}, l.walpha));
-      all.push_back(bind_view(r, base, p + "ssm_out.weight", {di, e}, l.ssm_out));
-      all.push_back(bind_vector(r, base, p + "ssm_conv1d.weight", {s.ssm_d_conv, ch}, l.conv1d));
-      all.push_back(bind_vector(r, base, p + "ssm_dt.bias", {nvh}, l.ssm_dt));
-      all.push_back(bind_vector(r, base, p + "ssm_a", {nvh}, l.ssm_a));
-      all.push_back(bind_vector(r, base, p + "ssm_norm.weight", {ds}, l.ssm_norm));
+  for (std::uint32_t il = 0; il < s.n_layer; ++il)
+    if (Status ls = bind_layer(r, base, s, "blk." + std::to_string(il) + ".", s.is_recurrent(il), w.layers[il]); !ls) return R::fail(ls);
+  // GP3-08: the MTP block, when the file has one. A file may leave its tensors out (the MTP piece is optional to a
+  // converter); then the model runs without drafting. One that has some of them must have all of them.
+  if (s.n_layer_all > s.n_layer) {
+    if (s.n_layer_all - s.n_layer != 1)
+      return R::fail(Status::fail(Code::unsupported, "more than one MTP block (nextn_predict_layers > 1) is not read yet"));
+    const std::string p = "blk." + std::to_string(s.n_layer) + ".";
+    if (r.find_tensor(p + "nextn.eh_proj.weight")) {
+      Qwen35MoeMtp& m = w.mtp;
+      if (Status ls = bind_layer(r, base, s, p, false, m.layer); !ls) return R::fail(ls);
+      std::vector<Status> all;
+      all.push_back(bind_view(r, base, p + "nextn.eh_proj.weight", {2 * e, e}, m.eh_proj));
+      all.push_back(bind_vector(r, base, p + "nextn.enorm.weight", {e}, m.enorm));
+      all.push_back(bind_vector(r, base, p + "nextn.hnorm.weight", {e}, m.hnorm));
+      all.push_back(bind_view(r, base, p + "nextn.embed_tokens.weight", {e, nv}, m.embed_tokens, false));
+      all.push_back(bind_view(r, base, p + "nextn.shared_head_head.weight", {e, nv}, m.head, false));
+      if (r.find_tensor(p + "nextn.shared_head_norm.weight")) all.push_back(bind_vector(r, base, p + "nextn.shared_head_norm.weight", {e}, m.head_norm));
+      for (const Status& x : all)
+        if (!x) return R::fail(x);
+      if (!m.embed_tokens.present()) m.embed_tokens = w.tok_embd;
+      if (!m.head.present()) m.head = w.output;
+      if (m.head_norm.empty()) m.head_norm = w.output_norm;
+      m.present = true;
     }
-    if (r.find_tensor(p + "ffn_gate_up_exps.weight"))
-      return R::fail(Status::fail(Code::unsupported, "fused expert gate/up tensors are not read yet", 0, p + "ffn_gate_up_exps.weight"));
-    all.push_back(bind_view(r, base, p + "ffn_gate_inp.weight", {e, ne}, l.gate_inp));
-    all.push_back(bind_experts(r, base, p + "ffn_up_exps.weight", e, ff, ne, l.up_exps));
-    all.push_back(bind_experts(r, base, p + "ffn_gate_exps.weight", e, ff, ne, l.gate_exps));
-    all.push_back(bind_experts(r, base, p + "ffn_down_exps.weight", ff, e, ne, l.down_exps));
-    all.push_back(bind_view(r, base, p + "ffn_up_shexp.weight", {e, ffs}, l.up_shexp));
-    all.push_back(bind_view(r, base, p + "ffn_gate_shexp.weight", {e, ffs}, l.gate_shexp));
-    all.push_back(bind_view(r, base, p + "ffn_down_shexp.weight", {ffs, e}, l.down_shexp));
-    all.push_back(bind_vector(r, base, p + "ffn_gate_inp_shexp.weight", {e}, l.gate_inp_shexp));
-    for (const Status& x : all)
-      if (!x) return R::fail(x);
   }
   // weights the file stores rotated (pelias.rot32.tensors, written by `pelias quantize --rotate32`)
   for (const io::GgufKv& kv : r.kv()) {
@@ -1118,18 +1180,28 @@ Result<Qwen35MoeWeights> bind_qwen35moe(const io::GgufReader& r, const std::uint
     std::vector<std::string> names;
     if (Status as = r.array_strings(kv.value, names); !as) return R::fail(as);
     std::vector<WeightView*> views{&w.output};
-    for (Qwen35MoeLayer& l : w.layers)
-      for (WeightView* p : {&l.wq, &l.wk, &l.wv, &l.wo, &l.wqkv, &l.wgate, &l.wbeta, &l.walpha, &l.ssm_out, &l.up_exps, &l.gate_exps, &l.down_exps,
-                            &l.up_shexp, &l.gate_shexp, &l.down_shexp})
+    std::vector<Qwen35MoeLayer*> layers;
+    for (Qwen35MoeLayer& l : w.layers) layers.push_back(&l);
+    if (w.mtp.present) {
+      layers.push_back(&w.mtp.layer);
+      views.push_back(&w.mtp.eh_proj);
+      if (w.mtp.head.data != w.output.data) views.push_back(&w.mtp.head);
+    }
+    for (Qwen35MoeLayer* l : layers)
+      for (WeightView* p : {&l->wq, &l->wk, &l->wv, &l->wo, &l->wqkv, &l->wgate, &l->wbeta, &l->walpha, &l->ssm_out, &l->up_exps, &l->gate_exps,
+                            &l->down_exps, &l->up_shexp, &l->gate_shexp, &l->down_shexp})
         views.push_back(p);
     for (const std::string& nm : names) {
       WeightView* hit = nullptr;
       for (WeightView* p : views)
-        if (p->present() && p->name == nm) hit = p;
+        if (p->present() && p->name == nm) {
+          if (hit && hit != p) p->rot32 = true;  // a fused tensor's other views (q/k/v, gate/up) share its name
+          hit = p;
+        }
       if (!hit) {
-        // a block the reference does not run (the MTP block) may be stored rotated; anything else must be a product here
+        // an MTP block the file left incomplete is not bound (no drafting); its rotated tensors are skipped with it
         const bool mtp = nm.rfind("blk." + std::to_string(s.n_layer) + ".", 0) == 0;
-        if (mtp) continue;
+        if (mtp && !w.mtp.present) continue;
         return R::fail(Status::fail(Code::unsupported, "the file marks a tensor as rotated that is not a product weight of this model", 0, nm));
       }
       if (hit == &w.output && w.output.data == w.tok_embd.data)
@@ -1137,9 +1209,9 @@ Result<Qwen35MoeWeights> bind_qwen35moe(const io::GgufReader& r, const std::uint
       if (hit->ne[0] % 32 != 0) return R::fail(Status::fail(Code::corrupt, "a rotated tensor's row length is not a multiple of 32", 0, nm));
       hit->rot32 = true;
     }
-    for (const Qwen35MoeLayer& l : w.layers)
-      if (l.gate_exps.rot32 != l.up_exps.rot32)
-        return R::fail(Status::fail(Code::unsupported, "expert gate and up share one input, so both or neither must be rotated", 0, l.gate_exps.name));
+    for (const Qwen35MoeLayer* l : layers)
+      if (l->gate_exps.rot32 != l->up_exps.rot32)
+        return R::fail(Status::fail(Code::unsupported, "expert gate and up share one input, so both or neither must be rotated", 0, l->gate_exps.name));
   }
   return R::good(std::move(w));
 }
@@ -1251,6 +1323,18 @@ Result<int> attach_planes(const io::GgufReader& pr, const std::uint8_t* pb, Qwen
 namespace {
 Status forward_impl(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, const std::int32_t* tokens, int n_tokens, int out_begin, int out_end,
                     float* logits, const ForwardOptions& opt, DecodeState* st);
+
+// one token's embedding row (and its planes, when the table has them and they are read)
+void embed_row(const WeightView& te, std::int32_t tok, int64_t e, bool planes, float* out) {
+  (void)quant::dequantize_row(static_cast<quant::Type>(te.type), te.data + static_cast<uint64_t>(tok) * te.row_bytes, out, e);
+  if (planes && te.planes) {
+    if (te.plane_mask)
+      quant::plane_add_row_sparse(te.planes + static_cast<uint64_t>(te.plane_off[tok]) * 34u * static_cast<uint64_t>(te.plane_k_stored),
+                                  te.plane_mask + static_cast<uint64_t>(tok) * te.plane_mask_bytes, e, te.plane_k_stored, te.plane_k, out);
+    else
+      quant::plane_add_row(te.planes + static_cast<uint64_t>(tok) * te.plane_row_bytes, e, te.plane_k_stored, te.plane_k, out);
+  }
+}
 }  // namespace
 
 Status forward_reference(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, const std::int32_t* tokens, int n_tokens, int out_begin,
@@ -1279,6 +1363,173 @@ Status forward_decode(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, DecodeS
   if (st.k.size() != s.n_layer) return Status::fail(Code::invalid_argument, "the decode state was not sized for this model (decode_state_reset)");
   if (n_new <= 0) return Status::fail(Code::invalid_argument, "no new tokens");
   return forward_impl(s, w, tokens, n_new, last_only ? n_new - 1 : 0, n_new, logits, opt, &st);
+}
+
+void mtp_state_reset(MtpState& st) {
+  st.pos = 0;
+  st.kv = {};
+  st.kv.k.assign(1, {});
+  st.kv.v.assign(1, {});
+}
+
+void mtp_state_truncate(const Qwen35MoeSpec& s, MtpState& st, std::int64_t pos) {
+  if (pos >= st.pos || pos < 0) return;
+  const std::size_t kv_w = static_cast<std::size_t>(s.head_dim) * s.n_head_kv;
+  st.kv.k[0].resize(static_cast<std::size_t>(pos) * kv_w);
+  st.kv.v[0].resize(static_cast<std::size_t>(pos) * kv_w);
+  st.pos = pos;
+  st.kv.pos = pos;
+}
+
+Status mtp_forward(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, MtpState& st, const std::int32_t* tokens, const float* h_prev, int n,
+                   float* logits, float* h_out, const ForwardOptions& opt) {
+  if (!w.mtp.present) return Status::fail(Code::unsupported, "this file has no MTP block (nextn_predict_layers 0, or its tensors left out)");
+  if (n <= 0) return Status::fail(Code::invalid_argument, "no tokens");
+  if (st.kv.k.size() != 1) return Status::fail(Code::invalid_argument, "the MTP state was not reset (mtp_state_reset)");
+  if (Status cs = check_act_rounding(opt, w); !cs) return cs;
+  const Qwen35MoeMtp& m = w.mtp;
+  // the per-layer records and the measurement options belong to the trunk's layers; the MTP block runs plain
+  ForwardOptions o = opt;
+  o.expert_picks = nullptr;
+  o.expert_weight = nullptr;
+  o.imatrix = nullptr;
+  o.route = nullptr;
+  o.state_codes = nullptr;
+  o.qk_dump = nullptr;
+  o.hot.clear();
+  o.cold_gpu256 = false;
+  o.swap_margin = 0.0f;
+  o.defer_experts = 0;
+  o.m_stats = nullptr;
+  o.neuron_skip = 0.0;
+  o.kv_store = ForwardOptions::StateStore::exact;
+  o.hidden_out = nullptr;
+  const int threads = o.threads > 0 ? o.threads : static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
+  const int64_t e = s.n_embd;
+  std::vector<Scratch> sc(z(threads));
+  for (Scratch& x : sc) {
+    x.planes = o.planes;
+    x.fast = o.fast_cpu;
+  }
+  Ctx c{s, threads, sc, n, o};
+  c.st = &st.kv;
+  c.pos0 = st.pos;
+  c.il = 0;  // the MTP state holds one layer
+  // [enorm(embedding) | hnorm(h_prev)] -> eh_proj
+  std::vector<float> cat(z(2 * n * e)), emb(z(e)), x(z(n * e)), xn(z(n * e)), y(z(n * e));
+  for (int64_t t = 0; t < n; ++t) {
+    const std::int32_t tok = tokens[t];
+    if (tok < 0 || static_cast<uint64_t>(tok) >= s.n_vocab) return Status::fail(Code::invalid_argument, "a token id is outside the vocabulary");
+    embed_row(m.embed_tokens, tok, e, o.planes, emb.data());
+    rms_norm(emb.data(), m.enorm.data(), cat.data() + t * 2 * e, e, s.rms_eps);
+    rms_norm(h_prev + t * e, m.hnorm.data(), cat.data() + t * 2 * e + e, e, s.rms_eps);
+  }
+  mm(c, m.eh_proj, cat.data(), n, 2 * e, x.data(), e);
+  // one full-attention decoder block: x += attn(attn_norm(x)); x += moe(post_norm(x))
+  const Qwen35MoeLayer& l = m.layer;
+  for (int64_t t = 0; t < n; ++t) rms_norm(x.data() + t * e, l.attn_norm.data(), xn.data() + t * e, e, s.rms_eps);
+  st.kv.pos = st.pos;
+  full_attention(c, l, xn.data(), y.data());
+  for (int64_t i = 0; i < n * e; ++i) x[z(i)] += y[z(i)];
+  for (int64_t t = 0; t < n; ++t) rms_norm(x.data() + t * e, l.post_norm.data(), xn.data() + t * e, e, s.rms_eps);
+  moe(c, l, xn.data(), y.data());
+  for (int64_t i = 0; i < n * e; ++i) x[z(i)] += y[z(i)];
+  st.pos += n;
+  st.kv.pos = st.pos;
+  // the head norm gives the block's hidden (the next draft step's seed) and the logits' input
+  for (int64_t t = 0; t < n; ++t) rms_norm(x.data() + t * e, m.head_norm.data(), xn.data() + t * e, e, s.rms_eps);
+  if (h_out) std::copy_n(xn.data(), z(n * e), h_out);
+  if (logits) mm(c, m.head, xn.data(), n, e, logits, s.n_vocab);
+  return Status::good();
+}
+
+namespace {
+std::int32_t argmax_row(const float* lg, int64_t nv) {  // the first of equal largest logits, as greedy sampling picks
+  int64_t best = 0;
+  for (int64_t i = 1; i < nv; ++i)
+    if (lg[i] > lg[best]) best = i;
+  return static_cast<std::int32_t>(best);
+}
+}  // namespace
+
+Status generate_greedy_mtp(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, const std::vector<std::int32_t>& prompt, int n_predict, int n_draft,
+                           std::int32_t eos, std::vector<std::int32_t>& out, MtpStats* stats, const ForwardOptions& opt) {
+  out.clear();
+  if (prompt.empty()) return Status::fail(Code::invalid_argument, "an empty prompt");
+  if (n_predict <= 0) return Status::good();
+  if (n_draft < 0) return Status::fail(Code::invalid_argument, "the draft length is 0 or more");
+  if (n_draft > 0 && !w.mtp.present) return Status::fail(Code::unsupported, "this file has no MTP block to draft with");
+  const int64_t e = s.n_embd, nv = s.n_vocab, P = static_cast<int64_t>(prompt.size());
+  MtpStats local;
+  MtpStats& stt = stats ? *stats : local;
+  DecodeState ts;
+  decode_state_reset(s, ts);
+  MtpState ms;
+  mtp_state_reset(ms);
+  // prompt: the trunk's last logits and every position's hidden
+  std::vector<float> lg(z(nv)), hid(z(P * e));
+  ForwardOptions o = opt;
+  o.hidden_out = hid.data();
+  if (Status st = forward_decode(s, w, ts, prompt.data(), static_cast<int>(P), lg.data(), true, o); !st) return st;
+  std::vector<float> pending(hid.end() - e, hid.end());  // h of the last position run by the trunk
+  if (n_draft > 0) {  // the MTP block catches up on the prompt: token p with h of p - 1 (zeros before the first)
+    std::vector<float> hp(z(P * e), 0.0f);
+    std::copy(hid.begin(), hid.end() - e, hp.begin() + e);
+    if (Status st = mtp_forward(s, w, ms, prompt.data(), hp.data(), static_cast<int>(P), nullptr, nullptr, opt); !st) return st;
+  }
+  std::int32_t last = argmax_row(lg.data(), nv);
+  out.push_back(last);
+  while (static_cast<int>(out.size()) < n_predict && last != eos) {
+    ++stt.steps;
+    // draft up to n_draft tokens from `last` (never more than the tokens still wanted after the trunk's own next one)
+    const int room = n_predict - static_cast<int>(out.size()) - 1;
+    const int k = std::max(0, std::min(n_draft, room));
+    std::vector<std::int32_t> drafts;
+    const std::int64_t m0 = ms.pos;
+    if (k > 0) {
+      std::vector<float> h(pending), dl(z(nv)), hn(z(e));
+      std::int32_t tok = last;
+      for (int i = 0; i < k; ++i) {
+        if (Status st = mtp_forward(s, w, ms, &tok, h.data(), 1, dl.data(), hn.data(), opt); !st) return st;
+        tok = argmax_row(dl.data(), nv);
+        drafts.push_back(tok);
+        h = hn;
+      }
+      mtp_state_truncate(s, ms, m0);  // the drafts' cache entries go; the kept tokens are run again below with the trunk's h
+      stt.drafted += k;
+    }
+    // verify: the trunk runs `last` and the drafts as one batch (every row's logits and hidden)
+    const int nb = 1 + k;
+    std::vector<std::int32_t> batch{last};
+    batch.insert(batch.end(), drafts.begin(), drafts.end());
+    std::vector<float> bl(z(nb * nv)), bh(z(nb * e));
+    const DecodeState saved = k > 0 ? ts : DecodeState{};
+    o.hidden_out = bh.data();
+    if (Status st = forward_decode(s, w, ts, batch.data(), nb, bl.data(), false, o); !st) return st;
+    int a = 0;  // drafts kept: each must equal the trunk's own choice at the row before it
+    while (a < k && argmax_row(bl.data() + a * nv, nv) == drafts[z(a)] && drafts[z(a)] != eos) ++a;
+    if (a < k && drafts[z(a)] == eos && argmax_row(bl.data() + a * nv, nv) == eos) ++a;  // a kept end-of-text ends the run
+    const std::int32_t next = argmax_row(bl.data() + a * nv, nv);
+    if (a < k) {  // the trunk's state must not hold the rejected drafts: back to before the batch, then the kept rows again
+      ts = saved;
+      std::vector<float> rl(z(nv));
+      o.hidden_out = bh.data();
+      if (Status st = forward_decode(s, w, ts, batch.data(), a + 1, rl.data(), true, o); !st) return st;
+    }
+    stt.accepted += a;
+    if (n_draft > 0) {  // the MTP block catches up on the kept tokens, each paired with the trunk's h of the position before
+      std::vector<float> hp(z((a + 1) * e));
+      std::copy(pending.begin(), pending.end(), hp.begin());
+      std::copy(bh.begin(), bh.begin() + a * e, hp.begin() + e);
+      if (Status st = mtp_forward(s, w, ms, batch.data(), hp.data(), a + 1, nullptr, nullptr, opt); !st) return st;
+    }
+    pending.assign(bh.begin() + a * e, bh.begin() + (a + 1) * e);
+    for (int i = 0; i < a && static_cast<int>(out.size()) < n_predict; ++i) out.push_back(drafts[z(i)]);
+    if (!out.empty() && out.back() == eos) break;
+    if (static_cast<int>(out.size()) < n_predict) out.push_back(next);
+    last = next;
+  }
+  return Status::good();
 }
 
 namespace {
@@ -1335,16 +1586,7 @@ Status forward_impl(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, const std
   for (int64_t t = 0; t < n; ++t) {
     const std::int32_t tok = tokens[t];
     if (tok < 0 || static_cast<uint64_t>(tok) >= s.n_vocab) return Status::fail(Code::invalid_argument, "a token id is outside the vocabulary");
-    (void)quant::dequantize_row(static_cast<quant::Type>(w.tok_embd.type), w.tok_embd.data + static_cast<uint64_t>(tok) * w.tok_embd.row_bytes,
-                                x.data() + t * e, e);
-    if (opt.planes && w.tok_embd.planes) {
-      const WeightView& te = w.tok_embd;
-      if (te.plane_mask)
-        quant::plane_add_row_sparse(te.planes + static_cast<uint64_t>(te.plane_off[tok]) * 34u * static_cast<uint64_t>(te.plane_k_stored),
-                                    te.plane_mask + static_cast<uint64_t>(tok) * te.plane_mask_bytes, e, te.plane_k_stored, te.plane_k, x.data() + t * e);
-      else
-        quant::plane_add_row(te.planes + static_cast<uint64_t>(tok) * te.plane_row_bytes, e, te.plane_k_stored, te.plane_k, x.data() + t * e);
-    }
+    embed_row(w.tok_embd, tok, e, opt.planes, x.data() + t * e);
   }
   for (std::uint32_t il = 0; il < s.n_layer; ++il) {
     const Qwen35MoeLayer& l = w.layers[il];
@@ -1389,6 +1631,8 @@ Status forward_impl(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, const std
   if (opt.defer_experts > 0)  // the last layer's deferred experts arrive before the output norm
     for (int64_t i = 0; i < n * e; ++i) x[z(i)] += ydef_prev[z(i)];
   if (dst) dst->pos += n;
+  if (opt.hidden_out)  // GP3-08: every token's post-norm hidden, the MTP block's seed
+    for (int64_t t = 0; t < n; ++t) rms_norm(x.data() + t * e, w.output_norm.data(), opt.hidden_out + t * e, e, s.rms_eps);
   if (!logits) return Status::good();  // the activations were all the caller wanted (importance matrix)
   const int64_t m = out_end - out_begin;
   for (int64_t t = 0; t < m; ++t) rms_norm(x.data() + (out_begin + t) * e, w.output_norm.data(), xn.data() + t * e, e, s.rms_eps);
