@@ -404,6 +404,67 @@ projected KL. Script: `alloc_cross.py`.
   - the error propagated through SwiGLU (silu(gate)·up into down). Inputs are drawn with the imatrix's variances, and the
     proxy is checked against down's measured input energy.
 
+### 6.7 The 40-layer slopes and the two options (author 06:12; extraction MEASURED, projections DERIVED)
+
+**Inputs (MEASURED).**
+- Experts 0-1 of every layer, gate, up and down, from the BF16 original: `gp/TIER/slices*`, 120 matrices.
+- Each quantized to Q4_K, Q4_TG2, Q5_K, Q6_K and Q8_0 with its own importance.
+- Error measured three ways:
+  - weight error (wrel);
+  - error through SwiGLU relative to the expert's own output (orel);
+  - the same in absolute terms (oabs).
+- Scripts: `tier_slopes.py`, `tier_project.py`, `tier_vram.py`; `kqwp.cc` is the pipe helper.
+
+**Findings.**
+- **Relative errors are nearly flat across layers.**
+  - Q4_K orel is 3.6-5.3e-3, layers 1-39 alike.
+  - Layer 0 is lowest (2.2-3.5e-3), so in these measures the early layers do not stand out as needing protection.
+- **Gate/up vs down.**
+  - Down's orel matches gate/up in layers 0-31.
+  - In layers 32-39 it is 10-35 % higher, so the allocator gives down slightly more: 3,500 Q5_K vs 3,124 for gate.
+- **The SwiGLU proxy is weak.**
+  - Its per-channel down-input energy correlates -0.18 to 0.63 with the imatrix.
+  - So orel's gate/up-vs-down split carries that caveat. wrel and orel give the same answer within 0.0002 KL.
+- **Absolute output error (oabs) would move bytes to layers 27-39** (5-6 bits per weight there) and project KL 0.0072 /
+  0.0082.
+  - It ignores that the residual stream also grows with depth.
+  - How much a unit of error costs per layer is UNMEASURED. To measure it: `kld` with one group of 10 layers changed at a
+    time (4 runs, about 25 min each).
+
+**Option 1: static Q4_TG2-floor file, 50/50 mix ranking (orel).**
+- VRAM is for the hot set, the top 64 experts per layer.
+- "+ x GB in the file" puts the side file's bytes into the file instead, for comparison.
+
+| File | KL WikiText | KL chat+code | VRAM, hot 64 | Expert MB per token |
+|---|---|---|---|---|
+| Unsloth, 22.65 GB | 0.0128 (MEASURED) | about 0.0129 | 4.89 GB | 612 |
+| **Tiered, 22.65 GB** | **0.0089 (-30 %)** | **0.0108 (-16 %)** | 5.60 GB | 641-688 |
+| + 1 GB in the file (23.65 GB) | 0.0077 | 0.0093 | 5.85 GB | 681-729 |
+| + 2 GB in the file (24.65 GB) | 0.0070 | 0.0081 | 6.21 GB | 716-762 |
+
+**Option 2: the 22.65 GB tiered base + block-selective planes.**
+- The planes are chosen by weight error and layer slope only (Option A), so the choice does not depend on the text.
+- If the CPU side computes the plane term, the planes need no VRAM. The CPU plane kernel is not built yet.
+- MB per token is the extra read on the system-RAM bus, ESTIMATE from block share x picks.
+- "Hot only" reads the planes only for the context-hot top 32 experts, which carry 55 % of routing weight on WikiText; it
+  is applied as a flat factor (ASSUMPTION).
+
+| Side file | Read | KL WikiText | KL chat+code | VRAM added | Extra MB per token |
+|---|---|---|---|---|---|
+| 0.5 GB | always | 0.0086 | 0.0101 | 0 | about 16 |
+| 1.0 GB | always | 0.0083 | 0.0096 | 0 | about 31 |
+| 1.0 GB | hot only | 0.0086 | 0.0101 | 0 | about 17 |
+| 2.0 GB | always | 0.0079 | 0.0087 | 0 | about 63 |
+| 4.23 GB | always | 0.0065 | 0.0072 | 0 | about 134 |
+
+**Reading.**
+- At the same total bytes, the file is more accurate. +2 GB gives 0.0070 / 0.0081 in the file, against 0.0079 / 0.0087 as
+  planes.
+- The planes add no VRAM and only CPU-bus reads; the file adds 0.25-0.6 GB of VRAM to the hot set.
+- Reading block planes always beats reading them for context-hot experts only.
+- The tiered file costs 0.71 GB more VRAM than Unsloth at the same size (5.60 vs 4.89 GB for the hot 64). That fits a
+  12 GB card either way.
+
 ## 7. Status
 
 - Built and pushed: `pelias planes`; `--planes / --plane-k / --head-rescore` on `kld` and `generate`; `generate
