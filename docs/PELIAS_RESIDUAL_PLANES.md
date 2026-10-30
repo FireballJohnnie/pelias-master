@@ -465,6 +465,24 @@ projected KL. Script: `alloc_cross.py`.
 - The tiered file costs 0.71 GB more VRAM than Unsloth at the same size (5.60 vs 4.89 GB for the hot 64). That fits a
   12 GB card either way.
 
+### 6.8 Planes for the most-weighted picks only (DPA-MoE's lesson; author 07:17; offline)
+
+DPA-MoE (arXiv:2610.21378) found the router's own per-token scores carry most of its gain. Tested on the WikiText route dump
+(`per_pick_planes.py`): an expert's output enters the layer as w x y_e, so its error counts as w^2; reading planes for a subset
+of a token's 8 picks captures the subset's share of w^2 (ASSUMPTION: the plane cuts each expert's error by the same factor).
+
+| Planes read for | Plane bytes read | Benefit kept (w^2) | Benefit kept (w) |
+|---|---|---|---|
+| top 1 pick per token | 12.5 % | 42.1 % | 24.5 % |
+| top 2 | 25 % | 60.7 % | 41.4 % |
+| top 4 | 50 % | **80.8 %** | 66.1 % |
+| all 8 | 100 % | 100 % | 100 % |
+
+Router weights by rank: 0.245, 0.168, 0.134, 0.113, 0.098, 0.088, 0.080, 0.074 (MEASURED).
+DERIVED: the 2 GB worst-error side file read for the top 4 picks costs about 32 MB per token on the CPU bus (as the 1 GB file
+read always) and projects KL about 0.0081 / 0.0091 (WikiText / chat+code), against 0.0083 / 0.0096 for the 1 GB file read
+always. This replaces "context-hot" reading (6.7), which tested weaker.
+
 ## 7. Status
 
 - Built and pushed: `pelias planes`; `--planes / --plane-k / --head-rescore` on `kld` and `generate`; `generate
