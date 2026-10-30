@@ -23,6 +23,9 @@
 //   v2 fix 6 (Fable item 6): (c) with a per-stage counter waited per warp (c1), and with the next stage's weights prefetched into
 //   L2 before the wait (c2), and with the warp's whole next-stage share prefetched (c3); the check runs the counted kernel with
 //   the whole-share prefetch over two stages (path 3).
+//   Tier (2026-10-30, docs/PELIAS_RESIDUAL_PLANES.md 6.9): r3 stream --distinct --mix FILE gives each layer's 7 routed experts
+//   their own types (40 lines of 7 "gate,up,down" triples, Q4_TG2 / Q5_K / Q6_K; tools/analysis/tier_r3_mix.py samples them from
+//   the tiered file's allocation and measured usage) instead of Q4_TG2 gate/up + Q5_K down; check adds those shapes.
 // Build (WSL / Linux): nvcc -std=c++17 -O3 -arch=sm_89 r3.cu -o r3
 // Build (Windows, from an x64 Native Tools prompt): nvcc -std=c++17 -O3 -arch=sm_89 -Xcompiler /Zc:preprocessor r3.cu -o r3.exe
 //   (MSVC's traditional preprocessor stops on the CUDA headers without /Zc:preprocessor; MEASURED with nvcc 13.4)
@@ -719,7 +722,10 @@ static int run_check() {
   const struct { int fmt, n, K; const char* name; } C[] = {
       {r3::kQ7ZT, 2048, 2048, "Q7_ZT 2048 x 2048"}, {r3::kQ7ZT, 512, 4096, "Q7_ZT 512 x 4096"}, {r3::kQ7ZT, 2048, 512, "Q7_ZT 2048 x 512"},
       {r3::kQ4TG2, 512, 2048, "Q4_TG2 512 x 2048 (expert gate/up)"}, {r3::kQ5K, 2048, 512, "Q5_K 2048 x 512 (expert down)"},
-      {r3::kQ6K, 4096, 2048, "Q6_K 4096 x 2048 (output head rows)"}};
+      {r3::kQ6K, 4096, 2048, "Q6_K 4096 x 2048 (output head rows)"},
+      // tiered experts (r3 stream --mix): every expert format in both expert shapes
+      {r3::kQ5K, 512, 2048, "Q5_K 512 x 2048 (tiered expert gate/up)"}, {r3::kQ6K, 512, 2048, "Q6_K 512 x 2048 (tiered expert gate/up)"},
+      {r3::kQ4TG2, 2048, 512, "Q4_TG2 2048 x 512 (tiered expert down)"}, {r3::kQ6K, 2048, 512, "Q6_K 2048 x 512 (tiered expert down)"}};
   Act A512, A2048, A4096;
   make_act(A512, 512, rng);
   make_act(A2048, 2048, rng);
@@ -822,7 +828,7 @@ static int run_check() {
 }
 
 // ---- stream: one token's weight reads, three ways
-static int run_stream(int soak_s, bool distinct) {
+static int run_stream(int soak_s, bool distinct, const std::vector<std::vector<int>>& mix) {
   set_grids();
   std::mt19937 rng(7);
   const int nsm = sms();
@@ -854,9 +860,13 @@ static int run_stream(int soak_s, bool distinct) {
       add(l, r3::kQ7ZT, 2048, 4096, 1);
     }
     add(l, r3::kQ7ZT, 512, 2048, 2); add(l, r3::kQ7ZT, 512, 2048, 2);  // shared expert gate, up
-    for (int e = 0; e < 7; ++e) { add(l, r3::kQ4TG2, 512, 2048, 2); add(l, r3::kQ4TG2, 512, 2048, 2); }
+    const std::vector<int>* mx = mix.empty() ? nullptr : &mix[static_cast<size_t>(li)];  // tier: 7 x (gate, up, down) formats
+    for (int e = 0; e < 7; ++e) {
+      add(l, mx ? (*mx)[3 * e] : r3::kQ4TG2, 512, 2048, 2);
+      add(l, mx ? (*mx)[3 * e + 1] : r3::kQ4TG2, 512, 2048, 2);
+    }
     add(l, r3::kQ7ZT, 2048, 512, 3);  // shared expert down
-    for (int e = 0; e < 7; ++e) add(l, r3::kQ5K, 2048, 512, 3);
+    for (int e = 0; e < 7; ++e) add(l, mx ? (*mx)[3 * e + 2] : r3::kQ5K, 2048, 512, 3);
     for (Mat& m : l.m) upload(m);
   }
   Mat head;
@@ -948,9 +958,18 @@ static int run_stream(int soak_s, bool distinct) {
     return med;
   };
   size_t head_bytes = head.bytes();
-  std::printf("device %s, %d SMs; one token: %zu jobs (40 layers x [dense Q7_ZT, shared expert, 7 experts Q4_TG2 gate/up + Q5_K down] + "
+  std::printf("device %s, %d SMs; one token: %zu jobs (40 layers x [dense Q7_ZT, shared expert, 7 experts %s] + "
               "Q6_K head), %.3f GB of weights (head %.3f GB), %lld warp tasks; cold (64 MiB written first), median of 21\n",
-              prop.name, nsm, jobs.size(), bytes / 1e9, head_bytes / 1e9, total);
+              prop.name, nsm, jobs.size(), mix.empty() ? "Q4_TG2 gate/up + Q5_K down" : "in the --mix file's types", bytes / 1e9, head_bytes / 1e9, total);
+  {
+    size_t eb = 0;  // the routed experts' bytes alone (stages 2 and 3 minus the shared expert)
+    for (int L = 0; L < 40; ++L) {
+      const auto& l = layers[static_cast<size_t>(distinct ? L : (L % 4 == 3 ? 0 : 1 + L % 3))];
+      for (size_t i = 0; i < l.m.size(); ++i)
+        if (l.stage[i] >= 2 && l.m[i].fmt != r3::kQ7ZT) eb += l.m[i].bytes();
+    }
+    std::printf("routed experts in this token: %.1f MB\n", eb / 1e6);
+  }
   // (a) one launch per matrix, queued back to back
   auto grid_a = [&](const Job& J) { return std::max(1, static_cast<int>(std::min<long long>((J.ntask + 7) / 8, nsm * 8LL))); };
   const double ta = timed([&] {
@@ -1204,12 +1223,38 @@ int main(int argc, char** argv) {
     for (int i = 2; i + 1 < argc; ++i)
       if (std::string(argv[i]) == "--soak") soak = std::atoi(argv[i + 1]);
     bool distinct = false;
-    for (int i = 2; i < argc; ++i)
+    std::string mix_path;
+    for (int i = 2; i < argc; ++i) {
       if (std::string(argv[i]) == "--distinct") distinct = true;
+      if (std::string(argv[i]) == "--mix" && i + 1 < argc) mix_path = argv[i + 1];
+    }
+    std::vector<std::vector<int>> mix;
+    if (!mix_path.empty()) {  // 40 lines, each 7 triples gate,up,down of Q4_TG2 / Q5_K / Q6_K, separated by spaces
+      if (!distinct) { std::fprintf(stderr, "--mix needs --distinct (each layer its own experts)\n"); return 1; }
+      std::FILE* f = std::fopen(mix_path.c_str(), "r");
+      if (!f) { std::fprintf(stderr, "cannot read %s\n", mix_path.c_str()); return 1; }
+      char line[4096];
+      while (std::fgets(line, sizeof line, f)) {
+        std::vector<int> v;
+        for (char* tok = std::strtok(line, " ,\t\r\n"); tok; tok = std::strtok(nullptr, " ,\t\r\n")) {
+          const std::string t = tok;
+          if (t == "Q4_TG2") v.push_back(r3::kQ4TG2);
+          else if (t == "Q5_K") v.push_back(r3::kQ5K);
+          else if (t == "Q6_K") v.push_back(r3::kQ6K);
+          else { std::fprintf(stderr, "%s: unknown type %s (Q4_TG2, Q5_K, Q6_K)\n", mix_path.c_str(), tok); std::fclose(f); return 1; }
+        }
+        if (v.empty()) continue;
+        if (v.size() != 21) { std::fprintf(stderr, "%s: a line needs 7 x (gate, up, down) = 21 types\n", mix_path.c_str()); std::fclose(f); return 1; }
+        mix.push_back(v);
+      }
+      std::fclose(f);
+      if (mix.size() != 40) { std::fprintf(stderr, "%s: needs 40 lines (one per layer), has %zu\n", mix_path.c_str(), mix.size()); return 1; }
+    }
     print_kernels();
-    std::printf("layers: %s\n", distinct ? "40 distinct (no weight read twice per token)" : "4 distinct, cycled over 40");
-    return run_stream(soak, distinct);
+    std::printf("layers: %s%s\n", distinct ? "40 distinct (no weight read twice per token)" : "4 distinct, cycled over 40",
+                mix.empty() ? "" : ("; experts typed by " + mix_path).c_str());
+    return run_stream(soak, distinct, mix);
   }
-  std::fprintf(stderr, "usage: r3 check | stream [--soak SECONDS] [--distinct]\n");
+  std::fprintf(stderr, "usage: r3 check | stream [--soak SECONDS] [--distinct] [--mix FILE]\n");
   return 1;
 }
