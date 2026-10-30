@@ -96,7 +96,9 @@ Result<Tokenizer> Tokenizer::from_gguf(const io::GgufReader& g) {
   if (s) s = g.array_ints(*yv, types64);
   if (s) s = g.array_strings(*mv, merges);
   if (!s) return R::fail(s);
-  std::vector<std::int32_t> types(types64.begin(), types64.end());
+  std::vector<std::int32_t> types;  // token types are small enums (0..6); narrowed one by one (MSVC C4244 on the range form)
+  types.reserve(types64.size());
+  for (const std::int64_t t : types64) types.push_back(static_cast<std::int32_t>(t));
   R r = from_parts(std::move(tokens), std::move(types), merges, pre);
   if (!r.ok()) return r;
   auto id_of = [&](const char* key) -> std::int32_t {
