@@ -10,7 +10,10 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <map>
 #include <thread>
+
+#include "io/tier_build.h"
 
 #include "quant/block_types.h"
 #include "quant/planes.h"
@@ -56,6 +59,50 @@ Status bind_view(const io::GgufReader& r, const std::uint8_t* base, const std::s
   out.ne[1] = ne[1];
   out.ne[2] = ne[2];
   out.row_bytes = quant::row_bytes(t->type, ne[0]);
+  out.name = name;
+  return Status::good();
+}
+
+// Routed experts: the stock tensor, or a usage-tiered weight (io/tier_build.h) read as one view whose experts each keep
+// their own type and rows.
+Status bind_experts(const io::GgufReader& r, const std::uint8_t* base, const std::string& name, uint64_t ne0, uint64_t ne1, uint64_t n_exp,
+                    WeightView& out) {
+  const io::GgufValue* tv = r.find(io::tier_types_key(name));
+  if (!tv) return bind_view(r, base, name, {ne0, ne1, n_exp}, out);
+  if (r.find_tensor(name)) return Status::fail(Code::corrupt, "a tiered weight is also stored whole", 0, name);
+  std::vector<std::int64_t> types;
+  if (tv->type != io::GgufValueType::array) return Status::fail(Code::corrupt, "the tier's types are not a list", 0, name);
+  if (Status s = r.array_ints(*tv, types); !s) return s;
+  if (types.size() != n_exp) return Status::fail(Code::corrupt, "the tier names a type for " + std::to_string(types.size()) + " experts, the layer has " + std::to_string(n_exp), 0, name);
+  std::map<uint32_t, uint64_t> count;
+  for (const std::int64_t t : types) {
+    if (t < 0 || t > 0xFFFF) return Status::fail(Code::corrupt, "the tier names an invalid type id", 0, name);
+    ++count[static_cast<uint32_t>(t)];
+  }
+  std::map<uint32_t, WeightView> part;
+  for (const auto& [t, n] : count) {
+    WeightView v;
+    const std::string pn = io::tier_part_name(name, t);
+    if (Status s = bind_view(r, base, pn, {ne0, ne1, n}, v); !s) return s;
+    part[t] = v;
+  }
+  out = WeightView{};
+  out.slots.resize(n_exp);
+  std::map<uint32_t, uint64_t> next;
+  for (uint64_t e = 0; e < n_exp; ++e) {
+    const auto t = static_cast<uint32_t>(types[e]);
+    const WeightView& v = part[t];
+    out.slots[e] = ExpertSlot{v.data + next[t]++ * ne1 * v.row_bytes, t, v.row_bytes};
+  }
+  uint32_t most = count.begin()->first;
+  for (const auto& [t, n] : count)
+    if (n > count[most]) most = t;
+  out.data = part[most].data;
+  out.type = most;
+  out.row_bytes = part[most].row_bytes;
+  out.ne[0] = ne0;
+  out.ne[1] = ne1;
+  out.ne[2] = n_exp;
   out.name = name;
   return Status::good();
 }
@@ -114,8 +161,13 @@ void load_tile(const WeightView& w, uint64_t first_row, int nr, int64_t k, Scrat
   float* wt = sc.wt.data();
   for (int r = 0; r < nr; ++r) {
     // the type and the row length were checked when the tensor was bound
-    (void)quant::dequantize_row(static_cast<quant::Type>(w.type), w.data + (first_row + static_cast<uint64_t>(r)) * w.row_bytes,
-                                sc.row.data(), k);
+    const uint64_t row = first_row + static_cast<uint64_t>(r);
+    if (w.slots.empty()) {
+      (void)quant::dequantize_row(static_cast<quant::Type>(w.type), w.data + row * w.row_bytes, sc.row.data(), k);
+    } else {  // a usage-tiered expert: its own type and rows
+      const ExpertSlot& s = w.slots[row / w.ne[1]];
+      (void)quant::dequantize_row(static_cast<quant::Type>(s.type), s.data + (row % w.ne[1]) * s.row_bytes, sc.row.data(), k);
+    }
     if (sc.planes && w.planes)  // residual sign planes: the row as the original weights, to the planes read
       quant::plane_add_row(w.planes + (first_row + static_cast<uint64_t>(r)) * w.plane_row_bytes, k, w.plane_k_stored, w.plane_k, sc.row.data());
     const float* src = sc.row.data();
@@ -968,9 +1020,9 @@ Result<Qwen35MoeWeights> bind_qwen35moe(const io::GgufReader& r, const std::uint
     if (r.find_tensor(p + "ffn_gate_up_exps.weight"))
       return R::fail(Status::fail(Code::unsupported, "fused expert gate/up tensors are not read yet", 0, p + "ffn_gate_up_exps.weight"));
     all.push_back(bind_view(r, base, p + "ffn_gate_inp.weight", {e, ne}, l.gate_inp));
-    all.push_back(bind_view(r, base, p + "ffn_up_exps.weight", {e, ff, ne}, l.up_exps));
-    all.push_back(bind_view(r, base, p + "ffn_gate_exps.weight", {e, ff, ne}, l.gate_exps));
-    all.push_back(bind_view(r, base, p + "ffn_down_exps.weight", {ff, e, ne}, l.down_exps));
+    all.push_back(bind_experts(r, base, p + "ffn_up_exps.weight", e, ff, ne, l.up_exps));
+    all.push_back(bind_experts(r, base, p + "ffn_gate_exps.weight", e, ff, ne, l.gate_exps));
+    all.push_back(bind_experts(r, base, p + "ffn_down_exps.weight", ff, e, ne, l.down_exps));
     all.push_back(bind_view(r, base, p + "ffn_up_shexp.weight", {e, ffs}, l.up_shexp));
     all.push_back(bind_view(r, base, p + "ffn_gate_shexp.weight", {e, ffs}, l.gate_shexp));
     all.push_back(bind_view(r, base, p + "ffn_down_shexp.weight", {ffs, e}, l.down_shexp));

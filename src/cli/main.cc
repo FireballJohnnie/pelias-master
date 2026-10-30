@@ -35,6 +35,7 @@
 #include "io/requantize.h"
 #include "io/safetensors.h"
 #include "io/sha256.h"
+#include "io/tier_build.h"
 #include "os/clock.h"
 #include "os/file_map.h"
 #include "os/membw.h"
@@ -143,6 +144,11 @@ void usage() {
       "                                  --rotate32: store the product weights whose names contain one of GROUPS (or 'all')\n"
       "                                  rotated per 32 values (Walsh-Hadamard); the reader rotates their inputs to match\n"
       "                                  a new GGUF in a stock mix (default Q4_K_M), identical to the reference's (exit 6 on a write failure)\n"
+      "  quantize --tier ALLOC.tsv --model BASE.gguf --original ORIG.gguf --out OUT.gguf [--imatrix IMATRIX.gguf] [--threads N]\n"
+      "                                  usage-tiered experts (docs/PELIAS_RESIDUAL_PLANES.md 6.7; tools/tier_alloc.py): BASE's\n"
+      "                                  tensors copied unchanged, except each routed-expert weight ALLOC names, quantized again\n"
+      "                                  expert by expert from ORIG (F32 / F16 / BF16) to the type ALLOC gives that expert. Only\n"
+      "                                  Pelias reads the result (pelias.tier.*)\n"
       "  convert --model FOLDER --out OUT.gguf [--type BF16|Q4_K_M|Q6_K|Q8_0] [--threads N]\n"
       "                                  a Hugging Face folder (safetensors) to a GGUF: BF16 as the reference converter writes it,\n"
       "                                  or a stock mix as the reference quantizer writes it from that BF16 file (exit 6 on a write failure)\n"
@@ -487,7 +493,58 @@ int cmd_plan(const Args& a) {
 }
 
 
+int cmd_quantize_tier(const Args& a) {
+  const std::string in_path = a.get("model"), orig_path = a.get("original"), out_path = a.get("out");
+  if (in_path.empty() || orig_path.empty() || out_path.empty()) {
+    usage();
+    return 1;
+  }
+  io::TierBuildOptions opt;
+  if (a.has("threads")) {
+    const Result<std::uint64_t> t = io::parse_whole(a.get("threads"), 1024);
+    if (!t.ok() || t.value == 0) {
+      std::fprintf(stderr, "pelias: --threads %s\n", t.ok() ? "must be at least 1" : t.status.message.c_str());
+      return 1;
+    }
+    opt.threads = static_cast<int>(t.value);
+  }
+  opt.imatrix = a.get("imatrix");
+  const Result<std::map<std::string, std::vector<std::uint32_t>>> alloc = io::read_tier_alloc(a.get("tier"));
+  if (!alloc.ok()) return fail_input(alloc.status);
+  os::FileMap bm, om;
+  io::GgufReader br, orr;
+  Status s = bm.open(in_path);
+  if (s) s = br.parse(bm);
+  if (!s) return fail_input(s);
+  s = om.open(orig_path);
+  if (s) s = orr.parse(om);
+  if (!s) return fail_input(s);
+  std::printf("tier: %zu weights re-quantized expert by expert from the original; every other tensor copied\n", alloc.value.size());
+  std::fflush(stdout);
+  Timer timer;
+  std::size_t last_pct = 0;
+  const Result<io::TierBuildReport> res = io::build_tiered(bm, br, om, orr, alloc.value, out_path, opt, [&](std::size_t i, std::size_t n, const std::string&) {
+    const std::size_t pct = i * 100 / n;
+    if (pct >= last_pct + 5 || i == n) {
+      last_pct = pct;
+      std::printf("  %3zu %% (%zu of %zu tensors, %.0f s)\n", pct, i, n, timer.seconds());
+      std::fflush(stdout);
+    }
+  });
+  if (!res.ok()) {
+    std::fprintf(stderr, "pelias: %s\n", res.status.text().c_str());
+    return res.status.code == Code::io_error ? 6 : 2;
+  }
+  const io::TierBuildReport& rep = res.value;
+  std::printf("done in %.1f s: %zu tiered weights (%s in the base file, %s now), %zu tensors copied, %s of tensor data; importance used for %zu weights\n",
+              timer.seconds(), rep.tiered, plan::format_bytes(rep.expert_bytes_base).c_str(), plan::format_bytes(rep.expert_bytes_out).c_str(), rep.copied,
+              plan::format_bytes(rep.file_bytes).c_str(), rep.with_imatrix);
+  for (const auto& [t, n] : rep.experts_by_type) std::printf("  %-7s %llu expert matrices\n", quant::type_info(t).name, static_cast<unsigned long long>(n));
+  return 0;
+}
+
 int cmd_quantize(const Args& a) {
+  if (a.has("tier")) return cmd_quantize_tier(a);
   const std::string in_path = a.get("model"), out_path = a.get("out");
   if (in_path.empty() || out_path.empty()) {
     usage();

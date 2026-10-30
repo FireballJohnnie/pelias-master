@@ -62,7 +62,7 @@ if(NOT WIN32)
   target_link_libraries(pelias_os PRIVATE ${CMAKE_DL_LIBS})
 endif()
 pelias_add_module(pelias_io
-  SOURCES src/io/sha256.cpp src/io/json.cpp src/io/gguf_reader.cpp src/io/safetensors.cpp src/io/number_text.cpp src/io/gguf_writer.cpp src/io/requantize.cpp src/io/imatrix_weights.cpp src/io/gguf_compare.cpp src/io/text_file.cpp src/io/planes_build.cpp
+  SOURCES src/io/sha256.cpp src/io/json.cpp src/io/gguf_reader.cpp src/io/safetensors.cpp src/io/number_text.cpp src/io/gguf_writer.cpp src/io/requantize.cpp src/io/imatrix_weights.cpp src/io/gguf_compare.cpp src/io/text_file.cpp src/io/planes_build.cpp src/io/tier_build.cpp
   DEPENDS pelias_os pelias_hal pelias_quant)
 pelias_add_module(pelias_ingest
   SOURCES src/ingest/hf_metadata.cpp src/ingest/hf_vocab.cpp src/ingest/qwen35moe.cpp src/ingest/stage_a.cpp

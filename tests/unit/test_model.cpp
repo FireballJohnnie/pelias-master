@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -13,6 +14,7 @@
 
 #include "gguf_builder.h"
 #include "io/planes_build.h"
+#include "io/tier_build.h"
 #include "io/requantize.h"
 #include "io/gguf_reader.h"
 #include "model/arch_qwen35moe.h"
@@ -697,3 +699,140 @@ TEST(planes_bring_a_quantized_file_toward_its_original) {
   std::printf("    exact head re-score: 8 rows %.4g, all rows %.4g (%.3f of the file alone)\n", mse(ref, lh), kall, kall / k0);
   CHECK(kall <= k2);
 }
+
+// Usage-tiered experts (io/tier_build.h, docs/PELIAS_RESIDUAL_PLANES.md 6.7): (1) a tier that gives every expert its base
+// file's own type rebuilds that file's expert bytes exactly and the same logits bit for bit; (2) a mixed tier reads each
+// expert in its own type (every row equals quantize + dequantize of the original row in that type), its size is the sum of
+// its parts, finer experts move the logits toward the original, and an existing output is refused.
+TEST(tiered_experts_read_each_expert_in_its_own_type) {
+  TinyModel tm;
+  tiny_model(tm);
+  CHECK(tm.ok);
+  if (!tm.ok) return;
+  namespace fs = std::filesystem;
+  namespace q = pelias::quant;
+  static int run = 0;
+  const fs::path dir = fs::temp_directory_path() / ("pelias_tier_test_" + std::to_string(::getpid()) + "_" + std::to_string(run++));
+  std::error_code ec;
+  fs::create_directories(dir, ec);
+  const std::string q4 = (dir / "tiny_Q4_K_M.gguf").string();
+  pelias::io::RequantOptions ro;
+  ro.ftype = q::FileType::q4_k_m;
+  ro.threads = 2;
+  CHECK(pelias::io::requantize(tm.map, tm.reader, q4, ro).ok());
+  pelias::os::FileMap qm;
+  pelias::io::GgufReader qr;
+  CHECK(qm.open(q4).ok() && qr.parse(qm).ok());
+  const std::uint32_t L = tm.spec.n_layer, E = tm.spec.n_expert;
+  const std::vector<std::int32_t> tok{11, 427, 3, 999, 58, 58, 0, 731, 210, 64, 5, 300, 17};
+  const int n = static_cast<int>(tok.size()), v = static_cast<int>(tm.spec.n_vocab);
+  pelias::model::ForwardOptions opt;
+  opt.threads = 2;
+  auto logits = [&](const pelias::model::Qwen35MoeWeights& w) {
+    std::vector<float> lg(static_cast<std::size_t>(n) * static_cast<std::size_t>(v));
+    CHECK(pelias::model::forward_reference(tm.spec, w, tok.data(), n, 0, n, lg.data(), opt).ok());
+    return lg;
+  };
+  auto mse = [&](const std::vector<float>& a, const std::vector<float>& b) {
+    double e = 0.0;
+    for (std::size_t i = 0; i < a.size(); ++i) e += static_cast<double>(a[i] - b[i]) * (a[i] - b[i]);
+    return e / static_cast<double>(a.size());
+  };
+  const char* kinds[] = {"gate", "up", "down"};
+  // (1) every expert in the base file's own type
+  std::map<std::string, std::vector<std::uint32_t>> same;
+  for (std::uint32_t l = 0; l < L; ++l)
+    for (const char* k : kinds) {
+      const std::string nm = "blk." + std::to_string(l) + ".ffn_" + k + "_exps.weight";
+      same[nm] = std::vector<std::uint32_t>(E, qr.find_tensor(nm)->type);
+    }
+  const std::string t1 = (dir / "tiny_tier_same.gguf").string();
+  pelias::io::TierBuildOptions to;
+  to.threads = 2;
+  const auto r1 = pelias::io::build_tiered(qm, qr, tm.map, tm.reader, same, t1, to);
+  CHECK(r1.ok());
+  if (!r1.ok()) {
+    std::printf("      %s\n", r1.status.text().c_str());
+    return;
+  }
+  CHECK_EQ(r1.value.expert_bytes_out, r1.value.expert_bytes_base);
+  pelias::os::FileMap m1;
+  pelias::io::GgufReader g1;
+  CHECK(m1.open(t1).ok() && g1.parse(m1).ok());
+  for (const auto& [nm, types] : same) {  // one part per weight, byte for byte the base file's tensor
+    const auto* a = qr.find_tensor(nm);
+    const auto* b = g1.find_tensor(pelias::io::tier_part_name(nm, types[0]));
+    CHECK(a && b && a->bytes == b->bytes && std::memcmp(qm.data() + a->file_offset, m1.data() + b->file_offset, a->bytes) == 0);
+  }
+  auto w0 = pelias::model::bind_qwen35moe(qr, qm.data(), tm.spec);
+  auto w1 = pelias::model::bind_qwen35moe(g1, m1.data(), tm.spec);
+  CHECK(w0.ok() && w1.ok());
+  if (!w0.ok() || !w1.ok()) return;
+  CHECK(!w1.value.layers[0].gate_exps.slots.empty());
+  const std::vector<float> ref = logits(tm.w), l0 = logits(w0.value), l1 = logits(w1.value);
+  CHECK(l0 == l1);
+  // (2) a mixed tier: experts cycle through four types
+  const std::uint32_t cyc[4] = {static_cast<std::uint32_t>(q::Type::q4_tg2), static_cast<std::uint32_t>(q::Type::q5_k),
+                                static_cast<std::uint32_t>(q::Type::q6_k), static_cast<std::uint32_t>(q::Type::q8_0)};
+  std::map<std::string, std::vector<std::uint32_t>> mixed, fine, coarse;
+  std::uint64_t want_bytes = 0;
+  for (const auto& [nm, types] : same) {
+    const auto* t = qr.find_tensor(nm);
+    for (std::uint32_t e = 0; e < E; ++e) {
+      mixed[nm].push_back(cyc[(e + nm.size()) % 4]);
+      want_bytes += q::row_bytes(mixed[nm].back(), t->ne[0]) * t->ne[1];
+    }
+    fine[nm] = std::vector<std::uint32_t>(E, cyc[3]);
+    coarse[nm] = std::vector<std::uint32_t>(E, cyc[0]);
+  }
+  const std::string t2 = (dir / "tiny_tier_mixed.gguf").string(), t3 = (dir / "tiny_tier_fine.gguf").string(), t4 = (dir / "tiny_tier_coarse.gguf").string();
+  const auto r2 = pelias::io::build_tiered(qm, qr, tm.map, tm.reader, mixed, t2, to);
+  CHECK(r2.ok() && r2.value.expert_bytes_out == want_bytes);
+  CHECK(pelias::io::build_tiered(qm, qr, tm.map, tm.reader, fine, t3, to).ok());
+  CHECK(pelias::io::build_tiered(qm, qr, tm.map, tm.reader, coarse, t4, to).ok());
+  CHECK(!pelias::io::build_tiered(qm, qr, tm.map, tm.reader, mixed, t2, to).ok());  // an existing output is refused
+  pelias::os::FileMap m2, m3, m4;
+  pelias::io::GgufReader g2, g3, g4;
+  CHECK(m2.open(t2).ok() && g2.parse(m2).ok() && m3.open(t3).ok() && g3.parse(m3).ok() && m4.open(t4).ok() && g4.parse(m4).ok());
+  auto w2 = pelias::model::bind_qwen35moe(g2, m2.data(), tm.spec);
+  auto w3 = pelias::model::bind_qwen35moe(g3, m3.data(), tm.spec);
+  auto w4 = pelias::model::bind_qwen35moe(g4, m4.data(), tm.spec);
+  CHECK(w2.ok() && w3.ok() && w4.ok());
+  if (!w2.ok() || !w3.ok() || !w4.ok()) return;
+  // every expert row through its slot = quantize + dequantize of the original row in that expert's type
+  bool rows_ok = true;
+  for (std::uint32_t l = 0; l < L && rows_ok; ++l) {
+    const pelias::model::Qwen35MoeLayer& ly = w2.value.layers[l];
+    for (const pelias::model::WeightView* wv : {&ly.gate_exps, &ly.up_exps, &ly.down_exps}) {
+      const auto* src = tm.reader.find_tensor(wv->name);
+      const std::int64_t k = static_cast<std::int64_t>(wv->ne[0]);
+      std::vector<float> orig(static_cast<std::size_t>(k)), got(orig.size()), want(orig.size());
+      for (std::uint32_t e = 0; e < E && rows_ok; ++e) {
+        const pelias::model::ExpertSlot& sl = wv->slots[e];
+        rows_ok = rows_ok && sl.type == mixed[wv->name][e];
+        std::vector<std::uint8_t> qb(q::row_bytes(sl.type, wv->ne[0]));
+        for (std::uint64_t r = 0; r < wv->ne[1] && rows_ok; r += 37) {
+          (void)q::dequantize_row(static_cast<q::Type>(src->type), tm.map.data() + src->file_offset + (e * wv->ne[1] + r) * q::row_bytes(src->type, wv->ne[0]), orig.data(), k);
+          (void)q::quantize_rows(static_cast<q::Type>(sl.type), orig.data(), qb.data(), 1, k, nullptr);
+          (void)q::dequantize_row(static_cast<q::Type>(sl.type), qb.data(), want.data(), k);
+          (void)q::dequantize_row(static_cast<q::Type>(sl.type), sl.data + r * sl.row_bytes, got.data(), k);
+          rows_ok = got == want;
+        }
+      }
+    }
+  }
+  CHECK(rows_ok);
+  const double e_coarse = mse(logits(w4.value), ref), e_mixed = mse(logits(w2.value), ref), e_fine = mse(logits(w3.value), ref), e_base = mse(l0, ref);
+  std::printf("    logit error vs the original: Q4_K_M %.3g; tiered all Q4_TG2 %.3g, mixed %.3g, all Q8_0 %.3g\n", e_base, e_coarse, e_mixed, e_fine);
+  CHECK(e_fine < e_mixed && e_mixed < e_coarse);
+  // the allocation file (tools/tier_alloc.py) reads back as written; unknown types and repeated names are refused
+  const std::string a1 = (dir / "alloc_ok.tsv").string(), a2 = (dir / "alloc_bad.tsv").string(), a3 = (dir / "alloc_twice.tsv").string();
+  if (std::FILE* f = std::fopen(a1.c_str(), "wx")) { std::fputs("blk.0.ffn_gate_exps.weight\tQ4_TG2,Q5_K,Q6_K,Q8_0\r\n\nblk.0.ffn_up_exps.weight\tQ8_0\n", f); std::fclose(f); }
+  if (std::FILE* f = std::fopen(a2.c_str(), "wx")) { std::fputs("blk.0.ffn_gate_exps.weight\tQ4_TG2,Q9_X\n", f); std::fclose(f); }
+  if (std::FILE* f = std::fopen(a3.c_str(), "wx")) { std::fputs("x\tQ8_0\nx\tQ8_0\n", f); std::fclose(f); }
+  const auto ra = pelias::io::read_tier_alloc(a1);
+  CHECK(ra.ok() && ra.value.size() == 2 && ra.value.at("blk.0.ffn_gate_exps.weight") == std::vector<std::uint32_t>(cyc, cyc + 4) &&
+        ra.value.at("blk.0.ffn_up_exps.weight") == std::vector<std::uint32_t>{cyc[3]});
+  CHECK(!pelias::io::read_tier_alloc(a2).ok() && !pelias::io::read_tier_alloc(a3).ok());
+}
+

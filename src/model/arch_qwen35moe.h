@@ -38,9 +38,19 @@ struct RouteRecord {
   std::int16_t pred[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
 };
 
+// One routed expert's own storage in a usage-tiered file (`pelias quantize --tier`): its first row and its type.
+struct ExpertSlot {
+  const std::uint8_t* data = nullptr;
+  std::uint32_t type = 0;
+  std::uint64_t row_bytes = 0;
+};
+
 struct WeightView {
   const std::uint8_t* data = nullptr;
   std::uint32_t type = 0;
+  // Usage-tiered experts (pelias.tier.types.<name>): when not empty, matrix e is read from slots[e] (its own type and row
+  // size); data / type / row_bytes then name the most common type, for the checks that need one type per weight.
+  std::vector<ExpertSlot> slots;
   std::uint64_t ne[3] = {1, 1, 1};
   std::uint64_t row_bytes = 0;
   std::string name;
