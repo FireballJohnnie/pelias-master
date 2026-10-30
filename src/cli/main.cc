@@ -132,6 +132,7 @@ void usage() {
       "  device [--index N]              what the GPU reports (CUDA and NVML), and the VRAM ceiling\n"
       "  mtp-logits --model FILE --ids 1,2,3 --out OUT.bin [--threads N] [--fast-cpu]\n"
       "                                  GP3-08 gate: the MTP block's logits and hidden for each position (format of tools/oracle/mtp_oracle)\n"
+      "  logits --model FILE --ids 1,2,3 --out OUT.bin [--threads N] [--fast-cpu] [--decode]   every position's logits (oracle checks)\n"
       "  bench-dot [--type Q4_TG2] [--mb 1024] [--k 2048] [--threads N] [--reps 5] [--planes K] [--int8] [--tokens N [--groups]] [--reference] [--portable]\n"
       "                                  GP3-10 CPU kernels: GB/s of one type's rows (+ dense planes), decode (one activation row)\n"
       "  membw [--mib N] [--threads 1,2,4,6,8,12,16] [--reps N]\n"
@@ -206,7 +207,8 @@ void usage() {
       "  generate --model FILE (--prompt TEXT | --prompt-file F | --prompt-list F --out-dir DIR) [--n-predict 128] [--ctx 32768] [--threads N]\n"
       "      [--temp 1.0] [--top-k 20] [--top-p 0.95] [--min-p 0] [--repeat-penalty 1] [--repeat-last-n 64]\n"
       "      [--presence-penalty 0] [--frequency-penalty 0] [--seed 20261019 | -1] [--ignore-eos] [--show-special]\n"
-      "      [--ids-out FILE] [--no-nfc] [--no-special] [--act-int8 GROUPS] [--act-int8-path ...] [--act-rot h32] [--no-mmap]\n"
+      "      [--ids-out FILE] [--no-nfc] [--no-special] [--act-int8 GROUPS] [--act-int8-path ...] [--act-rot h32] [--no-mmap] [--chat]\n"
+      "                                  --chat wraps the prompt as one user turn in the model family's chat format\n"
       "                                  text from the fp32 reference pass on the CPU (slow; a correctness reference, not the\n"
       "                                  engine): the prompt once, then one token per step on the carried KV cache and\n"
       "                                  DeltaNet state. --temp 0 is greedy; the draw is Philox4x32-10 keyed by --seed.\n"
@@ -1082,7 +1084,7 @@ int cmd_kld(const Args& a) {
     std::size_t nrot = w.value.output.rot32 ? 1 : 0;
     for (const model::Qwen35MoeLayer& l : w.value.layers)
       for (const model::WeightView* p : {&l.wq, &l.wk, &l.wv, &l.wo, &l.wqkv, &l.wgate, &l.wbeta, &l.walpha, &l.ssm_out, &l.up_exps, &l.gate_exps,
-                                         &l.down_exps, &l.up_shexp, &l.gate_shexp, &l.down_shexp})
+                                         &l.down_exps, &l.up_shexp, &l.gate_shexp, &l.down_shexp, &l.ffn_gate, &l.ffn_up, &l.ffn_down})
         nrot += p->rot32 ? 1 : 0;
     if (nrot) std::fprintf(stderr, "pelias: %zu weights are stored rotated (pelias.rot32.tensors); their inputs are rotated to match\n", nrot);
   }
@@ -1810,6 +1812,73 @@ int cmd_teacher(const Args& a) {
 // pelias mtp-logits: GP3-08's gate against the reference library (tools/oracle/mtp_oracle.cpp writes the same format):
 // the trunk runs the ids, the MTP block runs id p with the trunk's post-norm hidden of p - 1 (zeros before the first), and
 // every position's MTP logits and post-norm hidden are written: int32 n, n_vocab, n_embd; n x n_vocab; n x n_embd (fp32).
+// pelias logits: every position's logits for a list of token ids (GP3-09 gate against the reference library's
+// logits_oracle). One fresh pass, or with --decode the tokens one at a time through the decode state.
+// Output: int32 n, int32 n_vocab, then n x n_vocab logits (fp32).
+int cmd_logits(const Args& a) {
+  const std::string path = a.get("model"), out = a.get("out"), idt = a.get("ids");
+  if (path.empty() || out.empty() || idt.empty()) {
+    std::fprintf(stderr, "usage: pelias logits --model FILE --ids 1,2,3 --out OUT.bin [--threads N] [--fast-cpu] [--decode]\n");
+    return 1;
+  }
+  if (std::ifstream(out, std::ios::binary)) {
+    std::fprintf(stderr, "pelias: %s already exists (nothing is overwritten)\n", out.c_str());
+    return 1;
+  }
+  std::vector<std::int32_t> ids;
+  for (std::size_t p = 0; p <= idt.size();) {
+    const std::size_t q = std::min(idt.find(',', p), idt.size());
+    const Result<std::uint64_t> r = io::parse_whole(idt.substr(p, q - p), 1u << 30);
+    if (!r.ok()) {
+      std::fprintf(stderr, "pelias: --ids takes comma-separated token ids\n");
+      return 1;
+    }
+    ids.push_back(static_cast<std::int32_t>(r.value));
+    p = q + 1;
+  }
+  model::ForwardOptions fo;
+  if (a.has("threads")) {
+    const Result<std::uint64_t> r = io::parse_whole(a.get("threads"), 4096);
+    if (!r.ok() || r.value == 0) {
+      std::fprintf(stderr, "pelias: --threads needs a whole number from 1\n");
+      return 1;
+    }
+    fo.threads = static_cast<int>(r.value);
+  }
+  if (!act_options(a, fo)) return 1;
+  os::FileMap m;
+  if (Status s = m.open(path); !s) return fail_input(s);
+  io::GgufReader g;
+  if (Status s = g.parse(m); !s) return fail_input(s);
+  const Result<model::Qwen35MoeSpec> spec = model::read_qwen35moe_spec(g);
+  if (!spec.ok()) return fail_input(spec.status);
+  Result<model::Qwen35MoeWeights> w = model::bind_qwen35moe(g, m.data(), spec.value);
+  if (!w.ok()) return fail_input(w.status);
+  const int n = static_cast<int>(ids.size());
+  const std::size_t nv = spec.value.n_vocab;
+  std::vector<float> lg(static_cast<std::size_t>(n) * nv);
+  if (a.has("decode")) {
+    model::DecodeState st;
+    model::decode_state_reset(spec.value, st);
+    for (int i = 0; i < n; ++i)
+      if (Status s = model::forward_decode(spec.value, w.value, st, ids.data() + i, 1, lg.data() + static_cast<std::size_t>(i) * nv, true, fo); !s)
+        return fail_input(s);
+  } else if (Status s = model::forward_reference(spec.value, w.value, ids.data(), n, 0, n, lg.data(), fo); !s) {
+    return fail_input(s);
+  }
+  std::ofstream f(out, std::ios::binary);
+  const std::int32_t hdr[2] = {n, static_cast<std::int32_t>(nv)};
+  f.write(reinterpret_cast<const char*>(hdr), sizeof hdr);
+  f.write(reinterpret_cast<const char*>(lg.data()), static_cast<std::streamsize>(lg.size() * sizeof(float)));
+  if (!f) {
+    std::fprintf(stderr, "pelias: could not write %s\n", out.c_str());
+    return 6;
+  }
+  std::fprintf(stderr, "pelias logits: %s, %d positions%s, written to %s\n", spec.value.arch.c_str(), n, a.has("decode") ? " (one at a time)" : "",
+               out.c_str());
+  return 0;
+}
+
 int cmd_mtp_logits(const Args& a) {
   const std::string path = a.get("model"), out = a.get("out"), idt = a.get("ids");
   if (path.empty() || out.empty() || idt.empty()) {
@@ -2053,7 +2122,17 @@ int cmd_generate(const Args& a) {
     jobs.push_back({text, ids_out, ""});
   }
   for (std::size_t job = 0; job < jobs.size(); ++job) {
-  const std::string& text = jobs[job].text;
+  // --chat: one user turn in the family's chat format, the assistant's turn opened (READ-SRC: the files' own
+  // tokenizer.chat_template, the plain case without a system message or tools). Qwen (qwen35moe, qwen3, qwen2): ChatML;
+  // llama: the Llama 3 header format (its BOS is added below when the file asks for it).
+  std::string chat_text;
+  if (a.has("chat")) {
+    if (spec.value.family == model::Family::llama)
+      chat_text = "<|start_header_id|>user<|end_header_id|>\n\n" + jobs[job].text + "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n";
+    else
+      chat_text = "<|im_start|>user\n" + jobs[job].text + "<|im_end|>\n<|im_start|>assistant\n";
+  }
+  const std::string& text = a.has("chat") ? chat_text : jobs[job].text;
   const std::string& ids_path = jobs[job].ids_path;
   std::FILE* tout = stdout;
   if (!jobs[job].txt_path.empty()) {
@@ -2082,7 +2161,7 @@ int cmd_generate(const Args& a) {
   std::vector<std::int32_t> stop;
   if (!a.has("ignore-eos")) {
     if (tk.value.eos_id() >= 0) stop.push_back(tk.value.eos_id());
-    for (const char* t : {"<|im_end|>", "<|endoftext|>"})
+    for (const char* t : {"<|im_end|>", "<|endoftext|>", "<|eot_id|>", "<|end_of_text|>"})
       if (const std::int32_t id = tk.value.find(t); id >= 0 && std::find(stop.begin(), stop.end(), id) == stop.end()) stop.push_back(id);
   }
   const bool show_special = a.has("show-special");
@@ -2227,6 +2306,7 @@ int main(int argc, char** argv) {
   if (cmd == "device") return cmd_device(a);
   if (cmd == "membw") return cmd_membw(a);
   if (cmd == "bench-dot") return cmd_bench_dot(a);
+  if (cmd == "logits") return cmd_logits(a);
   if (cmd == "mtp-logits") return cmd_mtp_logits(a);
   if (cmd == "inspect") return cmd_inspect(a);
   if (cmd == "key") return cmd_key(a);

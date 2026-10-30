@@ -391,7 +391,7 @@ void softmax(float* x, int64_t n) {
 
 // cos / sin per rotated pair for one text position: all three position components equal `pos`, the fourth 0.
 // The angle grows by one multiply per pair (theta *= base^(-2/n_rot)), as the reference's cache does.
-void rope_cache(const Qwen35MoeSpec& s, int64_t pos, std::vector<float>& cs) {
+void rope_cache(const Qwen35MoeSpec& s, int64_t pos, std::vector<float>& cs, const std::vector<float>* freq_factors = nullptr) {
   const int64_t n_rot = s.n_rot;
   cs.assign(z(n_rot), 0.0f);
   const float theta_scale = std::pow(s.rope_freq_base, -2.0f / static_cast<float>(n_rot));
@@ -408,11 +408,22 @@ void rope_cache(const Qwen35MoeSpec& s, int64_t pos, std::vector<float>& cs) {
       else if (sector % 3 == 0 && sector < 3 * sec0) use_e = false;
       else use_e = true;
     }
-    const float theta = use_e ? theta_e : theta_tpos;
+    float theta = use_e ? theta_e : theta_tpos;
+    if (freq_factors && !freq_factors->empty()) theta /= (*freq_factors)[z(i0 / 2)];  // rope_freqs (Llama 3.1+): theta / factor
     cs[z(i0)] = std::cos(theta);
     cs[z(i0 + 1)] = std::sin(theta);
     theta_tpos *= theta_scale;
     theta_e *= theta_scale;
+  }
+}
+
+// adjacent pairing (2i, 2i + 1) over the first n_rot dimensions: llama.cpp's NORM rope (the llama family)
+void rope_apply_norm(float* v, const std::vector<float>& cs, int64_t n_rot) {
+  for (int64_t i0 = 0; i0 < n_rot; i0 += 2) {
+    const float c = cs[z(i0)], sn = cs[z(i0 + 1)];
+    const float x0 = v[i0], x1 = v[i0 + 1];
+    v[i0] = x0 * c - x1 * sn;
+    v[i0 + 1] = x0 * sn + x1 * c;
   }
 }
 
@@ -441,6 +452,7 @@ struct Ctx {
   int64_t pos0 = 0;               // GP3-07: the position of the first token of this call
   DecodeState* st = nullptr;      // GP3-07: the carried state (null: a fresh sequence from position 0)
   double* prof = nullptr;         // PELIAS_PROF set: seconds per phase (Prof), added to by the calling thread
+  const std::vector<float>* rope_freqs = nullptr;  // GP3-09: rope_freqs.weight (Llama 3.1+), else null
 };
 
 // PELIAS_PROF=1 in the environment: forward_impl prints one line per call to stderr, wall seconds per phase
@@ -546,7 +558,7 @@ Status check_act_rounding(const ForwardOptions& o, const Qwen35MoeWeights& w) {
   std::vector<const WeightView*> v{&w.output};
   for (const Qwen35MoeLayer& l : w.layers)
     for (const WeightView* p : {&l.wq, &l.wk, &l.wv, &l.wo, &l.wqkv, &l.wgate, &l.wbeta, &l.walpha, &l.ssm_out, &l.gate_inp, &l.up_exps,
-                                &l.gate_exps, &l.down_exps, &l.up_shexp, &l.gate_shexp, &l.down_shexp})
+                                &l.gate_exps, &l.down_exps, &l.up_shexp, &l.gate_shexp, &l.down_shexp, &l.ffn_gate, &l.ffn_up, &l.ffn_down})
       v.push_back(p);
   for (const WeightView* p : v) {
     const ActFmt f = act_format(o, *p);
@@ -713,26 +725,43 @@ void mm(const Ctx& c, const WeightView& w, const float* x, int64_t n_tok, int64_
 void full_attention(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* out) {
   const Qwen35MoeSpec& s = c.s;
   const int64_t n = c.n, hd = s.head_dim, nh = s.n_head, nkv = s.n_head_kv, e = s.n_embd;
-  const int64_t q_w = 2 * hd * nh, kv_w = hd * nkv;
+  // qwen35moe: each head's query rows are [query | gate]; the dense families have the query alone (GP3-09)
+  const int64_t qh = s.attn_gate ? 2 * hd : hd;
+  const int64_t q_w = qh * nh, kv_w = hd * nkv;
   std::vector<float> qg(z(n * q_w)), k(z(n * kv_w)), v(z(n * kv_w)), att(z(n * hd * nh));
   mm(c, l.wq, xn, n, e, qg.data(), q_w);
   mm(c, l.wk, xn, n, e, k.data(), kv_w);
   mm(c, l.wv, xn, n, e, v.data(), kv_w);
-  // per-head norms, then rope at each token's position
+  if (!l.bq.empty())  // qwen2: q / k / v biases, added to the products
+    for (int64_t t = 0; t < n; ++t) {
+      for (int64_t i = 0; i < q_w; ++i) qg[z(t * q_w + i)] += l.bq[z(i)];
+      for (int64_t i = 0; i < kv_w; ++i) {
+        k[z(t * kv_w + i)] += l.bk[z(i)];
+        v[z(t * kv_w + i)] += l.bv[z(i)];
+      }
+    }
+  // per-head norms (qwen35moe, qwen3), then rope at each token's position (NEOX pairs, or adjacent pairs for llama)
+  const bool qkn = !l.q_norm.empty();
   parallel_items(n, c.threads, [&](int64_t t, int) {
     std::vector<float> cs, tmp(z(hd));
-    rope_cache(s, c.pos0 + t, cs);
+    rope_cache(s, c.pos0 + t, cs, c.rope_freqs);
     for (int64_t h = 0; h < nh; ++h) {
-      float* q = qg.data() + t * q_w + h * 2 * hd;
-      rms_norm(q, l.q_norm.data(), tmp.data(), hd, s.rms_eps);
-      std::copy(tmp.begin(), tmp.end(), q);
-      rope_apply(q, cs, s.n_rot);
+      float* q = qg.data() + t * q_w + h * qh;
+      if (qkn) {
+        rms_norm(q, l.q_norm.data(), tmp.data(), hd, s.rms_eps);
+        std::copy(tmp.begin(), tmp.end(), q);
+      }
+      if (s.rope_neox) rope_apply(q, cs, s.n_rot);
+      else rope_apply_norm(q, cs, s.n_rot);
     }
     for (int64_t h = 0; h < nkv; ++h) {
       float* kk = k.data() + t * kv_w + h * hd;
-      rms_norm(kk, l.k_norm.data(), tmp.data(), hd, s.rms_eps);
-      std::copy(tmp.begin(), tmp.end(), kk);
-      rope_apply(kk, cs, s.n_rot);
+      if (qkn) {
+        rms_norm(kk, l.k_norm.data(), tmp.data(), hd, s.rms_eps);
+        std::copy(tmp.begin(), tmp.end(), kk);
+      }
+      if (s.rope_neox) rope_apply(kk, cs, s.n_rot);
+      else rope_apply_norm(kk, cs, s.n_rot);
     }
   });
   if (c.opt.kv_store != ForwardOptions::StateStore::exact) {
@@ -744,7 +773,7 @@ void full_attention(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, floa
     std::uint16_t* dst = c.opt.qk_dump + static_cast<int64_t>(c.ai) * n * row;
     for (int64_t t = 0; t < n; ++t) {
       for (int64_t h = 0; h < nh; ++h)
-        for (int64_t i = 0; i < hd; ++i) dst[t * row + h * hd + i] = quant::fp32_to_fp16(qg[z(t * q_w + h * 2 * hd + i)]);
+        for (int64_t i = 0; i < hd; ++i) dst[t * row + h * hd + i] = quant::fp32_to_fp16(qg[z(t * q_w + h * qh + i)]);
       for (int64_t i = 0; i < nkv * hd; ++i) dst[t * row + nh * hd + i] = quant::fp32_to_fp16(k[z(t * kv_w + i)]);
     }
   }
@@ -769,7 +798,7 @@ void full_attention(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, floa
     Scratch& sc = c.sc[z(tid)];
     if (sc.scores.size() < z(p0 + n)) sc.scores.resize(z(p0 + n));
     float* sco = sc.scores.data();
-    const float* q = qg.data() + t * q_w + h * 2 * hd;
+    const float* q = qg.data() + t * q_w + h * qh;
     const int64_t last = p0 + t;  // the query's own position: it attends to 0..last
     for (int64_t u = 0; u <= last; ++u) {
       const float* kk = kall + u * kv_w + kvh * hd;
@@ -785,8 +814,10 @@ void full_attention(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, floa
       const float* vv = vall + u * kv_w + kvh * hd;
       for (int64_t i = 0; i < hd; ++i) o[i] += p * vv[i];
     }
-    const float* gate = q + hd;
-    for (int64_t i = 0; i < hd; ++i) o[i] *= sigmoid(gate[i]);
+    if (s.attn_gate) {
+      const float* gate = q + hd;
+      for (int64_t i = 0; i < hd; ++i) o[i] *= sigmoid(gate[i]);
+    }
   });
   mm(c, l.wo, att.data(), n, hd * nh, out, e);
 }
@@ -892,6 +923,18 @@ void delta_net(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* ou
       for (int64_t i = 0; i < ds; ++i) o[i] = tmp[z(i)] * silu(zz[i]);
     }
   mm(c, l.ssm_out, core.data(), n, d_inner, out, e);
+}
+
+// GP3-09: a dense decoder's FFN, down(silu(gate x) * up x) (llama.cpp build_ffn, LLM_FFN_SILU + LLM_FFN_PAR)
+void dense_ffn(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* out) {
+  const int64_t n = c.n, e = c.s.n_embd, ff = c.s.n_ff;
+  Clock::time_point tp = Clock::now();
+  std::vector<float> g(z(n * ff)), u(z(n * ff));
+  mm(c, l.ffn_gate, xn, n, e, g.data(), ff);
+  mm(c, l.ffn_up, xn, n, e, u.data(), ff);
+  for (int64_t i = 0; i < n * ff; ++i) g[z(i)] = silu(g[z(i)]) * u[z(i)];
+  mm(c, l.ffn_down, g.data(), n, ff, out, e);
+  if (c.prof) c.prof[p_experts] += since(tp);
 }
 
 void moe(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* out, float* deferred = nullptr) {
@@ -1163,6 +1206,41 @@ Status bind_layer(const io::GgufReader& r, const std::uint8_t* base, const Qwen3
   const uint64_t ne = s.n_expert, ff = s.n_ff_exp, ffs = s.n_ff_shexp;
   l.recurrent = recurrent;
   std::vector<Status> all;
+  if (s.dense) {  // GP3-09: attention (no output gate) + one gated FFN, llama.cpp's tensor names
+    const uint64_t ff_d = s.n_ff;
+    all.push_back(bind_vector(r, base, p + "attn_norm.weight", {e}, l.attn_norm));
+    all.push_back(bind_vector(r, base, p + "ffn_norm.weight", {e}, l.post_norm));
+    if (r.find_tensor(p + "attn_qkv.weight")) {  // fused [q | k | v] rows
+      WeightView f;
+      if (Status fs = bind_view(r, base, p + "attn_qkv.weight", {e, hd * nh + 2 * hd * nkv}, f); !fs) return fs;
+      l.wq = l.wk = l.wv = f;
+      l.wq.ne[1] = hd * nh;
+      l.wk.ne[1] = l.wv.ne[1] = hd * nkv;
+      l.wk.data = f.data + hd * nh * f.row_bytes;
+      l.wv.data = l.wk.data + hd * nkv * f.row_bytes;
+    } else {
+      all.push_back(bind_view(r, base, p + "attn_q.weight", {e, hd * nh}, l.wq));
+      all.push_back(bind_view(r, base, p + "attn_k.weight", {e, hd * nkv}, l.wk));
+      all.push_back(bind_view(r, base, p + "attn_v.weight", {e, hd * nkv}, l.wv));
+    }
+    all.push_back(bind_view(r, base, p + "attn_output.weight", {hd * nh, e}, l.wo));
+    if (s.qk_norm) {
+      all.push_back(bind_vector(r, base, p + "attn_q_norm.weight", {hd}, l.q_norm));
+      all.push_back(bind_vector(r, base, p + "attn_k_norm.weight", {hd}, l.k_norm));
+    }
+    if (s.qkv_bias || r.find_tensor(p + "attn_q.bias")) {
+      all.push_back(bind_vector(r, base, p + "attn_q.bias", {hd * nh}, l.bq));
+      all.push_back(bind_vector(r, base, p + "attn_k.bias", {hd * nkv}, l.bk));
+      all.push_back(bind_vector(r, base, p + "attn_v.bias", {hd * nkv}, l.bv));
+    }
+    if (r.find_tensor(p + "attn_output.bias")) return Status::fail(Code::unsupported, "an attention output bias is not read yet", 0, p + "attn_output.bias");
+    all.push_back(bind_view(r, base, p + "ffn_gate.weight", {e, ff_d}, l.ffn_gate));
+    all.push_back(bind_view(r, base, p + "ffn_up.weight", {e, ff_d}, l.ffn_up));
+    all.push_back(bind_view(r, base, p + "ffn_down.weight", {ff_d, e}, l.ffn_down));
+    for (const Status& x : all)
+      if (!x) return x;
+    return Status::good();
+  }
   all.push_back(bind_vector(r, base, p + "attn_norm.weight", {e}, l.attn_norm));
   all.push_back(bind_vector(r, base, p + "post_attention_norm.weight", {e}, l.post_norm));
   if (!l.recurrent) {
@@ -1224,6 +1302,11 @@ Result<Qwen35MoeWeights> bind_qwen35moe(const io::GgufReader& r, const std::uint
   if (!w.output.present()) w.output = w.tok_embd;  // tied embeddings
   st = bind_vector(r, base, "output_norm.weight", {e}, w.output_norm);
   if (!st) return R::fail(st);
+  if (r.find_tensor("rope_freqs.weight")) {
+    if (!s.dense) return R::fail(Status::fail(Code::unsupported, "rope frequency factors on a qwen35moe file", 0, "rope_freqs.weight"));
+    st = bind_vector(r, base, "rope_freqs.weight", {s.n_rot / 2}, w.rope_freqs);
+    if (!st) return R::fail(st);
+  }
   w.layers.resize(s.n_layer);
   for (std::uint32_t il = 0; il < s.n_layer; ++il)
     if (Status ls = bind_layer(r, base, s, "blk." + std::to_string(il) + ".", s.is_recurrent(il), w.layers[il]); !ls) return R::fail(ls);
@@ -1268,7 +1351,7 @@ Result<Qwen35MoeWeights> bind_qwen35moe(const io::GgufReader& r, const std::uint
     }
     for (Qwen35MoeLayer* l : layers)
       for (WeightView* p : {&l->wq, &l->wk, &l->wv, &l->wo, &l->wqkv, &l->wgate, &l->wbeta, &l->walpha, &l->ssm_out, &l->up_exps, &l->gate_exps,
-                            &l->down_exps, &l->up_shexp, &l->gate_shexp, &l->down_shexp})
+                            &l->down_exps, &l->up_shexp, &l->gate_shexp, &l->down_shexp, &l->ffn_gate, &l->ffn_up, &l->ffn_down})
         views.push_back(p);
     for (const std::string& nm : names) {
       WeightView* hit = nullptr;
@@ -1327,7 +1410,7 @@ Result<int> attach_planes(const io::GgufReader& pr, const std::uint8_t* pb, Qwen
   std::vector<WeightView*> views{&w.output, &w.tok_embd};  // a tied output layer shares the embedding's planes (below)
   for (Qwen35MoeLayer& l : w.layers)
     for (WeightView* p : {&l.wq, &l.wk, &l.wv, &l.wo, &l.wqkv, &l.wgate, &l.wbeta, &l.walpha, &l.ssm_out, &l.up_exps, &l.gate_exps, &l.down_exps,
-                          &l.up_shexp, &l.gate_shexp, &l.down_shexp})
+                          &l.up_shexp, &l.gate_shexp, &l.down_shexp, &l.ffn_gate, &l.ffn_up, &l.ffn_down})
       views.push_back(p);
   auto suffix = [](const std::string& a, const char* sfx) {
     const std::size_t n = std::char_traits<char>::length(sfx);
@@ -1632,13 +1715,15 @@ Status forward_impl(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, const std
     return Status::fail(Code::invalid_argument, "the cold-expert format needs 8-bit activations on the gpu path and a hot set of n_layer x n_expert entries");
   if (opt.swap_margin > 0.0f && opt.hot.size() != static_cast<std::size_t>(s.n_layer) * s.n_expert)
     return Status::fail(Code::invalid_argument, "the near-tie swap needs a hot set of n_layer x n_expert entries");
-  if (opt.defer_experts < 0 || opt.defer_experts >= static_cast<int>(s.n_expert_used))
+  if (s.dense && (opt.defer_experts != 0 || opt.swap_margin > 0.0f || opt.cold_gpu256 || opt.plane_picks > 0))
+    return Status::fail(Code::invalid_argument, "expert options (deferral, near-tie swap, cold experts, plane picks) on a dense model");
+  if (!s.dense && (opt.defer_experts < 0 || opt.defer_experts >= static_cast<int>(s.n_expert_used)))
     return Status::fail(Code::invalid_argument, "expert deferral must keep at least one expert immediate");
   if (opt.planes && opt.t_decode) {
     bool any = w.output.planes != nullptr;
     for (const Qwen35MoeLayer& l : w.layers)
       for (const WeightView* p : {&l.wq, &l.wk, &l.wv, &l.wo, &l.wqkv, &l.wgate, &l.wbeta, &l.walpha, &l.ssm_out, &l.up_exps, &l.gate_exps, &l.down_exps,
-                                  &l.up_shexp, &l.gate_shexp, &l.down_shexp})
+                                  &l.up_shexp, &l.gate_shexp, &l.down_shexp, &l.ffn_gate, &l.ffn_up, &l.ffn_down})
         any = any || p->planes != nullptr;
     if (any) return Status::fail(Code::unsupported, "residual planes with the T-decode route are not built yet (the dequantized path reads them)");
   }
@@ -1660,6 +1745,7 @@ Status forward_impl(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, const std
   Ctx c{s, threads, sc, n, opt};
   c.st = dst;
   c.pos0 = dst ? dst->pos : 0;
+  if (!w.rope_freqs.empty()) c.rope_freqs = &w.rope_freqs;
   static const bool prof_on = std::getenv("PELIAS_PROF") != nullptr;
   double prof[p_n] = {};
   if (prof_on) c.prof = prof;
@@ -1691,6 +1777,11 @@ Status forward_impl(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, const std
     if (prof_on) prof[l.recurrent ? p_deltanet : p_attn] += since(tp);
     for (int64_t i = 0; i < n * e; ++i) x[z(i)] += y[z(i)];
     for (int64_t t = 0; t < n; ++t) rms_norm(x.data() + t * e, l.post_norm.data(), xn.data() + t * e, e, s.rms_eps);
+    if (s.dense) {  // GP3-09: one gated FFN (the profile line counts it as "experts")
+      dense_ffn(c, l, xn.data(), y.data());
+      for (int64_t i = 0; i < n * e; ++i) x[z(i)] += y[z(i)];
+      continue;
+    }
     if (opt.defer_experts > 0) {  // Block M: this layer's deferred experts wait; the previous layer's arrive now
       moe(c, l, xn.data(), y.data(), ydef_now.data());
       for (int64_t i = 0; i < n * e; ++i) x[z(i)] += y[z(i)] + ydef_prev[z(i)];

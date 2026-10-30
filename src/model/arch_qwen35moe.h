@@ -83,6 +83,10 @@ struct Qwen35MoeLayer {
   // routed experts and the gated shared expert
   WeightView gate_inp, up_exps, gate_exps, down_exps, up_shexp, gate_shexp, down_shexp;
   std::vector<float> gate_inp_shexp;
+  // GP3-09 dense decoders: q / k / v biases (qwen2; empty when absent) and the one gated FFN per layer
+  // (post_norm is then ffn_norm)
+  std::vector<float> bq, bk, bv;
+  WeightView ffn_gate, ffn_up, ffn_down;
 };
 
 // GP3-08: the MTP block (blk.<n_layer>, nextn_predict_layers = 1), read as llama.cpp's graph runs it (READ-SRC
@@ -106,6 +110,8 @@ struct Qwen35MoeWeights {
   // candidates (ForwardOptions::head_rescore); absent unless attached
   WeightView output_exact;
   std::vector<float> output_norm;
+  // rope_freqs.weight (Llama 3.1 and later: per rotated pair, the angle is divided by its factor); empty when absent
+  std::vector<float> rope_freqs;
   std::vector<Qwen35MoeLayer> layers;  // the trunk only (spec.n_layer)
   Qwen35MoeMtp mtp;                    // the MTP block, when the file has one (spec.n_layer_all = n_layer + 1)
 };

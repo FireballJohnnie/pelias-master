@@ -4,7 +4,7 @@
 // Copyright (c) 2026 John Lipka and the Pelias contributors
 //
 // spec.h - the shape of a model as its GGUF file states it (masterwork 14.2, model/spec). One struct per architecture
-// family; this step reads qwen35moe (Qwen3.5 / 3.6 MoE: gated DeltaNet and full-attention layers, 256 routed experts
+// family; qwen35moe (Qwen3.5 / 3.6 MoE: gated DeltaNet and full-attention layers, 256 routed experts
 // with a gated shared expert, one MTP block after the trunk). Every value comes from the file's metadata or from a
 // tensor's shape; nothing is assumed from the model's name.
 #pragma once
@@ -18,7 +18,20 @@
 
 namespace pelias::model {
 
+// The architecture families the reference pass runs (GP3-09, author 2026-10-30 11:24: dense families before the first
+// build). qwen35moe is the hybrid MoE; the others are dense decoders: every layer attention + one gated FFN.
+enum class Family { qwen35moe, qwen3, qwen2, llama };
+
 struct Qwen35MoeSpec {
+  Family family = Family::qwen35moe;
+  std::string arch;                // general.architecture as the file names it
+  bool dense = false;              // dense decoder: no DeltaNet, no experts; ffn_gate / ffn_up / ffn_down per layer
+  std::uint32_t n_ff = 0;          // feed_forward_length (dense)
+  bool rope_neox = true;           // NEOX pairs (i, i + n_rot/2); false: adjacent pairs (2i, 2i+1), the llama order
+  bool attn_gate = true;           // the query projection carries a per-head output gate [query | gate] (qwen35moe)
+  bool qk_norm = true;             // per-head RMS norms on q and k (qwen35moe, qwen3)
+  bool qkv_bias = false;           // q / k / v biases (qwen2)
+  std::uint32_t n_ctx_train = 0;   // context_length (informational)
   std::uint32_t n_layer = 0;       // trunk layers run in the main pass (block_count - nextn_predict_layers)
   std::uint32_t n_layer_all = 0;   // block_count (the MTP block(s) included)
   std::uint32_t n_embd = 0;
@@ -51,7 +64,7 @@ struct Qwen35MoeSpec {
 };
 
 // Reads and checks the spec. Refuses what the reference pass does not handle (another architecture, rope scaling,
-// shapes that do not agree with each other), naming the key.
+// shapes that do not agree with each other), naming the key. Reads qwen35moe and the dense families qwen3, qwen2 and llama.
 Result<Qwen35MoeSpec> read_qwen35moe_spec(const io::GgufReader& r);
 
 }  // namespace pelias::model

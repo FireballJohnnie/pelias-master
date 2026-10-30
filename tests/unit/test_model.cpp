@@ -103,15 +103,24 @@ TEST(model_spec_refuses_what_it_cannot_run) {
   CHECK(ptest::write_and_map(ptest::data_dir() + "/model_spec.gguf", qwen35moe_meta(2, 2).build(), m));
   CHECK(r.parse(m).ok());
   CHECK(!pelias::model::read_qwen35moe_spec(r).ok());
-  // another architecture
+  // another architecture (llama, qwen2 and qwen3 are read since GP3-09)
   ptest::GgufBuilder b;
-  b.kv_string("general.architecture", "llama").tensor("token_embd.weight", {256, 10}, 0);
+  b.kv_string("general.architecture", "falcon").tensor("token_embd.weight", {256, 10}, 0);
   pelias::os::FileMap m2;
   pelias::io::GgufReader r2;
   CHECK(ptest::write_and_map(ptest::data_dir() + "/model_spec2.gguf", b.build(), m2));
   CHECK(r2.parse(m2).ok());
   const auto s = pelias::model::read_qwen35moe_spec(r2);
   CHECK(!s.ok() && s.status.code == pelias::Code::unsupported);
+  // a dense family without its keys: refused as incomplete, naming the key
+  ptest::GgufBuilder b3;
+  b3.kv_string("general.architecture", "llama").tensor("token_embd.weight", {256, 10}, 0);
+  pelias::os::FileMap m3;
+  pelias::io::GgufReader r3;
+  CHECK(ptest::write_and_map(ptest::data_dir() + "/model_spec3.gguf", b3.build(), m3));
+  CHECK(r3.parse(m3).ok());
+  const auto s3 = pelias::model::read_qwen35moe_spec(r3);
+  CHECK(!s3.ok() && s3.status.code == pelias::Code::corrupt);
 }
 
 TEST(kl_token_matches_itself_and_a_known_case) {
@@ -1217,5 +1226,118 @@ TEST(fused_qkv_and_gate_up_files_read_the_same) {
     CHECK(pelias::model::forward_reference(tm.spec, tm.w, tok.data(), n, 0, n, a.data(), o).ok());
     CHECK(pelias::model::forward_reference(tm.spec, fw.value, tok.data(), n, 0, n, c.data(), o).ok());
     CHECK(a == c);
+  }
+}
+
+// GP3-09: the dense families (qwen3: q/k norms, tied output; qwen2: q/k/v biases; llama: adjacent-pair rope and
+// rope_freqs) on tiny F32 files with small deterministic values: the spec reads, the weights bind, the logits are finite;
+// the fast CPU path agrees with the reference within the rung-1 tolerance; the decode path one token at a time equals
+// the fresh pass (fast path: bit for bit). The values against the reference library are checked by
+// tools/oracle/logits_oracle.cpp + make_tiny_dense.py (sandbox, test-only).
+namespace {
+bool dense_model(const std::string& fam, bool rope_freqs, TinyModel& tm) {
+  const std::uint32_t E = 128, H = 4, HKV = 2, HD = 32, FF = 192, L = 2, V = 300;
+  ptest::GgufBuilder b;
+  const std::string a = fam + ".";
+  b.kv_string("general.architecture", fam)
+      .kv_u32(a + "block_count", L)
+      .kv_u32(a + "embedding_length", E)
+      .kv_u32(a + "feed_forward_length", FF)
+      .kv_u32(a + "attention.head_count", H)
+      .kv_u32(a + "attention.head_count_kv", HKV)
+      .kv_f32(a + "rope.freq_base", 500000.0f)
+      .kv_f32(a + "attention.layer_norm_rms_epsilon", 1e-6f)
+      .tensor("token_embd.weight", {E, V}, 0)
+      .tensor("output_norm.weight", {E}, 0);
+  if (fam != "qwen3") b.tensor("output.weight", {E, V}, 0);
+  if (rope_freqs) b.tensor("rope_freqs.weight", {HD / 2}, 0);
+  for (std::uint32_t il = 0; il < L; ++il) {
+    const std::string p = "blk." + std::to_string(il) + ".";
+    b.tensor(p + "attn_norm.weight", {E}, 0).tensor(p + "attn_q.weight", {E, H * HD}, 0).tensor(p + "attn_k.weight", {E, HKV * HD}, 0);
+    b.tensor(p + "attn_v.weight", {E, HKV * HD}, 0).tensor(p + "attn_output.weight", {H * HD, E}, 0).tensor(p + "ffn_norm.weight", {E}, 0);
+    b.tensor(p + "ffn_gate.weight", {E, FF}, 0).tensor(p + "ffn_up.weight", {E, FF}, 0).tensor(p + "ffn_down.weight", {FF, E}, 0);
+    if (fam == "qwen3") b.tensor(p + "attn_q_norm.weight", {HD}, 0).tensor(p + "attn_k_norm.weight", {HD}, 0);
+    if (fam == "qwen2") b.tensor(p + "attn_q.bias", {H * HD}, 0).tensor(p + "attn_k.bias", {HKV * HD}, 0).tensor(p + "attn_v.bias", {HKV * HD}, 0);
+  }
+  std::vector<std::uint8_t> bytes = b.build();
+  pelias::os::FileMap m0;
+  pelias::io::GgufReader r0;
+  const std::string stem = ptest::data_dir() + "/dense_" + fam + (rope_freqs ? "_rf" : "");
+  if (!ptest::write_and_map(stem + "_layout.gguf", bytes, m0) || !r0.parse(m0).ok()) return false;
+  std::uint32_t h = 20261030u;
+  auto unit = [&h]() {
+    h ^= h << 13;
+    h ^= h >> 17;
+    h ^= h << 5;
+    return static_cast<float>(h) / 2147483648.0f - 1.0f;
+  };
+  for (const pelias::io::GgufTensor& t : r0.tensors()) {
+    float* d = reinterpret_cast<float*>(bytes.data() + t.file_offset);
+    const float row = 1.0f / std::sqrt(static_cast<float>(t.ne[0]));
+    for (std::uint64_t i = 0; i < t.elements(); ++i) {
+      const float u = unit();
+      float v = u * row;
+      if (t.name.find("norm") != std::string::npos) v = 1.0f + 0.1f * u;
+      else if (t.name.find(".bias") != std::string::npos) v = 0.3f * u;
+      else if (t.name == "rope_freqs.weight") v = 1.0f + 3.5f * (u + 1.0f);
+      else if (t.name == "token_embd.weight") v = 0.5f * u;
+      std::memcpy(d + i, &v, 4);
+    }
+  }
+  if (!ptest::write_and_map(stem + ".gguf", bytes, tm.map) || !tm.reader.parse(tm.map).ok()) return false;
+  auto s = pelias::model::read_qwen35moe_spec(tm.reader);
+  if (!s.ok()) return false;
+  tm.spec = s.value;
+  auto w = pelias::model::bind_qwen35moe(tm.reader, tm.map.data(), tm.spec);
+  if (!w.ok()) return false;
+  tm.w = std::move(w.value);
+  tm.ok = true;
+  return true;
+}
+}  // namespace
+
+TEST(dense_families_run_fast_and_decode_paths) {
+  struct F {
+    const char* fam;
+    bool rf;
+  };
+  for (const F f : {F{"qwen3", false}, F{"qwen2", false}, F{"llama", false}, F{"llama", true}}) {
+    TinyModel tm;
+    CHECK(dense_model(f.fam, f.rf, tm));
+    if (!tm.ok) continue;
+    CHECK(tm.spec.dense);
+    CHECK(tm.spec.rope_neox == (std::string(f.fam) != "llama"));
+    CHECK(tm.w.rope_freqs.empty() == !f.rf);
+    CHECK((tm.w.output.data == tm.w.tok_embd.data) == (std::string(f.fam) == "qwen3"));
+    const std::vector<std::int32_t> tok{11, 27, 3, 299, 58, 58, 0, 131, 210, 64, 5};
+    const int n = static_cast<int>(tok.size()), v = static_cast<int>(tm.spec.n_vocab);
+    pelias::model::ForwardOptions ref, fast;
+    ref.threads = fast.threads = 3;
+    fast.fast_cpu = true;
+    std::vector<float> a(static_cast<std::size_t>(n) * static_cast<std::size_t>(v)), bfast(a.size()), dec(a.size());
+    CHECK(pelias::model::forward_reference(tm.spec, tm.w, tok.data(), n, 0, n, a.data(), ref).ok());
+    CHECK(pelias::model::forward_reference(tm.spec, tm.w, tok.data(), n, 0, n, bfast.data(), fast).ok());
+    pelias::model::DecodeState st;
+    pelias::model::decode_state_reset(tm.spec, st);
+    for (int i = 0; i < n; ++i)
+      CHECK(pelias::model::forward_decode(tm.spec, tm.w, st, tok.data() + i, 1, dec.data() + static_cast<std::ptrdiff_t>(i) * v, true, fast).ok());
+    float amax = 0.0f;
+    double d_fast = 0.0, d_dec = 0.0;
+    bool finite = true;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      finite = finite && std::isfinite(a[i]);
+      amax = std::max(amax, std::fabs(a[i]));
+      d_fast = std::max(d_fast, static_cast<double>(std::fabs(a[i] - bfast[i])));
+      d_dec = std::max(d_dec, static_cast<double>(std::fabs(bfast[i] - dec[i])));
+    }
+    std::printf("    %s%s: max |logit| %.3g, fast vs reference %.3g, decode vs batch (fast) %.3g\n", f.fam, f.rf ? " + rope_freqs" : "",
+                static_cast<double>(amax), d_fast, d_dec);
+    CHECK(finite);
+    CHECK(amax > 1e-3f);
+    CHECK(d_fast <= 1e-5 * static_cast<double>(amax));
+    CHECK(d_dec <= 1e-5 * static_cast<double>(amax));
+    pelias::model::ForwardOptions bad = ref;
+    bad.defer_experts = 1;  // expert options are refused on a dense model
+    CHECK(!pelias::model::forward_reference(tm.spec, tm.w, tok.data(), n, 0, n, a.data(), bad).ok());
   }
 }
