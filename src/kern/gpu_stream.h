@@ -13,7 +13,8 @@
 //     share one stage; between stages, a counter barrier per warp (fix 6) instead of a grid-wide sync.
 // Formats (r3_formats.h, now kern): dense Q7_ZT (fold route, dp4a), expert Q4_TG2 (grid), expert down Q5_K, output head
 // Q6_K. The weights are repacked once at upload (Q7_ZT into base / header / mask / H arrays, Q6_K into 208-byte blocks + a
-// d array; Q4_TG2 and Q5_K as stored). Activations: the engine's int8 per 32 with an fp32 scale and the per-32 sum, as
+// d array; Q4_TG2 and Q5_K as stored). Added 2026-10-30 for the stock GGUF files (dp4a on the int8 activations): Q8_0
+// (repacked qs[256] | d[8] per 256), Q4_K (as stored), IQ4_XS (repacked to 144 bytes, its levels by __byte_perm). Activations: the engine's int8 per 32 with an fp32 scale and the per-32 sum, as
 // act_q8x32 (kern/gpu_ops.h) writes them.
 // Host API only: no CUDA types here, so host code includes it in every build (the stubs report "no GPU backend").
 #pragma once
@@ -25,9 +26,9 @@ namespace pelias::kern::gpu {
 
 // One matrix on the device in the streaming layout. Filled by stream_upload, freed by stream_release.
 struct StreamWeights {
-  std::uint32_t type = 0;  // quant::Type id: Q7_ZT (202), Q4_TG2 (204), Q5_K (13) or Q6_K (14)
+  std::uint32_t type = 0;  // quant::Type id: Q7_ZT (202), Q4_TG2 (204), Q5_K (13), Q6_K (14), Q8_0 (8), Q4_K (12) or IQ4_XS (23)
   std::int64_t n = 0, k = 0;
-  void* w = nullptr;     // Q7_ZT base (224 bytes per 256) / Q4_TG2, Q5_K blocks as stored / Q6_K repacked 208-byte blocks
+  void* w = nullptr;     // Q7_ZT base (224 bytes per 256) / Q4_TG2, Q5_K, Q4_K as stored / Q6_K 208-byte blocks / Q8_0 qs[256] | d[8] / IQ4_XS 144-byte blocks
   void* hdr = nullptr;   // Q7_ZT: u64 per 256 (fp16 d | eight 6-bit levels << 16)
   void* mask = nullptr;  // Q7_ZT: u8 per 256 (the gated 32-blocks)
   void* hb = nullptr;    // Q7_ZT: two u32 per 256 (the H words of the gated blocks)
@@ -35,7 +36,7 @@ struct StreamWeights {
   std::uint64_t bytes = 0;  // device bytes of the matrix (what one token reads)
 };
 
-// The four types, and k one of 256, 512, 1024, 2048, 4096 (a row is split over k / 128 lanes of a warp)
+// The seven types, and k one of 256, 512, 1024, 2048, 4096 (a row is split over k / 128 lanes of a warp)
 bool stream_type_ok(std::uint32_t type, std::int64_t k);
 // rows: n rows of k values in GGUF storage (row bytes = quant::row_bytes(type, k)), host memory; repacked and copied
 bool stream_upload(std::uint32_t type, const void* rows, std::int64_t n, std::int64_t k, StreamWeights* out);

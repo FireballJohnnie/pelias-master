@@ -1,7 +1,7 @@
 // Copyright (c) 2026 John Lipka and the Pelias contributors. Apache-2.0.
 // provenance: original
 // Rung 1 of the R3 streaming kernel moved into src (kern/gpu_stream.h; masterwork 16.1 / 16.2): one token's table with
-// every format the kernel reads (Q7_ZT, Q4_TG2, Q5_K, Q6_K), every lane count (k 256 to 4096: 2 to 32 lanes per row), three
+// every format the kernel reads (Q7_ZT, Q4_TG2, Q5_K, Q6_K; Q8_0, Q4_K, IQ4_XS since 2026-10-30), every lane count (k 256 to 4096: 2 to 32 lanes per row), three
 // stages, and per-expert waits inside a stage (two gate/up jobs signal their groups, two down jobs wait for them), against
 // an fp64 host reference of the same rounded activations (int8 x scale per 32, from act_q8x32). The same table run a second
 // time (the counters are never reset: epoch 2) and run unstaged must give the same bits. The plan refuses tables it cannot
@@ -130,9 +130,12 @@ TEST(rung1_stream_r3_against_fp64) {
   Mat m0(q::Type::q7_zt, 300, 2048, 101u), m1(q::Type::q6_k, 97, 2048, 202u), m2(q::Type::q5_k, 65, 256, 303u), m3(q::Type::q4_tg2, 33, 4096, 404u),
       m4(q::Type::q4_tg2, 512, 2048, 505u), m5(q::Type::q4_tg2, 512, 2048, 606u), m6(q::Type::q5_k, 2048, 512, 707u),
       m7(q::Type::q5_k, 2048, 512, 808u), m8(q::Type::q6_k, 1000, 2048, 909u), m9(q::Type::q7_zt, 31, 1024, 111u);
-  const Mat* mats[] = {&m0, &m1, &m2, &m3, &m9, &m4, &m5, &m6, &m7, &m8};
-  const Act* acts[] = {&a2048, &a2048, &a256, &a4096, &a1024, &a2048, &a2048, &a512, &a512, &a2048};
-  constexpr int nj = 10;
+  // stage 2 also carries the int8-path formats added 2026-10-30 (Q8_0, Q4_K, IQ4_XS), each at two lane counts
+  Mat m10(q::Type::q8_0, 129, 1024, 1010u), m11(q::Type::q4_k, 77, 4096, 1111u), m12(q::Type::iq4_xs, 200, 512, 1212u),
+      m13(q::Type::q8_0, 64, 256, 1313u), m14(q::Type::q4_k, 300, 2048, 1414u), m15(q::Type::iq4_xs, 45, 4096, 1515u);
+  const Mat* mats[] = {&m0, &m1, &m2, &m3, &m9, &m4, &m5, &m6, &m7, &m8, &m10, &m11, &m12, &m13, &m14, &m15};
+  const Act* acts[] = {&a2048, &a2048, &a256, &a4096, &a1024, &a2048, &a2048, &a512, &a512, &a2048, &a1024, &a4096, &a512, &a256, &a2048, &a4096};
+  constexpr int nj = 16;
   std::vector<Dev<float>*> ys;
   std::vector<g::StreamJob> jobs(nj);
   for (int j = 0; j < nj; ++j) {
@@ -148,7 +151,7 @@ TEST(rung1_stream_r3_against_fp64) {
   jobs[6].signal = 1;  // expert B gate/up
   jobs[7].wait = 0;    // expert A down waits for A's gate/up only
   jobs[8].wait = 1;
-  const int stage_end[] = {5, 9, 10};
+  const int stage_end[] = {5, 9, 16};
   g::StreamPlan plan;
   CHECK(plan.build(jobs.data(), nj, stage_end, 3, 2));
   if (plan.jobs() == 0) {

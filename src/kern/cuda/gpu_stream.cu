@@ -21,7 +21,7 @@
 namespace pelias::kern::gpu {
 namespace {
 
-enum Fmt : int { kQ7ZT = 0, kQ4TG2 = 1, kQ5K = 2, kQ6K = 3 };
+enum Fmt : int { kQ7ZT = 0, kQ4TG2 = 1, kQ5K = 2, kQ6K = 3, kQ8_0 = 4, kQ4K = 5, kIQ4XS = 6 };
 
 struct DJob {
   int fmt, n, K, lpr;      // format, rows, inputs, lanes per row (K / 128)
@@ -56,6 +56,9 @@ int fmt_of(std::uint32_t type) {
     case static_cast<std::uint32_t>(quant::Type::q4_tg2): return kQ4TG2;
     case static_cast<std::uint32_t>(quant::Type::q5_k): return kQ5K;
     case static_cast<std::uint32_t>(quant::Type::q6_k): return kQ6K;
+    case static_cast<std::uint32_t>(quant::Type::q8_0): return kQ8_0;
+    case static_cast<std::uint32_t>(quant::Type::q4_k): return kQ4K;
+    case static_cast<std::uint32_t>(quant::Type::iq4_xs): return kIQ4XS;
     default: return -1;
   }
 }
@@ -76,6 +79,17 @@ constexpr int kLutBytes = 2048 * 4;
 __device__ __forceinline__ float i8f(const int* xw, int i) {  // int8 -> float by the magic number (exact for int8)
   const unsigned b = (static_cast<unsigned>(xw[i >> 2]) >> (8 * (i & 3))) & 0xffu;
   return __int_as_float(static_cast<int>((b ^ 0x80u) | 0x4B000000u)) - 8388736.f;
+}
+
+// IQ4_XS: four 4-bit codes (one per byte, 0..15) -> the four int8 levels kvalues_iq4nl[code], packed for __dp4a. The 16
+// levels sit in four words; __byte_perm picks by the low 3 bits of each code from (T0, T1) and (T2, T3), bit 3 chooses
+// between the two (checked on the host for all 65,536 code combinations, 2026-10-30)
+__device__ __forceinline__ int iq4_levels(std::uint32_t v) {
+  constexpr std::uint32_t T0 = 0xBFAD9881u, T1 = 0xF6EADDCFu, T2 = 0x26190D01u, T3 = 0x71594535u;  // kvalues_iq4nl 0-3, 4-7, 8-11, 12-15
+  const std::uint32_t x = v & 0x07070707u, t = x | (x >> 4);
+  const std::uint32_t sel = (t & 0xffu) | ((t >> 4) & 0x0f00u) | ((t >> 8) & 0xf000u);
+  const std::uint32_t lo = __byte_perm(T0, T1, sel), hi = __byte_perm(T2, T3, sel), m = ((v >> 3) & 0x01010101u) * 0xffu;
+  return static_cast<int>((lo & ~m) | (hi & m));
 }
 
 // one lane's part (128 values = 4 sub-blocks of 32) of one row; returns the partial dot product
@@ -211,6 +225,83 @@ __device__ float lane_part(const DJob& J, int r, int part) {
       }
       acc += __ldg(J.xs + jg) *
              (d * static_cast<float>(sc) * static_cast<float>(sq) - dmin * static_cast<float>(mn) * static_cast<float>(__ldg(J.xsum + jg)));
+    }
+  } else if (J.fmt == kQ8_0) {  // repacked per 256: qs[256] (int8) | d[8] (fp16); the half's 128 values and 4 d's
+    const std::uint8_t* bp = J.w + rb * 272;
+    const uint2 dd = *reinterpret_cast<const uint2*>(bp + 256 + half * 8);
+#pragma unroll
+    for (int jj = 0; jj < 4; ++jj) {
+      const int jg = jg0 + jj;
+      const int4 qa = ld_cs4(bp + half * 128 + 32 * jj), qb = ld_cs4(bp + half * 128 + 32 * jj + 16);
+      int P = 0;
+      P = __dp4a(qa.x, xw[8 * jj], P);
+      P = __dp4a(qa.y, xw[8 * jj + 1], P);
+      P = __dp4a(qa.z, xw[8 * jj + 2], P);
+      P = __dp4a(qa.w, xw[8 * jj + 3], P);
+      P = __dp4a(qb.x, xw[8 * jj + 4], P);
+      P = __dp4a(qb.y, xw[8 * jj + 5], P);
+      P = __dp4a(qb.z, xw[8 * jj + 6], P);
+      P = __dp4a(qb.w, xw[8 * jj + 7], P);
+      const std::uint32_t dw = (jj < 2 ? dd.x : dd.y) >> (16 * (jj & 1));
+      const float d = __half2float(__ushort_as_half(static_cast<unsigned short>(dw & 0xffffu)));
+      acc += d * __ldg(J.xs + jg) * static_cast<float>(P);
+    }
+  } else if (J.fmt == kQ4K) {  // as stored (144 bytes): d | dmin | scales[12] | qs[128]; Q5_K without qh
+    const std::uint8_t* bp = J.w + rb * 144;
+    const int4 hd = ld_cs4(bp);
+    int4 ql[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) ql[i] = ld_cs4(bp + 16 + half * 64 + 16 * i);
+    const std::uint32_t qw[16] = {static_cast<std::uint32_t>(ql[0].x), static_cast<std::uint32_t>(ql[0].y), static_cast<std::uint32_t>(ql[0].z),
+                                  static_cast<std::uint32_t>(ql[0].w), static_cast<std::uint32_t>(ql[1].x), static_cast<std::uint32_t>(ql[1].y),
+                                  static_cast<std::uint32_t>(ql[1].z), static_cast<std::uint32_t>(ql[1].w), static_cast<std::uint32_t>(ql[2].x),
+                                  static_cast<std::uint32_t>(ql[2].y), static_cast<std::uint32_t>(ql[2].z), static_cast<std::uint32_t>(ql[2].w),
+                                  static_cast<std::uint32_t>(ql[3].x), static_cast<std::uint32_t>(ql[3].y), static_cast<std::uint32_t>(ql[3].z),
+                                  static_cast<std::uint32_t>(ql[3].w)};
+    const std::uint32_t h0 = static_cast<std::uint32_t>(hd.x);
+    const float d = __half2float(__ushort_as_half(static_cast<unsigned short>(h0 & 0xffffu)));
+    const float dmin = __half2float(__ushort_as_half(static_cast<unsigned short>(h0 >> 16)));
+    const std::uint32_t s0 = static_cast<std::uint32_t>(hd.y), s1 = static_cast<std::uint32_t>(hd.z), s2 = static_cast<std::uint32_t>(hd.w);
+#pragma unroll
+    for (int jj = 0; jj < 4; ++jj) {
+      const int j = half * 4 + jj, jg = jg0 + jj;
+      auto qb = [&](int k) { return static_cast<int>(((k < 4 ? s0 : (k < 8 ? s1 : s2)) >> (8 * (k & 3))) & 0xffu); };
+      int sc, mn;
+      if (j < 4) {
+        sc = qb(j) & 63;
+        mn = qb(j + 4) & 63;
+      } else {
+        sc = (qb(j + 4) & 0xF) | ((qb(j - 4) >> 6) << 4);
+        mn = (qb(j + 4) >> 4) | ((qb(j) >> 6) << 4);
+      }
+      // sub-block j: 32 nibbles of bytes 32 (jj / 2) .. +31 of the half, low nibbles for even j, high for odd
+      const int sh = 4 * (j & 1);
+      int sq = 0;
+#pragma unroll
+      for (int g = 0; g < 8; ++g) sq = __dp4a(static_cast<int>((qw[8 * (jj >> 1) + g] >> sh) & 0x0F0F0F0Fu), xw[8 * jj + g], sq);
+      acc += __ldg(J.xs + jg) *
+             (d * static_cast<float>(sc) * static_cast<float>(sq) - dmin * static_cast<float>(mn) * static_cast<float>(__ldg(J.xsum + jg)));
+    }
+  } else if (J.fmt == kIQ4XS) {  // repacked per 256 (144 bytes): d | scales_h | scales_l[4] | 8 zero bytes | qs[128]
+    const std::uint8_t* bp = J.w + rb * 144;
+    const int4 hd = ld_cs4(bp);
+    const std::uint32_t h0 = static_cast<std::uint32_t>(hd.x), sl = static_cast<std::uint32_t>(hd.y);
+    const float d = __half2float(__ushort_as_half(static_cast<unsigned short>(h0 & 0xffffu)));
+    const std::uint32_t sh = h0 >> 16;
+#pragma unroll
+    for (int jj = 0; jj < 4; ++jj) {
+      const int ib = half * 4 + jj, jg = jg0 + jj;
+      const int ls = static_cast<int>(((sl >> (4 * ib)) & 0xfu) | (((sh >> (2 * ib)) & 3u) << 4));
+      const int4 qv = ld_cs4(bp + 16 + 16 * ib);  // 16 bytes: value l (low nibble of byte l) and l + 16 (high nibble)
+      const std::uint32_t qw[4] = {static_cast<std::uint32_t>(qv.x), static_cast<std::uint32_t>(qv.y), static_cast<std::uint32_t>(qv.z),
+                                   static_cast<std::uint32_t>(qv.w)};
+      int P = 0;
+#pragma unroll
+      for (int w = 0; w < 4; ++w) {
+        P = __dp4a(iq4_levels(qw[w] & 0x0F0F0F0Fu), xw[8 * jj + w], P);
+        P = __dp4a(iq4_levels((qw[w] >> 4) & 0x0F0F0F0Fu), xw[8 * jj + 4 + w], P);
+      }
+      acc += d * static_cast<float>(ls - 32) * __ldg(J.xs + jg) * static_cast<float>(P);
     }
   } else {  // kQ6K
     const std::uint8_t* bp = J.w + rb * 208;
@@ -364,7 +455,7 @@ bool stream_type_ok(std::uint32_t type, std::int64_t k) {
 
 bool stream_upload(std::uint32_t type, const void* rows, std::int64_t n, std::int64_t k, StreamWeights* out) {
   if (!out || !rows || n <= 0 || n > 0x7fffffff) return sfail("stream_upload: bad arguments");
-  if (!stream_type_ok(type, k)) return sfail("stream_upload: the streaming kernel reads Q7_ZT, Q4_TG2, Q5_K, Q6_K with k 256-4096 (powers of two)");
+  if (!stream_type_ok(type, k)) return sfail("stream_upload: the streaming kernel reads Q7_ZT, Q4_TG2, Q5_K, Q6_K, Q8_0, Q4_K, IQ4_XS with k 256-4096 (powers of two)");
   *out = StreamWeights{};
   out->type = type;
   out->n = n;
@@ -404,8 +495,32 @@ bool stream_upload(std::uint32_t type, const void* rows, std::int64_t n, std::in
       return false;
     }
     out->bytes = static_cast<std::uint64_t>(nb) * 210;
-  } else {  // Q4_TG2 (144) and Q5_K (176) as stored
-    const std::uint64_t bb = f == kQ4TG2 ? 144 : 176;
+  } else if (f == kQ8_0) {  // GGUF Q8_0 (8 blocks of 34 bytes: d, qs[32]) -> qs[256] | d[8] per 256 (272 bytes, 16-byte aligned)
+    std::vector<std::uint8_t> w(static_cast<std::size_t>(nb) * 272);
+    for (std::int64_t b = 0; b < nb; ++b)
+      for (int i = 0; i < 8; ++i) {
+        const std::uint8_t* p = in + 272 * b + 34 * i;
+        std::memcpy(w.data() + 272 * b + 32 * i, p + 2, 32);
+        std::memcpy(w.data() + 272 * b + 256 + 2 * i, p, 2);
+      }
+    if (!up(w, &out->w)) {
+      stream_release(out);
+      return false;
+    }
+    out->bytes = static_cast<std::uint64_t>(nb) * 272;
+  } else if (f == kIQ4XS) {  // GGUF IQ4_XS (136 bytes) -> 8 header bytes, 8 zero bytes, qs[128] (144, 16-byte aligned)
+    std::vector<std::uint8_t> w(static_cast<std::size_t>(nb) * 144, 0);
+    for (std::int64_t b = 0; b < nb; ++b) {
+      std::memcpy(w.data() + 144 * b, in + 136 * b, 8);
+      std::memcpy(w.data() + 144 * b + 16, in + 136 * b + 8, 128);
+    }
+    if (!up(w, &out->w)) {
+      stream_release(out);
+      return false;
+    }
+    out->bytes = static_cast<std::uint64_t>(nb) * 136;
+  } else {  // Q4_TG2 (144), Q4_K (144) and Q5_K (176) as stored
+    const std::uint64_t bb = f == kQ5K ? 176 : 144;
     std::vector<std::uint8_t> w(in, in + static_cast<std::size_t>(nb) * bb);
     if (!up(w, &out->w)) {
       stream_release(out);
