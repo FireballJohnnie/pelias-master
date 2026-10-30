@@ -9,6 +9,11 @@
 #include <cstring>
 #include <vector>
 
+// gcc 15 reports -Wfree-nonheap-object on plain std::vector<std::uint8_t> lifetimes in this file (a false positive of its
+// interprocedural analysis; gcc 13 and clang 21 do not); the vectors here are ordinary allocations
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic ignored "-Wfree-nonheap-object"
+#endif
 #include "kern/cpu_dot.h"
 #include "pelias_test.h"
 #include "quant/planes.h"
@@ -195,8 +200,9 @@ TEST(cpu_dot_reads_every_readable_type) {
 namespace {
 bool run_q8(std::uint32_t id, std::int64_t k, const kn::RowPlanes* pl, std::uint32_t seed, int* checked) {
   const q::Type t = static_cast<q::Type>(id);
-  std::vector<std::uint8_t> row(q::row_bytes(id, static_cast<std::uint64_t>(k)));
-  if (row.empty()) return true;
+  const std::uint64_t rb = q::row_bytes(id, static_cast<std::uint64_t>(k));
+  if (rb == 0) return true;
+  std::vector<std::uint8_t> row(static_cast<std::size_t>(rb));
   if (q::can_quantize(t)) {
     const std::vector<float> src = noise(k, seed, 0.05f);
     if (!q::quantize_row(t, src.data(), row.data(), k)) return false;
