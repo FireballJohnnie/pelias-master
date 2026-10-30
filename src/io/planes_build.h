@@ -11,6 +11,7 @@
 // embedding table's rows when the model ties the output layer to it).
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -27,6 +28,16 @@ struct PlaneBuildOptions {
   bool exact_head = false;   // also store the original output rows (BF16)
   std::string imatrix;       // optional importance matrix (GGUF)
   bool skip_mtp = true;      // leave out the MTP blocks (the last nextn_predict_layers blocks; the reference does not run them)
+  // Planes per tensor: the first rule whose text is part of the tensor's name sets its plane count (0 = no planes for it);
+  // a tensor no rule names gets k. Example: {"output.weight", 3}, {"_exps", 1}, {"", 1}.
+  std::vector<std::pair<std::string, int>> k_rules;
+  // Block selection (Option A, docs/PELIAS_RESIDUAL_PLANES.md 6.7): the tensors whose name contains `select` keep planes only
+  // on the 256-blocks that remove the most relative error (the block's importance-weighted error removed / the importance-
+  // weighted energy of its matrix, times block_weights[name] when given), budget_bytes of plane data in all, in the side file
+  // as block-selective tensors (<name> + <name>.planemask + <name>.planeoff). Those tensors must share one plane count.
+  std::string select;
+  std::uint64_t budget_bytes = 0;
+  std::map<std::string, double> block_weights;
 };
 
 struct PlaneBuildReport {
@@ -35,6 +46,9 @@ struct PlaneBuildReport {
   std::uint64_t bytes = 0;                 // plane bytes written (without the exact head)
   double err_before = 0.0, err_after = 0.0;  // sum over every planed weight of imp * residual^2, before and after
   std::size_t imatrix_basis_skips = 0;     // weights fitted without importance: the matrix was collected in the other basis
+  std::size_t tiered = 0;                  // usage-tiered weights given planes (fitted expert by expert in each expert's type)
+  std::uint64_t blocks_candidate = 0, blocks_selected = 0;  // block selection: blocks scored, blocks kept
+  double select_err_before = 0.0, select_err_after = 0.0;   // the selected tensors' importance-weighted error, before / after
 };
 
 using PlaneProgress = std::function<void(std::size_t done, std::size_t total, const std::string& name)>;

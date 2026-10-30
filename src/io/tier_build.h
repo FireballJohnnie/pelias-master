@@ -32,6 +32,14 @@ inline std::string tier_part_name(const std::string& name, std::uint32_t type) {
   return name + "." + t;
 }
 
+// A plane side file's record of the weight it was fitted to (pelias.planes.types): the type id of a stock weight, or for a
+// tiered weight -1 - (sum over experts of (e + 1) x type mod 2^31 - 1), so planes fitted to another allocation are refused.
+inline std::int64_t tier_signature(const std::vector<std::uint32_t>& types) {
+  std::uint64_t h = 0;
+  for (std::size_t e = 0; e < types.size(); ++e) h = (h + (e + 1) * static_cast<std::uint64_t>(types[e])) % 2147483647u;
+  return -1 - static_cast<std::int64_t>(h);
+}
+
 // The allocation (tools/tier_alloc.py): weight name -> one type id per expert.
 Result<std::map<std::string, std::vector<std::uint32_t>>> read_tier_alloc(const std::string& path);
 

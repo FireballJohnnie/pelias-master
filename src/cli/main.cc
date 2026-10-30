@@ -184,7 +184,8 @@ void usage() {
       "                                  F of each routed expert's hidden values (oracle); --defer-experts D: the D lowest\n"
       "                                  experts added one layer later; --swap-near-tie M: use the first unpicked expert when\n"
       "                                  the last pick is not in the hot set, it is, and their probabilities differ by < M\n"
-      "      [--planes FILE] [--plane-k K] [--head-rescore N]   (residual planes; see planes and generate)\n"
+      "      [--planes FILE] [--plane-k K] [--plane-picks N] [--head-rescore N]   (residual planes; see planes and generate)\n"
+      "                                  --plane-picks N: the routed experts' planes only for each token's N highest-weighted picks\n"
       "  kld-compare --a A.bin --b B.bin [--name-a S] [--name-b S]\n"
       "                                  paired comparison of two --dump-kld files scored on the same base: mean difference,\n"
       "                                  chunk-clustered standard error, 95 % interval, top-token disagreements, verdict\n"
@@ -209,13 +210,17 @@ void usage() {
       "                                  the first K stored planes; --head-rescore N recomputes the N largest logits exactly from\n"
       "                                  the original output rows (a plane file built with --exact-head)\n"
       "  planes --model FILE --base ORIGINAL.gguf --out PLANES.gguf [--k 2] [--refit 8] [--imatrix IMATRIX.gguf] [--exact-head]\n"
-      "         [--threads N] [--keep-mtp]\n"
+      "         [--threads N] [--keep-mtp] [--k-rules PART=K,...] [--select PART --budget-mb N [--block-weights FILE]]\n"
       "                                  residual sign planes of any model file against its original weights (F32/F16/BF16, same\n"
       "                                  tensor names): per 256 values, K fp16 scales and K sign bits per value, fitted plane by\n"
       "                                  plane then together (--refit rounds); weighted per column by an importance matrix when\n"
       "                                  given. --exact-head also stores the original output rows (BF16) for --head-rescore.\n"
       "                                  The output must not exist; the model file's types are recorded so it is only read\n"
-      "                                  with that file.\n"
+      "                                  with that file. A usage-tiered model file (quantize --tier) is fitted expert by expert.\n"
+      "                                  --k-rules: the first PART found in a tensor's name sets its plane count (0 = none; others\n"
+      "                                  --k). --select PART --budget-mb N: the tensors whose names contain PART keep planes only on\n"
+      "                                  the 256-blocks that remove the most relative error, N MB in all (--block-weights: name<TAB>\n"
+      "                                  factor per line, weighting a tensor's blocks)\n"
       "  teacher --model ORIGINAL.gguf --ids A.ids [--ids B.ids ...] --out-dir DIR [--threads N]\n"
       "                                  the original model's view of decoded text (generate --ids-out files): for every output\n"
       "                                  position its own top-1 and top-2 and the held token's logit and log-probability, to\n"
@@ -818,8 +823,8 @@ bool act_options(const Args& a, model::ForwardOptions& fo) {
 // the weights (model::attach_planes). Returns 0, or the exit code after printing why.
 int plane_options(const Args& a, os::FileMap& pm, io::GgufReader& pg, model::Qwen35MoeWeights& w, model::ForwardOptions& fo, const char* who) {
   if (!a.has("planes")) {
-    if (a.has("plane-k") || a.has("head-rescore") || a.has("planes-mode")) {
-      std::fprintf(stderr, "pelias: --plane-k, --head-rescore and --planes-mode need --planes FILE\n");
+    if (a.has("plane-k") || a.has("head-rescore") || a.has("planes-mode") || a.has("plane-picks")) {
+      std::fprintf(stderr, "pelias: --plane-k, --plane-picks, --head-rescore and --planes-mode need --planes FILE\n");
       return 1;
     }
     return 0;
@@ -832,6 +837,14 @@ int plane_options(const Args& a, os::FileMap& pm, io::GgufReader& pg, model::Qwe
       return 1;
     }
     k = static_cast<int>(r.value);
+  }
+  if (a.has("plane-picks")) {
+    const Result<std::uint64_t> r = io::parse_whole(a.get("plane-picks"), 64);
+    if (!r.ok()) {
+      std::fprintf(stderr, "pelias: --plane-picks needs a whole number (0 = every pick)\n");
+      return 1;
+    }
+    fo.plane_picks = static_cast<int>(r.value);
   }
   if (a.has("head-rescore")) {
     const Result<std::uint64_t> r = io::parse_whole(a.get("head-rescore"), 1u << 20);
@@ -855,8 +868,13 @@ int plane_options(const Args& a, os::FileMap& pm, io::GgufReader& pg, model::Qwe
   int stored = 0;
   for (const model::Qwen35MoeLayer& l : w.layers)
     if (l.down_exps.planes) stored = l.down_exps.plane_k_stored;
-  std::fprintf(stderr, "pelias %s: residual planes on %d weights (%d of %d stored per row) from %s, %.2f GB in %.1f s; exact head re-score %s\n", who,
-               n.value, k > 0 ? k : stored, stored, a.get("planes").c_str(), static_cast<double>(pm.size()) / 1e9, tl.seconds(),
+  std::size_t sparse = 0;
+  for (const model::Qwen35MoeLayer& l : w.layers)
+    for (const model::WeightView* p : {&l.gate_exps, &l.up_exps, &l.down_exps}) sparse += p->plane_mask ? 1 : 0;
+  std::fprintf(stderr, "pelias %s: residual planes on %d weights (%d of %d stored per row on the routed experts; %zu expert weights block-selective) "
+               "from %s, %.2f GB in %.1f s; read for %s; exact head re-score %s\n", who,
+               n.value, k > 0 ? std::min(k, stored) : stored, stored, sparse, a.get("planes").c_str(), static_cast<double>(pm.size()) / 1e9, tl.seconds(),
+               fo.plane_picks > 0 ? ("each token's top " + std::to_string(fo.plane_picks) + " expert picks").c_str() : "every pick",
                fo.head_rescore > 0 && w.output_exact.present() ? std::to_string(fo.head_rescore).c_str() : "off");
   if (fo.head_rescore > 0 && !w.output_exact.present()) {
     std::fprintf(stderr, "pelias: --head-rescore needs a plane file built with --exact-head\n");
@@ -937,6 +955,7 @@ int cmd_kld(const Args& a) {
   model::ForwardOptions fo;
   fo.threads = threads;
   fo.head_rescore = plane_fo.head_rescore;
+  fo.plane_picks = plane_fo.plane_picks;
   if (!act_options(a, fo)) return 1;
   // Block M: speed ideas, each measured for its accuracy cost
   std::uint64_t m_stats[6] = {0, 0, 0, 0, 0, 0};
@@ -1420,6 +1439,51 @@ int cmd_planes(const Args& a) {
   po.imatrix = a.get("imatrix");
   po.exact_head = a.has("exact-head");
   po.skip_mtp = !a.has("keep-mtp");
+  if (a.has("k-rules")) {  // PART=K,PART=K,...: the first PART found in a tensor's name sets its plane count (0 = none)
+    const std::string t = a.get("k-rules");
+    for (std::size_t p0 = 0; p0 <= t.size();) {
+      const std::size_t p1 = std::min(t.find(',', p0), t.size());
+      const std::string item = t.substr(p0, p1 - p0);
+      const std::size_t eq = item.rfind('=');
+      const Result<std::uint64_t> r = eq == std::string::npos ? Result<std::uint64_t>::fail(Status::fail(Code::invalid_argument, "no =")) : io::parse_whole(item.substr(eq + 1), 4);
+      if (!r.ok()) {
+        std::fprintf(stderr, "pelias: --k-rules takes PART=K items (K 0 to 4), comma-separated; '%s' is not one\n", item.c_str());
+        return 1;
+      }
+      po.k_rules.emplace_back(item.substr(0, eq), static_cast<int>(r.value));
+      p0 = p1 + 1;
+    }
+  }
+  if (a.has("select")) {
+    po.select = a.get("select");
+    const Result<std::uint64_t> r = io::parse_whole(a.get("budget-mb"), std::uint64_t{1} << 30);
+    if (!a.has("budget-mb") || !r.ok() || r.value == 0) {
+      std::fprintf(stderr, "pelias: --select needs --budget-mb N (plane data of the selected tensors, megabytes of 10^6 bytes)\n");
+      return 1;
+    }
+    po.budget_bytes = r.value * 1000000ull;
+  }
+  if (a.has("block-weights")) {  // name<TAB>factor per line (tools/analysis/plane_block_weights.py)
+    const Result<std::string> text = io::read_text_file(a.get("block-weights"), std::uint64_t{16} << 20);
+    if (!text.ok()) return fail_input(text.status);
+    std::size_t p0 = 0;
+    while (p0 < text.value.size()) {
+      std::size_t p1 = text.value.find('\n', p0);
+      if (p1 == std::string::npos) p1 = text.value.size();
+      std::string line = text.value.substr(p0, p1 - p0);
+      p0 = p1 + 1;
+      if (!line.empty() && line.back() == '\r') line.pop_back();
+      if (line.empty()) continue;
+      const std::size_t tab = line.find('\t');
+      char* end = nullptr;
+      const double f = tab == std::string::npos ? 0.0 : std::strtod(line.c_str() + tab + 1, &end);
+      if (tab == std::string::npos || end == line.c_str() + tab + 1 || !(f > 0.0)) {
+        std::fprintf(stderr, "pelias: --block-weights lines are name<TAB>factor (factor above 0): '%s'\n", line.c_str());
+        return 1;
+      }
+      po.block_weights[line.substr(0, tab)] = f;
+    }
+  }
   os::FileMap mm, bm;
   Status s = mm.open(path);
   if (!s) return fail_input(s);
@@ -1447,6 +1511,12 @@ int cmd_planes(const Args& a) {
     return rep.status.code == Code::invalid_argument ? 1 : 2;
   }
   for (const std::string& x : rep.value.skipped) std::fprintf(stderr, "pelias planes: left out %s\n", x.c_str());
+  if (rep.value.tiered) std::fprintf(stderr, "pelias planes: %zu usage-tiered weights fitted expert by expert in each expert's own type\n", rep.value.tiered);
+  if (rep.value.blocks_candidate)
+    std::fprintf(stderr, "pelias planes: block selection '%s': %llu of %llu blocks kept (%.2f %%); their tensors' residual %.6g -> %.6g (%.4f)\n",
+                 po.select.c_str(), static_cast<unsigned long long>(rep.value.blocks_selected), static_cast<unsigned long long>(rep.value.blocks_candidate),
+                 100.0 * static_cast<double>(rep.value.blocks_selected) / static_cast<double>(rep.value.blocks_candidate), rep.value.select_err_before,
+                 rep.value.select_err_after, rep.value.select_err_before > 0 ? rep.value.select_err_after / rep.value.select_err_before : 0.0);
   if (rep.value.imatrix_basis_skips)
     std::fprintf(stderr, "pelias planes: %zu weights fitted without importance (the matrix was collected rotated and the file is not, or the reverse)\n",
                  rep.value.imatrix_basis_skips);

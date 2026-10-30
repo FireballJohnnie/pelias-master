@@ -836,3 +836,137 @@ TEST(tiered_experts_read_each_expert_in_its_own_type) {
   CHECK(!pelias::io::read_tier_alloc(a2).ok() && !pelias::io::read_tier_alloc(a3).ok());
 }
 
+// Planes on a usage-tiered file, block selection, per-tensor plane counts and per-pick reading (docs/PELIAS_RESIDUAL_PLANES.md
+// 6.7-6.9): (1) planes fitted expert by expert on a tiered file move the logits toward the original; (2) selecting every block
+// gives exactly the full-row planes' logits, a half budget keeps exactly that many blocks and lands between none and all;
+// (3) --k-rules set each tensor's plane count; (4) per-pick reading: all picks = every pick, fewer picks lands between;
+// (5) planes fitted to one allocation are refused on another.
+TEST(planes_on_tiered_files_select_blocks_and_picks) {
+  TinyModel tm;
+  tiny_model(tm);
+  CHECK(tm.ok);
+  if (!tm.ok) return;
+  namespace fs = std::filesystem;
+  namespace q = pelias::quant;
+  static int run = 0;
+  const fs::path dir = fs::temp_directory_path() / ("pelias_tierplanes_test_" + std::to_string(::getpid()) + "_" + std::to_string(run++));
+  std::error_code ec;
+  fs::create_directories(dir, ec);
+  const std::string q4 = (dir / "tiny_Q4_K_M.gguf").string();
+  pelias::io::RequantOptions ro;
+  ro.ftype = q::FileType::q4_k_m;
+  ro.threads = 2;
+  CHECK(pelias::io::requantize(tm.map, tm.reader, q4, ro).ok());
+  pelias::os::FileMap qm;
+  pelias::io::GgufReader qr;
+  CHECK(qm.open(q4).ok() && qr.parse(qm).ok());
+  const std::uint32_t L = tm.spec.n_layer, E = tm.spec.n_expert;
+  const std::uint32_t cyc[3] = {static_cast<std::uint32_t>(q::Type::q4_tg2), static_cast<std::uint32_t>(q::Type::q5_k), static_cast<std::uint32_t>(q::Type::q6_k)};
+  std::map<std::string, std::vector<std::uint32_t>> mixed, other;
+  for (std::uint32_t l = 0; l < L; ++l)
+    for (const char* k : {"gate", "up", "down"}) {
+      const std::string nm = "blk." + std::to_string(l) + ".ffn_" + k + "_exps.weight";
+      for (std::uint32_t e = 0; e < E; ++e) {
+        mixed[nm].push_back(cyc[(e + l) % 3]);
+        other[nm].push_back(cyc[(e + l + 1) % 3]);
+      }
+    }
+  const std::string tf = (dir / "tiny_tier.gguf").string(), tf2 = (dir / "tiny_tier_other.gguf").string();
+  pelias::io::TierBuildOptions to;
+  to.threads = 2;
+  CHECK(pelias::io::build_tiered(qm, qr, tm.map, tm.reader, mixed, tf, to).ok());
+  CHECK(pelias::io::build_tiered(qm, qr, tm.map, tm.reader, other, tf2, to).ok());
+  pelias::os::FileMap tmap, tmap2;
+  pelias::io::GgufReader tr, tr2;
+  CHECK(tmap.open(tf).ok() && tr.parse(tmap).ok() && tmap2.open(tf2).ok() && tr2.parse(tmap2).ok());
+  auto tw = pelias::model::bind_qwen35moe(tr, tmap.data(), tm.spec);
+  auto tw2 = pelias::model::bind_qwen35moe(tr2, tmap2.data(), tm.spec);
+  CHECK(tw.ok() && tw2.ok());
+  if (!tw.ok() || !tw2.ok()) return;
+  const std::vector<std::int32_t> tok{11, 427, 3, 999, 58, 58, 0, 731, 210, 64, 5, 300, 17};
+  const int n = static_cast<int>(tok.size()), v = static_cast<int>(tm.spec.n_vocab);
+  auto logits = [&](const pelias::model::Qwen35MoeWeights& w, int picks) {
+    pelias::model::ForwardOptions o;
+    o.threads = 2;
+    o.plane_picks = picks;
+    std::vector<float> lg(static_cast<std::size_t>(n) * static_cast<std::size_t>(v));
+    CHECK(pelias::model::forward_reference(tm.spec, w, tok.data(), n, 0, n, lg.data(), o).ok());
+    return lg;
+  };
+  auto mse = [&](const std::vector<float>& a, const std::vector<float>& b) {
+    double e = 0.0;
+    for (std::size_t i = 0; i < a.size(); ++i) e += static_cast<double>(a[i] - b[i]) * (a[i] - b[i]);
+    return e / static_cast<double>(a.size());
+  };
+  auto planes = [&](const std::string& name, pelias::io::PlaneBuildOptions po, pelias::io::PlaneBuildReport* rep_out) {
+    const std::string pf = (dir / name).string();
+    po.threads = 2;
+    const auto rep = pelias::io::build_planes(tmap, tr, tm.map, tm.reader, pf, po);
+    CHECK(rep.ok());
+    if (!rep.ok()) std::printf("      %s\n", rep.status.text().c_str());
+    if (rep.ok() && rep_out) *rep_out = rep.value;
+    return pf;
+  };
+  struct Attached { pelias::os::FileMap m; pelias::io::GgufReader g; pelias::model::Qwen35MoeWeights w; bool ok = false; };
+  auto attach = [&](const std::string& pf, const pelias::model::Qwen35MoeWeights& base, Attached& at) {
+    at.ok = at.m.load(pf).ok() && at.g.parse(at.m).ok();
+    at.w = base;
+    if (at.ok) at.ok = pelias::model::attach_planes(at.g, at.m.data(), at.w, 0).ok();
+    return at.ok;
+  };
+  const std::vector<float> ref = logits(tm.w, 0), l0 = logits(tw.value, 0);
+  // (1) one plane on everything, the tiered experts fitted expert by expert
+  pelias::io::PlaneBuildOptions full;
+  full.k = 1;
+  pelias::io::PlaneBuildReport r1;
+  const std::string p1 = planes("full_k1.gguf", full, &r1);
+  CHECK_EQ(r1.tiered, static_cast<std::size_t>(L * 3));
+  Attached a1;
+  CHECK(attach(p1, tw.value, a1));
+  if (!a1.ok) return;
+  const std::vector<float> l1 = logits(a1.w, 0);
+  // (2) block selection: every block = the full-row planes exactly; half the budget = that many blocks, between
+  std::uint64_t exp_blocks = 0;
+  for (const auto& [nm, ty] : mixed) {
+    const auto* t = tm.reader.find_tensor(nm);
+    exp_blocks += t->ne[1] * t->ne[2] * (t->ne[0] / 256);
+  }
+  pelias::io::PlaneBuildOptions all = full, half = full;
+  all.select = "_exps";
+  all.budget_bytes = exp_blocks * 34;
+  half.select = "_exps";
+  half.budget_bytes = (exp_blocks / 2) * 34;
+  pelias::io::PlaneBuildReport r2, r3;
+  const std::string p2 = planes("sel_all.gguf", all, &r2), p3 = planes("sel_half.gguf", half, &r3);
+  CHECK_EQ(r2.blocks_selected, exp_blocks);
+  CHECK_EQ(r3.blocks_selected, exp_blocks / 2);
+  Attached a2, a3;
+  CHECK(attach(p2, tw.value, a2) && attach(p3, tw.value, a3));
+  if (!a2.ok || !a3.ok) return;
+  CHECK(a2.w.layers[0].gate_exps.plane_mask != nullptr);
+  const std::vector<float> l2 = logits(a2.w, 0), l3 = logits(a3.w, 0);
+  CHECK(l2 == l1);
+  const double e0 = mse(l0, ref), e1 = mse(l1, ref), e3 = mse(l3, ref);
+  std::printf("    logit error vs the original: tiered %.4g; + half the expert blocks %.4g; + one plane everywhere %.4g\n", e0, e3, e1);
+  CHECK(e1 < e0 && e1 < e3 && e3 < e0);
+  CHECK(r3.select_err_after < r3.select_err_before);
+  // (3) per-tensor plane counts
+  pelias::io::PlaneBuildOptions rules = full;
+  rules.k_rules = {{"token_embd", 3}, {"_exps", 1}, {"", 0}};  // the tiny model ties its output layer to the embedding
+  const std::string p4 = planes("rules.gguf", rules, nullptr);
+  Attached a4;
+  CHECK(attach(p4, tw.value, a4));
+  if (!a4.ok) return;
+  CHECK(a4.w.tok_embd.plane_k_stored == 3 && a4.w.output.plane_k_stored == 3 && a4.w.layers[1].down_exps.plane_k_stored == 1 &&
+        a4.w.layers[1].down_shexp.planes == nullptr);
+  // (4) per-pick reading: as many picks as the model uses = every pick; one pick lands between none and every
+  const int nu = static_cast<int>(tm.spec.n_expert_used);
+  CHECK(logits(a1.w, nu) == l1);
+  const double ep = mse(logits(a1.w, 1), ref);
+  std::printf("    per-pick planes (tiny model, %d picks): every pick %.4g, top 1 %.4g\n", nu, e1, ep);
+  CHECK(ep > e1 && ep < e0);
+  // (5) the same planes on another allocation are refused
+  Attached a5;
+  CHECK(!attach(p1, tw2.value, a5));
+}
+

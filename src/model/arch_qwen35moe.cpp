@@ -168,8 +168,13 @@ void load_tile(const WeightView& w, uint64_t first_row, int nr, int64_t k, Scrat
       const ExpertSlot& s = w.slots[row / w.ne[1]];
       (void)quant::dequantize_row(static_cast<quant::Type>(s.type), s.data + (row % w.ne[1]) * s.row_bytes, sc.row.data(), k);
     }
-    if (sc.planes && w.planes)  // residual sign planes: the row as the original weights, to the planes read
-      quant::plane_add_row(w.planes + (first_row + static_cast<uint64_t>(r)) * w.plane_row_bytes, k, w.plane_k_stored, w.plane_k, sc.row.data());
+    if (sc.planes && w.planes) {  // residual sign planes: the row as the original weights, to the planes read
+      if (w.plane_mask)  // block-selective: only the selected blocks of this row carry planes
+        quant::plane_add_row_sparse(w.planes + static_cast<uint64_t>(w.plane_off[row]) * 34u * static_cast<uint64_t>(w.plane_k_stored),
+                                    w.plane_mask + row * w.plane_mask_bytes, k, w.plane_k_stored, w.plane_k, sc.row.data());
+      else
+        quant::plane_add_row(w.planes + row * w.plane_row_bytes, k, w.plane_k_stored, w.plane_k, sc.row.data());
+    }
     const float* src = sc.row.data();
     for (int64_t i = 0; i < k; ++i) wt[z(i * kTile + r)] = src[z(i)];
   }
@@ -843,11 +848,40 @@ void moe(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* out, flo
   std::vector<int64_t> busy;
   for (int64_t x = 0; x < ne; ++x)
     if (!slots[z(x)].empty()) busy.push_back(x);
-  parallel_items(static_cast<int64_t>(busy.size()), c.threads, [&](int64_t bi, int tid) {
-    const int64_t ex = busy[z(bi)];
-    const std::vector<int64_t>& list = slots[z(ex)];
+  // plane_picks: an expert's rows are run in two groups, the picks that read their planes (rank < plane_picks) and the rest
+  const bool split_picks = c.opt.plane_picks > 0 && c.opt.plane_picks < nu && c.opt.planes;
+  std::vector<std::vector<int64_t>> groups;
+  std::vector<char> group_planes;
+  for (const int64_t x : busy) {
+    if (!split_picks) {
+      groups.push_back(slots[z(x)]);
+      group_planes.push_back(1);
+      continue;
+    }
+    std::vector<int64_t> a, b;  // slot = t * nu + k, and k is the pick's rank (the picks are kept in descending order)
+    for (const int64_t slot : slots[z(x)]) ((slot % nu) < c.opt.plane_picks ? a : b).push_back(slot);
+    for (int g = 0; g < 2; ++g) {
+      std::vector<int64_t>& v = g == 0 ? a : b;
+      if (v.empty()) continue;
+      groups.push_back(std::move(v));
+      group_planes.push_back(g == 0 ? 1 : 0);
+    }
+  }
+  std::vector<int64_t> group_ex;
+  for (const int64_t x : busy) {
+    if (!split_picks) { group_ex.push_back(x); continue; }
+    int cnt = 0;
+    for (const int64_t slot : slots[z(x)]) cnt |= ((slot % nu) < c.opt.plane_picks) ? 1 : 2;
+    if (cnt & 1) group_ex.push_back(x);
+    if (cnt & 2) group_ex.push_back(x);
+  }
+  parallel_items(static_cast<int64_t>(groups.size()), c.threads, [&](int64_t bi, int tid) {
+    const int64_t ex = group_ex[z(bi)];
+    const std::vector<int64_t>& list = groups[z(bi)];
     const int64_t m = static_cast<int64_t>(list.size());
     Scratch& sc = c.sc[z(tid)];
+    const bool planes_before = sc.planes;
+    sc.planes = planes_before && group_planes[z(bi)] != 0;
     sc.xe.resize(z(m * e));
     sc.ge.resize(z(m * ff));
     sc.ue.resize(z(m * ff));
@@ -900,6 +934,7 @@ void moe(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* out, flo
       const float* src = sc.ye.data() + r * e;
       for (int64_t i = 0; i < e; ++i) dst[i] = src[i] * wgt;
     }
+    sc.planes = planes_before;
   });
   if (c.opt.imatrix) {
     ImatrixEntry& ed = c.opt.imatrix->entry(l.down_exps.name, ff, ne);
@@ -1064,6 +1099,13 @@ Result<Qwen35MoeWeights> bind_qwen35moe(const io::GgufReader& r, const std::uint
   return R::good(std::move(w));
 }
 
+std::int64_t plane_signature(const WeightView& v) {
+  if (v.slots.empty()) return static_cast<std::int64_t>(v.type);
+  std::vector<std::uint32_t> t;  // a tiered weight: its per-expert types (io::tier_signature, as the plane builder writes it)
+  for (const ExpertSlot& x : v.slots) t.push_back(x.type);
+  return io::tier_signature(t);
+}
+
 Result<int> attach_planes(const io::GgufReader& pr, const std::uint8_t* pb, Qwen35MoeWeights& w, int k_use) {
   using R = Result<int>;
   bool found = false;
@@ -1074,17 +1116,27 @@ Result<int> attach_planes(const io::GgufReader& pr, const std::uint8_t* pb, Qwen
     return R::fail(Status::fail(Code::unsupported, "the plane side file uses another block size"));
   if (k_use < 0 || static_cast<uint64_t>(k_use) > k)
     return R::fail(Status::fail(Code::invalid_argument, "more planes asked for than the side file stores (" + std::to_string(k) + ")"));
-  const int ku = k_use == 0 ? static_cast<int>(k) : k_use;
-  std::vector<std::int64_t> types;
-  const io::GgufValue* tv = pr.find("pelias.planes.types");
-  if (!tv || tv->type != io::GgufValueType::array) return R::fail(Status::fail(Code::corrupt, "the plane side file names no source types"));
-  if (Status st = pr.array_ints(*tv, types); !st) return R::fail(st);
+  auto ints = [&](const char* key, std::vector<std::int64_t>& out) -> Status {
+    const io::GgufValue* v = pr.find(key);
+    if (!v) return Status::good();
+    if (v->type != io::GgufValueType::array) return Status::fail(Code::corrupt, std::string(key) + " is not a list");
+    return pr.array_ints(*v, out);
+  };
+  std::vector<std::int64_t> types, ks, sparse;
+  if (!pr.find("pelias.planes.types")) return R::fail(Status::fail(Code::corrupt, "the plane side file names no source types"));
+  for (const auto& [key, vec] : {std::pair<const char*, std::vector<std::int64_t>*>{"pelias.planes.types", &types}, {"pelias.planes.ks", &ks},
+                                 {"pelias.planes.sparse", &sparse}})
+    if (Status st = ints(key, *vec); !st) return R::fail(st);
   const bool tied = w.output.data == w.tok_embd.data;
   std::vector<WeightView*> views{&w.output, &w.tok_embd};  // a tied output layer shares the embedding's planes (below)
   for (Qwen35MoeLayer& l : w.layers)
     for (WeightView* p : {&l.wq, &l.wk, &l.wv, &l.wo, &l.wqkv, &l.wgate, &l.wbeta, &l.walpha, &l.ssm_out, &l.up_exps, &l.gate_exps, &l.down_exps,
                           &l.up_shexp, &l.gate_shexp, &l.down_shexp})
       views.push_back(p);
+  auto suffix = [](const std::string& a, const char* sfx) {
+    const std::size_t n = std::char_traits<char>::length(sfx);
+    return a.size() >= n && a.compare(a.size() - n, n, sfx) == 0;
+  };
   int n = 0;
   size_t ti = 0;
   for (const io::GgufTensor& t : pr.tensors()) {
@@ -1099,22 +1151,44 @@ Result<int> attach_planes(const io::GgufReader& pr, const std::uint8_t* pb, Qwen
       w.output_exact.name = t.name;
       continue;
     }
+    if (suffix(t.name, ".planemask") || suffix(t.name, ".planeoff")) continue;  // read with their plane tensor below
     if (ti >= types.size()) return R::fail(Status::fail(Code::corrupt, "the plane side file names fewer source types than it has plane tensors"));
-    const std::int64_t src_type = types[ti++];
+    const std::int64_t src_type = types[ti];
+    const int kt = ks.empty() ? static_cast<int>(k) : static_cast<int>(ks[ti]);
+    const bool sp = !sparse.empty() && sparse[ti] != 0;
+    ++ti;
+    if (kt < 1 || kt > quant::kPlaneMaxK) return R::fail(Status::fail(Code::corrupt, "a plane tensor's plane count is out of range", 0, t.name));
     WeightView* hit = nullptr;
     for (WeightView* p : views)
       if (p->present() && p->name == t.name) hit = p;
     if (!hit) continue;  // a block the reference does not run (MTP), or a tensor that is not a product here
-    if (src_type != static_cast<std::int64_t>(hit->type))
+    if (src_type != plane_signature(*hit))
       return R::fail(Status::fail(Code::invalid_argument, "the plane side file was built for another type of this tensor (another model file)", 0, t.name));
-    const uint64_t prb = static_cast<uint64_t>(quant::plane_row_bytes(static_cast<int64_t>(hit->ne[0]), static_cast<int>(k)));
-    if (hit->ne[0] % quant::kPlaneBlock != 0 || t.type != static_cast<uint32_t>(quant::Type::i8) || t.ne[0] != prb || t.ne[1] != hit->ne[1] * hit->ne[2] ||
-        t.ne[2] != 1)
+    const uint64_t rows = hit->ne[1] * hit->ne[2];
+    if (hit->ne[0] % quant::kPlaneBlock != 0 || t.type != static_cast<uint32_t>(quant::Type::i8))
       return R::fail(Status::fail(Code::corrupt, "a plane tensor does not match its weight's rows", 0, t.name));
+    if (!sp) {
+      const uint64_t prb = static_cast<uint64_t>(quant::plane_row_bytes(static_cast<int64_t>(hit->ne[0]), kt));
+      if (t.ne[0] != prb || t.ne[1] != rows || t.ne[2] != 1)
+        return R::fail(Status::fail(Code::corrupt, "a plane tensor does not match its weight's rows", 0, t.name));
+      hit->plane_row_bytes = prb;
+      hit->plane_mask = nullptr;
+      hit->plane_off = nullptr;
+    } else {
+      const io::GgufTensor* mk = pr.find_tensor(t.name + ".planemask");
+      const io::GgufTensor* of = pr.find_tensor(t.name + ".planeoff");
+      const uint64_t mb = (hit->ne[0] / quant::kPlaneBlock + 7) / 8;
+      if (!mk || !of || mk->type != static_cast<uint32_t>(quant::Type::i8) || mk->ne[0] != mb || mk->ne[1] != rows ||
+          of->type != static_cast<uint32_t>(quant::Type::i32) || of->ne[0] != rows || t.ne[0] != static_cast<uint64_t>(34 * kt))
+        return R::fail(Status::fail(Code::corrupt, "a block-selective plane tensor's mask or offsets do not match its weight", 0, t.name));
+      hit->plane_mask = pb + mk->file_offset;
+      hit->plane_off = reinterpret_cast<const std::uint32_t*>(pb + of->file_offset);
+      hit->plane_mask_bytes = mb;
+      hit->plane_row_bytes = 0;
+    }
     hit->planes = pb + t.file_offset;
-    hit->plane_row_bytes = prb;
-    hit->plane_k_stored = static_cast<int>(k);
-    hit->plane_k = ku;
+    hit->plane_k_stored = kt;
+    hit->plane_k = k_use == 0 ? kt : std::min(k_use, kt);
     ++n;
   }
   if (tied && w.tok_embd.planes) {
@@ -1122,6 +1196,9 @@ Result<int> attach_planes(const io::GgufReader& pr, const std::uint8_t* pb, Qwen
     w.output.plane_row_bytes = w.tok_embd.plane_row_bytes;
     w.output.plane_k_stored = w.tok_embd.plane_k_stored;
     w.output.plane_k = w.tok_embd.plane_k;
+    w.output.plane_mask = w.tok_embd.plane_mask;
+    w.output.plane_off = w.tok_embd.plane_off;
+    w.output.plane_mask_bytes = w.tok_embd.plane_mask_bytes;
   }
   return R::good(n);
 }
@@ -1212,9 +1289,14 @@ Status forward_impl(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, const std
     if (tok < 0 || static_cast<uint64_t>(tok) >= s.n_vocab) return Status::fail(Code::invalid_argument, "a token id is outside the vocabulary");
     (void)quant::dequantize_row(static_cast<quant::Type>(w.tok_embd.type), w.tok_embd.data + static_cast<uint64_t>(tok) * w.tok_embd.row_bytes,
                                 x.data() + t * e, e);
-    if (opt.planes && w.tok_embd.planes)
-      quant::plane_add_row(w.tok_embd.planes + static_cast<uint64_t>(tok) * w.tok_embd.plane_row_bytes, e, w.tok_embd.plane_k_stored, w.tok_embd.plane_k,
-                           x.data() + t * e);
+    if (opt.planes && w.tok_embd.planes) {
+      const WeightView& te = w.tok_embd;
+      if (te.plane_mask)
+        quant::plane_add_row_sparse(te.planes + static_cast<uint64_t>(te.plane_off[tok]) * 34u * static_cast<uint64_t>(te.plane_k_stored),
+                                    te.plane_mask + static_cast<uint64_t>(tok) * te.plane_mask_bytes, e, te.plane_k_stored, te.plane_k, x.data() + t * e);
+      else
+        quant::plane_add_row(te.planes + static_cast<uint64_t>(tok) * te.plane_row_bytes, e, te.plane_k_stored, te.plane_k, x.data() + t * e);
+    }
   }
   for (std::uint32_t il = 0; il < s.n_layer; ++il) {
     const Qwen35MoeLayer& l = w.layers[il];

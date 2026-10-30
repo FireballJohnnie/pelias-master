@@ -62,6 +62,11 @@ struct WeightView {
   const std::uint8_t* planes = nullptr;
   std::uint64_t plane_row_bytes = 0;
   int plane_k = 0, plane_k_stored = 0;
+  // Block-selective planes (quant::plane_add_row_sparse): when plane_mask is set, row r keeps planes only on the blocks its
+  // mask (plane_mask_bytes per row) selects, stored from block plane_off[r] of `planes` (34 x plane_k_stored bytes a block).
+  const std::uint8_t* plane_mask = nullptr;
+  const std::uint32_t* plane_off = nullptr;
+  std::uint64_t plane_mask_bytes = 0;
   [[nodiscard]] bool present() const { return data != nullptr; }
 };
 
@@ -192,6 +197,10 @@ struct ForwardOptions {
   // With the output layer's original rows attached (Qwen35MoeWeights::output_exact) and planes on: the head_rescore
   // largest logits of each output row are recomputed exactly from the original rows and the unrounded fp32 input.
   int head_rescore = 0;
+  // With planes on: read the routed experts' planes only for each token's plane_picks highest-weighted picks (0 = all);
+  // an expert's output enters the layer times its routing weight, so its error counts as weight^2 (docs/PELIAS_RESIDUAL_PLANES.md
+  // 6.8: the top 4 of 8 keep about 81 % of the planes' benefit at half the plane reads).
+  int plane_picks = 0;
 };
 
 // The orthonormal Walsh-Hadamard transform of every 32-value block of x[0..n) in place (n a multiple of 32). It is its

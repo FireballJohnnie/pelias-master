@@ -152,4 +152,13 @@ void plane_add_row(const std::uint8_t* in, std::int64_t n, int k_stored, int k_u
   }
 }
 
+void plane_add_row_sparse(const std::uint8_t* in, const std::uint8_t* mask, std::int64_t n, int k_stored, int k_use, float* y) {
+  const std::int64_t bytes = 34 * static_cast<std::int64_t>(k_stored);
+  for (std::int64_t b = 0; b < n / kPlaneBlock; ++b) {
+    if (!((mask[b / 8] >> (b % 8)) & 1)) continue;
+    plane_add_row(in, kPlaneBlock, k_stored, k_use, y + b * kPlaneBlock);  // one block: the same layout as a 256-value row
+    in += bytes;
+  }
+}
+
 }  // namespace pelias::quant

@@ -28,4 +28,9 @@ double plane_fit_row(const float* r, const float* imp, std::int64_t n, int k, in
 // y[0..n) += the first k_use of the k_stored planes in `in` (one row as written by plane_fit_row).
 void plane_add_row(const std::uint8_t* in, std::int64_t n, int k_stored, int k_use, float* y);
 
+// Block-selective planes (Option A, docs/PELIAS_RESIDUAL_PLANES.md 6.7): a row keeps planes only on the 256-blocks its mask
+// selects (bit b of mask[b / 8] set = block b has planes), stored back to back in block order, 34 k_stored bytes each.
+// y[0..n) += the first k_use planes of every selected block; `in` points at the row's first selected block.
+void plane_add_row_sparse(const std::uint8_t* in, const std::uint8_t* mask, std::int64_t n, int k_stored, int k_use, float* y);
+
 }  // namespace pelias::quant
