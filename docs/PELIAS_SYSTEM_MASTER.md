@@ -436,7 +436,7 @@ Build these settings belong to: the patched llama.cpp tier build on commit `2ca1
 
 ## 6. Draft build: what is needed on WSL2 and Windows 11
 
-> **2026-10-30:** the Windows CPU-only build was configured with `cmake -G "Visual Studio 18 2026" -A x64 -DPELIAS_CUDA=OFF` and built Release with MSVC 14.51.36231 and CMake 4.4.4 (`C:\Program Files\CMake\bin\cmake.exe`), /W4 /WX with 0 warnings; 84 unit tests pass on Windows; Windows and WSL logits agree within 2.6e-6 of the largest on Qwen3-1.7B (MEASURED; BUILD_LOG 2026-10-30 14:26-14:28). The rows below are the 2026-10-25 record.
+> **2026-10-30:** the Windows CPU-only build was configured with `cmake -G "Visual Studio 18 2026" -A x64 -DPELIAS_CUDA=OFF` and built Release with MSVC 14.51.36231 and CMake 4.4.4 (the Windows install, not WSL's), /W4 /WX with 0 warnings; 84 unit tests pass on Windows; Windows and WSL logits agree within 2.6e-6 of the largest on Qwen3-1.7B (MEASURED; BUILD_LOG 2026-10-30 14:26-14:28). The rows below are the 2026-10-25 record.
 
 **What the draft build is:** the trainer's framework (the host-only build and the CUDA build, with their tests), the shared base as it gets written, and the Wave 0 probe program. The engine and server drafts use the same tools (the engine stays HELD; native Linux is held), so they add nothing to install. The author runs every install and every GPU program.
 
