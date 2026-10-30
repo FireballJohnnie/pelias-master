@@ -1,6 +1,6 @@
 # Pelias: what we found by thinking outside the box, and how it compares
 
-*Updated 2026-10-29 01:2x: light vs heavy 8th bit and rotation coverage (every tensor checked), the MTP piece rotated, and the idle-units tour (C1 KV codes on real attention, C3 fragility signals, C4 tags + H, rANS entropy). Previous versions: 2026-10-29 00:1x (1-bit decoder exact on GPU and whole model), 2026-10-28 16:1x.*
+*Updated 2026-10-30 15:0x: usage-tiered experts and residual planes measured on the whole model (scoreboard 2), and the list before the first engine build done (dense families, BitNet, FP8 / NVFP4, Windows). Previous: 2026-10-29 01:2x: light vs heavy 8th bit and rotation coverage (every tensor checked), the MTP piece rotated, and the idle-units tour (C1 KV codes on real attention, C3 fragility signals, C4 tags + H, rANS entropy). Previous versions: 2026-10-29 00:1x (1-bit decoder exact on GPU and whole model), 2026-10-28 16:1x.*
 
 ## Plain-language summary
 
@@ -15,7 +15,9 @@ Three things made the difference:
 
 5. **The light bit, rotated, is the rule.** Of the two ways to use the 8th bit, the light one (one fine step, "0-weighted") rotated is the most accurate in every case, and it is the only safe one: if it is not read, the number falls back to its 7-bit value, while a heavy (range) bit that goes missing wrecks the number (about 360x more error).
 
-**Where it stands:** our 7.53-bit file is **236 MB smaller than Unsloth's and slightly more accurate** (0.012536 against 0.012864; not yet a statistically settled win), and it is **as accurate as our own 8-bit file**. On the author's own chat text the order holds (0.021198 against Unsloth's 0.022368, not yet settled). The speed of the whole engine is still to be measured.
+6. **We give every expert its own precision by how much it is used, and fix the rest with sign planes.** A model like this has 256 experts per layer and uses 8 per word, some far more than others. A standard file must store a whole layer's experts the same way; Pelias stores each in its own type. At exactly the size of Unsloth's file that cut the error by 26.6 %. One extra sign bit per weight on the worst blocks, kept in a 2 GB side file the processor reads, takes it to 31.7 % below Unsloth's file.
+
+**Where it stands:** our 7.53-bit file is **236 MB smaller than Unsloth's and slightly more accurate** (0.012536 against 0.012864; not yet a statistically settled win), and it is **as accurate as our own 8-bit file**. On the author's own chat text the order holds (0.021198 against Unsloth's 0.022368, not yet settled). Measured by Pelias at the same size, the usage-tiered file is **26.6 % closer to the original than Unsloth's** (settled), and 31.7 % with 2 GB of planes beside it (scoreboard 2). The speed of the whole engine is still to be measured; every piece before it is built and checked.
 
 ## New for consumer PCs (what we have not seen done elsewhere)
 
@@ -29,6 +31,8 @@ Three things made the difference:
 | CPU and GPU reading RAM at once | 93 % of the memory's rated speed on a consumer desktop | MEASURED (probe) |
 | A 1-bit code per attention key (the author's H gate on KV pages) | Picks the keys that hold the attention better than page bounds (Quest) or a recent window, so long contexts read a fraction of the KV cache | MEASURED (real q, k; 512-token chunks) |
 | The light 8th bit, rotated | Most accurate and safe to skip: a late or missing bit costs 1.4x, not 360x | MEASURED (sandbox, real weights) |
+| Every expert in its own precision, by use, at the public file's exact size | 26.6 % less error with no extra bytes; a standard file cannot express it | MEASURED (whole model) |
+| Sign-plane side files for any existing file, applied by the CPU | Improves a file people already have without changing it; 2 GB on the worst blocks costs no VRAM | MEASURED (whole model) |
 
 ## Scoreboard (whole model, measured)
 
@@ -46,6 +50,17 @@ Paired runs over the same 25,500 tokens, 8-bit activations as the engine uses th
 | urm_ZT2 through the 1-bit decoder (run D) | Q7_ZT, 8th bit by counting ones | 0.012923 | +0.000059, tie (vs the float path: +0.000387, not resolved; int8 rounding flips, see A) | -236.4 MB |
 | urm_TG (expert gate/up as Q4_TG, bit tags) | Q7_ZT dense | 0.012876 | +0.000012, tie | -236.4 MB |
 | **urm_TG2 (expert gate/up as Q4_TG2: bit tags with an exact 0, full importance; MTP eh_proj rotated)** | **Q7_ZT dense** | **0.012056** | **-0.000808, t -1.98 (a hair short of resolved)** | **-236.4 MB** |
+
+**Scoreboard 2: same size, scored by Pelias (2026-10-30).** Pelias's own reading of Unsloth's MTP file is the baseline here (0.012808), so compare these rows with each other, not with the table above.
+
+| File | KL | vs Unsloth read by Pelias | Size |
+|---|---|---|---|
+| Unsloth MTP UD-Q4_K_M | 0.012808 | baseline | 22,663,387,424 bytes |
+| **Usage-tiered experts** (Q4_TG2 floor, Q5_K, Q6_K, Q8_0 per expert) | **0.009404** | **-26.6 %, t -12.41, settled** | +19,360 bytes (type lists) |
+| Tiered + 1 GB worst-block planes | 0.008963 | -30.0 % (vs tiered -4.7 %, t -2.26) | + 1 GB side file |
+| **Tiered + 2 GB worst-block planes** | **0.008747** | **-31.7 %, t -12.81** (vs tiered -7.0 %, t -4.09) | + 2 GB side file |
+| Tiered + 2 GB, read for the top 4 picks only | 0.008800 | -31.3 % (92 % of the gain at half the reads) | + 2 GB side file |
+| Unsloth + 2 whole-file planes | 0.005818 | -54.6 %, t -12.25 | + 10.2 GB side file |
 
 **On the author's own chat text** (run C; 53,334 tokens, never published): urm_Z 0.020977, urm_ZT2 0.021198, Unsloth 0.022368. Ours lower by 0.0012-0.0014, not resolved (chat text swings about 4x more from chunk to chunk).
 
@@ -197,10 +212,12 @@ Limited to what their formats do; we have not tested the other projects themselv
 | Rotation | QuaRot, SpinQuant, QuIP# rotate linear layers of the (mostly dense) models they report | Dense tensors only on this MoE model; experts left as stored (MEASURED) |
 | Bit-serial decoding | Exists (T-MAC, Any-Precision LLM) | New here: the per-32-block gate, the 0.5 fill, the split across memories (MEASURED pieces) |
 | Training | QLoRA re-quantizes after merging | Training on the served bytes and int8 backward passes: PLAN, untested |
+| Per-expert precision | MoPEQ, GEMQ (offline), DynaExq (run time); DPA-MoE reads a varying number of sign planes per expert from router scores, everything resident on the GPU | Usage x measured error slope per expert at a fixed byte budget, in one Pelias file (MEASURED -26.6 %); planes in RAM applied by the CPU, read for the top N picks (MEASURED) |
+| Sign-bit planes | Binary-coded quantization (AnyBCQ, Any-Precision LLM, BitStack) as the model's own format | A side file on any existing file, bound to its exact types; worst-error blocks only; locked into an int4 core past 3 planes (sandbox: 19 % less error) |
+| Activation rounding | llama.cpp rounds each product's input to 8 bits on the CPU path | Exact inputs on Qwen3-1.7B Q8_0: KL 0.002263 vs 0.003617 with llama.cpp's rounding (paired t -16.28) |
 
 ## Next
 
-1. The author's review; Fable's math check of the engine plan (#3). The idle-units tour is done (C1, C3, C4 stack, rANS entropy); the status board of every idle-unit item is in the Idle Units List doc.
-2. R3: the per-32 int8 kernel, which the T-decode decode path folds into; first a read-only ceiling kernel (is ~325 GB/s the limit of one cold launch?).
-3. On hold (author): stuck tokens by kind, Q4_TG v2 (full importance + the 0 level) on the whole model. Then the miss map sharpened; more own-text chunks; C1 at long context.
-4. The engine, where the speed of all of this is measured end to end.
+1. Done 2026-10-30: the list before the first engine build (MTP head, CPU kernels for 32 types, dense Qwen3 / Qwen2 / Llama, BitNet b1.58, FP8 / NVFP4, the Windows build), all measured on the PC; R3 v2 at 5.685 ms per real token.
+2. Next: the GPU kernels into the product, the inference rungs, the first engine test build on WSL and Windows: where the speed of all of this is measured end to end.
+3. Right after it: the parked accuracy checks (a dense plane and three output-head planes on the tiered file; the split-token grade against the original).

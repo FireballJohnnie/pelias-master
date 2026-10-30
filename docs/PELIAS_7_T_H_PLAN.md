@@ -1,6 +1,6 @@
 # Making 7 bits viable: what was done, and the plan for T, H and the 1-bit decoder
 
-Author's request, 2026-10-28 14:48; updated 2026-10-29 01:2x (section 9: light vs heavy, rotation coverage, MTP rule, the idle-units tour). Every number is labelled: **MEASURED** (sandbox on real weights, or a whole-model run on the PC) or **DERIVED** (worked out on paper, to be measured). Engine format = 8-bit activations, eight scales per 256 (gpu256x8), paired against the same 25,500 tokens.
+Author's request, 2026-10-28 14:48; updated 2026-10-29 01:2x (section 9: light vs heavy, rotation coverage, MTP rule, the idle-units tour) and 2026-10-30 15:0x (section 10: planes on the 7-bit and 1-bit bases, the int4 core, Q4_TG2 as the tiered floor, BitNet). Every number is labelled: **MEASURED** (sandbox on real weights, or a whole-model run on the PC) or **DERIVED** (worked out on paper, to be measured). Engine format = 8-bit activations, eight scales per 256 (gpu256x8), paired against the same 25,500 tokens.
 
 ## 1. The goal and the bar
 
@@ -148,3 +148,36 @@ Rotated wins every column (about 17 %), light wins every row (1.5 %); a missing 
 ### 9.4 Run A: urm_TG2 (MEASURED 2026-10-29 03:37)
 
 Expert gate/up as Q4_TG2, MTP eh_proj rotated, same size as urm_ZT2 (-236.4 MB vs Unsloth): **KL 0.012056**, same top 95.47 %. Paired: vs Unsloth -0.000808 [-0.001618, +0.000002] (t -1.98); vs urm_ZT2 -0.000480; vs run E -0.000820; vs urm_Z -0.000346. The best file so far; Q4_TG2 option A is the expert gate/up format for R3.
+
+## 10. Since 2026-10-29: planes on the bit system, and where the line went (updated 2026-10-30 15:0x)
+
+### 10.1 Residual planes on the 7-bit and 1-bit bases (MEASURED, sandbox, real blk.20; tools/analysis/planes_bits_check.py)
+
+| Base | bpw | Error | Reading |
+|---|---|---|---|
+| Q7_Z (rotated attn_qkv) | 7.25 | 1.133e-4 | |
+| Q7_Z + 1 plane | 8.31 | 3.262e-5 (-71 %) | a plane removes about what a true 8th bit removes (even-noise theory -75 %), not twice |
+| Q8_Z / Q8_0 | 8.25 / 8.5 | 2.854e-5 / 2.806e-5 | |
+| Q7_ZT | 7.53 | 6.089e-5 | the gated 8th bit stays the cheapest bit |
+| Q7_ZT + 1 plane | 8.59 | 1.980e-5 | -29 % vs Q8_0 at about the same size |
+| 1-bit sign base (experts gate + down 0-3) | 1.06 | 0.366 | |
+| + 1 / + 2 / + 3 planes | 2.13 / 3.19 / 4.25 | 0.116 / 0.0372 / 0.0130 | no blow-up, each plane about 1/3; 1.8-2.8x behind Q2_K 0.066, Q3_K 0.020, Q4_K 0.0047 at similar bits |
+| Q4_TG2 / Q4_K | 4.5 / 4.5 | 0.00418 / 0.00468 | -11 %; + 1 plane both about 0.0016 |
+
+### 10.2 The planes as one integer (MEASURED, sandbox; tools/analysis/plane_stack_check.py; author 09:33)
+
+Four planes with scales locked to s, s/2, s/4, s/8 (+ one fp16 offset per 256) are the bits of one int4 number: 0.01051 at 4.125 bpw vs 4 free planes 0.01299 at 4.25 (-19 %); locked-3 0.0384 vs free-3 0.0372; locked-2 0.1170 vs free-2 0.1163. Free 1-bit planes on top: + 1 0.00281 (5.19), + 2 0.00071 (6.25). This is the T/H idea one level up: a fixed integer base the int4 / int8 hardware reads, plus 1-bit refinements read by need. The plane ladder and the small-card layout built on it are in the game plan (PLAN, after the first engine build).
+
+### 10.3 Where Q4_TG2 went (MEASURED, whole model)
+
+Q4_TG2 became the floor of the usage-tiered expert file (`quantize --tier`): every expert as Q4_TG2, Q5_K, Q6_K or Q8_0 by use and error slope at the Unsloth file's exact expert bytes. KL 0.009404 vs Unsloth's 0.012808 read by Pelias (-26.6 %, t -12.41); + 2 GB worst-block planes 0.008747; R3 streams the tiered types at +0.3 to +1.3 % per token (docs/PELIAS_RESIDUAL_PLANES.md 6.9-6.12).
+
+### 10.4 BitNet b1.58: a model built on 1-bit-class weights (MEASURED, 2026-10-30)
+
+BitNet b1.58 2B4T (I2_S: ternary weights in 2 bits, one scale per tensor, inputs rounded to 8 bits per token) runs in Pelias: top-1 14 of 14 against transformers on the same weights, KL 0.0016 (the floor of the 8-bit input rounding). Its products are sums of +x, -x and 0: the AND + popcount arithmetic of the 1-bit decoder fits them (PLAN: a T-decode kernel for ternary weights, after the first engine build).
+
+### 10.5 Order from here
+
+1. GP3-10 GPU kernels into src (the R3 kernels with Q7_ZT fold, Q4_TG2 and the K-quants), GP3-12 rungs, GP3-14 first engine test build.
+2. Then, before new ideas: the parked accuracy checks (dense plane + 3 head planes on the tiered file; the split-token grade).
+3. Then the T/H items in the engine: the H read rule (planes by need), the 1-bit route for split storage, the small-card layout.

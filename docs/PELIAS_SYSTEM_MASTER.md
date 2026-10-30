@@ -4,6 +4,8 @@
 
 > **Copy in pelias-master (2026-10-26).** As delivered on 2026-10-25, with two toolchain rows of Section 6 corrected (CMake 4.4.3 and Ninja 1.13.2 on Windows were in the record of 2026-10-23 01:09; see `PELIAS_SYSTEM_MASTERWORK.md` 18.1, C19). The holds described in Sections 3 and 5 were lifted by the author on 2026-10-26; the current order of work is `PELIAS_SYSTEM_MASTERWORK.md` Section 15.
 
+> **Status note (2026-10-30 15:0x).** This page stays the 2026-10-25 scaffold; the live status is `docs/PELIAS_GAME_PLAN.md` and `logs/BUILD_LOG.md`. Since it was written: pelias-master holds the product code (reader, quantizers incl. usage-tiered experts, tokenizers for qwen35 / qwen2 / llama-bpe, the fp32 reference and the fast AVX2 CPU path for 32 storage types, MTP, dense and BitNet families, residual planes, `kld`, `teacher`); the Windows MSVC build of the CPU code is proven (Visual Studio 2026, MSVC 14.51.36231, CMake 4.4.4, /W4 /WX, 0 warnings, 84 tests, 2026-10-30; MEASURED), see Section 6; the GPU engine (GP3-14) is next.
+
 ## 0. How to read this
 
 - **Built from:** the trainer master and notes (local head `953c9b1`), the engine blueprint, scaffold and specification extracts (local commit `ba74954`), and the server notes (master Part 6 and the server runbook). Where a fact already lives in one of them, this page names the place and does not repeat it.
@@ -433,6 +435,8 @@ Build these settings belong to: the patched llama.cpp tier build on commit `2ca1
 - **Where a name or number in this page and a home document disagree**, the home document wins; this page is only the index.
 
 ## 6. Draft build: what is needed on WSL2 and Windows 11
+
+> **2026-10-30:** the Windows CPU-only build was configured with `cmake -G "Visual Studio 18 2026" -A x64 -DPELIAS_CUDA=OFF` and built Release with MSVC 14.51.36231 and CMake 4.4.4 (`C:\Program Files\CMake\bin\cmake.exe`), /W4 /WX with 0 warnings; 84 unit tests pass on Windows; Windows and WSL logits agree within 2.6e-6 of the largest on Qwen3-1.7B (MEASURED; BUILD_LOG 2026-10-30 14:26-14:28). The rows below are the 2026-10-25 record.
 
 **What the draft build is:** the trainer's framework (the host-only build and the CUDA build, with their tests), the shared base as it gets written, and the Wave 0 probe program. The engine and server drafts use the same tools (the engine stays HELD; native Linux is held), so they add nothing to install. The author runs every install and every GPU program.
 

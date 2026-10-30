@@ -6,7 +6,7 @@
 |---|---|
 | Document | `docs/PELIAS_SYSTEM_MASTERWORK.md`, pelias-master |
 | Written | 2026-10-26 |
-| Status | **Specification only. No product code exists.** Reviewed by Claude Fable on 2026-10-26 (step R0); its 19 findings are folded in (Section 18.1, C21 to C24; 18.2, N8 to N11; and the sections they name). The build starts on the author's go. |
+| Status | **Specification, with the product code being built in this repository** (updated 2026-10-30). Built and measured so far: the GGUF / safetensors readers, Pelias's own quantizers (bit-identical to the reference, plus Q8_Z, Q7_ZT, Q4_TG2 and usage-tiered experts), the tokenizers (qwen35, qwen2, llama-bpe), the fp32 CPU reference and the fast AVX2 CPU path for 32 storage types, the MTP block, dense Qwen3 / Qwen2 / Llama and BitNet b1.58 families, residual sign planes, `kld`, `kld-compare`, `teacher`; the Windows MSVC build. The GPU engine (step 10, game plan GP3-14) is next. Reviewed by Claude Fable on 2026-10-26 (step R0); its 19 findings are folded in (Section 18.1, C21 to C24; 18.2, N8 to N11; and the sections they name). |
 | Copyright | Copyright (c) 2026 John Lipka and the Pelias contributors |
 | Licence | Apache-2.0 (the same standard text as pelias-trainer and pelias-engine) |
 | Built from | pelias-trainer (local head `953c9b1`), pelias-engine (local commit `ba74954`), the server runbook and handoff of 2026-10-24, the long master `PELIAS_PROPRIETARY_MASTER_SERVER.md` (the 2026-10-25 version, sha256 `c935a4a4…`, local only; the engine specification files cite `56634f43…`, the 2026-10-24 version), `PELIAS_SYSTEM_MASTER.md` (2026-10-25), the author's attachments of 2026-10-26 (listed in 19.2), the author's drives (working folder, proposals folder, FlareSolverr folder; exact paths in the git-ignored `profiles/local_only/LOCAL_SOURCES.md`), and published sources (19.3) |
@@ -679,6 +679,21 @@ What ReBAR could give: the CPU writing directly into VRAM (write-combining, CPU-
 
 The modelled ceiling on the reference machine is 10.87 ms per token = 92.0 tok/s (26.2 GB/s cold reads) to 11.34 ms = 88.2 tok/s (9.59 GB/s) (DERIVED; spine time 7.73 ms is assumed). Every recorded run used the patched llama.cpp tier build: WSL2 reference Cell A 37.9 short and 42.1 at 12 k; Windows-native Cell A 47.3 / 46.8 short and 53.7 / 54.1 at 12 k (two launches); the best WSL2 cell 53.5 / 53.0 / 49.0 at short / 4 k / 12 k; the blueprint's summary over the WSL2 launches and load modes it lists, 44 to 54 short and 43 to 49 at 12 k (MEASURED). The measured WSL2 time split shows zero CPU/GPU overlap and 4.6 to 5.0 ms or more of handoff per token against 0.25 ms modelled (DERIVED from E0 timers). The first run of the Pelias engine is the measurement that finally isolates the gap. Gates: first at least the tier's result, then G3 (at least 55.0 tok/s at 12 k), then the ceiling table. Prompt reading at least 1,670 tok/s at 12 k, aimed at 2,238 (MEASURED stock).
 
+
+### 10.8 What is built and measured toward the engine (updated 2026-10-30; details in the game plan and logs/BUILD_LOG.md)
+
+| Piece | Result | Label |
+|---|---|---|
+| R3, one persistent kernel streaming a token's weights (2.27 GB, 40 distinct layers) | 20.81 ms one launch per matrix -> 8.79 ms (v1) -> **5.685 ms** on the real token path (v2: Q4_TG2 grid in shared memory, counter barriers, per-expert counters); pure streaming 4.75 ms, about 478 GB/s; read ceiling 494 GB/s | MEASURED (probe, WSL / Windows) |
+| The usage-tiered expert types on R3 | +0.3 % (chat+code mix) to +1.3 % (WikiText mix) per token | MEASURED |
+| CPU cold-expert kernels (GP3-10 CPU), 16 threads, float / int8 activations | Q8_0 35 / 39 GB/s, Q6_K 38 / 36, Q5_K 31 / 27, Q4_K 22 / 28, IQ4_XS 24 / 29 (gate 27 GB/s; reference path 8.5); Q4_TG2 17, IQ2_XXS 10-11 still below the gate; RAM 40-42 GB/s | MEASURED |
+| RAM read by thread count (`pelias membw`) | 2 threads 45.9-47.8 GB/s (93 % of 51.2); no lag felt by the user up to 4 readers: engine default 4 cold-reader threads | MEASURED |
+| MTP block (GP3-08, O18) | Tiny model vs llama.cpp 9.4e-6; real file fast vs reference 9.1e-6, top-1 13 of 13; drafted greedy = plain greedy | MEASURED |
+| Residual planes read by the CPU next to the GPU's work (the bus as an accuracy tool) | 2 GB of worst-block planes on the tiered file: KL 0.008747 (-31.7 % vs Unsloth's file read by Pelias), no VRAM; top 4 picks only 0.008800 at half the reads | MEASURED (CPU reference; engine timing PLAN) |
+| Windows | MSVC /W4 /WX, 0 warnings, 84 tests; Windows vs WSL logits within 2.6e-6 of the largest | MEASURED |
+
+Open for step 10: CPU decode 4.0-4.2 tok/s on 1.7-2.4 B dense models (thread start-up per product suspected); the dense projections on the CPU batch path; O13 to O15. The first engine test build is where the modelled speed of 10.7 meets its first measurement.
+
 ---
 
 ## 11. The server on port 8062, and the web interface (R22)
@@ -1171,6 +1186,10 @@ Dates up to 2026-10-17 are **file modification dates on the author's drives** (e
 | 2026-10-24 | Engine hold (06:07); WSL and Windows versions (06:21); final micro-batch and export rulings (07:39); "ground up means the ground up" (08:15); the long master requested (09:09); the interim launchers and the server runbook | Long master 8.2; handoff of 2026-10-24 |
 | 2026-10-25 | The engine records consolidated (1,559-row manifest); the system master with its numbers and the draft-build list; a Batch C probe source written in the early hours of 10-26 (not yet run) | Backup INDEX entries 10 to 13 |
 | 2026-10-26 | The author lifts the holds and asks for this masterwork: one ground-up, universal, installable system, port 8062, Fable review before the build, and a first benchmark against the published 4-bit files. Afternoon: build step 1 starts; Batch C rewritten and run on Windows in twelve revisions, the int8 limit measured and the kernels adopted | Section 0.2; 17.5 |
+| 2026-10-27 | Step 2 and 3 gates on the PC: Pelias's quantizer byte-identical to llama.cpp's on all 753 tensors; the CPU reference scores drift (Milestone 1); the PEL sweep against Unsloth; rotation per 32 cuts the file's drift 8.9 % (R1, R2) | Game plan, status 10-27; Block J |
+| 2026-10-28 | The author's bit-level line: Q8_Z zip scales (-61 MB, same accuracy), Q7_ZT with the gated 8th bit (-236 MB, ties 8-bit), the 1-bit decoder (exact, on idle units), bit tags; the miss map's data (hard tokens repeat across files) | Game plan Blocks M, runs A-E; PELIAS_7_T_H_PLAN.md |
+| 2026-10-29 | urm_TG2 0.012056 vs Unsloth's 0.012864 at -236 MB (t -1.98); R3 v2 to 5.685 ms per token; the near-tie priority (author 18:44): residual sign planes, KL -54.6 % on Unsloth's file; splits graded by the original model (Pelias 12, llama.cpp 3) | Game plan PRIORITY; BUILD_LOG |
+| 2026-10-30 | Usage-tiered experts at the public file's exact size, KL -26.6 % (settled); + 2 GB worst-block planes -31.7 %; then the whole list before the first engine build, measured on the PC: MTP, CPU kernels for 32 types, dense Qwen3 / Qwen2 / Llama, BitNet b1.58, FP8 / NVFP4, the Windows build | 10.8; docs/PELIAS_RESIDUAL_PLANES.md; BUILD_LOG |
 
 The thread through all of it, in the long master's words: the project began as a **training** problem, the measurements of that problem raised the **inference** question, and the llama.cpp work was the way to learn what a ground-up server must do. Every speed recorded so far came from the patched llama.cpp build; the first Pelias engine run is the experiment that answers the question the whole project has been asking.
 
@@ -1312,6 +1331,10 @@ What turns this into fps numbers (probe P-G1, DECISION (proposed)): a small test
 - The read ceiling, 494 GB/s, is 89.5 % of this card's peak as run: its memory is overclocked to about 552 GB/s (author's +1000 MHz).
 - Other cards: 21.8. What the PC needs: 21.9.
 
+**Update 2026-10-30.**
+- R3 v2 is MEASURED: 5.685 ms per real token (pure streaming 4.75 ms, about 478 GB/s), from v1's 8.79 ms (10.8).
+- The bus also carries accuracy: residual planes in RAM applied by the CPU, 2 GB on the tiered file for KL -31.7 % against Unsloth's file at no VRAM cost (MEASURED on the CPU reference; its time in the token loop is unmeasured, so it has no k here).
+
 A primitive speeds up only the part of a job it fixes, so the end-to-end gain follows Amdahl's law: gain = 1 ÷ ((1 − f) + f ÷ k) − 1, where k is the primitive's factor and f is the share of the job's time spent in that bottleneck.
 
 **Calibration.** f is unmeasured for every field but one. For the LLM, k = 1 / (1 − 0.775) = 4.444 (the live hit rate), and the measured runs give f back-solved: 0.269 (38.8 → 49.0 tok/s), 0.299 (41.1 → 53.5), 0.466 (31.3 → 49.0) and 0.522 (31.8 → 53.5), so **27 % to 52 %**. The table uses those two ends for every field as the best measured guide until each field measures its own f (ruling 12:52). "Whole job" is k itself: the gain if the entire job were that bottleneck, an upper bound only. All values DERIVED; the anchor row reproduces the measured runs by construction.
@@ -1387,6 +1410,8 @@ t = D / (e·B)  +  h·X / (e·B)  +  (1 − h)·X / C  +  o
 - **Hit-rate curve:** 2 GiB → 0.43, 4 GiB → 0.63, 6 GiB → 0.76, linear in between and held at 0.76 above (past 6 GiB is unmeasured). The 6.1 GiB bank's held-out hit rate was 0.765 (MEASURED).
 - **Whole model in VRAM:** the file (22.43 GB, MEASURED) + 1.0 GB fits, so h = 1.
 - **Calibration check:** with e = 0.895, o = 3.2 ms and h = 0.765, the model gives the 4070 95.3 tok/s. The game plan's independent rung-1 figure is 89-103 tok/s (DERIVED, Fable-corrected).
+
+**Since then (2026-10-29 11:43, MEASURED):** R3 v2 reads the same 2.27 GB token on the real token path in 5.685 ms (399 GB/s, 0.72 of 552 GB/s, DERIVED), against v1's 259 GB/s behind e = 0.47. The tables below keep e = 0.47 as the low end until the engine's own tok/s replaces them; with e = 0.72 every low end would rise (not recomputed here).
 
 **Small MoE models** (21.8.5) use the same formula, scaled from the 35B by two ratios and one assumption:
 - bytes per total parameter: 0.641 (22.43 GB / 35B);

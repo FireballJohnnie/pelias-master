@@ -2,7 +2,7 @@
 
 **One ground-up program that probes the machine, takes a local GGUF or safetensors model, coaches and runs training or quantization, writes the resulting GGUF, and serves it on port 8062 through its own engine and server.**
 
-> **PRE-RELEASE, PRIVATE. Updated 2026-10-29.** Milestone 1 runs: Pelias reads the model, quantizes it with its own formats (`pelias quantize`), runs the whole model on the CPU reference path and scores it against the original (`pelias kld`). All of it is ground-up code. The GPU engine is being built now: R3, the streaming decode kernel, is exact on every format and is being tuned. Every number below carries a label. The raw results are in `data/probe_results/` and `logs/BUILD_LOG.md`.
+> **PRE-RELEASE, PRIVATE. Updated 2026-10-30.** Pelias reads the model, quantizes it with its own formats (`pelias quantize`, including usage-tiered experts), runs the whole model on the CPU (an exact reference path and a fast AVX2 path) and scores it against the original (`pelias kld`). Every item on the list before the first engine build is done and measured on the PC: the MTP draft head, fast CPU code for 32 storage types, dense Qwen3 / Qwen2 / Llama models, BitNet b1.58, FP8 / NVFP4 files and the Windows (MSVC) build. All of it is ground-up code. Next: the GPU kernels go into the product, then the first engine test build. Every number below carries a label. The raw results are in `data/probe_results/` and `logs/BUILD_LOG.md`.
 
 > **How to read the numbers in this repository.** Every result marked MEASURED was measured on one machine: the author's PC (RTX 4070 12 GB with its memory overclocked, Ryzen 7 5800X3D, 64 GB DDR4-3200, Windows 11 + WSL2). Every figure for other hardware is DERIVED: a proposal, with its formula and inputs written down, so anyone with that hardware can run the same benchmark and report what they measure. Where a measurement disagrees with a derived figure, the measurement wins and the derivation gets fixed.
 
@@ -28,6 +28,21 @@ Beat the best published 4-bit file of Qwen3.6-35B-A3B on accuracy, at the same s
 
 urm_TG2 is lower than Unsloth at a smaller size. Its 95 % interval, [-0.001618, +0.000002], just touches zero (t -1.98 at 100 chunks), so the gap is not yet called resolved; more chunks or a second text settle it.
 
+### Accuracy at the same size: usage-tiered experts and residual planes (2026-10-30)
+
+Scored by Pelias against the original (BF16) model, WikiText-2, 100 chunks, paired token by token. The baseline here is Unsloth's MTP UD-Q4_K_M read by Pelias (0.012808), so these rows compare with each other, not with the llama.cpp-path figure above.
+
+| File | KL vs the original | Size | Label |
+|---|---|---|---|
+| Unsloth MTP UD-Q4_K_M, read by Pelias | 0.012808 | 22,663,387,424 bytes | MEASURED |
+| **Usage-tiered experts** (each of the 10,240 experts in its own type by use and measured error: Q4_TG2 floor, Q5_K, Q6_K, Q8_0) | **0.009404 (-26.6 %, t -12.41, settled)** | 22,663,406,784 bytes (+19,360: the type lists) | MEASURED |
+| Tiered + 1 GB of residual sign planes on the worst-error blocks | 0.008963 (-4.7 % vs tiered, t -2.26) | + 1 GB side file, read by the CPU | MEASURED |
+| **Tiered + 2 GB of such planes** | **0.008747 (-31.7 % vs Unsloth, t -12.81)** | + 2 GB side file | MEASURED |
+| Tiered + 2 GB, planes read only for each token's top 4 experts | 0.008800 (92 % of the gain at half the plane reads) | + 2 GB side file | MEASURED |
+| Unsloth's file + 2 whole-file planes | 0.005818 (-54.6 %, t -12.25) | + 10.2 GB side file | MEASURED |
+
+A user gets this one of three ways: run a premade file as it is, add a plane side file built once for that exact file (the file stays portable), or build a Pelias tiered file from the original weights (Pelias only). Details: `docs/PELIAS_RESIDUAL_PLANES.md`.
+
 ### Methods proven so far
 
 | Method | Result | Label |
@@ -40,6 +55,10 @@ urm_TG2 is lower than Unsloth at a smaller size. Its 95 % interval, [-0.001618, 
 | **Q4_TG2: the author's bit tags with an exact 0 (expert gate/up)** | Weighted error -10 to -11 % per tensor vs imatrix Q4_K, same bytes | MEASURED |
 | The miss map (where the model gets stuck) | The same hard tokens repeat across every file (47-66 % vs 1 % by chance); number and math tokens get stuck at 2x the base rate | MEASURED |
 | The author's H gate on KV pages | 72.6 % of attention mass kept in 1/8 of the keys, vs 62.0 % (Quest pages) and 42.6 % (recent window) | MEASURED (512-token chunks) |
+| **Usage-tiered experts** | -26.6 % KL at the public file's exact size (table above) | MEASURED (whole model) |
+| **Residual sign planes** (side file; worst-error blocks; top-4 picks) | -54.6 % on the public file; -31.7 % with 2 GB on the tiered file; 92 % of it at half the reads | MEASURED (whole model) |
+| Planes locked into one int4 core | 19 % less error than 4 free planes (0.01051 vs 0.01299) | MEASURED (sandbox, real weights) |
+| Exact activations on a Q8_0 file (Qwen3-1.7B) | KL 0.002263 vs llama.cpp's 0.00367 on the same file (-38 %; first 20 chunks, not paired) | MEASURED |
 
 **Candidate file (PEL7):** dense Q7_ZT, rotated, with the light 8th bit; expert gate/up Q4_TG2; expert down at Unsloth's types; the MTP input projection rotated.
 
@@ -51,9 +70,11 @@ urm_TG2 is lower than Unsloth at a smaller size. Its 95 % interval, [-0.001618, 
 | System RAM read rate (`pelias membw`) | DDR4 saturates at 2 threads (47.8 GB/s, 93 % of 51.2); no lag felt by the user up to 4 reader threads | MEASURED |
 | GPU read ceiling | 494 GB/s on one long read: 98 % of the stock 504 GB/s, 89.5 % of this card's overclocked memory (about 552 GB/s) | MEASURED |
 | One launch per matrix (how engines read today) | 150-352 GB/s per matrix size | MEASURED |
-| **R3 v1, one token's weights (2.27 GB) in one streaming launch** | **8.79 ms (259 GB/s) vs 20.81 ms one launch per matrix**; with 160 dependency syncs 12.57 ms | MEASURED |
+| R3 v1, one token's weights (2.27 GB) in one streaming launch | 8.79 ms (259 GB/s) vs 20.81 ms one launch per matrix; with 160 dependency syncs 12.57 ms | MEASURED |
+| **R3 v2, the same token on the real token path (40 distinct layers)** | **5.685 ms**; pure streaming 4.75 ms (about 478 GB/s); the usage-tiered types add +0.3 to +1.3 % | MEASURED |
+| CPU kernels (`pelias bench-dot`, 16 threads, float / int8 activations) | Q8_0 35 / 39 GB/s, Q6_K 38 / 36, Q5_K 31 / 27, Q4_K 22 / 28, IQ4_XS 24 / 29 vs 8.5 for the reference path; Q4_TG2 17 and IQ2_XXS 10-11 still below the 27 GB/s gate | MEASURED |
 
-**Where the rest of the speed is:** an independent review of R3 v1 (`docs/reviews/FABLE_R3_V1_REVIEW_2026-10-29.md`) traces about 4 of the 8.79 ms to one lookup in the Q4_TG2 decode. Without it, the other formats already stream at about 375-405 GB/s (DERIVED). R3 v2 removes the bottlenecks one at a time, measuring each. At the 494 GB/s ceiling a token's weights take 4.60 ms (DERIVED). Projected speeds once R3 is in the engine are in the game plan (DERIVED, not measured).
+**Where the rest of the speed was:** an independent review of R3 v1 (`docs/reviews/FABLE_R3_V1_REVIEW_2026-10-29.md`) traces about 4 of the 8.79 ms to one lookup in the Q4_TG2 decode. Without it, the other formats already stream at about 375-405 GB/s (DERIVED). R3 v2 removed them one at a time, measuring each, down to the 5.685 ms above; the remaining ~0.93 ms to pure streaming is measured and explained. At the 494 GB/s ceiling a token's weights take 4.60 ms (DERIVED). Projected speeds once R3 is in the engine are in the game plan (DERIVED, not measured).
 
 ### Before vs now: speed on the same PC
 
@@ -77,9 +98,10 @@ The newer projections sit above that ceiling because they rest on measurements t
 
 ### Running now and next
 
-1. **Done:** the KV / DeltaNet-state compaction test (KV at 8 bits costs +0.00035 KL; the DeltaNet state needs 8 bits or more), and R3 v2 (one token of real weights in 5.685 ms on 40 distinct layers, from v1's 8.76 ms; the remaining ~0.93 ms gap to pure streaming is measured and explained in masterwork 21.6).
-2. **GP3-07, the decode loop (built; the gate is next):** the reference pass now carries its KV cache and DeltaNet state from token to token, with a sampler (greedy, temperature, top-k, top-p, min-p, penalties; seeded Philox) and `pelias generate`. Incremental decode equals the full re-run exactly on the test model. The gate is greedy decode against llama.cpp, token for token, on 20 fixed prompts.
-3. **Next:** GP3-08 (the MTP head in the reference), GP3-10 (CPU and GPU kernels, R3 inside Pelias), then the engine (GP3-14) and the server.
+1. **Done (2026-10-30, MEASURED on the PC): the list before the first engine build.** GP3-08 the MTP draft head (real file, fast vs reference 9.1e-6, top-1 13 of 13); GP3-10 CPU kernels (32 types, int8-activation path, batch kernels); fused gate/up and q/k/v tensors; GP3-09 dense Qwen3 / Qwen2 / Llama with their tokenizers and `generate --chat`; BitNet b1.58 2B4T (top-1 14 of 14 vs transformers); GP3-11 FP8 (via the converter) and NVFP4 GGUF files; the Windows MSVC build (/W4 /WX, 0 warnings, 84 tests; Windows vs WSL logits within 2.6e-6 of the largest).
+2. **Next:** GP3-10 GPU kernels into the product (the measured R3 streaming kernels, RMSNorm, IMRoPE, attention, DeltaNet, router, top-k; rung 1 against an fp64 reference with zero compute-sanitizer errors), GP3-12 inference rungs (one layer, then the full forward pass on the GPU), GP3-14 the first engine test build on WSL and Windows.
+3. **Right after the first build:** the parked accuracy checks (a dense plane and three output-head planes on the tiered file, the split-token grade), before any new idea (small-card layout, infinite context, dense 1-bit + planes).
+4. **Open for the engine:** CPU decode 4.0-4.2 tok/s on 1.7-2.4 B models (thread start-up per product suspected); dense projections on the CPU batch path; Q4_TG2 / IQ2_XXS CPU decode below the gate; a native FP8 / compressed-tensors safetensors reader.
 
 ## Other cards: proposed numbers, waiting for your benchmarks
 
@@ -138,7 +160,7 @@ On the oldest cards, dense models are limited to what fits in 4-6 GB. Small MoE 
 
 ## Building
 
-Everything needed to build is in this repository: C++20, CMake 3.24+ and Ninja; no third-party libraries. The CUDA toolkit is needed only for the CUDA presets and the GPU probes. Every step is built and tested on Linux (gcc, clang and gcc with AddressSanitizer, in the sandbox) and on the author's WSL2. The Windows preset (MSVC x64) was built and tested through step 3 (d6b7100) and not since, so a Windows build of the current code is untested; the R3 probe was built natively on Windows (see below). Other setups are untested.
+Everything needed to build is in this repository: C++20, CMake 3.24+ and Ninja; no third-party libraries. The CUDA toolkit is needed only for the CUDA presets and the GPU probes. Every step is built and tested on Linux (gcc, clang and gcc with AddressSanitizer, in the sandbox) and on the author's WSL2. The CPU build (no CUDA) is also proven on Windows with Visual Studio 2026 (MSVC 14.51, /W4 /WX, 0 warnings, 84 tests; c03789b, 2026-10-30), configured as below; the R3 probe was built natively on Windows (see below). Other setups are untested.
 
 ```
 git clone https://github.com/FireballJohnnie/pelias-master.git && cd pelias-master
@@ -148,20 +170,23 @@ cmake --preset host && cmake --build --preset host && ctest --preset host
 cmake --preset wsl && cmake --build --preset wsl && ctest --preset wsl
 # Windows: from an x64 Native Tools Command Prompt (where cl -> Hostx64\x64)
 cmake --preset windows && cmake --build --preset windows && ctest --preset windows
+# Windows, CPU only, Visual Studio generator (the configuration proven on 2026-10-30)
+cmake -S . -B build-msvc -G "Visual Studio 18 2026" -A x64 -DPELIAS_CUDA=OFF && cmake --build build-msvc --config Release --parallel
+build-msvc\Release\pelias_unit.exe --data <empty folder>
 ```
 
 Options (add to the configure line):
 - `-DPELIAS_CPU_AVX2=ON`: the CPU reference pass with AVX2 and FMA (gcc / clang; identical logits, faster; the author's runs use it). `-march=native` was measured slower and is not offered.
 - `-DPELIAS_CUDA_ARCHITECTURES=86`: the CUDA architecture of your card (default 89, the author's RTX 4070; only 89 has been run).
 
-The binary is `build/<preset>/pelias`. A first run on your own GGUF file (Qwen3.6-35B-A3B class, `qwen35moe`; Pelias never downloads models):
+The binary is `build/<preset>/pelias`. A first run on your own GGUF file (Qwen3.6-35B-A3B class, `qwen35moe`; dense `qwen3`, `qwen2`, `llama` and BitNet `bitnet-b1.58` files also run; Pelias never downloads models):
 
 ```
 build/host/pelias inspect --model model.gguf
 build/host/pelias generate --model model.gguf --prompt "The capital of France is" --temp 0 --n-predict 32
 ```
 
-`generate` runs the fp32 reference pass on the CPU: it is the correctness reference that the engine is checked against, not the fast path, so expect it to be slow. The engine (GP3-14) is the fast path.
+`generate` runs the fp32 reference pass on the CPU: it is the correctness reference that the engine is checked against, so expect it to be slow. `--fast-cpu` (on `kld`, `logits`, `generate`) uses the AVX2 kernels instead: the same products, another order of the sum. `--chat` wraps the prompt in the model family's chat format. The engine (GP3-14) will be the fast path.
 
 **Commands** (`pelias --help` lists every option):
 
@@ -173,10 +198,14 @@ build/host/pelias generate --model model.gguf --prompt "The capital of France is
 | `pelias teacher --model ORIGINAL.gguf --ids A.ids [--ids B.ids ...] --out-dir DIR` | The original model's own top-1 / top-2 at every position of decoded text; `tools/split_grade.py` grades the GP3-07 splits with it (who is right: Pelias, llama.cpp or neither) |
 | `pelias tokenize --model F --text TEXT` | The model's tokenizer (equal to llama.cpp's, token for token, on the P-D1 test files; `logs/BUILD_LOG.md`) |
 | `pelias quantize --model IN --out OUT [--recipe R.tsv] [--imatrix M.gguf] [--rotate32 GROUPS]` | Quantize with Pelias's own formats (incl. Q8_Z, Q7_ZT, Q4_TG2) |
+| `pelias quantize --tier ALLOC.tsv --model BASE --original ORIG --out OUT [--imatrix M.gguf]` | Usage-tiered experts: each routed expert re-quantized from the original into the type `tools/tier_alloc.py` gives it (Pelias reads the result) |
+| `pelias convert --model FOLDER --out OUT.gguf [--type BF16\|Q4_K_M\|Q6_K\|Q8_0]` and `pelias verify --model A --reference B` | Hugging Face folder to GGUF; compare two files tensor by tensor and byte for byte |
+| `pelias logits --model F --ids 1,2,3 --out OUT.bin [--fast-cpu] [--decode]` and `pelias mtp-logits ...` | Every position's logits (and the MTP block's) for the oracle checks in `tools/oracle/` |
+| `pelias bench-dot [--type T] [--int8] [--tokens N] [--planes K]` | GB/s of the CPU kernels for one storage type |
 | `pelias imatrix --model F --file TEXT --out M.gguf` | Importance matrix from the fp32 reference pass |
 | `pelias kld --model F --base BASE.bin` | Score a file against the original. `--dump-kld`, `--route-dump`, `--dump-codes` and `--dump-qk` write per-token data; `--kv-store` / `--state-store` test KV and DeltaNet-state compaction |
 | `pelias kld-compare --a A.bin --b B.bin` | Paired comparison of two scored files (difference, interval, verdict) |
-| `pelias planes --model F --base ORIGINAL.gguf --out P.gguf [--k 2] [--exact-head]` | Residual sign planes of any model file against its original weights (each plane cuts the weight error about 3x); `kld` and `generate` read them with `--planes P.gguf`, `--plane-k K`, `--head-rescore N`, and `generate --planes-mode all\|prefill\|start:N` |
+| `pelias planes --model F --base ORIGINAL.gguf --out P.gguf [--k 2] [--exact-head]` | Residual sign planes of any model file against its original weights (each plane cuts the weight error about 3x); `--k-rules` per-tensor counts, `--select PART --budget-mb N` planes only on the worst-error blocks; `kld` and `generate` read them with `--planes P.gguf`, `--plane-k K`, `--plane-picks N` (top N picks only), `--head-rescore N`, and `generate --planes-mode all\|prefill\|start:N` |
 | `pelias membw` | System RAM read rate by threads, page size and prefetch, and the lag the user would feel |
 
 **GPU probes** (stand-alone, one `.cu` each; the build line is at the top of each file):
@@ -202,6 +231,7 @@ Use your card's `-arch` (sm_70 V100, sm_75 Turing, sm_80 / sm_86 Ampere, sm_89 A
 | `src/` | The product code: GGUF / safetensors I/O, tokenizer, quantizers, the reference model, the OS and device layers, the `pelias` commands |
 | `tests/` | Unit tests (run by `ctest`) |
 | `tools/probes/` | GPU and CPU probes: `tdecode` (1-bit decoder, read ceiling), `r3` (streaming decode kernel), `gfx_probe`, `e16`, `batch_c` |
+| `tools/oracle/` | Test-only references, never linked into the product: llama.cpp logits and MTP oracles, tiny test models, tokenizer vectors, BitNet checks |
 | `tools/experiments/` | Sandbox checks behind each result (named in the game plan); `older_cards/` computes masterwork 21.8 |
 | `tools/` | Recipe tool, imatrix merge, route statistics, table generators, UI texture baker |
 | `data/probe_results/` | Measured results kept with the code (run logs, miss logs, per-token KL summaries) |
