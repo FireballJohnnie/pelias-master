@@ -895,9 +895,9 @@ TEST(tiered_experts_read_each_expert_in_its_own_type) {
   CHECK(e_fine < e_mixed && e_mixed < e_coarse);
   // the allocation file (tools/tier_alloc.py) reads back as written; unknown types and repeated names are refused
   const std::string a1 = (dir / "alloc_ok.tsv").string(), a2 = (dir / "alloc_bad.tsv").string(), a3 = (dir / "alloc_twice.tsv").string();
-  if (std::FILE* f = std::fopen(a1.c_str(), "wx")) { std::fputs("blk.0.ffn_gate_exps.weight\tQ4_TG2,Q5_K,Q6_K,Q8_0\r\n\nblk.0.ffn_up_exps.weight\tQ8_0\n", f); std::fclose(f); }
-  if (std::FILE* f = std::fopen(a2.c_str(), "wx")) { std::fputs("blk.0.ffn_gate_exps.weight\tQ4_TG2,Q9_X\n", f); std::fclose(f); }
-  if (std::FILE* f = std::fopen(a3.c_str(), "wx")) { std::fputs("x\tQ8_0\nx\tQ8_0\n", f); std::fclose(f); }
+  if (std::FILE* f = std::fopen(a1.c_str(), "wbx")) { std::fputs("blk.0.ffn_gate_exps.weight\tQ4_TG2,Q5_K,Q6_K,Q8_0\r\n\nblk.0.ffn_up_exps.weight\tQ8_0\n", f); std::fclose(f); }
+  if (std::FILE* f = std::fopen(a2.c_str(), "wbx")) { std::fputs("blk.0.ffn_gate_exps.weight\tQ4_TG2,Q9_X\n", f); std::fclose(f); }
+  if (std::FILE* f = std::fopen(a3.c_str(), "wbx")) { std::fputs("x\tQ8_0\nx\tQ8_0\n", f); std::fclose(f); }
   const auto ra = pelias::io::read_tier_alloc(a1);
   CHECK(ra.ok() && ra.value.size() == 2 && ra.value.at("blk.0.ffn_gate_exps.weight") == std::vector<std::uint32_t>(cyc, cyc + 4) &&
         ra.value.at("blk.0.ffn_up_exps.weight") == std::vector<std::uint32_t>{cyc[3]});
