@@ -95,6 +95,13 @@ bool deltanet_gates(float* beta, float* alpha, const float* dt, const float* a, 
 // nv * ds, value head h at h * ds, each value times 1 / sqrt(ds)
 bool deltanet_recurrent(const float* conv, std::int64_t ch, const float* beta, const float* alpha, float* state, std::int64_t n,
                         std::int64_t nk, std::int64_t nv, std::int64_t ds, float* core, Stream s = nullptr);
+// The same recurrence, 16 tokens at a time (the chunked form for long prompts; same arguments, same state layout, so the two
+// can be mixed call by call). Per value head and chunk, with l_t the cumulative log decay inside the chunk:
+//   u_t = beta_t (v_t - e^l_t S0 k_t - sum_{s<t} e^(l_t - l_s) (k_t . k_s) u_s)      (forward substitution)
+//   o_t = e^l_t S0 q_t + sum_{s<=t} e^(l_t - l_s) (q_t . k_s) u_s,   S_end = e^l_last S0 + sum_s e^(l_last - l_s) u_s k_s^T
+// Not bit for bit equal to deltanet_recurrent (other summation order); checked against fp64 and against it (rung 1).
+bool deltanet_chunked(const float* conv, std::int64_t ch, const float* beta, const float* alpha, float* state, std::int64_t n,
+                      std::int64_t nk, std::int64_t nv, std::int64_t ds, float* core, Stream s = nullptr);
 // per value head: o = rms_norm(o) * w * silu(z), in place on core (n rows of nv * ds), z alike
 bool gated_norm(float* core, const float* z, const float* w, std::int64_t n, std::int64_t nv, std::int64_t ds, float eps,
                 Stream s = nullptr);

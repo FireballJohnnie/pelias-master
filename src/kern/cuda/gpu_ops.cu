@@ -442,6 +442,120 @@ __global__ void k_dn_recurrent(const float* __restrict__ conv, std::int64_t ch, 
   for (std::int64_t i = 0; i < ds; ++i) gst[j * ds + i] = M[j * P + i];
 }
 
+// chunked DeltaNet (see deltanet_chunked in kern/gpu_ops.h for the math): one block of 256 threads per value head walks
+// the chunks in order with the head's state in shared memory; inside a chunk every step is parallel except the forward
+// substitution, which runs per state column (column j only needs column j).
+constexpr int kDnC = 16;     // tokens per chunk
+constexpr int kDnMaxPairs = 16;  // (token, column) pairs per thread kept in registers: C x ds / 256 <= 16, so ds <= 256
+__global__ void __launch_bounds__(256) k_dn_chunked(const float* __restrict__ conv, std::int64_t ch, const float* __restrict__ beta,
+                                                    const float* __restrict__ alpha, float* __restrict__ state, std::int64_t n,
+                                                    std::int64_t nk, std::int64_t nv, std::int64_t ds, float qscale, float* __restrict__ core) {
+  extern __shared__ float smem[];
+  constexpr int C = kDnC;
+  const std::int64_t hv = blockIdx.x, hk = hv % nk, P = ds + 1;
+  const int tid = static_cast<int>(threadIdx.x), nth = static_cast<int>(blockDim.x);
+  float* S = smem;              // ds x P: S[j * P + i] = state M[j][i]
+  float* Kc = S + ds * P;       // C x ds
+  float* Qc = Kc + C * ds;      // C x ds (q, then e^l_t S0 q_t)
+  float* Uc = Qc + C * ds;      // C x ds (v, then u)
+  float* L = Uc + C * ds;       // C x C: beta_t e^(l_t - l_s) k_t . k_s, s < t
+  float* Pm = L + C * C;        // C x C: e^(l_t - l_s) q_t . k_s, s <= t
+  float* lg = Pm + C * C;       // C: cumulative log decay
+  float* bt = lg + C;           // C: beta
+  float* gst = state + hv * ds * ds;
+  for (std::int64_t x = tid; x < ds * ds; x += nth) S[(x / ds) * P + x % ds] = gst[x];
+  const std::int64_t d_inner = nv * ds, cds = C * ds;
+  for (std::int64_t c0 = 0; c0 < n; c0 += C) {
+    const int m = static_cast<int>(n - c0 < C ? n - c0 : C);
+    for (std::int64_t x = tid; x < cds; x += nth) {
+      const int t = static_cast<int>(x / ds);
+      const std::int64_t i = x % ds;
+      if (t < m) {
+        const float* row = conv + (c0 + t) * ch;
+        Qc[x] = row[hk * ds + i];
+        Kc[x] = row[nk * ds + hk * ds + i];
+        Uc[x] = row[2 * nk * ds + hv * ds + i];
+      } else {
+        Qc[x] = 0.0f;
+        Kc[x] = 0.0f;
+        Uc[x] = 0.0f;
+      }
+    }
+    if (tid == 0) {
+      float cum = 0.0f;
+      for (int t = 0; t < C; ++t) {
+        if (t < m) {
+          cum += alpha[(c0 + t) * nv + hv];
+          bt[t] = beta[(c0 + t) * nv + hv];
+        } else {
+          bt[t] = 0.0f;
+        }
+        lg[t] = cum;
+      }
+    }
+    __syncthreads();
+    for (int x = tid; x < C * C; x += nth) {
+      const int t = x / C, s = x % C;
+      float kk = 0.0f, qk = 0.0f;
+      if (t < m && s <= t) {
+        for (std::int64_t i = 0; i < ds; ++i) {
+          kk += Kc[t * ds + i] * Kc[s * ds + i];
+          qk += Qc[t * ds + i] * Kc[s * ds + i];
+        }
+      }
+      const float w = (t < m && s <= t) ? expf(lg[t] - lg[s]) : 0.0f;
+      L[x] = s < t ? bt[t] * w * kk : 0.0f;
+      Pm[x] = w * qk;
+    }
+    // S0 k_t into u's right-hand side, S0 q_t kept in registers until every thread has read Qc
+    float sq[kDnMaxPairs];
+    int np = 0;
+    for (std::int64_t x = tid; x < cds; x += nth, ++np) {
+      const int t = static_cast<int>(x / ds);
+      const std::int64_t j = x % ds;
+      float sk = 0.0f, sqv = 0.0f;
+      if (t < m) {
+        for (std::int64_t i = 0; i < ds; ++i) {
+          const float sv = S[j * P + i];
+          sk += sv * Kc[t * ds + i];
+          sqv += sv * Qc[t * ds + i];
+        }
+      }
+      const float e = expf(lg[t]);
+      sq[np] = e * sqv;
+      Uc[x] = t < m ? bt[t] * (Uc[x] - e * sk) : 0.0f;
+    }
+    __syncthreads();
+    np = 0;
+    for (std::int64_t x = tid; x < cds; x += nth, ++np) Qc[x] = sq[np];
+    __syncthreads();
+    for (std::int64_t j = tid; j < ds; j += nth)  // forward substitution, one column per thread
+      for (int t = 1; t < m; ++t) {
+        float acc = Uc[t * ds + j];
+        for (int s = 0; s < t; ++s) acc -= L[t * C + s] * Uc[s * ds + j];
+        Uc[t * ds + j] = acc;
+      }
+    __syncthreads();
+    for (std::int64_t x = tid; x < cds; x += nth) {  // outputs
+      const int t = static_cast<int>(x / ds);
+      if (t >= m) continue;
+      const std::int64_t j = x % ds;
+      float o = Qc[x];
+      for (int s = 0; s <= t; ++s) o += Pm[t * C + s] * Uc[s * ds + j];
+      core[(c0 + t) * d_inner + hv * ds + j] = o * qscale;
+    }
+    const float el = expf(lg[m - 1]);
+    for (std::int64_t x = tid; x < ds * ds; x += nth) {  // the state at the chunk's end
+      const std::int64_t j = x / ds, i = x % ds;
+      float v = el * S[j * P + i];
+      for (int s = 0; s < m; ++s) v += expf(lg[m - 1] - lg[s]) * Uc[s * ds + j] * Kc[s * ds + i];
+      S[j * P + i] = v;
+    }
+    __syncthreads();
+  }
+  for (std::int64_t x = tid; x < ds * ds; x += nth) gst[x] = S[(x / ds) * P + x % ds];
+}
+
 __global__ void __launch_bounds__(128) k_gated_norm(float* core, const float* __restrict__ z, const float* __restrict__ w, std::int64_t nv,
                                                     std::int64_t ds, float eps) {
   __shared__ double sh[33];
@@ -698,6 +812,24 @@ bool deltanet_recurrent(const float* conv, std::int64_t ch, const float* beta, c
   const float qscale = 1.0f / std::sqrt(static_cast<float>(ds));  // as the reference, on the host
   k_dn_recurrent<<<static_cast<unsigned>(nv), static_cast<unsigned>(ds), smem, st(s)>>>(conv, ch, beta, alpha, state, n, nk, nv, ds, qscale, core);
   return launched("deltanet recurrent");
+}
+
+bool deltanet_chunked(const float* conv, std::int64_t ch, const float* beta, const float* alpha, float* state, std::int64_t n, std::int64_t nk,
+                      std::int64_t nv, std::int64_t ds, float* core, Stream s) {
+  if (nk <= 0 || nv <= 0 || nv % nk != 0 || ds <= 0 || ds > 256 || ds % 32 != 0 || ch < (2 * nk + nv) * ds || !conv || !beta || !alpha || !state || !core)
+    return fail("deltanet_chunked: bad shape or pointer (d_state a multiple of 32, at most 256)");
+  if (n <= 0) return true;
+  const std::size_t smem = static_cast<std::size_t>(ds * (ds + 1) + 3 * kDnC * ds + 2 * kDnC * kDnC + 2 * kDnC) * sizeof(float);
+  int dev = 0, optin = 0;
+  if (!ck(cudaGetDevice(&dev), "cudaGetDevice") || !ck(cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev), "shared memory limit"))
+    return false;
+  if (smem > static_cast<std::size_t>(optin))
+    return fail("deltanet_chunked: a chunk needs " + std::to_string(smem) + " bytes of shared memory, this card offers " + std::to_string(optin));
+  if (!ck(cudaFuncSetAttribute(k_dn_chunked, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)), "shared memory opt-in"))
+    return false;
+  const float qscale = 1.0f / std::sqrt(static_cast<float>(ds));  // as the reference, on the host
+  k_dn_chunked<<<static_cast<unsigned>(nv), 256, smem, st(s)>>>(conv, ch, beta, alpha, state, n, nk, nv, ds, qscale, core);
+  return launched("deltanet chunked");
 }
 
 bool gated_norm(float* core, const float* z, const float* w, std::int64_t n, std::int64_t nv, std::int64_t ds, float eps, Stream s) {

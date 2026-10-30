@@ -52,6 +52,10 @@ bool deltanet_recurrent(const float*, std::int64_t, const float*, const float*, 
                         float*, Stream) {
   return false;
 }
+bool deltanet_chunked(const float*, std::int64_t, const float*, const float*, float*, std::int64_t, std::int64_t, std::int64_t, std::int64_t,
+                      float*, Stream) {
+  return false;
+}
 bool gated_norm(float*, const float*, const float*, std::int64_t, std::int64_t, std::int64_t, float, Stream) { return false; }
 
 // R3 streaming (kern/gpu_stream.h)
