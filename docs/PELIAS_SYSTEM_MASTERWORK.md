@@ -716,6 +716,7 @@ A single page served by Pelias itself (HTML, CSS and JavaScript written for this
 | Run states | Idle, running, paused on a warning, complete, stopped by a fault |
 | Warning window | The problem, its numbers, and the actions confirm, deny, try again (and stop) |
 | Telemetry | Live speed, VRAM, temperatures, clocks, hit rate, log lines; the page polls `/api/telemetry` and never blocks the engine |
+| Accuracy options (author 2026-10-30 09:09: "make this an option on the gui that people can turn on and off") | Toggles a user can switch on and off, each showing its measured cost and gain on this machine: **usage-tiered experts** (load a `quantize --tier` file, or build one from the original); **residual planes** on or off, with the plane file, the plane count (`--plane-k`), reading for every pick or the top N picks (`--plane-picks`), and when (`--planes-mode`: all tokens, prompt only, prompt + first N); **exact head re-score** (`--head-rescore N`). Each toggle maps to the engine option of the same name and is saved in the profile |
 
 ### 11.6 Two programs or one
 
