@@ -965,6 +965,14 @@ The imatrix or the GPTQ objective adds weight to the router's input space and to
 - Element-wise kernels: 0 NaN/Inf on zero, denormal and outlier inputs.
 - compute-sanitizer memcheck, racecheck, initcheck and synccheck all at 0.
 
+**Routes toward the ceilings on today's misses (author 17:46-17:47 "yes"; each gets a prediction before its run; measure the slowdown before assuming the fix):**
+- C1 R3's remaining 0.93 ms (5.685 ms real token vs 4.75 ms streaming; drain / ramp at 120 stage barriers): put the small steps (norms, router, the decode DeltaNet step) inside R3's job table as job types, so a token is one persistent launch with counter waits; would replace the one-CUDA-graph-per-step plan (U8, up to 3.2 ms, ESTIMATE). Same on WSL and Windows. Test: real-token time vs today's 5.685 ms.
+- C2 chunked DeltaNet 0.94x of recurrent (MEASURED 17:36): variants side by side (state in registers, head split over 4 blocks, hoisted decays, 32-token chunks), 1 token and 1,000 tokens. In progress.
+- C3 the bus handoff flag: the graphics probe measured a VRAM flag at 0.8-1.4 us on Windows vs 2.40 us for CUDA's system-RAM flag; WSL2 cannot map that VRAM window, so the bus hand-offs may be fastest in the native Windows engine. Test: one A/B, same build, WSL vs Windows, once the engine runs.
+- C4 clock state: checked 17:44 (nvidia-smi): CUDA runs in P2 with the memory overclock holding (11,251 MHz), so P2 does not throttle memory here. Recheck if a run's GB/s drops.
+- C5 CPU decode about 4 tok/s on small models (suspected: thread start-up per product, not proven): a pool of spinning threads pinned one per core (the 5800X3D's 8 cores share its 96 MB L3; the author's L3 rule). Test: PELIAS_PROF before / after.
+- C6 Q4_TG2 and IQ2_XXS CPU decode below 27 GB/s (grid lookup): keep each tag's 16 grid floats as 4 byte-planes and build the exact floats with 4 byte shuffles (pshufb) per 32 values; bit exact (no int8 rounding of the grid). Test: sandbox bit-for-bit vs dequantize_row, then bench-dot GB/s on the PC.
+
 **Open kernel items to close here:**
 - O13: the expert down projection (K = 512) runs at 0.27–0.29 of the int8 peak. Try a persistent next-tile kernel, probe first.
 - O14: the grouped launch with real, unequal routing counts.
