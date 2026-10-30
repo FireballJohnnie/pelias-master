@@ -12,7 +12,10 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "kern/gpu_decode.h"
 #include "kern/gpu_ops.h"
@@ -951,19 +954,40 @@ bool deltanet_gates(float* beta, float* alpha, const float* dt, const float* a, 
   return launched("deltanet gates");
 }
 
+// The shared-memory opt-in of a kernel, done once per kernel and size; the card's limit read once (C2: the per-call device
+// query and opt-in were part of every decode step's host time).
+bool smem_ready(const void* kernel, std::size_t smem, const char* what) {
+  static std::mutex mu;
+  static int optin = -1;
+  static std::vector<std::pair<const void*, std::size_t>> done;
+  std::lock_guard<std::mutex> lock(mu);
+  if (optin < 0) {
+    int dev = 0, v = 0;
+    if (!ck(cudaGetDevice(&dev), "cudaGetDevice") || !ck(cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev), "shared memory limit"))
+      return false;
+    optin = v;
+  }
+  if (smem > static_cast<std::size_t>(optin))
+    return fail(std::string(what) + ": needs " + std::to_string(smem) + " bytes of shared memory, this card offers " + std::to_string(optin));
+  for (const auto& d : done)
+    if (d.first == kernel && d.second >= smem) return true;
+  if (!ck(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)), "shared memory opt-in")) return false;
+  for (auto& d : done)
+    if (d.first == kernel) {
+      d.second = smem;
+      return true;
+    }
+  done.emplace_back(kernel, smem);
+  return true;
+}
+
 bool deltanet_recurrent(const float* conv, std::int64_t ch, const float* beta, const float* alpha, float* state, std::int64_t n, std::int64_t nk,
                         std::int64_t nv, std::int64_t ds, float* core, Stream s) {
   if (nk <= 0 || nv <= 0 || nv % nk != 0 || ds <= 0 || ds > 1024 || ds % 32 != 0 || ch < (2 * nk + nv) * ds || !conv || !beta || !alpha || !state || !core)
     return fail("deltanet_recurrent: bad shape or pointer");
   if (n <= 0) return true;
   const std::size_t smem = static_cast<std::size_t>(ds * (ds + 1) + 3 * ds) * sizeof(float);
-  int dev = 0, optin = 0;
-  if (!ck(cudaGetDevice(&dev), "cudaGetDevice") || !ck(cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev), "shared memory limit"))
-    return false;
-  if (smem > static_cast<std::size_t>(optin))
-    return fail("deltanet_recurrent: the state needs " + std::to_string(smem) + " bytes of shared memory, this card offers " + std::to_string(optin));
-  if (!ck(cudaFuncSetAttribute(k_dn_recurrent, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)), "shared memory opt-in"))
-    return false;
+  if (!smem_ready(reinterpret_cast<const void*>(k_dn_recurrent), smem, "deltanet_recurrent")) return false;
   const float qscale = 1.0f / std::sqrt(static_cast<float>(ds));  // as the reference, on the host
   k_dn_recurrent<<<static_cast<unsigned>(nv), static_cast<unsigned>(ds), smem, st(s)>>>(conv, ch, beta, alpha, state, n, nk, nv, ds, qscale, core);
   return launched("deltanet recurrent");
@@ -975,13 +999,7 @@ bool deltanet_chunked(const float* conv, std::int64_t ch, const float* beta, con
     return fail("deltanet_chunked: bad shape or pointer (d_state a multiple of 32, at most 256)");
   if (n <= 0) return true;
   const std::size_t smem = static_cast<std::size_t>(ds * (ds + 1) + 3 * kDnC * ds + 2 * kDnC * kDnC + 2 * kDnC) * sizeof(float);
-  int dev = 0, optin = 0;
-  if (!ck(cudaGetDevice(&dev), "cudaGetDevice") || !ck(cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev), "shared memory limit"))
-    return false;
-  if (smem > static_cast<std::size_t>(optin))
-    return fail("deltanet_chunked: a chunk needs " + std::to_string(smem) + " bytes of shared memory, this card offers " + std::to_string(optin));
-  if (!ck(cudaFuncSetAttribute(k_dn_chunked, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)), "shared memory opt-in"))
-    return false;
+  if (!smem_ready(reinterpret_cast<const void*>(k_dn_chunked), smem, "deltanet_chunked")) return false;
   const float qscale = 1.0f / std::sqrt(static_cast<float>(ds));  // as the reference, on the host
   k_dn_chunked<<<static_cast<unsigned>(nv), 256, smem, st(s)>>>(conv, ch, beta, alpha, state, n, nk, nv, ds, qscale, core);
   return launched("deltanet chunked");
@@ -1007,13 +1025,7 @@ bool launch_chunked_rows(const float* conv, std::int64_t ch, const float* beta, 
                          std::int64_t nv, std::int64_t ds, float* core, Stream s) {
   const std::size_t smem =
       static_cast<std::size_t>(kDnRows * (ds + 1) + 2 * C * ds + 2 * C * kDnRows + 2 * C * C + 4 * C) * sizeof(float);
-  int dev = 0, optin = 0;
-  if (!ck(cudaGetDevice(&dev), "cudaGetDevice") || !ck(cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev), "shared memory limit"))
-    return false;
-  if (smem > static_cast<std::size_t>(optin))
-    return fail("deltanet_chunked_rows: a chunk needs " + std::to_string(smem) + " bytes of shared memory, this card offers " + std::to_string(optin));
-  if (!ck(cudaFuncSetAttribute(k_dn_chunked_rows<C>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)), "shared memory opt-in"))
-    return false;
+  if (!smem_ready(reinterpret_cast<const void*>(k_dn_chunked_rows<C>), smem, "deltanet_chunked_rows")) return false;
   const float qscale = 1.0f / std::sqrt(static_cast<float>(ds));
   const dim3 grid(static_cast<unsigned>(nv), static_cast<unsigned>(ds / kDnRows));
   k_dn_chunked_rows<C><<<grid, 256, smem, st(s)>>>(conv, ch, beta, alpha, state, n, nk, nv, ds, qscale, core);
