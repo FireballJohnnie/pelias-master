@@ -45,6 +45,8 @@ Copyright (c) 2026 John Lipka and the Pelias contributors
 
 **Standing rule (author 20:38):** every split-token decode test keeps the model and planes loaded in RAM for all prompts. Before the next one: `pelias generate --prompt-list` (one load, every prompt, one ids file each). The 2026-10-29 runs reloaded per prompt (43 s each, MEASURED).
 
+**Results 2026-10-29 (MEASURED; BUILD_LOG):** Unsloth MTP UD-Q4_K_M in Pelias's own format, 100 chunks: KLD 0.012808 without planes, **0.005818 with 2 planes (-54.6 %, t -12.25)**, 0.005741 with the exact head re-score of 64 (-1.3 % more, t -16.8). Splits graded by the BF16 original: v8 (no planes) Pelias 7 / llama.cpp 4; **with planes Pelias 12 / llama.cpp 3**; the original's own top-1 share of the held tokens: llama.cpp 98.0 %, Pelias 98.7 %, Pelias with planes 99.1 %. Open, folded into GP3-14: planes per token from the flag / dual predict (graded 0-2 planes), the fast plane add on the GPU 1-bit path and the CPU bus.
+
 **Run order:** (1) build the side file from the original BF16 model against the Unsloth MTP file (and urm_ZT2); (2) `pelias kld` with 0 / 1 / 2 planes and with the head re-score; (3) the 20-prompt decode again with planes; (4) score against the original model's own greedy output.
 
 **Parked until after Pelias-master 1.0 (author):** the wormhole DAX tail test (don't serve ~22 GB models through a DAX daemon; plain virtiofs loaded the model in 25 s).
