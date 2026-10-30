@@ -549,6 +549,19 @@ brackets.
 - The GPU side of the tiered file costs 0.3-1.3 % per token. The CPU leg (cold experts, planes) is not in R3; the engine
   measures it.
 
+### 6.11 Three ways a user gets the accuracy (author 2026-10-30 09:17)
+
+| Way | What the user needs | What changes | Accuracy (this model, WikiText) | Runs in |
+|---|---|---|---|---|
+| 1. A premade file as is | The file (Unsloth's, anyone's) | Nothing | Unsloth UD-Q4_K_M: KL 0.012808 (MEASURED) | Any engine that reads it |
+| 2. Improve that file | A plane side file for that exact file: downloaded ready-made, or built once from the original weights | Nothing in the file; the side file is read next to it, and refused on any other file | + 2 planes everywhere (10.2 GB): 0.005818 (MEASURED); 1-2 GB worst-error planes on a stock file: UNMEASURED (measured so far on the tiered file only) | The file in any engine; the planes in Pelias |
+| 3. A Pelias tiered quant | The original weights once, about an hour of PC time at 35B | The experts rebuilt by use, at the same size; planes optional on top | 0.009404 at Unsloth's size (MEASURED); + planes: chain running | Pelias only |
+
+- **Why way 2 needs the original only once.** The planes store the gap between a file and the original weights. Someone who
+  has the original builds the side file once, and anyone with the same file can use it: a 1-2 GB download instead of 71 GB.
+- **Why ways 2 and 3 differ.** Way 2 keeps the file portable. Way 3 is the most accurate per byte, because the bytes go where
+  the experts are used.
+
 ## 7. Status
 
 - Built and pushed: `pelias planes`; `--planes / --plane-k / --head-rescore` on `kld` and `generate`; `generate

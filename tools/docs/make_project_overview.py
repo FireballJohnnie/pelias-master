@@ -136,6 +136,20 @@ s += [P("5. The new accuracy method: residual planes and usage-tiered experts", 
         "points (error left -> KL: 1.0 -> 0.012808, 0.484 -> 0.009404, 0.098 -> 0.005818), so each is a prediction until its run; chat-and-code "
         "KL has no measured baseline yet.")]
 
+s += [P("<b>How a user gets this: three ways</b> (each a choice in the Pelias interface)", H2),
+      table(["Way", "What the user needs", "What changes", "Accuracy here", "Runs in"], [
+          ["1. A premade file as is", "The file (Unsloth's or anyone's)", "Nothing", "KL 0.012808 (MEASURED)", "Any engine"],
+          ["2. Improve that file", "A plane side file for that exact file: downloaded ready-made, or built once from the original weights",
+           "Nothing in the file; the side file sits next to it and is refused on any other file", "2 planes: 0.005818 (MEASURED); 1-2 GB planes on a stock file UNMEASURED",
+           "The file anywhere; the planes in Pelias"],
+          ["3. A Pelias tiered quant", "The original weights once; about an hour of PC time at 35B", "The experts rebuilt by use, same size; planes optional on top",
+           "0.009404 at the same size (MEASURED)", "Pelias only"],
+      ], [1.25, 1.85, 1.75, 1.55, 1.1]),
+      Spacer(1, 3),
+      P("The planes store the gap between a file and the original weights, so way 2 needs the original only once: whoever has it builds the "
+        "side file, and anyone with the same file can use it, a 1 to 2 GB download instead of 71 GB. Way 2 keeps the file portable; way 3 is "
+        "the most accurate per byte.")]
+
 s += [P("6. Why the unified bus makes all of this work together", H1),
       *bullets([
           "<b>Precision lives where the bandwidth is.</b> Planes and the eighth bit can sit in main memory and be applied by the CPU while the GPU "
