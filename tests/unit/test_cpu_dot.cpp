@@ -289,17 +289,21 @@ bool run_batch(std::uint32_t id, std::int64_t k, const kn::RowPlanes* pl, std::u
   const q::Type t = static_cast<q::Type>(id);
   const std::uint64_t rb = q::row_bytes(id, static_cast<std::uint64_t>(k));
   if (rb == 0) return true;
-  std::vector<std::uint8_t> row(static_cast<std::size_t>(rb));
-  if (q::can_quantize(t)) {
-    const std::vector<float> src = noise(k, seed, 0.05f);
-    if (!q::quantize_row(t, src.data(), row.data(), k)) return false;
-  } else {
-    std::uint32_t r = seed;
+  auto make_row = [&](std::uint32_t sd, std::vector<std::uint8_t>& row) -> bool {
+    row.assign(static_cast<std::size_t>(rb), 0);
+    if (q::can_quantize(t)) {
+      const std::vector<float> src = noise(k, sd, 0.05f);
+      return static_cast<bool>(q::quantize_row(t, src.data(), row.data(), k));
+    }
+    std::uint32_t r = sd;
     for (std::uint8_t& b : row) {
       r = r * 1664525u + 1013904223u;
       b = static_cast<std::uint8_t>((r >> 24) & 0xBF);
     }
-  }
+    return true;
+  };
+  std::vector<std::uint8_t> row, row2, row3;
+  if (!make_row(seed, row) || !make_row(seed + 101u, row2) || !make_row(seed + 202u, row3)) return false;
   const int nmax = 19;
   std::vector<std::vector<float>> xs;
   std::vector<kn::ActQ8x32> acts(static_cast<std::size_t>(nmax));
@@ -316,6 +320,27 @@ bool run_batch(std::uint32_t id, std::int64_t k, const kn::RowPlanes* pl, std::u
       std::vector<float> yb(static_cast<std::size_t>(2 * n), -1.0f), yq(static_cast<std::size_t>(2 * n), -1.0f);
       kn::dot_row_n(t, row.data(), k, pl, xp.data(), n, yb.data(), 2);
       kn::dot_row_q8_n(t, row.data(), k, pl, acts.data(), n, yq.data(), 2);
+      // a block of three different rows (the same planes on each): out[t * 3 + r]
+      const std::uint8_t* rows3[3] = {row.data(), row2.data(), row3.data()};
+      const kn::RowPlanes* pl3[3] = {pl, pl, pl};
+      std::vector<float> zb(static_cast<std::size_t>(3 * n)), zq(static_cast<std::size_t>(3 * n));
+      kn::dot_rows_n(t, rows3, pl ? pl3 : nullptr, 3, k, xp.data(), n, zb.data(), 3);
+      kn::dot_rows_q8_n(t, rows3, pl ? pl3 : nullptr, 3, k, acts.data(), n, zq.data(), 3);
+      for (int r = 0; r < 3; ++r)
+        for (int t0 = 0; t0 < n; t0 += 4) {
+          const int nt = std::min(4, n - t0);
+          float f[4], g[4];
+          const kn::ActQ8x32* ap[4] = {};
+          for (int tt = 0; tt < nt; ++tt) ap[tt] = &acts[static_cast<std::size_t>(t0 + tt)];
+          kn::dot_row(t, rows3[r], k, pl, xp.data() + t0, nt, f);
+          kn::dot_row_q8(t, rows3[r], k, pl, ap, nt, g);
+          for (int tt = 0; tt < nt; ++tt)
+            if (!(zb[static_cast<std::size_t>(3 * (t0 + tt) + r)] == f[tt]) || !(zq[static_cast<std::size_t>(3 * (t0 + tt) + r)] == g[tt])) {
+              std::printf("  dot_rows_n: type %u (%s) k=%lld n=%d row %d t=%d: block differs from the row on its own\n", id, q::type_info(id).name,
+                          static_cast<long long>(k), n, r, t0 + tt);
+              ok = false;
+            }
+        }
       for (int t0 = 0; t0 < n; t0 += 4) {
         const int nt = std::min(4, n - t0);
         float f[4], g[4];
@@ -370,5 +395,5 @@ TEST(cpu_dot_batches_equal_groups_of_four_bit_for_bit) {
     cases += 2;
   }
   CHECK(run_batch(static_cast<std::uint32_t>(q::Type::q8_0), 96, nullptr, 3));  // not whole segments: the groups themselves
-  std::printf("    dot_row_n: %d type/length/plane cases, batch = groups of four bit for bit\n", cases + 1);
+  std::printf("    dot_row_n: %d type/length/plane cases, batch = groups of four bit for bit (one row and blocks of three)\n", cases + 1);
 }

@@ -330,7 +330,7 @@ int cmd_bench_dot(const Args& a) {
               static_cast<unsigned long long>(k), static_cast<unsigned long long>(rows), static_cast<unsigned long long>(rb),
               static_cast<unsigned long long>(pb), static_cast<int>(kp), static_cast<double>(rows * (rb + pb)) / 1e6,
               static_cast<unsigned long long>(threads), kern::active_isa() == kern::Isa::avx2 ? "AVX2" : "portable", a.has("int8") ? ", int8 activations" : "");
-  if (ntok > 1) std::printf("  %llu tokens per row, %s\n", static_cast<unsigned long long>(ntok), a.has("groups") ? "groups of four" : "the row decoded once");
+  if (ntok > 1) std::printf("  %llu tokens per row, %s\n", static_cast<unsigned long long>(ntok), a.has("groups") ? "groups of four" : "blocks of 16 rows, each decoded once");
   // 64 distinct rows, repeated to fill the buffer (the bytes read are what is timed, not their variety)
   const std::uint64_t distinct = std::min<std::uint64_t>(64, rows);
   std::vector<std::uint8_t> w(rows * rb), pl(rows * pb);
@@ -371,6 +371,23 @@ int cmd_bench_dot(const Args& a) {
       pool.emplace_back([&, ti]() {
         const std::uint64_t r0 = rows * ti / threads, r1 = rows * (ti + 1) / threads;
         std::vector<float> row(k);
+        if (!reference && ntok > 1 && !groups) {  // blocks of 16 rows, as the forward pass runs a batch (fast_rows)
+          for (std::uint64_t b0 = r0; b0 < r1; b0 += 16) {
+            const int nr = static_cast<int>(std::min<std::uint64_t>(16, r1 - b0));
+            const std::uint8_t* rws[16];
+            kern::RowPlanes rps[16];
+            const kern::RowPlanes* pps[16];
+            for (int r = 0; r < nr; ++r) {
+              rws[r] = w.data() + (b0 + static_cast<std::uint64_t>(r)) * rb;
+              rps[r] = {kp ? pl.data() + (b0 + static_cast<std::uint64_t>(r)) * pb : nullptr, nullptr, static_cast<int>(kp), static_cast<int>(kp)};
+              pps[r] = &rps[r];
+            }
+            float* yo = &y[b0 * ntok];  // the block's nr x ntok outputs, token-major
+            if (int8) kern::dot_rows_q8_n(t, rws, kp ? pps : nullptr, nr, static_cast<std::int64_t>(k), acts.data(), static_cast<std::int64_t>(ntok), yo, nr);
+            else kern::dot_rows_n(t, rws, kp ? pps : nullptr, nr, static_cast<std::int64_t>(k), xs.data(), static_cast<std::int64_t>(ntok), yo, nr);
+          }
+          return;
+        }
         for (std::uint64_t r = r0; r < r1; ++r) {
           if (reference) {
             (void)quant::dequantize_row(t, w.data() + r * rb, row.data(), static_cast<std::int64_t>(k));
@@ -384,15 +401,10 @@ int cmd_bench_dot(const Args& a) {
             kern::RowPlanes rp{kp ? pl.data() + r * pb : nullptr, nullptr, static_cast<int>(kp), static_cast<int>(kp)};
             const std::int64_t kk = static_cast<std::int64_t>(k);
             float* yo = &y[r * ntok];
-            if (ntok > 1 && !groups) {
-              if (int8) kern::dot_row_q8_n(t, w.data() + r * rb, kk, kp ? &rp : nullptr, acts.data(), static_cast<std::int64_t>(ntok), yo, 1);
-              else kern::dot_row_n(t, w.data() + r * rb, kk, kp ? &rp : nullptr, xs.data(), static_cast<std::int64_t>(ntok), yo, 1);
-            } else {
-              for (std::uint64_t t0 = 0; t0 < ntok; t0 += 4) {
-                const int nt = static_cast<int>(std::min<std::uint64_t>(4, ntok - t0));
-                if (int8) kern::dot_row_q8(t, w.data() + r * rb, kk, kp ? &rp : nullptr, as.data() + t0, nt, yo + t0);
-                else kern::dot_row(t, w.data() + r * rb, kk, kp ? &rp : nullptr, xs.data() + t0, nt, yo + t0);
-              }
+            for (std::uint64_t t0 = 0; t0 < ntok; t0 += 4) {
+              const int nt = static_cast<int>(std::min<std::uint64_t>(4, ntok - t0));
+              if (int8) kern::dot_row_q8(t, w.data() + r * rb, kk, kp ? &rp : nullptr, as.data() + t0, nt, yo + t0);
+              else kern::dot_row(t, w.data() + r * rb, kk, kp ? &rp : nullptr, xs.data() + t0, nt, yo + t0);
             }
           }
         }

@@ -41,7 +41,8 @@ std::size_t match_contraction(const std::vector<CpUnit>& u, const std::vector<Cp
   return 0;
 }
 
-bool is_other(const CpFlags& f) { return !(f.whitespace || f.letter || f.mark || f.number); }
+// [^\s\p{L}\p{M}\p{N}] (qwen35) or [^\s\p{L}\p{N}] (marks count as other)
+bool is_other(const CpFlags& f, bool marks_in_words) { return !(f.whitespace || f.letter || (marks_in_words && f.mark) || f.number); }
 
 }  // namespace
 
@@ -49,8 +50,24 @@ Result<Tokenizer> Tokenizer::from_parts(std::vector<std::string> tokens, std::ve
                                         const std::vector<std::string>& merges, std::string pre) {
   using R = Result<Tokenizer>;
   if (tokens.size() != types.size()) return R::fail(Status::fail(Code::corrupt, "token and type counts differ"));
-  if (pre != "qwen35") return R::fail(Status::fail(Code::unsupported, "pre-tokenizer not supported: " + pre));
   Tokenizer t;
+  // the split patterns (tokenizer.json of each family; llama.cpp src/llama-vocab.cpp lists the same three):
+  //   qwen35:    ...|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|...   NFC normalizer
+  //   qwen2:     ...|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|...              NFC normalizer
+  //   llama-bpe: ...|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|...         no normalizer
+  // (the contraction alternative and the whitespace tail are the same in all three)
+  if (pre == "qwen35") {
+    t.marks_in_words_ = true;
+  } else if (pre == "qwen2") {
+    t.marks_in_words_ = false;
+  } else if (pre == "llama-bpe") {
+    t.marks_in_words_ = false;
+    t.max_digits_ = 3;
+    t.nfc_ = false;
+    t.ignore_merges_ = true;
+  } else {
+    return R::fail(Status::fail(Code::unsupported, "pre-tokenizer not supported: " + pre));
+  }
   t.tokens_ = std::move(tokens);
   t.types_ = std::move(types);
   t.pre_ = std::move(pre);
@@ -148,7 +165,8 @@ std::vector<std::string> Tokenizer::split(std::string_view text) const {
   std::vector<CpFlags> f(n);
   for (std::size_t k = 0; k < n; ++k)
     if (u[k].valid) f[k] = flags_of(u[k].cp);
-  auto letter_or_mark = [&](std::size_t k) { return k < n && (f[k].letter || f[k].mark); };
+  const bool mw = marks_in_words_;
+  auto letter_or_mark = [&](std::size_t k) { return k < n && (f[k].letter || (mw && f[k].mark)); };
   auto emit = [&](std::size_t from, std::size_t to) {
     const std::size_t b0 = u[from].offset;
     const std::size_t b1 = to < n ? u[to].offset : text.size();
@@ -165,7 +183,7 @@ std::vector<std::string> Tokenizer::split(std::string_view text) const {
     }
     const char32_t c = u[i].cp;
     const bool c_valid = u[i].valid;
-    // 2. [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+
+    // 2. [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+ (qwen35) or [^\r\n\p{L}\p{N}]?\p{L}+
     {
       const bool prefix_ok = !(c_valid && is_rn(c)) && !f[i].letter && !f[i].number;
       std::size_t j = 0;
@@ -182,18 +200,20 @@ std::vector<std::string> Tokenizer::split(std::string_view text) const {
         continue;
       }
     }
-    // 3. \p{N}
+    // 3. \p{N} or \p{N}{1,3} (llama-bpe)
     if (f[i].number) {
-      emit(i, i + 1);
-      ++i;
+      std::size_t j = i + 1;
+      while (j < n && j - i < static_cast<std::size_t>(max_digits_) && f[j].number) ++j;
+      emit(i, j);
+      i = j;
       continue;
     }
-    // 4. ' ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*'
+    // 4. ' ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*' (qwen35) or ' ?[^\s\p{L}\p{N}]+[\r\n]*'
     {
       std::size_t j = i;
-      if (c_valid && c == ' ' && i + 1 < n && is_other(f[i + 1])) j = i + 1;
-      if (is_other(f[j])) {
-        while (j < n && is_other(f[j])) ++j;
+      if (c_valid && c == ' ' && i + 1 < n && is_other(f[i + 1], mw)) j = i + 1;
+      if (is_other(f[j], mw)) {
+        while (j < n && is_other(f[j], mw)) ++j;
         while (j < n && u[j].valid && is_rn(u[j].cp)) ++j;
         emit(i, j);
         i = j;
@@ -291,11 +311,21 @@ void Tokenizer::encode_plain(std::string_view piece, const EncodeOptions& opt, s
   if (piece.empty()) return;
   std::string normalized;
   std::string_view text = piece;
-  if (opt.nfc) {
+  if (opt.nfc && nfc_) {
     normalized = to_nfc(piece);
     text = normalized;
   }
-  for (const std::string& w : split(text)) bpe(w, out);
+  for (const std::string& w : split(text)) {
+    if (ignore_merges_) {  // llama-bpe (tokenizer.json "ignore_merges": true): a split that is a token is taken whole
+      std::string mapped;
+      for (const char ch : w) mapped += byte_char_[static_cast<unsigned char>(ch)];
+      if (const auto it = by_text_.find(mapped); it != by_text_.end()) {
+        out.push_back(it->second);
+        continue;
+      }
+    }
+    bpe(w, out);
+  }
 }
 
 std::vector<std::int32_t> Tokenizer::encode(std::string_view text, const EncodeOptions& opt) const {

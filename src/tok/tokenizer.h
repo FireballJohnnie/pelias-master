@@ -8,8 +8,8 @@
 //
 // Encoding, in order:
 //   1. the text is split on added tokens (control and user-defined), leftmost-longest match;
-//   2. each remaining piece is normalised (NFC; off to match llama.cpp, which does not normalise);
-//   3. the piece is split by the model's pre-tokenizer pattern (qwen35);
+//   2. each remaining piece is normalised (NFC where the family's tokenizer.json asks; off to match llama.cpp);
+//   3. the piece is split by the model's pre-tokenizer pattern (qwen35, qwen2 or llama-bpe);
 //   4. each split is mapped byte by byte to the byte-level alphabet and merged by BPE rank.
 #pragma once
 
@@ -37,7 +37,8 @@ struct EncodeOptions {
 
 class Tokenizer {
  public:
-  // Reads tokenizer.ggml.* from a parsed GGUF. Supports model "gpt2" with pre-tokenizer "qwen35".
+  // Reads tokenizer.ggml.* from a parsed GGUF. Supports model "gpt2" with pre-tokenizer "qwen35", "qwen2" (Qwen2 / Qwen2.5
+  // / Qwen3) or "llama-bpe" (Llama 3, BitNet b1.58 2B4T).
   static Result<Tokenizer> from_gguf(const io::GgufReader& gguf);
   // Builds from parts (tests and other sources): tokens, their types, and merges as "left right" strings.
   static Result<Tokenizer> from_parts(std::vector<std::string> tokens, std::vector<std::int32_t> types,
@@ -76,6 +77,10 @@ class Tokenizer {
   std::vector<std::string> tokens_;
   std::vector<std::int32_t> types_;
   std::string pre_;
+  bool marks_in_words_ = true;  // qwen35: \p{M} joins letters in words and is not "other"
+  int max_digits_ = 1;          // \p{N} per split (llama-bpe: up to 3)
+  bool nfc_ = true;             // the family's tokenizer.json normalizes to NFC (llama-bpe: none)
+  bool ignore_merges_ = false;  // llama-bpe: a split that is itself a token is taken whole, before any merge
   std::unordered_map<std::string, std::int32_t> by_text_;
   std::unordered_map<std::uint64_t, MergeInfo> merges_;
   std::int32_t byte_token_[256] = {};

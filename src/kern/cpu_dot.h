@@ -48,6 +48,12 @@ void dot_row(quant::Type t, const std::uint8_t* row, std::int64_t k, const RowPl
 void dot_row_n(quant::Type t, const std::uint8_t* row, std::int64_t k, const RowPlanes* planes, const float* const* xs, std::int64_t n,
                float* out, std::int64_t ldo);
 
+// A block of nr rows of one type (row r at rows[r], its planes at planes[r]; planes itself may be null) against n tokens:
+// out[t * ldo + r] exactly what dot_row gives (row r, token t). Each row is decoded once and each group of four tokens is
+// run across the whole block, so a batch reuses both the weights and the inputs (prefill, kld).
+void dot_rows_n(quant::Type t, const std::uint8_t* const* rows, const RowPlanes* const* planes, int nr, std::int64_t k, const float* const* xs,
+                std::int64_t n, float* out, std::int64_t ldo);
+
 // ---- the int8-activation path (GP3-10 item 5; the engine's activation format, ForwardOptions gpu256x8)
 //
 // Activations rounded per 32 values to an fp32 scale s_b and integers q in -127..127 (round half to even, as
@@ -78,5 +84,9 @@ void dot_row_q8(quant::Type t, const std::uint8_t* row, std::int64_t k, const Ro
 // n tokens at once (acts[0..n)): out[t * ldo] exactly what dot_row_q8 gives token t, the row decoded once.
 void dot_row_q8_n(quant::Type t, const std::uint8_t* row, std::int64_t k, const RowPlanes* planes, const ActQ8x32* acts, std::int64_t n,
                   float* out, std::int64_t ldo);
+
+// The int8 form of dot_rows_n: out[t * ldo + r] exactly what dot_row_q8 gives (row r, token t).
+void dot_rows_q8_n(quant::Type t, const std::uint8_t* const* rows, const RowPlanes* const* planes, int nr, std::int64_t k, const ActQ8x32* acts,
+                   std::int64_t n, float* out, std::int64_t ldo);
 
 }  // namespace pelias::kern

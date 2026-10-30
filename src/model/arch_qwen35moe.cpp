@@ -234,10 +234,9 @@ void fast_rows(const WeightView& w, uint64_t e, int64_t o_begin, int64_t o_end, 
                int64_t ldy, const Scratch& sc) {
   const int64_t k = static_cast<int64_t>(w.ne[0]);
   const uint64_t base_row = e * w.ne[1];
-  for (int64_t o = o_begin; o < o_end; ++o) {
+  const bool q8 = sc.acts && static_cast<int64_t>(sc.acts->size()) == n_tok;
+  auto row_of = [&](int64_t o, quant::Type& t, const std::uint8_t*& p, kern::RowPlanes& rp, bool& has_planes) {
     const uint64_t row = base_row + static_cast<uint64_t>(o);
-    quant::Type t;
-    const std::uint8_t* p;
     if (w.slots.empty()) {
       t = static_cast<quant::Type>(w.type);
       p = w.data + row * w.row_bytes;
@@ -246,28 +245,49 @@ void fast_rows(const WeightView& w, uint64_t e, int64_t o_begin, int64_t o_end, 
       t = static_cast<quant::Type>(s.type);
       p = s.data + (row % w.ne[1]) * s.row_bytes;
     }
-    kern::RowPlanes rp;
-    const kern::RowPlanes* pp = nullptr;
-    if (sc.planes && w.planes) {
+    has_planes = sc.planes && w.planes;
+    if (has_planes) {
       if (w.plane_mask)
         rp = {w.planes + static_cast<uint64_t>(w.plane_off[row]) * 34u * static_cast<uint64_t>(w.plane_k_stored),
               w.plane_mask + row * w.plane_mask_bytes, w.plane_k_stored, w.plane_k};
       else
         rp = {w.planes + row * w.plane_row_bytes, nullptr, w.plane_k_stored, w.plane_k};
-      pp = &rp;
     }
-    const bool q8 = sc.acts && static_cast<int64_t>(sc.acts->size()) == n_tok;
-    if (n_tok > 4) {  // a batch: the row decoded once (the same bits as the groups of four below)
-      if (q8) {
-        kern::dot_row_q8_n(t, p, k, pp, sc.acts->data(), n_tok, y + o, ldy);
-      } else {
-        thread_local std::vector<const float*> xs;
-        xs.resize(z(n_tok));
-        for (int64_t i = 0; i < n_tok; ++i) xs[z(i)] = x + i * ldx;
-        kern::dot_row_n(t, p, k, pp, xs.data(), n_tok, y + o, ldy);
+  };
+  if (n_tok > 4) {
+    // a batch: blocks of 16 rows (one matrix, so one type), each row decoded once, every group of four tokens run across the
+    // block (the same bits as one row and four tokens at a time below)
+    constexpr int kBlock = 16;
+    thread_local std::vector<const float*> xs;
+    if (!q8) {
+      xs.resize(z(n_tok));
+      for (int64_t i = 0; i < n_tok; ++i) xs[z(i)] = x + i * ldx;
+    }
+    for (int64_t o0 = o_begin; o0 < o_end; o0 += kBlock) {
+      const int nr = static_cast<int>(std::min<int64_t>(kBlock, o_end - o0));
+      const std::uint8_t* rows[kBlock];
+      kern::RowPlanes rps[kBlock];
+      const kern::RowPlanes* pps[kBlock];
+      quant::Type t = quant::Type::f32;
+      bool any = false;
+      for (int r = 0; r < nr; ++r) {
+        bool hp = false;
+        row_of(o0 + r, t, rows[r], rps[r], hp);
+        pps[r] = hp ? &rps[r] : nullptr;
+        any = any || hp;
       }
-      continue;
+      if (q8) kern::dot_rows_q8_n(t, rows, any ? pps : nullptr, nr, k, sc.acts->data(), n_tok, y + o0, ldy);
+      else kern::dot_rows_n(t, rows, any ? pps : nullptr, nr, k, xs.data(), n_tok, y + o0, ldy);
     }
+    return;
+  }
+  for (int64_t o = o_begin; o < o_end; ++o) {
+    quant::Type t;
+    const std::uint8_t* p;
+    kern::RowPlanes rp;
+    bool hp = false;
+    row_of(o, t, p, rp, hp);
+    const kern::RowPlanes* pp = hp ? &rp : nullptr;
     for (int64_t t0 = 0; t0 < n_tok; t0 += 4) {
       const int nt = static_cast<int>(std::min<int64_t>(4, n_tok - t0));
       float out[4];
@@ -278,9 +298,9 @@ void fast_rows(const WeightView& w, uint64_t e, int64_t o_begin, int64_t o_end, 
         for (int tt = 0; tt < nt; ++tt) y[(t0 + tt) * ldy + o] = out[tt];
         continue;
       }
-      const float* xs[4];
-      for (int tt = 0; tt < 4; ++tt) xs[tt] = x + std::min(t0 + tt, n_tok - 1) * ldx;
-      kern::dot_row(t, p, k, pp, xs, nt, out);
+      const float* xs4[4];
+      for (int tt = 0; tt < 4; ++tt) xs4[tt] = x + std::min(t0 + tt, n_tok - 1) * ldx;
+      kern::dot_row(t, p, k, pp, xs4, nt, out);
       for (int tt = 0; tt < nt; ++tt) y[(t0 + tt) * ldy + o] = out[tt];
     }
   }
