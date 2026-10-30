@@ -68,7 +68,7 @@ struct dim3 {
 typedef enum cudaError { cudaSuccess = 0, cudaErrorUnknown = 999 } cudaError_t;
 typedef struct CUstream_st* cudaStream_t;
 enum cudaMemcpyKind { cudaMemcpyHostToHost, cudaMemcpyHostToDevice, cudaMemcpyDeviceToHost, cudaMemcpyDeviceToDevice };
-enum cudaDeviceAttr { cudaDevAttrMaxSharedMemoryPerBlockOptin = 97 };
+enum cudaDeviceAttr { cudaDevAttrMultiProcessorCount = 16, cudaDevAttrCooperativeLaunch = 95, cudaDevAttrMaxSharedMemoryPerBlockOptin = 97 };
 enum cudaFuncAttribute { cudaFuncAttributeMaxDynamicSharedMemorySize = 8 };
 const char* cudaGetErrorString(cudaError_t);
 cudaError_t cudaGetLastError();
@@ -87,3 +87,15 @@ cudaError_t cudaConfigureCall(dim3 grid, dim3 block, size_t shmem = 0, cudaStrea
 extern "C" unsigned __cudaPushCallConfiguration(dim3 grid, dim3 block, size_t shmem = 0, void* stream = nullptr);
 extern "C" cudaError_t __cudaPopCallConfiguration(dim3* grid, dim3* block, size_t* shmem, void* stream);
 extern "C" cudaError_t cudaLaunchKernel(const void*, dim3, dim3, void**, size_t, cudaStream_t);
+cudaError_t cudaLaunchCooperativeKernel(const void*, dim3, dim3, void**, size_t, cudaStream_t);
+cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessorImpl(int*, const void*, int, size_t);
+template <class T>
+cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessor(int* n, T* f, int threads, size_t smem) {
+  return cudaOccupancyMaxActiveBlocksPerMultiprocessorImpl(n, reinterpret_cast<const void*>(f), threads, smem);
+}
+cudaError_t cudaMemcpyToSymbolImpl(const void*, const void*, size_t);
+template <class T>
+cudaError_t cudaMemcpyToSymbol(const T& sym, const void* src, size_t n) { return cudaMemcpyToSymbolImpl(&sym, src, n); }
+__device__ int __dp4a(int, int, int);
+__device__ void __nanosleep(unsigned);
+__device__ unsigned long long atomicAdd(unsigned long long*, unsigned long long);

@@ -4,6 +4,7 @@
 // kern/gpu_ops_none.cpp - the GPU kernels' interface in a build without the CUDA backend (PELIAS_CUDA off): every call
 // reports that there is no GPU backend, so callers fall back to the CPU path.
 #include "kern/gpu_ops.h"
+#include "kern/gpu_stream.h"
 
 namespace pelias::kern::gpu {
 namespace {
@@ -52,5 +53,22 @@ bool deltanet_recurrent(const float*, std::int64_t, const float*, const float*, 
   return false;
 }
 bool gated_norm(float*, const float*, const float*, std::int64_t, std::int64_t, std::int64_t, float, Stream) { return false; }
+
+// R3 streaming (kern/gpu_stream.h)
+bool stream_type_ok(std::uint32_t, std::int64_t) { return false; }
+bool stream_upload(std::uint32_t, const void*, std::int64_t, std::int64_t, StreamWeights*) { return false; }
+void stream_release(StreamWeights* w) {
+  if (w) *w = StreamWeights{};
+}
+const char* stream_last_error() { return "built without the CUDA backend (configure with -DPELIAS_CUDA=ON)"; }
+StreamPlan::~StreamPlan() {  // nothing was allocated; the fields are named so every compiler sees them used
+  dev_ = nullptr;
+  njobs_ = nstages_ = ngroups_ = grid_ = 0;
+  epoch_ = 0;
+  off_jobs_ = off_stage_ = off_grp_ = off_dep_ = off_gtasks_ = off_done_ = off_gdone_ = 0;
+}
+bool StreamPlan::build(const StreamJob*, int, const int*, int, int) { return false; }
+bool StreamPlan::run(Stream) { return false; }
+bool StreamPlan::run_unstaged(Stream) { return false; }
 
 }  // namespace pelias::kern::gpu
