@@ -166,6 +166,9 @@ Reading:
   engine runs near the 22 GB file's speed with accuracy near the 33 GB one.
 - **Planes need no new model file:** they work on any existing quantized file, given the original weights once.
 
+**Correction (6.3):** offered per-expert types as well, selective planes lose at a fixed size; a usage-tiered expert file
+reaches about 0.0079 at 22.65 GB with no planes. The rows above compare planes only with uniform files.
+
 ### 4.4 The runs that turn this into MEASURED (ESTIMATE about 4-5 h of PC time)
 
 1. A traditional Q5_K_M and Q6_K of this model through Pelias (quantize from BF16, about 15 min each; `kld`, about 25 min
@@ -195,9 +198,143 @@ Yes, and it is already measured.
   - **Exact rows stored in 8 bits** (0.51 GB): half the size, a small error left on the very rows that decide near-ties;
     the first two routes are cheaper.
 
-## 6. Status
+## 6. A file the size of Unsloth's with an accuracy win (analysis 2026-10-30)
+
+The author asked (05:32) for a method that stays near the Unsloth file's size (22.65 GB) and still wins on accuracy.
+
+### 6.1 What the research says
+
+- **The traditional step up is size-efficient.** Unsloth's published table for Qwen3.5-35B-A3B (an earlier model, other
+  eval text; MEASURED by Unsloth, UNVERIFIED here) shows UD-Q4_K_XL 19.17 GB, KLD 0.0137 and UD-Q5_K_XL 23.22 GB, KLD
+  0.0069. About +4 GB halves KLD; uniform planes needed +10 GB for -55 %.
+- **The same ±1-plane representation is known** as binary-coded quantization: AnyBCQ (greedy plus alternating refit,
+  several precisions from one store), Any-Precision LLM (one file read at several bit widths), BitStack (sign plus
+  residual blocks, any size). Pelias's planes are this family; the fit here was built ground up.
+- **MoE work points at per-expert precision.**
+  - DynaExq keeps hot experts at high precision and cold ones low, chosen at run time by usage (on Qwen3-30B-A3B).
+  - MoPEQ chooses bits per expert by Hessian or by frequency.
+  - MoBiQuant reads residual slices per token through a small router.
+- **Stock GGUF cannot express it.** All experts of one layer share one tensor and one type, so a GGUF file gives every
+  expert the same precision, the hot ones and the ones almost never picked.
+
+### 6.2 Measured inputs
+
+- **The Unsloth file by tensor class:**
+  - experts 19.57 GB of 22.65 (86 %);
+  - gate and up Q4_K, 6.04 GB each;
+  - down Q5_K/Q6_K, 7.49 GB;
+  - dense part 1.60 GB; embedding 0.54 GB; head 0.42 GB; MTP 0.53 GB.
+- **Expert usage is very uneven.** Ranked on chunks 0-49 and scored on chunks 50-99 of WikiText-2 (held out):
+
+  | Top experts of 256 per layer | Share of routing weight |
+  |---|---|
+  | 32 | 53 % |
+  | 64 | 74 % |
+  | 120 | 91 % |
+
+  The worst layer at 120 covers 70 % of picks. The 93.5 % in 4.2 was measured on the same text it was ranked on; 89.4 %
+  held out.
+- **Error per storage option** on blk.20 experts, relative to Q4_K:
+
+  | Option | Error vs Q4_K |
+  |---|---|
+  | Q2_K | 14.1x |
+  | Q3_K | 4.4x |
+  | IQ4_XS | 1.18x |
+  | Q5_K | 0.25x |
+  | Q6_K | 0.064x |
+  | Q8_0 | 0.007x |
+  | Q4_K + 1 plane | 0.36x |
+  | Q4_K + 2 planes | 0.097x |
+  | IQ4_XS + 1 plane | 0.38x |
+
+  Down shows the same pattern. Scripts and results: `base_planes_check.py`, `hotset_coverage.py`.
+
+### 6.3 The method: a usage-tiered expert file (Pelias-native)
+
+**The idea.** Each expert of each layer gets its own storage type, chosen by how much routing weight it carries. Hot
+experts get Q5_K/Q6_K/Q8_0, cold ones IQ4_XS (or Q3_K). Everything outside the experts stays exactly as in the Unsloth file.
+
+**The allocation is optimal for the measured inputs:** it minimises usage-weighted error under a byte budget, by a
+Lagrangian per expert. Script: `usage_alloc.py`, `usage_alloc_floor.py`.
+
+**Results (all DERIVED).**
+- The error is the held-out, usage-weighted expert error relative to the Unsloth file's experts (= 1).
+- KL uses the line in 4.2.
+- 22.65 GB is the Unsloth file's own size; 24.1 GB is +1.4 GB.
+
+| Experts | Lowest type allowed | Total file | Error vs Unsloth | Projected KL |
+|---|---|---|---|---|
+| Unsloth (gate/up Q4_K, down Q5_K) | — | 22.65 GB | 1.00 | 0.0128 (MEASURED) |
+| Tiered | IQ4_XS | **22.65 GB** | 0.35 | **about 0.0079 (-38 %)** |
+| Tiered | Q3_K | 22.65 GB | 0.29 | about 0.0074 (-42 %) |
+| Tiered | none (Q2_K allowed) | 22.65 GB | 0.28 | about 0.0072 (-44 %) |
+| Tiered | IQ4_XS | 24.1 GB | 0.20 | about 0.0066 (-48 %) |
+| Unsloth planes, 2 everywhere (MEASURED) | — | 31.9 GB | 0.10 | 0.0058 (MEASURED) |
+
+**With the IQ4_XS floor at 22.65 GB, the optimiser gives:**
+
+| Precision | gate/up | down |
+|---|---|---|
+| IQ4_XS (cold) | 6,188 | 6,227 |
+| Q5_K | 2,962 | 2,914 |
+| Q6_K | 1,069 | 1,081 |
+| Q8_0 | 21 | 18 |
+
+These are counts of layer-experts out of 10,240.
+
+**Planes at a fixed size: an honest finding.** Offered planes as well as types, the optimiser hardly uses them: the error
+at 22.65 GB is the same to three digits. At a fixed file size, a higher base type beats a plane bit for bit. So the
+size-neutral win comes from **per-expert precision**, which GGUF cannot express. It does not come from planes.
+
+**Where planes still earn their place:**
+- On top of a file you cannot or will not requantize, the Unsloth file included. This is what was measured: −55 % KL and
+  the 12-3 split result.
+- Read only when needed: on flagged tokens, on hot experts only, through the dual bus. They cost disk but few bytes per
+  token, which the fixed-size table does not count.
+- As the accuracy reserve above the tiered file: for example, 1 plane on the top 32 experts per layer, about 0.5 GB, read
+  on flagged tokens only.
+
+### 6.4 Risks and what is UNMEASURED
+
+- **Usage was measured on WikiText-2 only.** Code, math or chat may pick other experts. The IQ4_XS floor caps the damage:
+  an expert the ranking got wrong is at most 1.18x worse than Q4_K, never Q2_K's 14x. A second routing capture on code and
+  chat prompts settles the ranking's stability. Until then the floor stays at IQ4_XS.
+- **Layers are weighted equally.** Their sensitivity to error is UNMEASURED; a per-layer KL sweep would refine the budget.
+- **The error ratios come from blk.20 experts 0-3 only;** the rest is assumed alike.
+- **The KL line has two points;** a tiered file is not uniform, so the line may not hold.
+- **The file is Pelias-only.** llama.cpp cannot load mixed expert types in one tensor. A stock GGUF can still be written
+  per layer (one type for all experts of a layer, the hottest layers higher), which is weaker. Not computed yet.
+- **Engine work needed:**
+  - the experts of a layer stored as one tensor per type plus a 256-entry map from expert to (type, row);
+  - the loader, dequantizer and matvec choose per expert;
+  - `quantize` gains a usage-tiered option fed by a routes file;
+  - the gate, up and down kernels for IQ4_XS/Q5_K/Q6_K/Q8_0 already exist.
+
+### 6.5 Proposed run list (needs the author's go and order)
+
+1. **A routing capture on code and chat prompts.** `generate --prompt-list` with `--route-dump`, about 20 min. This checks
+   that the hot set holds outside WikiText.
+2. **The tiered quantize from BF16** (IQ4_XS floor, 22.65 GB), then `kld` with `--dump-codes`, `--dump-kld` and
+   `--route-dump`. Build about 2-3 h, run about 1 h. Prediction: KL about 0.0079, between 0.0070 and 0.0095.
+3. **The split-token decode and grade on the tiered file** (`--prompt-list`, the model held in RAM; `teacher`;
+   `split_grade.py`). Prediction: at least as good as v8 (Pelias 7, llama 4); below the planes run (12-3).
+4. **Tiered plus planes on the top 32 experts.** `kld` and decode, the planes on flagged tokens and on all tokens.
+5. Then the runs of 4.4, cut to what is still open: a traditional Q5_K_M as the reference at about 27 GB.
+
+## 7. Status
 
 - Built and pushed: `pelias planes`; `--planes / --plane-k / --head-rescore` on `kld` and `generate`; `generate
   --planes-mode all|prefill|start:N` and `--prompt-list` (model loaded once); `pelias teacher` and
   `tools/split_grade.py` (grading against the original). Commits fdb63e1, 52c3eda, 76b1166 and the build-log entries after.
 - GP3-08 (MTP) is paused (author 2026-10-30 05:08): the cost-down runs of 4.4 come first.
+
+## Sources
+
+- [Unsloth: Qwen3.5 GGUF benchmarks (KLD by file)](https://unsloth.ai/docs/models/qwen3.5/gguf-benchmarks) (English path UNVERIFIED; the [German copy](https://unsloth.ai/docs/de/modelle/qwen3.5/gguf-benchmarks) was found)
+- [AnyBCQ: hardware-efficient flexible binary-coded quantization for multi-precision LLMs](https://arxiv.org/abs/2510.10467)
+- [Any-Precision LLM (Park et al., 2024)](https://arxiv.org/abs/2402.10517)
+- [BitStack: any-size compression of LLMs](https://arxiv.org/abs/2410.23918)
+- [DynaExq: dynamic expert quantization for MoE inference](https://arxiv.org/abs/2511.15015)
+- [MoPEQ: mixture of mixed-precision quantized experts](https://arxiv.org/abs/2509.02512)
+- [MoBiQuant: mixture-of-bits quantization for token-adaptive elastic LLMs](https://arxiv.org/abs/2602.20191)

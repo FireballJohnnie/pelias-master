@@ -49,6 +49,8 @@ Copyright (c) 2026 John Lipka and the Pelias contributors
 
 **Next (author 2026-10-30 05:08): GP3-08 paused; the cost-down runs first** (docs/PELIAS_RESIDUAL_PLANES.md section 4.4): traditional Q5_K_M / Q6_K through Pelias; 1- and 3-plane side files; block-selective (A), hot-experts-only (B) and A + B planes; the flagged-only reading.
 
+**Analysis (author 2026-10-30 05:32): a file the size of Unsloth's with an accuracy win** (docs/PELIAS_RESIDUAL_PLANES.md section 6; DERIVED, UNMEASURED). A usage-tiered expert file: each expert of each layer gets its own type by its routing weight (hot Q5_K/Q6_K/Q8_0, cold IQ4_XS), everything else as in the Unsloth file; at the same 22.65 GB the projected KL is about 0.0079 (-38 % vs 0.012808), about 0.0066 at 24.1 GB. At a fixed size planes add almost nothing over per-expert types; they stay the add-on to existing files and the per-token reserve. Needs engine work (experts stored per type plus a map) and a routing check outside WikiText. Proposed runs, waiting for the author's go: routing capture on code/chat; the tiered quantize + kld; split-token decode + grade on it; tiered + planes on the top 32 experts; a Q5_K_M reference.
+
 **Run order:** (1) build the side file from the original BF16 model against the Unsloth MTP file (and urm_ZT2); (2) `pelias kld` with 0 / 1 / 2 planes and with the head re-score; (3) the 20-prompt decode again with planes; (4) score against the original model's own greedy output.
 
 **Parked until after Pelias-master 1.0 (author):** the wormhole DAX tail test (don't serve ~22 GB models through a DAX daemon; plain virtiofs loaded the model in 25 s).
