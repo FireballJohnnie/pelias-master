@@ -8,7 +8,6 @@ import sys
 from pelias_pdf_common import *
 
 OUT = sys.argv[1]
-TIER_RESULT = sys.argv[2] if len(sys.argv) > 2 else ""
 s = []
 s += [P("Pelias", TITLE),
       P("One consumer PC running a 35-billion-parameter model as if CPU and GPU were one machine, and reading precision only where it "
@@ -37,7 +36,7 @@ s += [P("1. In one page", H1),
         "only where and when they matter. With two planes the error against the original model fell by 55 % (MEASURED, settled), and at "
         "the near-ties the original model sided with Pelias 12 times out of 15 where it disagreed with the reference engine, llama.cpp "
         "(MEASURED). The newest step gives each of the 10,240 experts its own precision according to how often it is used, at exactly the "
-        "size of the best-known public file, which the standard file format cannot express."),
+        "size of the best-known public file, which the standard file format cannot express: measured, it cuts the error by 26.6 % at the same size."),
       table(["Result", "Value", "Label"], [
           ["Model file larger than the card's memory, running interactively", "1.69x the card's memory; 37.9 to 54.1 tokens/s", "MEASURED"],
           ["CPU-to-GPU hand-off", "2.40 µs (\"doorbell\") vs 30.5 to 34.0 µs launch-and-wait", "MEASURED"],
@@ -45,8 +44,8 @@ s += [P("1. In one page", H1),
           ["Best interim engine vs best stock layout", "53.5 vs 41.1 tokens/s (+30 %)", "MEASURED"],
           ["Two residual planes on the public 4-bit file", "KL 0.012808 -> 0.005818 (-54.6 %, t -12.25)", "MEASURED"],
           ["Near-tie disagreements judged by the original model", "Pelias 12, llama.cpp 3", "MEASURED"],
-          ["Usage-tiered experts at the public file's exact size", "KL about 0.0089 (-30 %) on WikiText, 0.0108 (-16 %) on chat and code",
-           "DERIVED; " + (TIER_RESULT or "the measurement is running")],
+          ["Usage-tiered experts at the public file's exact size", "KL 0.012808 -> 0.009404 (-26.6 %, t -12.41) on WikiText; about 0.0110 on chat and code",
+           "MEASURED; chat and code DERIVED"],
       ], [3.4, 2.9, 1.2])]
 
 s += [P("2. How it came to be: an accident, three times over", H1),
@@ -122,23 +121,28 @@ s += [P("5. The new accuracy method: residual planes and usage-tiered experts", 
         "gives all 256 experts of a layer one type. Pelias now stores each expert in its own type (a 4-bit floor of our own design, Q4_TG2, "
         "or 5, 6 or 8 bits), chosen by usage across both kinds of text and by the error each layer's experts show when passed through their "
         "own nonlinearity, measured on experts from all 40 layers of the original model."),
-      table(["Option (WikiText / chat+code)", "Size", "Projected KL", "Extra video memory", "Label"], [
-          ["Public 4-bit file", "22.65 GB", "0.0128 / about 0.0129", "-", "MEASURED / DERIVED"],
-          ["Usage-tiered experts", "22.65 GB", "0.0089 / 0.0108", "+0.71 GB for the hot experts", "DERIVED" + ("; " + TIER_RESULT if TIER_RESULT else "")],
-          ["+ 1 GB of planes on the worst-error blocks, applied by the CPU", "23.65 GB", "0.0083 / 0.0096", "none", "DERIVED"],
-          ["+ 2 GB of such planes", "24.65 GB", "0.0079 / 0.0087", "none", "DERIVED"],
-      ], [2.6, 0.8, 1.3, 1.5, 1.3]),
+      table(["Option (WikiText / chat+code)", "Size", "KL", "Extra video memory", "Label"], [
+          ["Public 4-bit file", "22.65 GB", "0.012808 / about 0.0129", "-", "MEASURED / DERIVED"],
+          ["Usage-tiered experts", "22.65 GB", "<b>0.009404</b> (-26.6 %, t -12.41) / about 0.0110", "+0.71 GB for the hot experts", "MEASURED / DERIVED"],
+          ["+ 1 GB of planes on the worst-error blocks, applied by the CPU", "23.65 GB", "about 0.0088 / 0.0100", "none", "DERIVED"],
+          ["+ 2 GB of such planes", "24.65 GB", "about 0.0083 / 0.0092", "none", "DERIVED"],
+          ["+ 2 GB, read only for each token's 4 most-weighted experts", "24.65 GB", "about 0.0085 / 0.0096 at half the plane reads", "none", "DERIVED"],
+      ], [2.6, 0.8, 1.5, 1.4, 1.2]),
       Spacer(1, 3),
-      P("Projected KL comes from a straight line through two measured points (KL = 0.0051 + 0.0078 x weight error left); every projection "
-        "is a prediction until its run. The tiered file was built and verified in the sandbox (a tier that keeps every expert's original type "
-        "reproduces the source file byte for byte and the same output bit for bit) and was being measured on the PC as this was written.")]
+      P("The tiered file was built from the original model on the PC in 34 minutes, 22,663,406,784 bytes against the public file's "
+        "22,663,387,424, with exactly the predicted mix of types, and measured: KL 0.009404 against 0.012808 (-26.6 %, 95 % interval "
+        "[-0.003949, -0.002860], t -12.41), lower on 94 of 100 text chunks, and the largest cut (-30.4 %) on the hardest stretch of text "
+        "(MEASURED). It had been predicted at 0.0089 (range 0.0080 to 0.0100). The remaining rows are projected through the three measured "
+        "points (error left -> KL: 1.0 -> 0.012808, 0.484 -> 0.009404, 0.098 -> 0.005818), so each is a prediction until its run; chat-and-code "
+        "KL has no measured baseline yet.")]
 
 s += [P("6. Why the unified bus makes all of this work together", H1),
       *bullets([
           "<b>Precision lives where the bandwidth is.</b> Planes and the eighth bit can sit in main memory and be applied by the CPU while the GPU "
           "runs the base: one plane read on every token adds about 31 to 63 MB per token on the CPU's bus and nothing to video memory "
-          "(DERIVED). Measured since: that bus is already the busier side when the hot experts miss, so the planes cost about 0.65 to 1.3 ms "
-          "there unless the hot experts' planes move to video memory; the engine will measure it.",
+          "(DERIVED). That bus is already the busier side when the hot experts miss, so the planes cost about 0.65 to 1.3 ms there; reading "
+          "them only for each token's 4 most-weighted experts keeps 81 % of their benefit at half the reads (the router weights fall from 0.245 "
+          "to 0.074 by rank, MEASURED), and the hot experts' planes can move to video memory; the engine will measure it.",
           "<b>Idle units do the extra work.</b> Sign planes and the gated bit are AND/popcount work, the kind that runs on integer and 1-bit "
           "units that sit idle during decoding (the GPU drew 45 to 47 W of its 200 W while reading RAM, MEASURED).",
           "<b>Usage decides placement and precision together.</b> The same routing statistics that pick the hot bank pick which experts get finer "
@@ -194,8 +198,8 @@ s += [P("9. Beyond language models", H1),
 
 s += [P("10. Where it stands and what comes next", H1),
       *bullets([
-          "<b>Running now:</b> the usage-tiered file at the public file's exact size, scored on 100 chunks against the original model; prediction "
-          "KL about 0.0089 (range 0.0080 to 0.0100) against 0.012808.",
+          "<b>Done (30 October, 08:16):</b> the usage-tiered file at the public file's exact size, scored on 100 chunks against the original "
+          "model: KL 0.009404 against 0.012808 (-26.6 %, settled), same top word 95.80 % against 95.02 % (MEASURED).",
           "<b>Next:</b> the worst-error plane side files (1 GB and 2 GB) on the tiered base, then the split-token grade against the original "
           "model; then the engine itself (one token loop on both processors), where end-to-end speed is measured.",
           "<b>Open measurements:</b> per-layer sensitivity (four runs), a chat-and-code baseline of the original model, energy per token, and the "
