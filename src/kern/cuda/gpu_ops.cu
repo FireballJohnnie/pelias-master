@@ -11,10 +11,12 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <string>
 
 #include "kern/gpu_decode.h"
 #include "kern/gpu_ops.h"
+#include "quant/iq_tables.h"
 #include "quant/quant_cpu.h"
 
 namespace pelias::kern::gpu {
@@ -89,7 +91,7 @@ constexpr int kTT = 8;  // tokens per pass of a decoded sub-block
 // one warp per output row; lane l decodes sub-blocks l, l + 32, ... and multiplies each with up to kTT token rows
 __global__ void __launch_bounds__(128) k_matmul(std::uint32_t type, const std::uint8_t* __restrict__ w, std::uint64_t rb, std::int64_t n_out,
                                                 std::int64_t k, const float* __restrict__ x, std::int64_t n_tok, std::int64_t ldx,
-                                                float* __restrict__ y, std::int64_t ldy, const float* __restrict__ grid) {
+                                                float* __restrict__ y, std::int64_t ldy, const Tables tb) {
   const std::int64_t r = static_cast<std::int64_t>(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32;
   const int lane = static_cast<int>(threadIdx.x & 31);
   if (r >= n_out) return;
@@ -101,7 +103,7 @@ __global__ void __launch_bounds__(128) k_matmul(std::uint32_t type, const std::u
     for (int i = 0; i < kTT; ++i) acc[i] = 0.0f;
     for (std::int64_t j = lane; j < nsub; j += 32) {
       float wv[32];
-      decode32(type, row, j, grid, wv);
+      decode32(type, row, j, tb, wv);
 #pragma unroll
       for (int tt = 0; tt < kTT; ++tt) {
         if (t0 + tt >= n_tok) break;
@@ -124,7 +126,7 @@ __global__ void __launch_bounds__(128) k_matmul(std::uint32_t type, const std::u
 __global__ void __launch_bounds__(128) k_moe_matmul(std::uint32_t type, const std::uint8_t* __restrict__ w, std::uint64_t eb, std::uint64_t rb,
                                                     std::int64_t n_out, std::int64_t k, const int* __restrict__ off,
                                                     const int* __restrict__ src, const int* __restrict__ dst, const float* __restrict__ x,
-                                                    std::int64_t ldx, float* __restrict__ y, std::int64_t ldy, const float* __restrict__ grid) {
+                                                    std::int64_t ldx, float* __restrict__ y, std::int64_t ldy, const Tables tb) {
   const int e = static_cast<int>(blockIdx.y);
   const int s0 = off[e], s1 = off[e + 1];
   if (s1 <= s0) return;  // an expert nobody picked: no work, no reads
@@ -139,7 +141,7 @@ __global__ void __launch_bounds__(128) k_moe_matmul(std::uint32_t type, const st
     for (int i = 0; i < kTT; ++i) acc[i] = 0.0f;
     for (std::int64_t j = lane; j < nsub; j += 32) {
       float wv[32];
-      decode32(type, row, j, grid, wv);
+      decode32(type, row, j, tb, wv);
 #pragma unroll
       for (int tt = 0; tt < kTT; ++tt) {
         if (c0 + tt >= s1) break;
@@ -159,12 +161,12 @@ __global__ void __launch_bounds__(128) k_moe_matmul(std::uint32_t type, const st
 }
 
 __global__ void k_gather(std::uint32_t type, const std::uint8_t* __restrict__ w, std::uint64_t rb, std::int64_t k,
-                         const std::int32_t* __restrict__ ids, float* __restrict__ out, const float* __restrict__ grid) {
+                         const std::int32_t* __restrict__ ids, float* __restrict__ out, const Tables tb) {
   const std::int64_t t = blockIdx.x;
   const std::uint8_t* row = w + static_cast<std::uint64_t>(ids[t]) * rb;
   for (std::int64_t j = threadIdx.x; j < k / 32; j += blockDim.x) {
     float v[32];
-    decode32(type, row, j, grid, v);
+    decode32(type, row, j, tb, v);
     for (int i = 0; i < 32; ++i) out[t * k + 32 * j + i] = v[i];
   }
 }
@@ -495,17 +497,46 @@ bool to_host(void* dst, const void* src, std::size_t bytes, Stream s) {
 bool dzero(void* p, std::size_t bytes, Stream s) { return ck(cudaMemsetAsync(p, 0, bytes, st(s)), "cudaMemset"); }
 bool sync(Stream s) { return ck(cudaStreamSynchronize(st(s)), "synchronize"); }
 
-const float* q4tg2_grid() {
-  static float* d = nullptr;
-  if (!d) {
-    float h[64];
-    for (int t = 0; t < 4; ++t)
-      for (int i = 0; i < 16; ++i) h[16 * t + i] = quant::q4_tg_grid(t, 2)[i];
-    float* p = static_cast<float*>(dalloc(sizeof h));
-    if (!p || !to_device(p, h, sizeof h)) return nullptr;
-    d = p;
+// the format tables of gpu_decode.h on the device, uploaded once (34,432 bytes: the Q4_TG grids, the IQ grids, the signs)
+bool device_tables(Tables* out) {
+  static Tables t;
+  static bool ready = false;
+  if (!ready) {
+    constexpr std::size_t kTg = 64 * 4, k2xxs = 256 * 8, k2xs = 512 * 8, k2s = 1024 * 8, k3xxs = 256 * 4, k3s = 512 * 4,
+                          k1s = 2048 * 8, kSg = 128;
+    constexpr std::size_t kAll = 2 * kTg + k2xxs + k2xs + k2s + k3xxs + k3s + k1s + kSg;
+    static unsigned char h[kAll];
+    std::size_t o = 0;
+    float g1[64], g2[64];
+    for (int tag = 0; tag < 4; ++tag)
+      for (int i = 0; i < 16; ++i) {
+        g1[16 * tag + i] = quant::q4_tg_grid(tag, 1)[i];
+        g2[16 * tag + i] = quant::q4_tg_grid(tag, 2)[i];
+      }
+    std::size_t off[9];
+    const void* src[9] = {g1, g2, quant::iq::kIq2xxsGrid, quant::iq::kIq2xsGrid, quant::iq::kIq2sGrid, quant::iq::kIq3xxsGrid,
+                          quant::iq::kIq3sGrid, quant::iq::kIq1sGrid, quant::iq::kSigns};
+    const std::size_t len[9] = {kTg, kTg, k2xxs, k2xs, k2s, k3xxs, k3s, k1s, kSg};
+    for (int i = 0; i < 9; ++i) {  // every piece starts on 8 bytes (the grids are read as 8-byte words)
+      off[i] = o;
+      std::memcpy(h + o, src[i], len[i]);
+      o += len[i];
+    }
+    auto* d = static_cast<unsigned char*>(dalloc(kAll));
+    if (!d || !to_device(d, h, kAll)) return fail("device_tables: upload failed");
+    t.tg1 = reinterpret_cast<const float*>(d + off[0]);
+    t.tg2 = reinterpret_cast<const float*>(d + off[1]);
+    t.iq2xxs = reinterpret_cast<const std::uint64_t*>(d + off[2]);
+    t.iq2xs = reinterpret_cast<const std::uint64_t*>(d + off[3]);
+    t.iq2s = reinterpret_cast<const std::uint64_t*>(d + off[4]);
+    t.iq3xxs = reinterpret_cast<const std::uint32_t*>(d + off[5]);
+    t.iq3s = reinterpret_cast<const std::uint32_t*>(d + off[6]);
+    t.iq1s = reinterpret_cast<const std::uint64_t*>(d + off[7]);
+    t.signs = d + off[8];
+    ready = true;
   }
-  return d;
+  *out = t;
+  return true;
 }
 
 bool matmul(std::uint32_t type, const void* w, std::uint64_t row_bytes, std::int64_t n_out, std::int64_t k, const float* x,
@@ -513,8 +544,9 @@ bool matmul(std::uint32_t type, const void* w, std::uint64_t row_bytes, std::int
   if (!type_ok(type, k, row_bytes)) return false;
   if (n_out <= 0 || n_tok < 0 || ldx < k || ldy < n_out || !w || !x || !y) return fail("matmul: bad shape or pointer");
   if (n_tok == 0) return true;
-  const float* grid = type == g_q4_tg2 ? q4tg2_grid() : nullptr;
-  k_matmul<<<blocks_for(n_out, 4), 128, 0, st(s)>>>(type, static_cast<const std::uint8_t*>(w), row_bytes, n_out, k, x, n_tok, ldx, y, ldy, grid);
+  Tables tb;
+  if (!device_tables(&tb)) return false;
+  k_matmul<<<blocks_for(n_out, 4), 128, 0, st(s)>>>(type, static_cast<const std::uint8_t*>(w), row_bytes, n_out, k, x, n_tok, ldx, y, ldy, tb);
   return launched("matmul");
 }
 
@@ -525,10 +557,11 @@ bool moe_matmul(std::uint32_t type, const void* w, std::uint64_t expert_bytes, s
   if (n_expert <= 0 || n_out <= 0 || expert_bytes < static_cast<std::uint64_t>(n_out) * row_bytes || !slot_off || !w || !x || !y)
     return fail("moe_matmul: bad shape or pointer");
   if (max_slots_per_expert == 0) return true;
-  const float* grid = type == g_q4_tg2 ? q4tg2_grid() : nullptr;
+  Tables tb;
+  if (!device_tables(&tb)) return false;
   const dim3 grd(blocks_for(n_out, 4), static_cast<unsigned>(n_expert));
   k_moe_matmul<<<grd, 128, 0, st(s)>>>(type, static_cast<const std::uint8_t*>(w), expert_bytes, row_bytes, n_out, k, slot_off, src, dst, x, ldx, y,
-                                       ldy, grid);
+                                       ldy, tb);
   return launched("moe_matmul");
 }
 
@@ -536,8 +569,9 @@ bool gather_rows(std::uint32_t type, const void* w, std::uint64_t row_bytes, std
                  Stream s) {
   if (!type_ok(type, k, row_bytes)) return false;
   if (n <= 0) return true;
-  const float* grid = type == g_q4_tg2 ? q4tg2_grid() : nullptr;
-  k_gather<<<static_cast<unsigned>(n), 128, 0, st(s)>>>(type, static_cast<const std::uint8_t*>(w), row_bytes, k, ids, out, grid);
+  Tables tb;
+  if (!device_tables(&tb)) return false;
+  k_gather<<<static_cast<unsigned>(n), 128, 0, st(s)>>>(type, static_cast<const std::uint8_t*>(w), row_bytes, k, ids, out, tb);
   return launched("gather_rows");
 }
 

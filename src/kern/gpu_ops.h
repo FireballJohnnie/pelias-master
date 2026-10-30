@@ -30,8 +30,6 @@ bool to_device(void* dst, const void* src, std::size_t bytes, Stream s = nullptr
 bool to_host(void* dst, const void* src, std::size_t bytes, Stream s = nullptr);
 bool dzero(void* p, std::size_t bytes, Stream s = nullptr);
 bool sync(Stream s = nullptr);
-// the 64 Q4_TG2 grid floats (quant::q4_tg_grid(tag, 2)) on the device, uploaded once; a matmul on Q4_TG2 needs them
-const float* q4tg2_grid();
 
 // ---- products straight from GGUF storage (gemm_gguf)
 // y[t * ldy + r] = sum_i W[r][i] * x[t * ldx + i] for r < n_out, t < n_tok; W in one of the types of gpu_decode.h

@@ -9,6 +9,7 @@
 #include <cstring>
 #include <vector>
 
+#include "gpu_test_rows.h"
 #include "kern/gpu_decode.h"
 #include "pelias_test.h"
 #include "quant/block_types.h"
@@ -28,43 +29,12 @@ std::vector<float> wave(std::int64_t n, std::uint32_t seed, float scale) {
   return x;
 }
 
-std::vector<std::uint8_t> quantized_row(q::Type t, const std::vector<float>& x) {
-  const std::int64_t n = static_cast<std::int64_t>(x.size());
-  std::vector<std::uint8_t> b(q::row_bytes(static_cast<std::uint32_t>(t), static_cast<std::uint64_t>(n)));
-  switch (t) {
-    case q::Type::f32: std::memcpy(b.data(), x.data(), b.size()); break;
-    case q::Type::f16:
-      for (std::int64_t i = 0; i < n; ++i) {
-        const std::uint16_t h = q::fp32_to_fp16(x[static_cast<std::size_t>(i)]);
-        std::memcpy(b.data() + 2 * i, &h, 2);
-      }
-      break;
-    case q::Type::bf16:
-      for (std::int64_t i = 0; i < n; ++i) {
-        const std::uint16_t h = q::fp32_to_bf16(x[static_cast<std::size_t>(i)]);
-        std::memcpy(b.data() + 2 * i, &h, 2);
-      }
-      break;
-    case q::Type::q8_0: q::quantize_q8_0(x.data(), b.data(), n); break;
-    case q::Type::q4_k: q::quantize_q4_k(x.data(), b.data(), n); break;
-    case q::Type::q5_k: q::quantize_q5_k(x.data(), b.data(), n); break;
-    case q::Type::q6_k: q::quantize_q6_k(x.data(), b.data(), n); break;
-    case q::Type::iq4_xs: q::quantize_iq4_xs(x.data(), b.data(), n); break;
-    case q::Type::q8_z: q::quantize_q8_z(x.data(), b.data(), n); break;
-    case q::Type::q7_zt: q::quantize_q7_zt(x.data(), b.data(), n); break;
-    case q::Type::q4_tg2: q::quantize_q4_tg(x.data(), b.data(), n, 2); break;
-    default: break;
-  }
-  return b;
-}
 }  // namespace
 
 TEST(gpu_decoders_equal_dequantize_row_bit_for_bit) {
-  const q::Type types[] = {q::Type::f32, q::Type::f16, q::Type::bf16, q::Type::q8_0, q::Type::q4_k, q::Type::q5_k, q::Type::q6_k,
-                           q::Type::iq4_xs, q::Type::q8_z, q::Type::q7_zt, q::Type::q4_tg2};
-  float grid[64];
-  for (int t = 0; t < 4; ++t)
-    for (int i = 0; i < 16; ++i) grid[16 * t + i] = q::q4_tg_grid(t, 2)[i];
+  namespace tg = pelias::test_gpu;
+  const std::vector<q::Type> types = tg::readable_types();
+  const g::Tables tb = tg::host_tables();
   const std::int64_t n = 2048;
   int checked = 0;
   for (const q::Type t : types) {
@@ -74,10 +44,10 @@ TEST(gpu_decoders_equal_dequantize_row_bit_for_bit) {
     CHECK(g::block_values(id) == q::type_info(id).block_elements);
     for (std::uint32_t seed : {1u, 77u, 9001u}) {
       const std::vector<float> x = wave(n, seed + id, seed == 77u ? 3.0f : 0.05f);
-      const std::vector<std::uint8_t> row = quantized_row(t, x);
+      const std::vector<std::uint8_t> row = tg::make_row(t, x, seed * 31u + id);
       std::vector<float> ref(static_cast<std::size_t>(n)), dev(static_cast<std::size_t>(n));
       CHECK(q::dequantize_row(t, row.data(), ref.data(), n).ok());
-      for (std::int64_t j = 0; j < n / 32; ++j) g::decode32(id, row.data(), j, grid, dev.data() + 32 * j);
+      for (std::int64_t j = 0; j < n / 32; ++j) g::decode32(id, row.data(), j, tb, dev.data() + 32 * j);
       bool same = true, finite = true;
       for (std::int64_t i = 0; i < n; ++i) {
         std::uint32_t a, b;
@@ -92,9 +62,11 @@ TEST(gpu_decoders_equal_dequantize_row_bit_for_bit) {
       ++checked;
     }
   }
-  CHECK(checked == 33);
-  CHECK(!g::type_supported(static_cast<std::uint32_t>(q::Type::q2_k)));
-  std::printf("    11 types x 3 rows of 2048: every sub-block equal to dequantize_row\n");
+  CHECK(types.size() == 32);  // every type dequantize_row reads
+  CHECK(checked == 3 * static_cast<int>(types.size()));
+  CHECK(!g::type_supported(static_cast<std::uint32_t>(q::Type::q8_1)));  // an activation type: never a weight
+  CHECK(!g::type_supported(static_cast<std::uint32_t>(q::Type::q8_k)));
+  std::printf("    %zu types x 3 rows of 2048: every sub-block equal to dequantize_row\n", types.size());
 }
 
 TEST(gpu_decoder_half_float_is_exact_for_every_half) {

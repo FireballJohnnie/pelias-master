@@ -14,6 +14,7 @@
 #include <cstring>
 #include <vector>
 
+#include "../unit/gpu_test_rows.h"
 #include "kern/gpu_decode.h"
 #include "kern/gpu_ops.h"
 #include "model/arch_qwen35moe.h"
@@ -54,36 +55,6 @@ struct Dev {
   }
 };
 
-std::vector<std::uint8_t> quantize(q::Type t, const std::vector<float>& x) {
-  const auto n = static_cast<std::int64_t>(x.size());
-  std::vector<std::uint8_t> b(q::row_bytes(static_cast<std::uint32_t>(t), static_cast<std::uint64_t>(n)));
-  switch (t) {
-    case q::Type::f32: std::memcpy(b.data(), x.data(), b.size()); break;
-    case q::Type::f16:
-      for (std::int64_t i = 0; i < n; ++i) {
-        const std::uint16_t h = q::fp32_to_fp16(x[static_cast<std::size_t>(i)]);
-        std::memcpy(b.data() + 2 * i, &h, 2);
-      }
-      break;
-    case q::Type::bf16:
-      for (std::int64_t i = 0; i < n; ++i) {
-        const std::uint16_t h = q::fp32_to_bf16(x[static_cast<std::size_t>(i)]);
-        std::memcpy(b.data() + 2 * i, &h, 2);
-      }
-      break;
-    case q::Type::q8_0: q::quantize_q8_0(x.data(), b.data(), n); break;
-    case q::Type::q4_k: q::quantize_q4_k(x.data(), b.data(), n); break;
-    case q::Type::q5_k: q::quantize_q5_k(x.data(), b.data(), n); break;
-    case q::Type::q6_k: q::quantize_q6_k(x.data(), b.data(), n); break;
-    case q::Type::iq4_xs: q::quantize_iq4_xs(x.data(), b.data(), n); break;
-    case q::Type::q8_z: q::quantize_q8_z(x.data(), b.data(), n); break;
-    case q::Type::q7_zt: q::quantize_q7_zt(x.data(), b.data(), n); break;
-    case q::Type::q4_tg2: q::quantize_q4_tg(x.data(), b.data(), n, 2); break;
-    default: break;
-  }
-  return b;
-}
-
 // a matrix of n rows of k values in type t (each row quantized on its own), and its exact float rows
 struct Mat {
   std::vector<std::uint8_t> bytes;
@@ -96,7 +67,8 @@ Mat make_mat(q::Type t, std::int64_t n, std::int64_t k, std::uint32_t seed) {
   m.bytes.resize(static_cast<std::size_t>(m.rb) * static_cast<std::size_t>(n));
   m.deq.resize(static_cast<std::size_t>(n * k));
   for (std::int64_t r = 0; r < n; ++r) {
-    const std::vector<std::uint8_t> row = quantize(t, wave(k, seed + static_cast<std::uint32_t>(r) * 7919u, 0.05f));
+    const std::uint32_t rs = seed + static_cast<std::uint32_t>(r) * 7919u;
+    const std::vector<std::uint8_t> row = pelias::test_gpu::make_row(t, wave(k, rs, 0.05f), rs * 2654435761u);
     std::memcpy(m.bytes.data() + static_cast<std::size_t>(r) * m.rb, row.data(), m.rb);
     (void)q::dequantize_row(t, row.data(), m.deq.data() + r * k, k);
   }
@@ -144,13 +116,14 @@ TEST(rung1_device_answers) {
 
 TEST(rung1_matmul_every_type_against_fp64) {
   if (!gpu_or_skip()) return;
-  const q::Type types[] = {q::Type::f32, q::Type::f16, q::Type::bf16, q::Type::q8_0, q::Type::q4_k, q::Type::q5_k, q::Type::q6_k,
-                           q::Type::iq4_xs, q::Type::q8_z, q::Type::q7_zt, q::Type::q4_tg2};
+  const std::vector<q::Type> types = pelias::test_gpu::readable_types();  // all 32 types the CPU reads
+  CHECK(types.size() == 32);
   const std::int64_t n_out = 97, k = 2048;  // 97: the last warp of the last block has one row
   double worst = 0.0;
   for (const q::Type t : types) {
     const Mat m = make_mat(t, n_out, k, 11u + static_cast<std::uint32_t>(t));
     Dev<std::uint8_t> dw(m.bytes);
+    double tw = 0.0;
     for (const std::int64_t n_tok : {std::int64_t{1}, std::int64_t{3}, std::int64_t{9}}) {  // 9: across the 8-token pass
       const std::vector<float> x = wave(n_tok * k, 5u + static_cast<std::uint32_t>(n_tok), 1.0f);
       Dev<float> dx(x), dy(static_cast<std::size_t>(n_tok * n_out));
@@ -166,19 +139,22 @@ TEST(rung1_matmul_every_type_against_fp64) {
         }
       const double e = rel_l2(y, ref);
       worst = std::max(worst, e);
+      tw = std::max(tw, e);
       CHECK(all_finite(y));
       CHECK(e <= kProductTol);
       if (e > kProductTol) std::printf("    %s n_tok %lld: relative L2 %.3e > %.0e\n", q::type_info(static_cast<std::uint32_t>(t)).name,
                                        static_cast<long long>(n_tok), e, kProductTol);
     }
+    std::printf("    %-8s worst relative L2 %.3e\n", q::type_info(static_cast<std::uint32_t>(t)).name, tw);
   }
-  std::printf("    11 types x n_tok 1 / 3 / 9, 97 x 2048: worst relative L2 vs fp64 %.3e (tolerance %.0e)\n", worst, kProductTol);
+  std::printf("    %zu types x n_tok 1 / 3 / 9, 97 x 2048: worst relative L2 vs fp64 %.3e (tolerance %.0e)\n", types.size(), worst, kProductTol);
 }
 
 TEST(rung1_matmul_refuses_what_it_cannot_read) {
   if (!gpu_or_skip()) return;
   float dummy = 0.0f;
-  CHECK(!g::matmul(static_cast<std::uint32_t>(q::Type::q2_k), &dummy, 84, 1, 256, &dummy, 1, 256, &dummy, 1));
+  CHECK(!g::matmul(static_cast<std::uint32_t>(q::Type::q8_1), &dummy, 36, 1, 256, &dummy, 1, 256, &dummy, 1));  // activation type
+  CHECK(!g::matmul(static_cast<std::uint32_t>(q::Type::i2_s), &dummy, 32, 1, 64, &dummy, 1, 64, &dummy, 1));    // half an I2_S block
   CHECK(!g::matmul(static_cast<std::uint32_t>(q::Type::q4_k), &dummy, 144, 1, 200, &dummy, 1, 200, &dummy, 1));
   CHECK(!g::matmul(static_cast<std::uint32_t>(q::Type::q4_k), &dummy, 143, 1, 256, &dummy, 1, 256, &dummy, 1));
 }
@@ -187,7 +163,7 @@ TEST(rung1_moe_matmul_edge_counts) {
   if (!gpu_or_skip()) return;
   const std::int64_t n_out = 64, k = 512;
   const int n_expert = 9;
-  for (const q::Type t : {q::Type::q4_tg2, q::Type::q5_k, q::Type::q6_k}) {
+  for (const q::Type t : {q::Type::q4_tg2, q::Type::q5_k, q::Type::q6_k, q::Type::iq1_m, q::Type::tq1_0, q::Type::i2_s, q::Type::nvfp4}) {
     std::vector<Mat> mats;
     std::vector<std::uint8_t> all;
     for (int e = 0; e < n_expert; ++e) {
@@ -239,7 +215,8 @@ TEST(rung1_moe_matmul_edge_counts) {
 TEST(rung1_gather_rows_exact) {
   if (!gpu_or_skip()) return;
   const std::int64_t n = 50, k = 1024;
-  for (const q::Type t : {q::Type::q8_0, q::Type::q6_k, q::Type::q4_tg2, q::Type::bf16}) {
+  for (const q::Type t : {q::Type::q8_0, q::Type::q6_k, q::Type::q4_tg2, q::Type::bf16, q::Type::mxfp4, q::Type::iq2_xxs, q::Type::i2_s,
+                          q::Type::nvfp4}) {
     const Mat m = make_mat(t, n, k, 9u);
     const std::vector<std::int32_t> ids = {7, 0, 49, 7, 23};
     Dev<std::uint8_t> dw(m.bytes);
