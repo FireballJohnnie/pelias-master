@@ -1465,6 +1465,7 @@ Universality items:
 | H-U1 | The bus outside LLMs: port one workload to `libpelias_substrate`, compare with its best conventional version |
 | H-U2 / H-U3 | A tiny CPU model keeps the bus tuned, against a coded rule. The model's CPU time per decision must be below the miss time it saves; compare three residency policies |
 | The 14 per-field probes (masterwork 21.3) | Each against a stock baseline with unchanged output, measuring its own f and k |
+| D-1B | Dense models at 1-bit + planes (author 10:24-10:31; explore after the build): 1-bit base fully in VRAM, planes from RAM (every weight read each token, so selective planes by default); fill spare VRAM with full layers; the 1-bit base as a self-drafter checked by the full stack in batches. DERIVED on the 4070, no planes: 27B ~56-62 tok/s, 70B ~24-27 tok/s (from measured 1-2-bit GPU runs at 48-55 % of spec bandwidth); plain 1-bit weight error 0.366 (MEASURED sandbox), so quality needs the planes or the drafter role. Measure: draft acceptance on a small dense model, then kld + speed |
 
 ### GP4-06 Freeze
 
