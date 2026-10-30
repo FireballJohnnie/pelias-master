@@ -129,10 +129,53 @@ TEST(cpu_dot_rows_that_are_not_whole_segments) {
 TEST(cpu_dot_reports_its_paths) {
   CHECK(kn::dot_has_fast_path(q::Type::q4_tg2));
   CHECK(kn::dot_has_fast_path(q::Type::q6_k));
-  CHECK(!kn::dot_has_fast_path(q::Type::q8_z));
-  CHECK(kn::dot_supported(q::Type::q8_z));
+  CHECK(!kn::dot_has_fast_path(q::Type::q7_z));
+  CHECK(kn::dot_supported(q::Type::q7_z));
   kn::force_isa(kn::Isa::portable);
   CHECK(kn::active_isa() == kn::Isa::portable);
   kn::force_isa(kn::Isa::avx2);
   CHECK(kn::active_isa() == kn::best_isa());
+}
+
+// Every type the reference reads, on synthetic bytes (random, with bit 6 of every byte cleared so no fp16 / E8M0 scale is
+// Inf or NaN): AVX2 = portable bit for bit, both = the reference within the tolerance, no value left out (a row whose
+// reference dot is non-zero never comes back as 0). Covers the types without a quantizer here (Q4_0, Q4_1, Q5_0, Q5_1,
+// MXFP4, the IQ1 / IQ2 / IQ3 grids, TQ1_0 / TQ2_0, ...).
+TEST(cpu_dot_reads_every_readable_type) {
+  int types = 0, fast = 0;
+  for (std::uint32_t id = 0; id < 256; ++id) {
+    const q::Type t = static_cast<q::Type>(id);
+    if (!q::can_dequantize(t)) continue;
+    for (std::int64_t k : {256, 1024}) {
+      const std::uint64_t rb = q::row_bytes(id, static_cast<std::uint64_t>(k));
+      if (rb == 0) continue;
+      std::vector<std::uint8_t> row(rb);
+      std::uint32_t seed = id * 2654435761u + static_cast<std::uint32_t>(k);
+      for (std::uint8_t& b : row) {
+        seed = seed * 1664525u + 1013904223u;
+        b = static_cast<std::uint8_t>((seed >> 24) & 0xBF);
+      }
+      const std::vector<float> x = noise(k, seed, 1.0f);
+      const float* xp[1] = {x.data()};
+      float port = 0.0f, avx = 0.0f;
+      kn::force_isa(kn::Isa::portable);
+      kn::dot_row(t, row.data(), k, nullptr, xp, 1, &port);
+      kn::force_isa(kn::Isa::avx2);
+      kn::dot_row(t, row.data(), k, nullptr, xp, 1, &avx);
+      double ref, mag;
+      reference(t, row, k, nullptr, x.data(), &ref, &mag);
+      const bool same = kn::best_isa() != kn::Isa::avx2 || port == avx;
+      const bool close = std::isfinite(ref) && std::fabs(static_cast<double>(port) - ref) <= 2e-6 * mag + 1e-30;
+      if (!same || !close)
+        std::printf("  cpu_dot: type %u (%s) k=%lld: avx2 %.9g portable %.9g reference %.9g (sum|wx| %.3g)\n", id, q::type_info(id).name,
+                    static_cast<long long>(k), static_cast<double>(avx), static_cast<double>(port), ref, mag);
+      CHECK(same);
+      CHECK(close);
+      CHECK(ref == 0.0 || port != 0.0f);
+    }
+    ++types;
+    if (kn::dot_has_fast_path(t)) ++fast;
+  }
+  std::printf("    cpu_dot: %d readable types checked, %d with an AVX2 dequantizer of their own\n", types, fast);
+  CHECK(types >= 30);
 }
