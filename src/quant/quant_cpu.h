@@ -110,6 +110,11 @@ void dequantize_tq2_0(const std::uint8_t* in, float* y, std::int64_t n);
 // per 128 values 32 bytes, byte j holds values j, 32 + j, 64 + j, 96 + j at bit shifts 6, 4, 2, 0; code 0 = -1, 1 = 0,
 // 2 = +1. Gives the ternary values only: the tensor's one scale (fp32 after the data) is applied by the caller.
 void dequantize_i2_s(const std::uint8_t* in, float* y, std::int64_t n);
+// NVFP4 (GGUF type 40; READ-SRC llama.cpp ggml-common.h block_nvfp4 and ggml-quants.c dequantize_row_nvfp4, read as a
+// specification): per 64 values 4 UE4M3 scales (one per 16) then 32 bytes of E2M1 codes; in sub-block s byte j holds value
+// j (low nibble) and j + 8 (high nibble); value = kvalues (the doubled E2M1 grid) x scale, the scale's UE4M3 decode halved.
+void dequantize_nvfp4(const std::uint8_t* in, float* y, std::int64_t n);
+float ue4m3_to_fp32(std::uint8_t x);
 void dequantize_iq2_xxs(const std::uint8_t* in, float* y, std::int64_t n);
 void dequantize_iq2_xs(const std::uint8_t* in, float* y, std::int64_t n);
 void dequantize_iq2_s(const std::uint8_t* in, float* y, std::int64_t n);

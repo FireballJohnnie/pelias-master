@@ -7,6 +7,7 @@
 // non-linear and microscaling 4-bit types (IQ4_NL, MXFP4), the ternary types (TQ1_0, TQ2_0) and the grid types
 // (IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, IQ1_M). Every float expression keeps the reference's operand order and
 // its integer-to-float conversions. Blocks are read field by field at fixed byte offsets (little-endian).
+#include <cmath>
 #include <cstring>
 
 #include "quant/iq_tables.h"
@@ -134,6 +135,25 @@ void dequantize_tq1_0(const std::uint8_t* in, float* y, std::int64_t n) {  // qs
     for (int nn = 0; nn < 4; ++nn)
       for (int j = 0; j < 4; ++j) *y++ = static_cast<float>(trit(static_cast<std::uint8_t>(qh[j] * pow3[nn])) - 1) * d;
   }
+}
+
+float ue4m3_to_fp32(std::uint8_t x) {  // unsigned E4M3 (bias 7), halved: the E2M1 grid in kFp4 is doubled
+  if (x == 0 || x == 0x7F) return 0.0f;
+  const int ex = (x >> 3) & 0xF, man = x & 0x7;
+  const float raw = ex == 0 ? std::ldexp(static_cast<float>(man), -9) : std::ldexp(1.0f + static_cast<float>(man) / 8.0f, ex - 7);
+  return raw * 0.5f;
+}
+
+void dequantize_nvfp4(const std::uint8_t* in, float* y, std::int64_t n) {  // d[4] (UE4M3), qs[32]
+  for (std::int64_t i = 0; i < n / 64; ++i, in += 36, y += 64)
+    for (int s = 0; s < 4; ++s) {
+      const float d = ue4m3_to_fp32(in[s]);
+      for (int j = 0; j < 8; ++j) {
+        const std::uint8_t b = in[4 + 8 * s + j];
+        y[16 * s + j] = static_cast<float>(kFp4[b & 0x0F]) * d;
+        y[16 * s + j + 8] = static_cast<float>(kFp4[b >> 4]) * d;
+      }
+    }
 }
 
 void dequantize_i2_s(const std::uint8_t* in, float* y, std::int64_t n) {  // 32 bytes per 128 values, 2-bit codes, no scale

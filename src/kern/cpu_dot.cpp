@@ -70,7 +70,7 @@ bool is_fast(q::Type t) {
     case q::Type::q5_1: case q::Type::iq4_nl: case q::Type::mxfp4: case q::Type::q2_k: case q::Type::q3_k:
     case q::Type::q8_z: case q::Type::f16: case q::Type::bf16: case q::Type::f32: case q::Type::iq2_xxs: case q::Type::iq2_xs:
     case q::Type::iq2_s: case q::Type::iq3_xxs: case q::Type::iq3_s: case q::Type::iq1_s: case q::Type::iq1_m: case q::Type::tq1_0:
-    case q::Type::tq2_0: case q::Type::q7_z: case q::Type::q7_zt: case q::Type::i2_s:
+    case q::Type::tq2_0: case q::Type::q7_z: case q::Type::q7_zt: case q::Type::i2_s: case q::Type::nvfp4:
       return true;
     default:
       return false;
@@ -660,6 +660,20 @@ PELIAS_TARGET_AVX2 void deq_iq4_nl(const std::uint8_t* p, float* y) {  // d, qs[
     dq16_s(_mm256_extracti128_si256(v, 1), d, y + 16);
   }
 }
+// NVFP4 (GGUF type 40), one 256-segment = 4 blocks of 36 bytes: 4 UE4M3 scales, then per 16-value sub-block 8 bytes whose
+// low nibbles are values 0-7 and high nibbles values 8-15; value = kFp4[code] x scale (the scale's decode halved)
+PELIAS_TARGET_AVX2 void deq_nvfp4(const std::uint8_t* p, float* y) {
+  const __m128i tab = _mm_loadu_si128(reinterpret_cast<const __m128i*>(kFp4)), m4 = _mm_set1_epi8(0x0F);
+  for (int b = 0; b < 4; ++b, p += 36)
+    for (int s = 0; s < 4; ++s, y += 16) {
+      const __m128i q = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(p + 4 + 8 * s));
+      const __m128i v = _mm_shuffle_epi8(tab, _mm_unpacklo_epi64(_mm_and_si128(q, m4), _mm_and_si128(_mm_srli_epi16(q, 4), m4)));
+      const __m256 d = _mm256_set1_ps(q::ue4m3_to_fp32(p[s]));
+      _mm256_storeu_ps(y, _mm256_mul_ps(i8x8(v), d));
+      _mm256_storeu_ps(y + 8, _mm256_mul_ps(i8x8(_mm_srli_si128(v, 8)), d));
+    }
+}
+
 PELIAS_TARGET_AVX2 void deq_mxfp4(const std::uint8_t* p, float* y) {  // e (E8M0), qs[16]; float(fp4[q]) * d
   const __m256i tab = _mm256_broadcastsi128_si256(_mm_loadu_si128(reinterpret_cast<const __m128i*>(kFp4)));
   for (int b = 0; b < 8; ++b, p += 17, y += 32) dq32_s(_mm256_shuffle_epi8(tab, nibbles32(p + 1)), e8m0_half(p[0]), 0.0f, false, y);
@@ -1068,6 +1082,7 @@ PELIAS_TARGET_AVX2 void deq_seg_avx2(q::Type t, const std::uint8_t* p, float* w)
     case q::Type::tq1_0: deq_tq1_0(p, w); break;
     case q::Type::tq2_0: deq_tq2_0(p, w); break;
     case q::Type::i2_s: deq_i2_s(p, w); break;
+    case q::Type::nvfp4: deq_nvfp4(p, w); break;
     case q::Type::q7_z: deq_q7_z(p, w); break;
     case q::Type::q7_zt: deq_q7_zt(p, w); break;
     default: (void)q::dequantize_row(t, p, w, kSeg); break;

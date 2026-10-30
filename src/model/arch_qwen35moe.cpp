@@ -489,6 +489,7 @@ ActFmt act_format(const ForwardOptions& o, const WeightView& w) {
   if (o.act_int8_gpu) return o.act_bits == 4 ? ActFmt::q4_32 : (o.act_gpu256 ? (o.act_gpu256_sub == 1 ? ActFmt::q8_256x8 : o.act_gpu256_sub == 2 ? ActFmt::q8_256e : ActFmt::q8_256) : ActFmt::q8_1);
   switch (t) {
     case quant::Type::q4_0: case quant::Type::q5_0: case quant::Type::q8_0: case quant::Type::iq4_nl: case quant::Type::mxfp4:
+    case quant::Type::nvfp4:  // its vec_dot_type is Q8_0 in the reference (ggml-cpu.c type traits)
       return ActFmt::q8_0;
     case quant::Type::q4_1: case quant::Type::q5_1:
       return ActFmt::q8_1;

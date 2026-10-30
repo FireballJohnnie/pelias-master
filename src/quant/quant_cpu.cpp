@@ -1053,7 +1053,7 @@ bool can_dequantize(Type t) {
     case Type::q4_0: case Type::q4_1: case Type::q5_0: case Type::q5_1: case Type::iq4_nl: case Type::mxfp4:
     case Type::tq1_0: case Type::tq2_0: case Type::iq2_xxs: case Type::iq2_xs: case Type::iq2_s: case Type::iq3_xxs:
     case Type::iq3_s: case Type::iq1_s: case Type::iq1_m: case Type::q8_z: case Type::q7_z: case Type::q7_zt: case Type::q4_tg: case Type::q4_tg2:
-    case Type::i2_s:
+    case Type::i2_s: case Type::nvfp4:
       return true;
     default:
       return false;
@@ -1149,6 +1149,7 @@ Status dequantize_row(Type t, const std::uint8_t* in, float* y, std::int64_t n) 
     case Type::tq1_0: dequantize_tq1_0(in, y, n); break;
     case Type::tq2_0: dequantize_tq2_0(in, y, n); break;
     case Type::i2_s: dequantize_i2_s(in, y, n); break;
+    case Type::nvfp4: dequantize_nvfp4(in, y, n); break;
     case Type::iq2_xxs: dequantize_iq2_xxs(in, y, n); break;
     case Type::iq2_xs: dequantize_iq2_xs(in, y, n); break;
     case Type::iq2_s: dequantize_iq2_s(in, y, n); break;
