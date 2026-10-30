@@ -322,6 +322,67 @@ size-neutral win comes from **per-expert precision**, which GGUF cannot express.
 4. **Tiered plus planes on the top 32 experts.** `kld` and decode, the planes on flagged tokens and on all tokens.
 5. Then the runs of 4.4, cut to what is still open: a traditional Q5_K_M as the reference at about 27 GB.
 
+### 6.6 Refinement checks before the build (author 2026-10-30 05:58; offline)
+
+**The hot set does not hold across texts (MEASURED).**
+- Compared: WikiText-2 picks (urm_ZT2 route dump, 25,500 tokens) against the per-expert pick counts in Unsloth's own
+  imatrix (their chat + code calibration text, 842,201 tokens).
+- Script: `domain_stability.py`.
+
+| Top N per layer, ranked on WikiText | Share of chat+code picks covered (mean / worst layer) | Ranked on chat+code itself | WikiText on itself |
+|---|---|---|---|
+| 32 | 19.1 % / 14.5 % | 30.9 % | 51.1 % |
+| 64 | 35.9 % / 30.0 % | 49.4 % | 72.2 % |
+| 120 | 59.9 % / 52.3 % | 72.2 % | 90.2 % |
+
+- The rank correlation per layer is 0.41 on average (lowest 0.22, layer 14).
+- Chat+code usage is also flatter: its own top 64 carry 49 % of its picks.
+
+**What that does to 6.3 (DERIVED).** Files are 22.65 GB with an IQ4_XS floor; the cells are error vs Unsloth and the
+projected KL. Script: `alloc_cross.py`.
+
+| Usage ranked on | Scored on WikiText | Scored on chat+code |
+|---|---|---|
+| WikiText | 0.381, KL 0.0081 | 0.864, KL 0.0118 |
+| chat+code | 0.735, KL 0.0108 | 0.653, KL 0.0102 |
+| 50/50 mix | 0.430, KL 0.0085 | 0.723, KL 0.0107 |
+
+- 6.3's -38 % holds only on the text the ranking came from. Ranked on a mix, the file is about -34 % on WikiText and about
+  -16 % on chat+code.
+- The KL line was fitted on WikiText. Chat+code's own KL is UNMEASURED.
+
+**Cold floor, Q4_TG2 against IQ4_XS (MEASURED on blk.20, experts 0-3).** Script: `floor_norm_check.py`.
+
+| Type | Bits per weight | gate error vs Q4_K | down error vs Q4_K |
+|---|---|---|---|
+| IQ4_XS | 4.25 | 1.18x | 1.17x |
+| Q4_TG2 | 4.50 | 0.90x | 0.89x |
+
+- IQ4_XS saves 5.6 % of the cold bytes (4.25 / 4.5), not 11 %.
+- At a fixed 22.65 GB the two floors are about equal (DERIVED, `alloc_cross_tg2.py`, mix ranking):
+
+  | Floor | WikiText KL | chat+code KL |
+  |---|---|---|
+  | Q4_TG2 | 0.0088 | 0.0107 |
+  | IQ4_XS | 0.0085 | 0.0107 |
+
+- Q4_TG2 caps a misranked expert at 0.90x instead of 1.18x and already has the shared-memory kernel (347 GB/s alone).
+  With rankings this unstable, that cap matters.
+
+**Output-norm scalar per expert: not worth it (MEASURED, diagonal input proxy).**
+- Every type shrinks the activation-weighted output energy slightly: IQ4_XS 0.997, Q4_TG2 0.995, Q4_K 0.999, Q6_K 0.999.
+- The best scalar per expert is 0.998-1.0003 and removes 0.00-0.06 % of the error.
+- The shrink is noise, not a gain error, so a scalar cannot undo it.
+
+**Still open: per-layer and gate/up-vs-down weighting.**
+- These need gate, up and down from every layer; only blk.20 gate and down are in the sandbox.
+- Next input: experts 0-1 of all 40 layers from the BF16 file, read only, with the existing `gp/M/extract_slice.py`
+  (480 MB).
+- Then two checks:
+  - the activation-weighted error per layer and per type;
+  - the error propagated through SwiGLU (silu(gate)·up into down). Inputs are drawn with the imatrix's variances, and the
+    proxy is checked against down's measured input energy.
+
 ## 7. Status
 
 - Built and pushed: `pelias planes`; `--planes / --plane-k / --head-rescore` on `kld` and `generate`; `generate
