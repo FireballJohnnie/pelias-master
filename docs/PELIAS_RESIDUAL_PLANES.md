@@ -530,6 +530,25 @@ brackets.
 | Tiered static, 23.65 GB | about 0.0080 (0.0077) | about 0.0097 (0.0093) |
 | Tiered static, 24.65 GB | about 0.0071 (0.0070) | about 0.0085 (0.0081) |
 
+### 6.10 GPU speed of the tiered experts, MEASURED (R3 probe, 2026-10-30 08:43)
+
+**Setup.**
+- One token: 40 distinct layers, cold, median of 21.
+- Each layer's 7 GPU experts take the tiered types, drawn by measured use (`tier_r3_mix.py`).
+- The baseline is Q4_TG2 gate/up + Q5_K down, the Unsloth sizes.
+- Exactness check: all 10 formats and shapes match the host reference.
+
+| Token | Routed experts | Pure streaming (b) | Real token path (c, per-expert counters) |
+|---|---|---|---|
+| Baseline | 532.2 MB | 4.766 ms | 5.693 ms |
+| Tiered, WikiText use | 596.8 MB | 4.891 ms (+2.6 %) | 5.767 ms (**+1.3 %**) |
+| Tiered, chat+code use | 560.2 MB | 4.816 ms (+1.0 %) | 5.710 ms (**+0.3 %**) |
+
+- Predicted +0.13 / +0.06 ms on the stream: met.
+- The new types stream at the same rate as the old ones (about 477 GB/s).
+- The GPU side of the tiered file costs 0.3-1.3 % per token. The CPU leg (cold experts, planes) is not in R3; the engine
+  measures it.
+
 ## 7. Status
 
 - Built and pushed: `pelias planes`; `--planes / --plane-k / --head-rescore` on `kld` and `generate`; `generate
