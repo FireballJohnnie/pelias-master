@@ -562,6 +562,16 @@ brackets.
 - **Why ways 2 and 3 differ.** Way 2 keeps the file portable. Way 3 is the most accurate per byte, because the bytes go where
   the experts are used.
 
+### 6.12 Block-selected planes on the tiered file, MEASURED (2026-10-30 09:09-10:09)
+
+Chain gp/block_tierplanes_v1.sh on the 22.65 GB tiered file (100 WikiText chunks, judged against BF16).
+
+| Run | Plane file | Blocks kept | Mean KL | Same top | vs tiered alone (0.009404) | vs Unsloth (0.012808) | Prediction |
+|---|---|---|---|---|---|---|---|
+| A2, every pick | 2,157,315,360 bytes | 58,823,529 (46.7 %) | 0.008747 ± 0.000385 | 96.106 % | -0.000656 (-7.0 %), 95 % [-0.000975, -0.000338], t -4.09 | -0.004061 (-31.7 %), t -12.81 | about 0.0083 (0.0077-0.0089): in range, above the point |
+
+A2: mean PPL ratio 1.003082; tokens where A2 has lower KL than the tiered file 53.51 %; top token right only in A2 416, only in the tiered file 338 (z 2.84). A1 (1 GB) and A2 top-4 to follow. The planes add 2.16 GB of RAM (no VRAM) for a further -7.0 % KL on top of the tiered file's -26.6 %.
+
 ## 7. Status
 
 - Built and pushed: `pelias planes`; `--planes / --plane-k / --head-rescore` on `kld` and `generate`; `generate
