@@ -1,6 +1,6 @@
 # Copyright (c) 2026 John Lipka and the Pelias contributors. Apache-2.0.
 # provenance: original
-# Builds docs/Pelias_project_overview.pdf: the project in one document (2026-10-30).
+# Builds docs/Pelias_project_overview.pdf: the project in one document (2026-10-30; rebuilt 14:5x with the plane runs and the pre-build list).
 #   python3 tools/docs/make_project_overview.py OUT.pdf ["TIER RESULT TEXT"]
 # Every number is copied with its label from docs/PELIAS_RESIDUAL_PLANES.md, docs/PELIAS_NEW_METHODS.md,
 # docs/PELIAS_SYSTEM_MASTERWORK.md (sections 20-21), the pathways document v2 and logs/BUILD_LOG.md. Nothing new is measured here.
@@ -46,6 +46,9 @@ s += [P("1. In one page", H1),
           ["Near-tie disagreements judged by the original model", "Pelias 12, llama.cpp 3", "MEASURED"],
           ["Usage-tiered experts at the public file's exact size", "KL 0.012808 -> 0.009404 (-26.6 %, t -12.41) on WikiText; about 0.0110 on chat and code",
            "MEASURED; chat and code DERIVED"],
+          ["+ 2 GB of planes on the worst-error blocks, read by the CPU", "KL 0.008747 (-31.7 % vs the public file, t -12.81); top-4 picks only 0.008800",
+           "MEASURED"],
+          ["Pelias with exact inputs vs llama.cpp, same Q8_0 file (Qwen3-1.7B)", "KL 0.002263 vs 0.00367 (-38 %; first 20 chunks, not paired)", "MEASURED"],
       ], [3.4, 2.9, 1.2])]
 
 s += [P("2. How it came to be: an accident, three times over", H1),
@@ -124,17 +127,18 @@ s += [P("5. The new accuracy method: residual planes and usage-tiered experts", 
       table(["Option (WikiText / chat+code)", "Size", "KL", "Extra video memory", "Label"], [
           ["Public 4-bit file", "22.65 GB", "0.012808 / about 0.0129", "-", "MEASURED / DERIVED"],
           ["Usage-tiered experts", "22.65 GB", "<b>0.009404</b> (-26.6 %, t -12.41) / about 0.0110", "+0.71 GB for the hot experts", "MEASURED / DERIVED"],
-          ["+ 1 GB of planes on the worst-error blocks, applied by the CPU", "23.65 GB", "about 0.0088 / 0.0100", "none", "DERIVED"],
-          ["+ 2 GB of such planes", "24.65 GB", "about 0.0083 / 0.0092", "none", "DERIVED"],
-          ["+ 2 GB, read only for each token's 4 most-weighted experts", "24.65 GB", "about 0.0085 / 0.0096 at half the plane reads", "none", "DERIVED"],
+          ["+ 1 GB of planes on the worst-error blocks, applied by the CPU", "23.65 GB", "<b>0.008963</b> (-4.7 %, t -2.26) / about 0.0100", "none", "MEASURED / DERIVED"],
+          ["+ 2 GB of such planes", "24.65 GB", "<b>0.008747</b> (-7.0 %, t -4.09) / about 0.0092", "none", "MEASURED / DERIVED"],
+          ["+ 2 GB, read only for each token's 4 most-weighted experts", "24.65 GB", "<b>0.008800</b>: 92 % of the gain at half the plane reads / about 0.0096", "none", "MEASURED / DERIVED"],
       ], [2.6, 0.8, 1.5, 1.4, 1.2]),
       Spacer(1, 3),
       P("The tiered file was built from the original model on the PC in 34 minutes, 22,663,406,784 bytes against the public file's "
         "22,663,387,424, with exactly the predicted mix of types, and measured: KL 0.009404 against 0.012808 (-26.6 %, 95 % interval "
         "[-0.003949, -0.002860], t -12.41), lower on 94 of 100 text chunks, and the largest cut (-30.4 %) on the hardest stretch of text "
-        "(MEASURED). It had been predicted at 0.0089 (range 0.0080 to 0.0100). The remaining rows are projected through the three measured "
-        "points (error left -> KL: 1.0 -> 0.012808, 0.484 -> 0.009404, 0.098 -> 0.005818), so each is a prediction until its run; chat-and-code "
-        "KL has no measured baseline yet.")]
+        "(MEASURED). It had been predicted at 0.0089 (range 0.0080 to 0.0100). The three plane rows were then built and run on the PC the same "
+        "morning (25 to 27 minutes each): every one landed inside its predicted range, each a little above the point, so the planes did slightly "
+        "less than projected; the second gigabyte buys about half the first (MEASURED). Reading the planes for each token's 4 most-weighted "
+        "experts kept 92 % of the gain, more than the 80.8 % projected. Chat-and-code KL still has no measured baseline, so that column stays DERIVED.")]
 
 s += [P("<b>How a user gets this: three ways</b> (each a choice in the Pelias interface)", H2),
       table(["Way", "What the user needs", "What changes", "Accuracy here", "Runs in"], [
@@ -212,10 +216,17 @@ s += [P("9. Beyond language models", H1),
 
 s += [P("10. Where it stands and what comes next", H1),
       *bullets([
-          "<b>Done (30 October, 08:16):</b> the usage-tiered file at the public file's exact size, scored on 100 chunks against the original "
-          "model: KL 0.009404 against 0.012808 (-26.6 %, settled), same top word 95.80 % against 95.02 % (MEASURED).",
-          "<b>Next:</b> the worst-error plane side files (1 GB and 2 GB) on the tiered base, then the split-token grade against the original "
-          "model; then the engine itself (one token loop on both processors), where end-to-end speed is measured.",
+          "<b>Done (30 October, 08:16 to 10:36):</b> the usage-tiered file at the public file's exact size, KL 0.009404 against 0.012808 "
+          "(-26.6 %, settled); 2 GB of worst-block planes on it 0.008747 (-31.7 % against the public file); top-4 reading 0.008800 (MEASURED).",
+          "<b>Done (30 October, 10:53 to 14:28): everything on the list before the first engine build</b> (MEASURED on the PC): the MTP draft "
+          "head (9.1e-6 against the reference on the real file); fast CPU code for 32 storage types (Q8_0 35-39 GB/s, Q6_K 36-38 at 16 threads, "
+          "against 8.5 for the reference path); an 8-bit integer CPU path; dense Qwen3, Qwen2 and Llama models with their tokenizers and chat; "
+          "BitNet b1.58 (top-1 14 of 14 against its reference); FP8 and NVFP4 files; and the Windows build (Visual Studio, strictest warnings, "
+          "0 warnings, 84 tests, logits within 2.6e-6 of the largest against the Linux build).",
+          "<b>Next:</b> the GPU kernels moved into the product (the measured streaming kernels and the rest of the token: norms, rotary positions, "
+          "attention, DeltaNet, router), the inference rungs (one layer, then the full forward pass on the GPU), and the first engine test build "
+          "on Linux and Windows, where end-to-end speed is measured. Right after it, the parked accuracy checks (a dense plane and three "
+          "output-head planes, the split-token grade) come before any new idea.",
           "<b>Open measurements:</b> per-layer sensitivity (four runs), a chat-and-code baseline of the original model, energy per token, and the "
           "same tests on a second machine.",
           "<b>Not claimed:</b> any result on hardware other than the one machine; any non-language-model gain until its own probe runs."])]
