@@ -673,7 +673,8 @@ void dequantize_q7_zt(const std::uint8_t* in, float* y, std::int64_t n) {
     int hslot = 0;
     for (int j = 0; j < 8; ++j) {
       const float s = q8_z_scale(d, static_cast<int>((packed >> (6 * j)) & 63u));
-      const bool gated = (mask >> j) & 1u;
+      // the format has exactly two gated blocks; a corrupt mask with more bits set reads no H word past the block's two
+      const bool gated = ((mask >> j) & 1u) && hslot < 2;
       std::uint32_t hb = 0;
       if (gated) {
         for (int b = 0; b < 4; ++b) hb |= static_cast<std::uint32_t>(in[233 + 4 * hslot + b]) << (8 * b);

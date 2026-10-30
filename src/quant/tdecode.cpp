@@ -94,7 +94,7 @@ float q7_zt_dot(const std::uint8_t* base, const std::uint8_t* hbits, const ActBl
     int hslot = 0;
     for (int j = 0; j < 8; ++j) {
       const ActBlock32& a = x[8 * i + j];
-      const bool gated = (mask >> j) & 1u;
+      const bool gated = ((mask >> j) & 1u) && hslot < 2;  // two H words per block (a corrupt mask reads no further)
       std::uint32_t h = 0;
       if (gated && route != HRoute::missing) {
         const std::uint8_t* hp = hbits + kQ7ZTHBytes * i + 4 * hslot;

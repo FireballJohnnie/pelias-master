@@ -208,7 +208,7 @@ void seg8_portable(q::Type t, const std::uint8_t* p, Seg8& o, bool ints = true) 
         set32(o, b, h2f(p), one ? -h2f(p + 2) : 0.0f);
         const std::uint32_t qh = u32le(p + ho);
         for (int j = 0; j < 16; ++j) {
-          const int x0 = (p[qo + j] & 0xF) | (((qh >> j) & 1) << 4), x1 = (p[qo + j] >> 4) | (((qh >> (j + 16)) & 1) << 4);
+          const int x0 = (p[qo + j] & 0xF) | static_cast<int>(((qh >> j) & 1u) << 4), x1 = (p[qo + j] >> 4) | static_cast<int>(((qh >> (j + 16)) & 1u) << 4);
           y[32 * b + j] = i8(one ? x0 : x0 - 16);
           y[32 * b + j + 16] = i8(one ? x1 : x1 - 16);
         }
@@ -241,7 +241,7 @@ void seg8_portable(q::Type t, const std::uint8_t* p, Seg8& o, bool ints = true) 
           for (int k = 0; ints && k < 32; ++k) y[32 * j + k] = static_cast<std::int8_t>(p[8 + 32 * j + k]);
           continue;
         }
-        const bool gated = t == q::Type::q7_zt && ((p[8] >> j) & 1u);
+        const bool gated = t == q::Type::q7_zt && ((p[8] >> j) & 1u) && hslot < 2;
         std::uint32_t hb = 0;
         if (gated) hb = u32le(p + 233 + 4 * hslot++);
         for (int g = 0; g < 4; ++g) {
@@ -930,7 +930,7 @@ PELIAS_TARGET_AVX2 void deq_q7_zt(const std::uint8_t* p, float* y) {  // d, 8 le
   int hslot = 0;
   for (int j = 0; j < 8; ++j) {
     const __m256 s = _mm256_set1_ps(q::q8_z_scale(d, static_cast<int>((packed >> (6 * j)) & 63u)));
-    const bool gated = (mask >> j) & 1u;
+    const bool gated = ((mask >> j) & 1u) && hslot < 2;  // two H words per block, as the reference reads them
     std::uint32_t hb = 0;
     if (gated) hb = u32le(p + 233 + 4 * hslot++);
     for (int g = 0; g < 4; ++g, y += 8) {

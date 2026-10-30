@@ -586,7 +586,7 @@ void t_decode_impl(const std::uint8_t* data, std::uint64_t row_bytes, int64_t n_
       int slot = 0;
       for (int j = 0; j < 8; ++j) {
         s[z(8 * i + j)] = quant::q8_z_scale(d, static_cast<int>((lv >> (6 * j)) & 63u));
-        if ((mask >> j) & 1u) {
+        if (((mask >> j) & 1u) && slot < 2) {  // two H words per block (a corrupt mask reads no further)
           const std::uint8_t* hp = p + 233 + 4 * slot++;
           hw[z(8 * i + j)] = static_cast<std::uint32_t>(hp[0]) | (static_cast<std::uint32_t>(hp[1]) << 8) | (static_cast<std::uint32_t>(hp[2]) << 16) |
                              (static_cast<std::uint32_t>(hp[3]) << 24);
