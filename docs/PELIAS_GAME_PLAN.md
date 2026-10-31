@@ -1473,7 +1473,8 @@ now), the MTP block's own bank, the chunked DeltaNet kernel for long prompts, th
 residual planes in the engine, NVML at start and peak. **Order (author 03:18):** (1) the doorbell as designed (pinned host-mapped
 flags, the GPU writes the router's picks, a spinning CPU thread runs the cold experts and rings back, the GPU waits on
 the flag in-stream; no cudaMemcpy syncs), (2) the MTP block's bank by live pick counts with idle-time promotion (U2;
-option 1 of 03:14), (3) DeltaNet: see the per-token kernel in action in the first engine runs, then decide the prefill path. First PC run (when the author allows): build, pelias_gpu_test
+option 1 of 03:14), (3) DeltaNet: see the per-token kernel in action in the first engine runs, then decide the prefill path. **Done in the sandbox 03:2x-04:0x:** doorbell (4c736fc), MTP live bank (4c736fc), R3 for one-token steps with one device
+copy per dense weight (62b84aa; author 03:29: R3-only + batched reads of R3's layout). First PC run (when the author allows): build, pelias_gpu_test
 (rung1 checkpoint, rung4 engine + verify / keep), sanitizers, then engine-check on the tiered file with --routes
 TIER/tier_v1_x8_routes.bin (prefill 512, decode 128, --mtp-draft 1-3, --float-ref).
 
