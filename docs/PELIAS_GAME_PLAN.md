@@ -97,6 +97,14 @@ energy per token (and per projection), not the count near 0.5. Router: NOT round
 ffn_gate_inp F32 [2048,256], ssm_alpha / ssm_beta F32 [2048,32]; act_format never rounds float weights, CPU and GPU alike), so
 the +0.001009 comes from the quantized-weight inputs (attention, DeltaNet projections, shared and routed experts). Which of them
 carries it: kld with --act-int8 per group (UNMEASURED; a CPU run, parked with the sweep).
+Author 02:40-02:41: the tie goes to the CPU, literally: a value within B of halfway keeps its exact fp32 value (ties carry
+the largest rounding error, about half a step; DERIVED, with an even spread the values within 0.1 of halfway are 20 % of values
+and 49 % of the error energy). Test: reference option --act-tie-band B, kld at B = 0.1 and 0.05 (40 chunks each), paired against
+the v17b dumps; prediction about 0.0089 at B = 0.1 if KL follows error energy. Engine form: GPU int8 pass + CPU exact
+correction W (x - round(x)) on the tied values (careful+1). The +0.001009 and the 9x t+1 persistence sit in the quantized
+projections writing the recurrent state and residual stream (DeltaNet main projections, attention Q/K/V/O, experts), which
+then move the unrounded router input on the next layer and token. Order (author): after the CPU speed items, with the
+scale-weighted error energy (r - round(r)) x scale per projection; PC idle until then.
 
 **First measurement (UNMEASURED; offline, existing tools):** per token, the count of coin-flip roundings (|frac - 0.5| < eps)
 against that token's KL and the next token's KL on WikiText; and the activation-rounding cost itself on WikiText (kld with
