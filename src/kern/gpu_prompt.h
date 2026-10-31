@@ -46,6 +46,7 @@ struct PromptWeights {
   // stack's matrices (rows = n_mat x n_out). Unset (null / 0): every expert, matrix e = expert e. int8 types only.
   const int* emap = nullptr;
   int n_mat = 0;
+  bool owned = false;  // the side tables were allocated by prompt_prepare (freed by prompt_release)
 };
 // Q4_K, Q5_K, Q6_K or Q4_TG2 with k a multiple of 256
 bool prompt_type_ok(std::uint32_t type, std::int64_t k);
@@ -53,6 +54,10 @@ bool prompt_type_ok(std::uint32_t type, std::int64_t k);
 // such a stack on the exact path (gpu_ops' moe_matmul, fp32), prompt_gemm refuses it (use gpu_ops' matmul on the rounded
 // floats).
 bool prompt_prepare(std::uint32_t type, const void* w_dev, std::int64_t rows, std::int64_t k, PromptWeights* out, Stream s = nullptr);
+// The same into caller memory (an arena reused layer by layer: no allocation in the step loop): prompt_table_bytes bytes
+// at `mem` (256-byte aligned; 0 bytes and mem null for types without an int8 step). prompt_release then frees nothing.
+std::size_t prompt_table_bytes(std::uint32_t type, std::int64_t rows, std::int64_t k);
+bool prompt_prepare_at(std::uint32_t type, const void* w_dev, std::int64_t rows, std::int64_t k, void* mem, PromptWeights* out, Stream s = nullptr);
 void prompt_release(PromptWeights* w);
 const char* prompt_last_error();
 

@@ -91,6 +91,8 @@ bool StreamPlan::run_unstaged(Stream) { return false; }
 // the int8 prompt path (kern/gpu_prompt.h)
 bool prompt_type_ok(std::uint32_t, std::int64_t) { return false; }
 bool prompt_prepare(std::uint32_t, const void*, std::int64_t, std::int64_t, PromptWeights*, Stream) { return false; }
+std::size_t prompt_table_bytes(std::uint32_t, std::int64_t, std::int64_t) { return 0; }
+bool prompt_prepare_at(std::uint32_t, const void*, std::int64_t, std::int64_t, void*, PromptWeights*, Stream) { return false; }
 void prompt_release(PromptWeights* w) {
   if (w) *w = PromptWeights{};
 }

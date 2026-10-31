@@ -1118,7 +1118,15 @@ bool prompt_type_ok(std::uint32_t type, std::int64_t k) {
          k > 0 && k % kQK == 0;
 }
 
-bool prompt_prepare(std::uint32_t type, const void* w_dev, std::int64_t rows, std::int64_t k, PromptWeights* out, Stream s) {
+std::size_t prompt_table_bytes(std::uint32_t type, std::int64_t rows, std::int64_t k) {
+  if (!prompt_type_ok(type, k) || rows <= 0) return 0;
+  const std::size_t nb = static_cast<std::size_t>(rows) * static_cast<std::size_t>(k / kQK);
+  if (type == static_cast<std::uint32_t>(quant::Type::q6_k)) return al(nb * 32);
+  if (type == static_cast<std::uint32_t>(quant::Type::q4_tg2)) return al(nb * 32) + al(128 * 4);
+  return al(nb * 16) + al(nb * 32);  // Q4_K, Q5_K
+}
+
+bool prompt_prepare_at(std::uint32_t type, const void* w_dev, std::int64_t rows, std::int64_t k, void* mem, PromptWeights* out, Stream s) {
   if (!out || !w_dev || rows <= 0 || rows % kBN != 0) return pfail("prompt_prepare: bad arguments (rows a multiple of 128)");
   *out = PromptWeights{};
   if (!prompt_type_ok(type, k)) {  // no int8 step: the exact path (moe_prompt) if the GPU decodes the type
@@ -1130,32 +1138,20 @@ bool prompt_prepare(std::uint32_t type, const void* w_dev, std::int64_t rows, st
     out->w = w_dev;
     return true;
   }
+  if (!mem || (reinterpret_cast<std::uintptr_t>(mem) & 255u) != 0) return pfail("prompt_prepare: the side-table memory must be given, 256-byte aligned");
   const std::size_t nb = static_cast<std::size_t>(rows) * static_cast<std::size_t>(k / kQK);
+  auto* m8 = static_cast<std::uint8_t*>(mem);
+  out->type = type;
+  out->rows = rows;
+  out->k = k;
+  out->w = w_dev;
   if (type == static_cast<std::uint32_t>(quant::Type::q6_k)) {  // rec: 16 int8 scales + fp32 d per 256; no min term
     if ((reinterpret_cast<std::uintptr_t>(w_dev) & 15u) != 0) return pfail("prompt_prepare: Q6_K data must start 16-byte aligned");
-    void* r6 = dalloc(nb * 32);
-    if (!r6) return pfail("prompt_prepare: device memory");
-    k_q6_prep<<<grid_of(nb, 256, 4096), 256, 0, pst(s)>>>(static_cast<const std::uint8_t*>(w_dev), static_cast<std::uint8_t*>(r6), nb);
-    if (!pck(cudaGetLastError(), "prompt_prepare (Q6_K)")) {
-      dfree(r6);
-      return false;
-    }
-    out->type = type;
-    out->rows = rows;
-    out->k = k;
-    out->w = w_dev;
-    out->rec = r6;
-    out->dig = nullptr;
-    return true;
+    k_q6_prep<<<grid_of(nb, 256, 4096), 256, 0, pst(s)>>>(static_cast<const std::uint8_t*>(w_dev), m8, nb);
+    out->rec = m8;
+    return pck(cudaGetLastError(), "prompt_prepare (Q6_K)");
   }
   if (type == static_cast<std::uint32_t>(quant::Type::q4_tg2)) {  // rec: s_j per 32 (fp32); dig: 64 digit words + 64 fp32 grid values
-    void* sc = dalloc(nb * 32);
-    void* tb = dalloc(128 * 4);
-    if (!sc || !tb) {
-      dfree(sc);
-      dfree(tb);
-      return pfail("prompt_prepare: device memory");
-    }
     std::uint32_t host[128];
     for (int t = 0; t < 4; ++t)
       for (int c = 0; c < 16; ++c) {
@@ -1164,48 +1160,36 @@ bool prompt_prepare(std::uint32_t type, const void* w_dev, std::int64_t rows, st
         host[t * 16 + c] = static_cast<std::uint32_t>(G) & 0xFFFFFFu;  // bytes low, mid, high (two's complement)
         std::memcpy(&host[64 + t * 16 + c], &gv, 4);
       }
-    k_tg2_prep<<<grid_of(nb, 256, 4096), 256, 0, pst(s)>>>(static_cast<const std::uint8_t*>(w_dev), static_cast<float*>(sc), nb);
-    if (!pck(cudaGetLastError(), "prompt_prepare (Q4_TG2)") || !to_device(tb, host, sizeof host, s)) {
-      dfree(sc);
-      dfree(tb);
-      return pfail("prompt_prepare (Q4_TG2): side tables");
-    }
-    out->type = type;
-    out->rows = rows;
-    out->k = k;
-    out->w = w_dev;
-    out->rec = sc;
-    out->dig = tb;
+    out->rec = m8;
+    out->dig = m8 + al(nb * 32);
+    k_tg2_prep<<<grid_of(nb, 256, 4096), 256, 0, pst(s)>>>(static_cast<const std::uint8_t*>(w_dev), static_cast<float*>(out->rec), nb);
+    if (!pck(cudaGetLastError(), "prompt_prepare (Q4_TG2)") || !to_device(out->dig, host, sizeof host, s)) return pfail("prompt_prepare (Q4_TG2): side tables");
     return true;
   }
-  void* rec = dalloc(nb * 16);
-  void* dg = dalloc(nb * 32);
-  if (!rec || !dg) {
-    dfree(rec);
-    dfree(dg);
-    return pfail("prompt_prepare: device memory");
-  }
+  out->rec = m8;
+  out->dig = m8 + al(nb * 16);
   const int bstride = type == static_cast<std::uint32_t>(quant::Type::q5_k) ? kBlk<1> : kBlk<0>;
-  k_prep_rec<<<grid_of(nb, 256, 4096), 256, 0, pst(s)>>>(static_cast<const std::uint8_t*>(w_dev), bstride, static_cast<uint4*>(rec), nb);
-  k_prep_dig<<<grid_of(nb, 256, 4096), 256, 0, pst(s)>>>(static_cast<const std::uint8_t*>(w_dev), bstride, static_cast<float*>(dg), nb);
-  if (!pck(cudaGetLastError(), "prompt_prepare")) {
-    dfree(rec);
-    dfree(dg);
+  k_prep_rec<<<grid_of(nb, 256, 4096), 256, 0, pst(s)>>>(static_cast<const std::uint8_t*>(w_dev), bstride, static_cast<uint4*>(out->rec), nb);
+  k_prep_dig<<<grid_of(nb, 256, 4096), 256, 0, pst(s)>>>(static_cast<const std::uint8_t*>(w_dev), bstride, static_cast<float*>(out->dig), nb);
+  return pck(cudaGetLastError(), "prompt_prepare");
+}
+
+bool prompt_prepare(std::uint32_t type, const void* w_dev, std::int64_t rows, std::int64_t k, PromptWeights* out, Stream s) {
+  const std::size_t bytes = prompt_table_bytes(type, rows, k);
+  void* mem = bytes ? dalloc(bytes) : nullptr;
+  if (bytes && !mem) return pfail("prompt_prepare: device memory");
+  if (!prompt_prepare_at(type, w_dev, rows, k, mem, out, s)) {
+    dfree(mem);
+    if (out) *out = PromptWeights{};
     return false;
   }
-  out->type = type;
-  out->rows = rows;
-  out->k = k;
-  out->w = w_dev;
-  out->rec = rec;
-  out->dig = dg;
+  out->owned = mem != nullptr;
   return true;
 }
 
 void prompt_release(PromptWeights* w) {
   if (!w) return;
-  dfree(w->rec);
-  dfree(w->dig);
+  if (w->owned) dfree(w->rec);  // rec is the start of the one side-table block (dig inside it)
   *w = PromptWeights{};
 }
 
