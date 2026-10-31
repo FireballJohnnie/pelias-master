@@ -14,6 +14,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 namespace pelias::kern::gpu {
 
@@ -147,6 +148,11 @@ bool to_host_async(void* dst, const void* src, std::size_t bytes, Stream s = nul
 // v21 (per-operation timeline): a one-thread kernel writes the GPU's globaltimer (ns) to *p (a device address, e.g. of
 // mapped memory) when the stream reaches it
 bool stamp(unsigned long long* p, Stream s = nullptr);
+// v23 pin probe: register existing host memory for GPU access (read-only first, then plain); *why gets the CUDA errors
+// on failure. read_rate: one kernel reading `bytes` from a device address (blocks x 256 threads), wall seconds after sync.
+bool host_register(void* p, std::size_t bytes, void** dev, std::string* why);
+void host_unregister(void* p);
+bool read_rate(const void* dev, std::size_t bytes, int blocks, double* seconds);
 // device to device copy (stream ordered)
 bool dcopy(void* dst, const void* src, std::size_t bytes, Stream s = nullptr);
 // per value head: o = rms_norm(o) * w * silu(z), in place on core (n rows of nv * ds), z alike

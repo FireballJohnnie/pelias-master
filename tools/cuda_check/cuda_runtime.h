@@ -113,6 +113,8 @@ cudaError_t cudaFuncGetAttributes(cudaFuncAttributes* at, T* f) { return cudaFun
 typedef struct CUevent_st* cudaEvent_t;
 #define cudaStreamNonBlocking 1
 #define cudaHostRegisterDefault 0
+#define cudaHostRegisterMapped 2
+#define cudaHostRegisterReadOnly 8
 #define cudaHostAllocDefault 0
 #define cudaHostAllocMapped 2
 #define cudaHostAllocPortable 1

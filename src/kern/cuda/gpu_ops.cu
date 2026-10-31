@@ -9,6 +9,7 @@
 // sinf / cosf, which may differ from the host's by an ulp.
 #include <cuda_runtime.h>
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -1002,6 +1003,52 @@ bool bell_wait(const unsigned* flag, unsigned value, Stream s, unsigned long lon
   return launched("doorbell wait");
 }
 __global__ void k_stamp(volatile unsigned long long* p) { *p = gtimer(); }
+// v23 pin probe: register existing host memory (e.g. a read-only file mapping) for GPU access, and a read-rate kernel
+bool host_register(void* p, std::size_t bytes, void** dev, std::string* why) {
+  cudaError_t e = cudaHostRegister(p, bytes, cudaHostRegisterMapped | cudaHostRegisterReadOnly);
+  if (e != cudaSuccess) {
+    if (why) *why = std::string("cudaHostRegister (mapped, read-only): ") + cudaGetErrorString(e);
+    cudaGetLastError();
+    e = cudaHostRegister(p, bytes, cudaHostRegisterMapped);
+    if (e != cudaSuccess) {
+      if (why) *why += std::string("; cudaHostRegister (mapped): ") + cudaGetErrorString(e);
+      cudaGetLastError();
+      return false;
+    }
+  }
+  void* d = nullptr;
+  if (cudaHostGetDevicePointer(&d, p, 0) != cudaSuccess) {
+    if (why) *why += "; cudaHostGetDevicePointer failed";
+    cudaGetLastError();
+    cudaHostUnregister(p);
+    return false;
+  }
+  if (dev) *dev = d;
+  return true;
+}
+void host_unregister(void* p) {
+  if (p) cudaHostUnregister(p);
+  cudaGetLastError();
+}
+__global__ void k_read_sum(const uint4* __restrict__ p, std::size_t n, unsigned* out) {
+  unsigned acc = 0;
+  for (std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x; i < n; i += static_cast<std::size_t>(gridDim.x) * blockDim.x) {
+    const uint4 v = p[i];
+    acc ^= v.x ^ v.y ^ v.z ^ v.w;
+  }
+  if (acc == 0x9e3779b9u) atomicAdd(out, 1u);  // keeps the reads
+}
+bool read_rate(const void* dev, std::size_t bytes, int blocks, double* seconds) {
+  unsigned* o = static_cast<unsigned*>(dalloc(sizeof(unsigned)));
+  if (!o) return false;
+  if (!sync()) return false;
+  const auto t0 = std::chrono::steady_clock::now();
+  k_read_sum<<<static_cast<unsigned>(blocks), 256>>>(static_cast<const uint4*>(dev), bytes / 16, o);
+  const bool ok = launched("read rate") && sync();
+  *seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  dfree(o);
+  return ok;
+}
 bool stamp(unsigned long long* p, Stream s) {
   if (!p) return fail("stamp: no address");
   k_stamp<<<1, 1, 0, st(s)>>>(p);

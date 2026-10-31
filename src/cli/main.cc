@@ -49,6 +49,7 @@
 #include "quant/type_rules.h"
 #include "io/text_file.h"
 #include "kern/cpu_dot.h"
+#include "kern/gpu_ops.h"
 #include "quant/planes.h"
 #include "quant/quant_cpu.h"
 #include "model/arch_qwen35moe.h"
@@ -2125,6 +2126,80 @@ double kl_rows(const float* ra, const float* rb, std::size_t nv) {
   return k;
 }
 
+// v23 (author 18:06): can the GPU read the cold experts in host memory (the dual bus for MTP drafts)? (1) register a
+// region of the model's read-only file mapping for GPU access; (2) register an ordinary private copy of it; for each that
+// registers, the GPU's read rate over it; (3) the same read over device memory for scale. Nothing is written to the file.
+int cmd_pin_probe(const Args& a) {
+  const std::string path = a.get("model");
+  if (path.empty()) {
+    std::fprintf(stderr, "usage: pelias pin-probe --model FILE [--mb 1024]\n");
+    return 1;
+  }
+  std::uint64_t mb = 1024;
+  if (a.has("mb")) {
+    const Result<std::uint64_t> r = io::parse_whole(a.get("mb"), 65536);
+    if (!r.ok() || r.value < 64) {
+      std::fprintf(stderr, "pelias: --mb takes 64 .. 65536\n");
+      return 1;
+    }
+    mb = r.value;
+  }
+  os::FileMap m;
+  if (Status s = m.open(path); !s) return fail_input(s);
+  const std::size_t bytes = static_cast<std::size_t>(mb) << 20;
+  if (m.size() < bytes + (std::uint64_t{1} << 30)) {
+    std::fprintf(stderr, "pelias: the file is smaller than the region asked for\n");
+    return 1;
+  }
+  const std::uint64_t off = (m.size() / 2) & ~std::uint64_t{4095};
+  auto* region = const_cast<std::uint8_t*>(m.data() + off);
+  std::printf("pin-probe: %s region of %llu MiB at offset %llu of a %.2f GB file\n", path.c_str(), static_cast<unsigned long long>(mb),
+              static_cast<unsigned long long>(off), static_cast<double>(m.size()) / 1e9);
+  Timer tw;
+  volatile std::uint8_t sink = 0;
+  for (std::size_t i = 0; i < bytes; i += 4096) sink = static_cast<std::uint8_t>(sink ^ region[i]);  // pages resident first
+  std::printf("  touch (page in): %.2f s\n", tw.seconds());
+  auto rate = [&](const void* dev, const char* what) {
+    for (int rep = 0; rep < 3; ++rep) {
+      double sec = 0.0;
+      if (!kern::gpu::read_rate(dev, bytes, 4096, &sec)) {
+        std::printf("  %s: read kernel failed: %s\n", what, kern::gpu::last_error());
+        return;
+      }
+      std::printf("  %s: read %llu MiB in %.4f s = %.2f GB/s\n", what, static_cast<unsigned long long>(mb), sec, static_cast<double>(bytes) / sec / 1e9);
+    }
+  };
+  {  // (1) the file mapping itself
+    void* dev = nullptr;
+    std::string why;
+    Timer tr;
+    const bool ok = kern::gpu::host_register(region, bytes, &dev, &why);
+    std::printf("  (1) register the read-only file mapping: %s (%.3f s)%s%s\n", ok ? "OK" : "REFUSED", tr.seconds(), ok ? "" : ": ", why.c_str());
+    if (ok) {
+      rate(dev, "(1) GPU reads the file mapping");
+      kern::gpu::host_unregister(region);
+    }
+  }
+  {  // (2) a private copy
+    std::vector<std::uint8_t> copy(region, region + bytes);
+    void* dev = nullptr;
+    std::string why;
+    Timer tr;
+    const bool ok = kern::gpu::host_register(copy.data(), bytes, &dev, &why);
+    std::printf("  (2) register a private copy: %s (%.3f s)%s%s\n", ok ? "OK" : "REFUSED", tr.seconds(), ok ? "" : ": ", why.c_str());
+    if (ok) {
+      rate(dev, "(2) GPU reads the pinned copy");
+      kern::gpu::host_unregister(copy.data());
+    }
+  }
+  {  // (3) device memory, for scale
+    void* d = kern::gpu::dalloc(bytes);
+    if (d && kern::gpu::to_device(d, region, bytes)) rate(d, "(3) GPU reads device memory");
+    kern::gpu::dfree(d);
+  }
+  return 0;
+}
+
 int cmd_engine_check(const Args& a) {
   const std::string path = a.get("model");
   if (path.empty()) {
@@ -3147,6 +3222,7 @@ int main(int argc, char** argv) {
   if (cmd == "mtp-logits") return cmd_mtp_logits(a);
   if (cmd == "gpu-check") return cmd_gpu_check(a);
   if (cmd == "engine-check") return cmd_engine_check(a);
+  if (cmd == "pin-probe") return cmd_pin_probe(a);
   if (cmd == "inspect") return cmd_inspect(a);
   if (cmd == "key") return cmd_key(a);
   if (cmd == "plan") return cmd_plan(a);
