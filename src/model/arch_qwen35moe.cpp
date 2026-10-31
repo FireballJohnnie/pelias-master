@@ -34,6 +34,26 @@ using std::uint64_t;
 
 inline size_t z(int64_t v) { return static_cast<size_t>(v); }
 
+// Coin-flip counter (ForwardOptions::flip_counts, kld --dump-flips): while set, the gpu256x8 rounding counts the values
+// whose scaled value v / scale sits within 1e-4, 1e-3 and 1e-2 of a step from halfway between two integers (a rounding
+// that a second implementation, summing in another order, can take the other way). One scope per rounded row.
+thread_local std::uint32_t* tl_flip = nullptr;
+struct FlipScope {
+  std::uint32_t* dst;
+  std::uint32_t loc[3] = {0, 0, 0};
+  explicit FlipScope(std::uint32_t* d) : dst(d) {
+    if (dst) tl_flip = loc;
+  }
+  ~FlipScope() {
+    if (!dst) return;
+    tl_flip = nullptr;
+    for (int i = 0; i < 3; ++i)
+      if (loc[i]) std::atomic_ref<std::uint32_t>(dst[i]).fetch_add(loc[i], std::memory_order_relaxed);
+  }
+  FlipScope(const FlipScope&) = delete;
+  FlipScope& operator=(const FlipScope&) = delete;
+};
+
 // ------------------------------------------------------------------------------------------------ binding
 
 Status shape_error(const std::string& name, const std::string& want) {
@@ -750,6 +770,7 @@ void mm(const Ctx& c, const WeightView& w, const float* x, int64_t n_tok, int64_
     }
     for (int64_t t = 0; t < n_tok; ++t) {
       std::memcpy(xr.data() + t * k, x + t * ldx, z(k) * sizeof(float));
+      const FlipScope fs(c.opt.flip_counts && n_tok == c.n ? c.opt.flip_counts + 3 * t : nullptr);  // the trunk's products (all positions)
       prep_row(xr.data() + t * k, k, f, w.rot32, c.opt.act_rot32);
     }
     std::vector<kern::ActQ8x32> acts;
@@ -1137,7 +1158,10 @@ void moe(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* out, flo
       std::atomic_ref<std::uint64_t>(c.opt.m_stats[5]).fetch_add(static_cast<std::uint64_t>(m));
     }
     if (fgu != ActFmt::none || l.gate_exps.rot32)
-      for (int64_t r = 0; r < m; ++r) prep_row(sc.xe.data() + r * e, e, fgu, l.gate_exps.rot32, c.opt.act_rot32);
+      for (int64_t r = 0; r < m; ++r) {
+        const FlipScope fs(c.opt.flip_counts ? c.opt.flip_counts + 3 * (list[z(r)] / nu) : nullptr);
+        prep_row(sc.xe.data() + r * e, e, fgu, l.gate_exps.rot32, c.opt.act_rot32);
+      }
     const bool int8_in = c.opt.fast_cpu && !c.opt.act_rot32;  // the engine's int8 path for gpu256x8 inputs
     auto own = [&](const float* xr, int64_t kk) {
       sc.own_acts.resize(z(m));
@@ -1173,7 +1197,10 @@ void moe(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* out, flo
     ActFmt fd = act_format(c.opt, l.down_exps);
     if (cold && fd != ActFmt::none) fd = ActFmt::q8_256;
     if (fd != ActFmt::none || l.down_exps.rot32)
-      for (int64_t r = 0; r < m; ++r) prep_row(sc.ge.data() + r * ff, ff, fd, l.down_exps.rot32, c.opt.act_rot32);
+      for (int64_t r = 0; r < m; ++r) {
+        const FlipScope fs(c.opt.flip_counts ? c.opt.flip_counts + 3 * (list[z(r)] / nu) : nullptr);
+        prep_row(sc.ge.data() + r * ff, ff, fd, l.down_exps.rot32, c.opt.act_rot32);
+      }
     if (int8_in && fd == ActFmt::q8_256x8) own(sc.ge.data(), ff);
     matmul_rows(l.down_exps, static_cast<uint64_t>(ex), 0, e, sc.ge.data(), m, ff, sc.ye.data(), e, sc);
     sc.acts = nullptr;
@@ -1967,6 +1994,16 @@ void act_round_q8_256x8(float* x, std::int64_t n) {
   for (std::int64_t i = 0; i < n; i += 32) {
     const float a = amax_of(x + i, 32);
     const float scale = a > 0.0f ? a / 127.0f : 1.0f;
+    if (tl_flip) {
+      const float inv = 1.0f / scale;
+      for (int j = 0; j < 32; ++j) {
+        const float r = x[i + j] * inv;
+        const float d = std::fabs(r - std::floor(r) - 0.5f);
+        tl_flip[0] += d < 1e-4f ? 1u : 0u;
+        tl_flip[1] += d < 1e-3f ? 1u : 0u;
+        tl_flip[2] += d < 1e-2f ? 1u : 0u;
+      }
+    }
     round32(x + i, scale, 1.0f / scale);
   }
 }

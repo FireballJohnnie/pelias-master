@@ -173,7 +173,7 @@ void usage() {
       "                                  KL divergence of the model against a base file written by llama-perplexity\n"
       "                                  --kl-divergence-base, computed by Pelias's fp32 CPU reference forward pass;\n"
       "                                  --expert-stats: per layer and expert, how often it was picked and its routing weight\n"
-      "      [--dump-kld OUT.bin] [--act-int8 GROUPS] [--act-int8-path cpu|gpu|gpu256|gpu256x8|gpu256e] [--act-rot h32] [--route-dump OUT.bin] [--dump-codes OUT.bin] [--dump-qk OUT.bin]\n"
+      "      [--dump-kld OUT.bin] [--act-int8 GROUPS] [--act-int8-path cpu|gpu|gpu256|gpu256x8|gpu256e] [--act-rot h32] [--route-dump OUT.bin] [--dump-codes OUT.bin] [--dump-qk OUT.bin] [--dump-flips OUT.bin]\n"
       "      [--kv-store q8|int4|int4r] [--state-store q8|int4|int4r|int8row] [--state-at P]\n"
       "                                  --dump-codes: per scored token and layer, the state code of the layer's normed input\n"
       "                                  (C6 miss map: sign bits after a fixed sign diagonal and Hadamard per 32, plus one\n"
@@ -1311,6 +1311,21 @@ int cmd_kld(const Args& a) {
       return 6;
     }
   }
+  // --dump-flips FILE: per scored token, the coin-flip counts of the 8-bit activation rounding (ForwardOptions::flip_counts)
+  const std::string flip_path = a.get("dump-flips");
+  std::vector<std::uint32_t> flip_chunk, flip_all;
+  if (!flip_path.empty()) {
+    if (std::ifstream(flip_path, std::ios::binary)) {
+      std::fprintf(stderr, "pelias: %s already exists (nothing is overwritten)\n", flip_path.c_str());
+      return 6;
+    }
+    if (fo.act_int8.empty() || !fo.act_gpu256 || fo.act_gpu256_sub != 1 || fo.act_rot32) {
+      std::fprintf(stderr, "pelias: --dump-flips counts the gpu256x8 rounding: it needs --act-int8 ... --act-int8-path gpu256x8\n");
+      return 1;
+    }
+    flip_chunk.assign(static_cast<std::size_t>(n_ctx) * 3, 0);
+    fo.flip_counts = flip_chunk.data();
+  }
   std::vector<model::RouteRecord> route_chunk(route_path.empty() ? 0 : static_cast<std::size_t>(n_ctx) * spec.value.n_layer);
   std::vector<model::RouteRecord> route_all;
   if (!route_path.empty()) fo.route = route_chunk.data();
@@ -1329,8 +1344,12 @@ int cmd_kld(const Args& a) {
     std::vector<std::int32_t> toks(base.tokens().begin() + static_cast<std::ptrdiff_t>(c) * n_ctx,
                                    base.tokens().begin() + static_cast<std::ptrdiff_t>(c + 1) * n_ctx);
     if (add_bos) toks[0] = static_cast<std::int32_t>(bos);
+    std::fill(flip_chunk.begin(), flip_chunk.end(), 0u);
     s = model::forward_reference(spec.value, w.value, toks.data(), n_ctx, first, n_ctx - 1, logits.data(), fo);
     if (!s) return fail_input(s);
+    if (!flip_path.empty())  // the scored positions only, in the order of the KL records
+      flip_all.insert(flip_all.end(), flip_chunk.begin() + static_cast<std::ptrdiff_t>(first) * 3,
+                      flip_chunk.begin() + static_cast<std::ptrdiff_t>(first + scored) * 3);
     s = base.read_chunk(records);
     if (!s) return fail_input(s);
     std::vector<std::int32_t> orig(base.tokens().begin() + static_cast<std::ptrdiff_t>(c) * n_ctx,
@@ -1397,6 +1416,22 @@ int cmd_kld(const Args& a) {
       return 6;
     }
     std::fprintf(stderr, "pelias kld: routing record written (%zu token-layers)\n", route_all.size());
+  }
+  if (!flip_path.empty()) {
+    // PELFLIP1: magic, u32 n_ctx, chunks, scored, u64 token hash (as --dump-kld), then per scored token u32 x 3: the values
+    // within 1e-4, 1e-3, 1e-2 of a step from halfway in the gpu256x8 rounding (trunk and expert inputs, every layer)
+    std::FILE* f = std::fopen(flip_path.c_str(), "wb");
+    bool okw = f != nullptr;
+    const std::uint32_t hdr[3] = {static_cast<std::uint32_t>(n_ctx), static_cast<std::uint32_t>(n_chunk), static_cast<std::uint32_t>(scored)};
+    const std::uint64_t hash = verify::kl_token_hash(base.tokens().data(), static_cast<std::size_t>(n_chunk) * static_cast<std::size_t>(n_ctx));
+    okw = okw && std::fwrite("PELFLIP1", 1, 8, f) == 8 && std::fwrite(hdr, 4, 3, f) == 3 && std::fwrite(&hash, 8, 1, f) == 1 &&
+          std::fwrite(flip_all.data(), 4, flip_all.size(), f) == flip_all.size();
+    okw = f != nullptr && std::fclose(f) == 0 && okw;
+    if (!okw) {
+      std::fprintf(stderr, "pelias: the coin-flip record could not be written\n");
+      return 6;
+    }
+    std::fprintf(stderr, "pelias kld: coin-flip record written (%zu tokens)\n", flip_all.size() / 3);
   }
   if (qk_file) {
     qk_ok = std::fclose(qk_file) == 0 && qk_ok;

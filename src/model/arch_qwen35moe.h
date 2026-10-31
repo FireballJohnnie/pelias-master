@@ -175,6 +175,10 @@ struct ForwardOptions {
   // (n_head + n_head_kv) x head_dim fp16 values: each token's query heads (per-head normed and roped; the gate half left
   // out) then its key heads (normed and roped), exactly what the attention scores use.
   std::uint16_t* qk_dump = nullptr;
+  // Optional coin-flip counts (activation rounding near halfway; game plan, author 2026-10-31): n_tokens x 3 counters
+  // (position-major), added to (not cleared): per token, over every gpu256x8-rounded trunk and expert input row, the
+  // values within 1e-4, 1e-3 and 1e-2 of a step from halfway. The output layer is not counted.
+  std::uint32_t* flip_counts = nullptr;
   // Speed ideas measured for their accuracy cost (game plan Block M). Each is off by default.
   // act_bits 4: with act_int8 on the gpu path, round to 4 bits per 32 values (symmetric, -7..7, fp16 scale) instead of
   // q8_1 (W4A4 with rotation, QuaRot-style).
