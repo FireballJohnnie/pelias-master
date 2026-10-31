@@ -1,0 +1,241 @@
+// Copyright (c) 2026 John Lipka and the Pelias contributors. Apache-2.0.
+// provenance: original
+// GP3-12 rungs 2-3 (masterwork 16.1): the trunk on the GPU (model/gpu_forward.h) against the CPU reference forward pass
+// (model/arch_qwen35moe.h forward_reference) with the matching options (the same per-32 int8 rounding before every
+// quantized product). A small qwen35moe built here with quantized weights of the kinds the engine meets: Q4_K / Q5_K / Q6_K /
+// Q4_TG2 products on the int8 tiles, Q8_0 and outputs not a multiple of 128 on the exact path, float router and vectors,
+// routed experts of another type in each layer. Rung 2: one layer (a DeltaNet layer; the attention layer); rung 3: all four
+// layers. Gates: mean KL(reference || GPU) over the positions <= 1e-4 and the top-1 token equal at >= 95 % of positions; the
+// relative L2 of the logits and the largest difference are printed. Why not 1e-6 as for single products: every product's
+// input is rounded to int8, and a value within float noise of a rounding boundary flips by one step (1/127 of its block's
+// largest value) in one path and not the other; such flips are expected and grow layer by layer, so the whole-model gate is
+// on what the outputs mean (the KL of the next-token distribution, 1e-4 = a tenth of the measured per-256 vs per-32 format
+// difference 0.000999), not on bits.
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <vector>
+
+#include "../unit/gguf_builder.h"
+#include "io/gguf_reader.h"
+#include "kern/gpu_ops.h"
+#include "model/arch_qwen35moe.h"
+#include "model/gpu_forward.h"
+#include "model/spec.h"
+#include "os/file_map.h"
+#include "pelias_test.h"
+#include "quant/block_types.h"
+#include "quant/quant_cpu.h"
+
+namespace q = pelias::quant;
+namespace g = pelias::kern::gpu;
+namespace m = pelias::model;
+
+namespace {
+
+struct Small {
+  pelias::os::FileMap map;
+  pelias::io::GgufReader reader;
+  m::Qwen35MoeSpec spec;
+  m::Qwen35MoeWeights w;
+  bool ok = false;
+};
+
+std::uint32_t ty(q::Type t) { return static_cast<std::uint32_t>(t); }
+
+// 4 blocks (DeltaNet x 3, full attention at block 3), n_embd 256, 8 experts of 256, 2 used; quantized as listed
+void small_model(Small& sm) {
+  ptest::GgufBuilder b;
+  const std::string a = "qwen35moe.";
+  b.kv_string("general.architecture", "qwen35moe")
+      .kv_u32(a + "block_count", 4)
+      .kv_u32(a + "nextn_predict_layers", 0)
+      .kv_u32(a + "embedding_length", 256)
+      .kv_u32(a + "attention.head_count", 4)
+      .kv_u32(a + "attention.head_count_kv", 2)
+      .kv_u32(a + "attention.key_length", 64)
+      .kv_u32(a + "attention.value_length", 64)
+      .kv_u32(a + "rope.dimension_count", 16)
+      .kv_i32_array(a + "rope.dimension_sections", {3, 3, 2, 0})
+      .kv_f32(a + "rope.freq_base", 1e7f)
+      .kv_f32(a + "attention.layer_norm_rms_epsilon", 1e-6f)
+      .kv_u32(a + "expert_count", 8)
+      .kv_u32(a + "expert_used_count", 2)
+      .kv_u32(a + "expert_feed_forward_length", 256)
+      .kv_u32(a + "expert_shared_feed_forward_length", 256)
+      .kv_u32(a + "ssm.conv_kernel", 4)
+      .kv_u32(a + "ssm.state_size", 32)
+      .kv_u32(a + "ssm.group_count", 4)
+      .kv_u32(a + "ssm.time_step_rank", 8)
+      .kv_u32(a + "ssm.inner_size", 256)
+      .kv_u32(a + "full_attention_interval", 4);
+  const std::uint64_t e = 256, hd = 64, nh = 4, nkv = 2, ch = 512, di = 256, ds = 32, nvh = 8, ne = 8, ff = 256, ffs = 256;
+  const std::uint32_t f32 = 0;
+  b.tensor("token_embd.weight", {e, 1000}, f32).tensor("output_norm.weight", {e}, f32).tensor("output.weight", {e, 1000}, ty(q::Type::q4_k));
+  const q::Type exp_t[4] = {q::Type::q4_tg2, q::Type::q5_k, q::Type::q6_k, q::Type::q4_k};
+  for (int il = 0; il < 4; ++il) {
+    const std::string p = "blk." + std::to_string(il) + ".";
+    b.tensor(p + "attn_norm.weight", {e}, f32).tensor(p + "post_attention_norm.weight", {e}, f32);
+    if (il == 3) {
+      b.tensor(p + "attn_q.weight", {e, 2 * hd * nh}, ty(q::Type::q4_k)).tensor(p + "attn_k.weight", {e, hd * nkv}, ty(q::Type::q5_k));
+      b.tensor(p + "attn_v.weight", {e, hd * nkv}, ty(q::Type::q6_k)).tensor(p + "attn_output.weight", {hd * nh, e}, ty(q::Type::q4_tg2));
+      b.tensor(p + "attn_q_norm.weight", {hd}, f32).tensor(p + "attn_k_norm.weight", {hd}, f32);
+    } else {
+      b.tensor(p + "attn_qkv.weight", {e, ch}, ty(q::Type::q4_k)).tensor(p + "attn_gate.weight", {e, di}, ty(q::Type::q5_k));
+      b.tensor(p + "ssm_beta.weight", {e, nvh}, ty(q::Type::q8_0)).tensor(p + "ssm_alpha.weight", {e, nvh}, ty(q::Type::q8_0));
+      b.tensor(p + "ssm_out.weight", {di, e}, ty(q::Type::q6_k)).tensor(p + "ssm_conv1d.weight", {4, ch}, f32);
+      b.tensor(p + "ssm_dt.bias", {nvh}, f32).tensor(p + "ssm_a", {nvh}, f32).tensor(p + "ssm_norm.weight", {ds}, f32);
+    }
+    const std::uint32_t xt = ty(exp_t[il]);
+    b.tensor(p + "ffn_gate_inp.weight", {e, ne}, f32).tensor(p + "ffn_up_exps.weight", {e, ff, ne}, xt).tensor(p + "ffn_gate_exps.weight", {e, ff, ne}, xt);
+    b.tensor(p + "ffn_down_exps.weight", {ff, e, ne}, xt).tensor(p + "ffn_up_shexp.weight", {e, ffs}, ty(q::Type::q4_k));
+    b.tensor(p + "ffn_gate_shexp.weight", {e, ffs}, ty(q::Type::q4_k)).tensor(p + "ffn_down_shexp.weight", {ffs, e}, ty(q::Type::q8_0));
+    b.tensor(p + "ffn_gate_inp_shexp.weight", {e}, f32);
+  }
+  std::vector<std::uint8_t> bytes = b.build();
+  pelias::os::FileMap m0;
+  pelias::io::GgufReader r0;
+  if (!ptest::write_and_map(ptest::data_dir() + "/gpu_forward_small_layout.gguf", bytes, m0) || !r0.parse(m0).ok()) return;
+  std::uint32_t h = 20261031u;
+  auto unit = [&h]() {  // xorshift, uniform in [-1, 1)
+    h ^= h << 13;
+    h ^= h >> 17;
+    h ^= h << 5;
+    return static_cast<float>(h) / 2147483648.0f - 1.0f;
+  };
+  for (const pelias::io::GgufTensor& t : r0.tensors()) {
+    const std::string& nm = t.name;
+    const std::uint64_t n = t.elements(), k = t.ne[0];
+    std::vector<float> v(static_cast<std::size_t>(n));
+    const float row = 1.0f / std::sqrt(static_cast<float>(k));
+    for (std::uint64_t i = 0; i < n; ++i) {
+      const float u = unit();
+      float x = u * row;
+      if (nm.find("norm") != std::string::npos) x = 1.0f + 0.1f * u;
+      else if (nm.find("ssm_a") != std::string::npos) x = -(0.5f + 0.5f * std::fabs(u));
+      else if (nm.find("ssm_dt") != std::string::npos) x = 0.1f * u;
+      else if (nm.find("conv1d") != std::string::npos) x = 0.3f * u;
+      else if (nm == "token_embd.weight") x = 0.5f * u;
+      v[static_cast<std::size_t>(i)] = x;
+    }
+    std::uint8_t* d = bytes.data() + t.file_offset;
+    if (t.type == 0) {
+      std::memcpy(d, v.data(), v.size() * sizeof(float));
+      continue;
+    }
+    const std::uint64_t rb = q::row_bytes(t.type, k);
+    for (std::uint64_t r = 0; r < n / k; ++r)
+      if (!q::quantize_row(static_cast<q::Type>(t.type), v.data() + r * k, d + r * rb, static_cast<std::int64_t>(k)).ok()) return;
+  }
+  if (!ptest::write_and_map(ptest::data_dir() + "/gpu_forward_small.gguf", bytes, sm.map) || !sm.reader.parse(sm.map).ok()) return;
+  auto s = m::read_qwen35moe_spec(sm.reader);
+  if (!s.ok()) return;
+  sm.spec = s.value;
+  auto w = m::bind_qwen35moe(sm.reader, sm.map.data(), sm.spec);
+  if (!w.ok()) return;
+  sm.w = std::move(w.value);
+  sm.ok = true;
+}
+
+double kl(const float* p_log, const float* q_log, int n) {  // KL(softmax(p) || softmax(q)) in double
+  double mp = p_log[0], mq = q_log[0];
+  for (int i = 1; i < n; ++i) {
+    mp = std::max(mp, static_cast<double>(p_log[i]));
+    mq = std::max(mq, static_cast<double>(q_log[i]));
+  }
+  double sp = 0.0, sq = 0.0;
+  for (int i = 0; i < n; ++i) {
+    sp += std::exp(p_log[i] - mp);
+    sq += std::exp(q_log[i] - mq);
+  }
+  const double lp = mp + std::log(sp), lq = mq + std::log(sq);
+  double d = 0.0;
+  for (int i = 0; i < n; ++i) {
+    const double a = p_log[i] - lp, b = q_log[i] - lq;
+    d += std::exp(a) * (a - b);
+  }
+  return d;
+}
+
+// one comparison: the model restricted to `layers` (indices into the trunk), n tokens
+void compare(const Small& sm, const std::vector<int>& layers, int n, const char* what) {
+  m::Qwen35MoeSpec s = sm.spec;
+  m::Qwen35MoeWeights w = sm.w;
+  w.layers.clear();
+  for (const int il : layers) w.layers.push_back(sm.w.layers[static_cast<std::size_t>(il)]);
+  s.n_layer = static_cast<std::uint32_t>(layers.size());
+  std::vector<std::int32_t> tok(static_cast<std::size_t>(n));
+  for (int t = 0; t < n; ++t) tok[static_cast<std::size_t>(t)] = static_cast<std::int32_t>((t * 37 + 11) % 1000);
+  const int nv = static_cast<int>(s.n_vocab);
+  std::vector<float> ref(static_cast<std::size_t>(n) * static_cast<std::size_t>(nv)), gpu(ref.size());
+  m::ForwardOptions o = m::GpuForward::matching_reference_options();
+  o.threads = 4;
+  CHECK(m::forward_reference(s, w, tok.data(), n, 0, n, ref.data(), o).ok());
+  auto f = m::GpuForward::open(s, w, 128);
+  CHECK(f.ok());
+  if (!f.ok()) {
+    std::printf("    %s: open failed: %s\n", what, f.status.text().c_str());
+    return;
+  }
+  m::GpuForwardStats st;
+  const pelias::Status ps = f.value->prefill(tok.data(), n, 0, n, gpu.data(), &st);
+  CHECK(ps.ok());
+  if (!ps.ok()) {
+    std::printf("    %s: prefill failed: %s\n", what, ps.text().c_str());
+    return;
+  }
+  double num = 0.0, den = 0.0, worst = 0.0, kl_sum = 0.0, kl_max = 0.0;
+  int top_same = 0;
+  bool finite = true;
+  for (int t = 0; t < n; ++t) {
+    const float* r = ref.data() + static_cast<std::size_t>(t) * static_cast<std::size_t>(nv);
+    const float* gq = gpu.data() + static_cast<std::size_t>(t) * static_cast<std::size_t>(nv);
+    int ar = 0, ag = 0;
+    for (int i = 0; i < nv; ++i) {
+      finite = finite && std::isfinite(gq[i]);
+      const double d = static_cast<double>(gq[i]) - r[i];
+      num += d * d;
+      den += static_cast<double>(r[i]) * r[i];
+      worst = std::max(worst, std::fabs(d));
+      if (r[i] > r[ar]) ar = i;
+      if (gq[i] > gq[ag]) ag = i;
+    }
+    top_same += ar == ag ? 1 : 0;
+    const double k = kl(r, gq, nv);
+    kl_sum += k;
+    kl_max = std::max(kl_max, k);
+  }
+  const double rel = den > 0 ? std::sqrt(num / den) : 0.0, kl_mean = kl_sum / n, top = static_cast<double>(top_same) / n;
+  CHECK(finite);
+  CHECK(kl_mean <= 1e-4);
+  CHECK(top >= 0.95);
+  std::printf("    %-34s %3d tokens: logits rel L2 %.3e, largest |diff| %.3e; KL mean %.3e max %.3e; top-1 equal %d / %d; GPU %.3f s (uploads %.3f s, %.1f MB)\n", what,
+              n, rel, worst, kl_mean, kl_max, top_same, n, st.seconds, st.upload_seconds, static_cast<double>(st.bytes_uploaded) / 1e6);
+}
+
+}  // namespace
+
+TEST(rung2_one_layer_on_the_gpu_against_the_reference) {
+  if (!g::available()) return;
+  Small sm;
+  small_model(sm);
+  CHECK(sm.ok);
+  if (!sm.ok) return;
+  const int n = std::getenv("PELIAS_GPU_QUICK") ? 24 : 96;
+  compare(sm, {0}, n, "one DeltaNet layer (experts Q4_TG2)");
+  compare(sm, {3}, n, "one attention layer (experts Q4_K)");
+}
+
+TEST(rung3_whole_trunk_on_the_gpu_against_the_reference) {
+  if (!g::available()) return;
+  Small sm;
+  small_model(sm);
+  CHECK(sm.ok);
+  if (!sm.ok) return;
+  const int n = std::getenv("PELIAS_GPU_QUICK") ? 24 : 96;
+  compare(sm, {0, 1, 2, 3}, n, "four layers (all expert types)");
+}

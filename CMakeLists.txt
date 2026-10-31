@@ -115,6 +115,11 @@ endif()
 if(PELIAS_CPU_AVX2 AND NOT MSVC)
   target_compile_options(pelias_model PRIVATE -mavx2 -mfma -ffp-contract=off)
 endif()
+# GP3-12 rungs 2-3 / GP3-14: the trunk on the GPU (host orchestration over kern/gpu_ops and kern/gpu_prompt; with the
+# stubs when PELIAS_CUDA is off, so every caller builds and gets "no GPU backend")
+pelias_add_module(pelias_engine
+  SOURCES src/model/gpu_forward.cpp
+  DEPENDS pelias_model pelias_kern_gpu pelias_quant)
 pelias_add_module(pelias_verify
   SOURCES src/verify/kl.cpp
   DEPENDS pelias_io pelias_quant pelias_hal)
@@ -122,7 +127,7 @@ pelias_add_module(pelias_verify
 # ---- the program
 add_executable(pelias src/cli/main.cc)
 pelias_apply_flags(pelias)
-target_link_libraries(pelias PRIVATE pelias_model pelias_kern pelias_verify pelias_tok pelias_plan pelias_ingest pelias_io pelias_hal pelias_quant pelias_os)
+target_link_libraries(pelias PRIVATE pelias_engine pelias_model pelias_kern pelias_verify pelias_tok pelias_plan pelias_ingest pelias_io pelias_hal pelias_quant pelias_os)
 
 # ---- tests (own harness, no framework)
 if(PELIAS_BUILD_TESTS)
@@ -134,10 +139,11 @@ if(PELIAS_BUILD_TESTS)
   target_link_libraries(pelias_unit PRIVATE pelias_model pelias_kern pelias_verify pelias_tok pelias_plan pelias_ingest pelias_io pelias_hal pelias_quant pelias_os)
   add_test(NAME unit COMMAND pelias_unit --data ${CMAKE_CURRENT_SOURCE_DIR}/tests/data)
   if(PELIAS_CUDA)  # rung 1 of the GPU kernels: runs on a card (the author's run, under compute-sanitizer)
-    add_executable(pelias_gpu_test tests/unit/main.cpp tests/gpu/test_gpu_rung1.cpp tests/gpu/test_gpu_stream.cpp tests/gpu/test_gpu_deltanet.cpp tests/gpu/test_gpu_prompt.cpp)
+    add_executable(pelias_gpu_test tests/unit/main.cpp tests/gpu/test_gpu_rung1.cpp tests/gpu/test_gpu_stream.cpp tests/gpu/test_gpu_deltanet.cpp tests/gpu/test_gpu_prompt.cpp
+                   tests/gpu/test_gpu_forward.cpp tests/unit/gguf_builder.cpp)
     pelias_apply_flags(pelias_gpu_test)
     target_include_directories(pelias_gpu_test PRIVATE tests)
-    target_link_libraries(pelias_gpu_test PRIVATE pelias_kern_gpu pelias_model pelias_kern pelias_io pelias_hal pelias_quant pelias_os)
+    target_link_libraries(pelias_gpu_test PRIVATE pelias_engine pelias_kern_gpu pelias_model pelias_kern pelias_io pelias_hal pelias_quant pelias_os)
     add_test(NAME gpu_rung1 COMMAND pelias_gpu_test)
   endif()
   add_executable(pelias_mutate tests/unit/mutate.cpp tests/unit/gguf_builder.cpp)
