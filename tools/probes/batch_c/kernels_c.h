@@ -245,6 +245,33 @@ cudaError_t gemm_list_v12(int nunits, const void* units, const int8_t* a8, const
                           const uint16_t* wdig, float* C, int P, int N, int K, int variant, cudaStream_t s);
 cudaError_t gemm_list_v12x8(int nunits, const void* units, const int8_t* a8, const float* sa32, const uint16_t* adig32, const BlockQ4K* w, const void* rec,
                             const uint16_t* wdig8, float* C, int P, int N, int K, int variant, cudaStream_t s);
+// D v2 (2026-10-30): expert GEMMs for the MoE slice in the per-32 format, over unit tables, with a choice of epilogue.
+// moe_tiles: v12x8 arithmetic on 64- or 16-row tiles (3 stages); units int4 (expert, packed row, column origin, 0).
+// moe_vec: the warp-vector path (dp4a) for experts with 1-8 rows; units int4 (expert, packed row, rows 1..8, 0).
+// epi 0: rows into C (N wide); 1: red.add.f32 of value x rw[row] into Yf[rtok[row]]; 2: red.add.s32 of
+// round(value x rw x scale) into Yi (ovf counts values above 2^31 / 8); 3: red.add.u64 of llround(value x rw x scale)
+// into Yl. Rows with rtok < 0 add nothing. fix_to_f32: Yi (or Yl when yi is null) x inv into y.
+struct MoeArgs {
+  const int8_t* a8 = nullptr;
+  const float* sa32 = nullptr;
+  const uint16_t* adig = nullptr;
+  const BlockQ4K* w = nullptr;
+  const void* rec = nullptr;
+  const uint16_t* wdig8 = nullptr;
+  int N = 0, K = 0;
+  float* C = nullptr;
+  const int* rtok = nullptr;
+  const float* rw = nullptr;
+  float* Yf = nullptr;
+  int* Yi = nullptr;
+  unsigned long long* Yl = nullptr;
+  float scale = 1.f;
+  unsigned* ovf = nullptr;
+};
+cudaError_t moe_tiles(int bmt, int epi, int nunits, const void* units, const MoeArgs& A, cudaStream_t s);
+cudaError_t moe_vec(int epi, int nunits, const void* units, const MoeArgs& A, cudaStream_t s);
+cudaError_t fix_to_f32(const int* yi, const unsigned long long* yl, size_t n, float inv, float* y, cudaStream_t s);
+cudaError_t moe_tile_info(int bmt, int* regs, int* local_bytes, int* smem, int* blocks_per_sm);
 // The bf16 GEMM on `batch` problems at once (A: batch x M x K, B: batch x N x K, C: batch x M x N), same tiles as gemm_bf16_tiled.
 cudaError_t gemm_bf16_batched(const uint16_t* A, const uint16_t* B, float* C, int M, int N, int K, int batch, int cfg, int raster, cudaStream_t s);
 // fp32 reference for v7's inputs (activation scale per 256).

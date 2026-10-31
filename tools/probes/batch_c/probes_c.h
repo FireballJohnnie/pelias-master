@@ -2060,4 +2060,385 @@ inline int p_moe(Ctx& c, const Args& a) {
   return all_ok ? 0 : 3;
 }
 
+// ================================================================ D v2 (2026-10-30 21:2x): tails, warp-vector, folded combine
+// Per-32 format throughout (the adopted one). Per layer of real routing:
+//   schedules (gate|up and down): S0 64-row tiles, every expert padded to 64 (D v1's work list); S1 64-row tiles for the
+//   whole 64-row bodies + 16-row tiles for the tails (experts padded to 16); S2 = S1 with experts of 1-8 rows on the
+//   warp-vector path. Checks: S1 = S0 bit for bit on every real row (same per-element arithmetic); the warp-vector rows
+//   within 1e-3 of S0 (different summation order).
+//   combine (down output into the token rows): C0 store + the separate combine kernel (D v1); C1 folded, red.add.f32;
+//   C2 folded, fixed point int32 (scale 2^k from the measured |down output| bound: max|O| x 8 x 2^k < 2^31) + a
+//   conversion pass; C3 folded, fixed point int64 (scale 2^k for 2^62 headroom) + conversion. Checks: each against C0
+//   (relative L2, max abs); C2 / C3 run twice must give the same bits (determinism); C2's overflow counter.
+inline int p_moe2(Ctx& c, const Args& a) {
+  using namespace k2b;
+  Result r;
+  r.probe = "MOE-SLICE-V2";
+  init_cuda(c);
+  const double peak8 = a.num("int8-peak", 259.5);
+  const std::string rpath = a.get("routes", "");
+  if (rpath.empty()) throw std::runtime_error("moe2: --routes FILE is required");
+  const dslice::Routes R = dslice::read_routes(rpath);
+  const int chunk = static_cast<int>(a.inum("chunk", 0));
+  std::vector<int> layers, nchs;
+  {
+    std::stringstream ss(a.get("layers", "0,20,39"));
+    std::string tok;
+    while (std::getline(ss, tok, ',')) layers.push_back(std::stoi(tok));
+    std::stringstream s2(a.get("nchunks", "1,8"));
+    while (std::getline(s2, tok, ',')) nchs.push_back(std::stoi(tok));
+  }
+  int nmax = 1;
+  for (const int n : nchs) nmax = std::max(nmax, n);
+  if (chunk < 0 || static_cast<unsigned>(chunk + nmax) > R.chunks) throw std::runtime_error("moe2: --chunk / --nchunks out of range");
+  const int Tmax = static_cast<int>(R.scored) * nmax, E = 256, H = 2048, F = 512, NU = 8;
+  Stream s;
+  Sampler sampler(c.nvml);
+  sampler.start(200);
+  JW before = state_now(c);
+  auto tops = [](double macs, double ms) { return 2.0 * macs / (ms * 1e-3) / 1e12; };
+  JW why;
+  const double wneed = w8_bytes(E * 2 * F, H) + w8_bytes(E * H, F) + static_cast<double>(E) * 2 * F * (H / 256) * 32 + static_cast<double>(E) * H * (F / 256) * 32;
+  if (!fits(a, wneed + 3.0 * (1ull << 30), why)) throw std::runtime_error("moe2: would cross the VRAM ceiling");
+  W8 wgu(E * 2 * F, H, 9100u, s), wdn(E * H, F, 9200u, s);
+  DevBuf gu8(static_cast<size_t>(E) * 2 * F * (H / 256) * 32), dn8(static_cast<size_t>(E) * H * (F / 256) * 32);
+  PP_CK(pkc::prep_q4k_dig8(wgu.q.as<pkc::BlockQ4K>(), gu8.as<uint16_t>(), E * 2 * F, H, s));
+  PP_CK(pkc::prep_q4k_dig8(wdn.q.as<pkc::BlockQ4K>(), dn8.as<uint16_t>(), E * H, F, s));
+  DevBuf X(static_cast<size_t>(Tmax) * H * 2), G(static_cast<size_t>(H) * 2);
+  PP_CK(pkc::fill_bf16(X.as<uint16_t>(), static_cast<size_t>(Tmax) * H, 9300u, s));
+  PP_CK(pkc::fill_bf16(G.as<uint16_t>(), H, 9400u, s));
+  std::vector<JW> infos;
+  for (const int bmt : {64, 16}) {
+    int regs = 0, loc = 0, sm = 0, bps = 0;
+    PP_CK(pkc::moe_tile_info(bmt, &regs, &loc, &sm, &bps));
+    JW j;
+    j.kv("tile_rows", bmt).kv("registers", regs).kv("local_spill_bytes", loc).kv("shared_bytes", sm).kv("blocks_per_sm", bps);
+    infos.push_back(j);
+    std::printf("    moe tile %2d rows: %3d registers, %4d spill bytes, %6d shared bytes, %d blocks per SM\n", bmt, regs, loc, sm, bps);
+  }
+  bool all_ok = true;
+  std::vector<JW> rows;
+  for (const int nch : nchs)
+    for (const int L : layers) {
+      if (g_abort.load()) break;
+      if (L < 0 || static_cast<unsigned>(L) >= R.n_layer) continue;
+      const int T = static_cast<int>(R.scored) * nch;
+      std::vector<int> cnt(E, 0), sel(static_cast<size_t>(T) * NU);
+      std::vector<float> wt(static_cast<size_t>(T) * NU);
+      for (int t = 0; t < T; ++t) {
+        const size_t rec = (static_cast<size_t>(chunk) * R.scored + t) * R.n_layer + L;
+        for (int k = 0; k < NU; ++k) {
+          const int e = R.sel[rec * 8 + k];
+          if (e < 0 || e >= E) throw std::runtime_error("moe2: expert index out of range");
+          sel[static_cast<size_t>(t) * NU + k] = e;
+          wt[static_cast<size_t>(t) * NU + k] = R.w[rec * 8 + k];
+          ++cnt[e];
+        }
+      }
+      // two layouts: experts padded to 64 (S0) and to 16 (S1 / S2)
+      auto layout = [&](int pad, std::vector<int>& off, std::vector<int>& src, std::vector<int>& prow, std::vector<int>& rtok, std::vector<float>& rwv) {
+        off.assign(E, 0);
+        int P = 0;
+        for (int e = 0; e < E; ++e) {
+          off[e] = P;
+          P += (cnt[e] + pad - 1) / pad * pad;
+        }
+        src.assign(P, -1);
+        rtok.assign(P, -1);
+        rwv.assign(P, 0.f);
+        prow.assign(static_cast<size_t>(T) * NU, 0);
+        std::vector<int> fill(E, 0);
+        for (int t = 0; t < T; ++t)
+          for (int k = 0; k < NU; ++k) {
+            const int e = sel[static_cast<size_t>(t) * NU + k], pr = off[e] + fill[e]++;
+            src[pr] = t;
+            rtok[pr] = t;
+            rwv[pr] = wt[static_cast<size_t>(t) * NU + k];
+            prow[static_cast<size_t>(t) * NU + k] = pr;
+          }
+        return P;
+      };
+      std::vector<int> off64, src64, prow64, rtok64, off16, src16, prow16, rtok16;
+      std::vector<float> rw64, rw16;
+      const int P64 = layout(64, off64, src64, prow64, rtok64, rw64), P16 = layout(16, off16, src16, prow16, rtok16, rw16);
+      // unit tables: n-tile major inside an expert (its weight tile stays in L2 across the row tiles)
+      auto units = [&](int N, int mode, std::vector<int>& u64, std::vector<int>& u16, std::vector<int>& uv) {
+        u64.clear();
+        u16.clear();
+        uv.clear();
+        for (int e = 0; e < E; ++e) {
+          if (!cnt[e]) continue;
+          if (mode == 0) {
+            for (int nt = 0; nt < N / 128; ++nt)
+              for (int mt = 0; mt < (cnt[e] + 63) / 64; ++mt) u64.insert(u64.end(), {e, off64[e] + mt * 64, nt * 128, 0});
+            continue;
+          }
+          if (mode == 2 && cnt[e] <= 8) {
+            uv.insert(uv.end(), {e, off16[e], cnt[e], 0});
+            continue;
+          }
+          const int body = cnt[e] / 64, tail = (cnt[e] - body * 64 + 15) / 16;
+          for (int nt = 0; nt < N / 128; ++nt) {
+            for (int mt = 0; mt < body; ++mt) u64.insert(u64.end(), {e, off16[e] + mt * 64, nt * 128, 0});
+            for (int tt = 0; tt < tail; ++tt) u16.insert(u16.end(), {e, off16[e] + body * 64 + tt * 16, nt * 128, 0});
+          }
+        }
+      };
+      struct UT {
+        std::vector<int> u64, u16, uv;
+        DevBuf d64, d16, dv;
+      };
+      UT ut[2][3];  // [gemm 0 gate|up / 1 down][schedule]
+      for (int gm = 0; gm < 2; ++gm)
+        for (int sc = 0; sc < 3; ++sc) {
+          UT& x = ut[gm][sc];
+          units(gm == 0 ? 2 * F : H, sc, x.u64, x.u16, x.uv);
+          x.d64 = DevBuf(std::max<size_t>(16, x.u64.size() * 4));
+          x.d16 = DevBuf(std::max<size_t>(16, x.u16.size() * 4));
+          x.dv = DevBuf(std::max<size_t>(16, x.uv.size() * 4));
+          if (!x.u64.empty()) PP_CK(cudaMemcpyAsync(x.d64.as(), x.u64.data(), x.u64.size() * 4, cudaMemcpyHostToDevice, s));
+          if (!x.u16.empty()) PP_CK(cudaMemcpyAsync(x.d16.as(), x.u16.data(), x.u16.size() * 4, cudaMemcpyHostToDevice, s));
+          if (!x.uv.empty()) PP_CK(cudaMemcpyAsync(x.dv.as(), x.uv.data(), x.uv.size() * 4, cudaMemcpyHostToDevice, s));
+        }
+      auto up = [&](const auto& v) {
+        DevBuf d(std::max<size_t>(16, v.size() * 4));
+        PP_CK(cudaMemcpyAsync(d.as(), v.data(), v.size() * 4, cudaMemcpyHostToDevice, s));
+        return d;
+      };
+      DevBuf dsrc64 = up(src64), dsrc16 = up(src16), dprow64 = up(prow64), dprow16 = up(prow16), drt64 = up(rtok64), drt16 = up(rtok16), drw64 = up(rw64),
+             drw16 = up(rw16), dwt = up(wt);
+      int vec_experts = 0, vec_rows = 0;
+      for (int e = 0; e < E; ++e)
+        if (cnt[e] && cnt[e] <= 8) {
+          ++vec_experts;
+          vec_rows += cnt[e];
+        }
+      JW row;
+      row.kv("layer", L).kv("chunks", nch).kv("tokens", T).kv("rows_pad64", P64).kv("rows_pad16", P16).kv("experts_1_to_8_rows", vec_experts).kv("rows_in_1_to_8", vec_rows);
+      for (int sc = 0; sc < 3; ++sc) {
+        JW j;
+        j.kv("gate_up_units_64", static_cast<int>(ut[0][sc].u64.size() / 4)).kv("gate_up_units_16", static_cast<int>(ut[0][sc].u16.size() / 4));
+        j.kv("gate_up_units_vec", static_cast<int>(ut[0][sc].uv.size() / 4));
+        row.kv_obj(std::string("units_S") + std::to_string(sc), j);
+      }
+      std::printf("  layer %2d, %4d tokens: rows padded to 64 %d, to 16 %d (real %d); experts with 1-8 rows %d (%d rows)\n", L, T, P64, P16, T * NU, vec_experts, vec_rows);
+      std::fflush(stdout);
+      // token side: fused norm + per-32 rounding, digits
+      DevBuf ta8(static_cast<size_t>(T) * H), tsa(static_cast<size_t>(T) * (H / 32) * 4), tx32(static_cast<size_t>(T) * (H / 32) * 4),
+          tdig(static_cast<size_t>(T) * (H / 256) * 32);
+      PP_CK(pkc::rmsnorm_q8x32(X.as<uint16_t>(), G.as<uint16_t>(), ta8.as<int8_t>(), tsa.as<float>(), tx32.as<float>(), T, H, s));
+      PP_CK(pkc::dig_x32(tx32.as<float>(), tdig.as<uint16_t>(), T, H, s));
+      const int Pm = std::max(P64, P16);
+      DevBuf pa8(static_cast<size_t>(Pm) * H), psa(static_cast<size_t>(Pm) * (H / 32) * 4), pdig(static_cast<size_t>(Pm) * (H / 256) * 32),
+          H1(static_cast<size_t>(Pm) * 2 * F * 4), qa8(static_cast<size_t>(Pm) * F), qsa(static_cast<size_t>(Pm) * (F / 32) * 4),
+          qs32(static_cast<size_t>(Pm) * (F / 32) * 4), qx32(static_cast<size_t>(Pm) * (F / 32) * 4), qdig(static_cast<size_t>(Pm) * (F / 256) * 32),
+          O(static_cast<size_t>(Pm) * H * 4), Y0(static_cast<size_t>(T) * H * 4), Yf(static_cast<size_t>(T) * H * 4), Yi(static_cast<size_t>(T) * H * 4),
+          Yl(static_cast<size_t>(T) * H * 8), Yc(static_cast<size_t>(T) * H * 4), ovf(16);
+      auto gather = [&](const DevBuf& sidx, int P) {
+        PP_CK(pkc::gather_q8(sidx.as<int>(), P, H, H / 32, (H / 256) * 16, ta8.as<int8_t>(), tsa.as<float>(), tdig.as<uint16_t>(), pa8.as<int8_t>(), psa.as<float>(),
+                             pdig.as<uint16_t>(), s));
+      };
+      auto args1 = [&] {
+        pkc::MoeArgs A;
+        A.a8 = pa8.as<int8_t>();
+        A.sa32 = psa.as<float>();
+        A.adig = pdig.as<uint16_t>();
+        A.w = wgu.q.as<pkc::BlockQ4K>();
+        A.rec = wgu.rec.as();
+        A.wdig8 = gu8.as<uint16_t>();
+        A.N = 2 * F;
+        A.K = H;
+        A.C = H1.as<float>();
+        return A;
+      };
+      auto args2 = [&](int sc, int epi, float scale) {
+        pkc::MoeArgs A;
+        A.a8 = qa8.as<int8_t>();
+        A.sa32 = qsa.as<float>();
+        A.adig = qdig.as<uint16_t>();
+        A.w = wdn.q.as<pkc::BlockQ4K>();
+        A.rec = wdn.rec.as();
+        A.wdig8 = dn8.as<uint16_t>();
+        A.N = H;
+        A.K = F;
+        A.C = O.as<float>();
+        A.rtok = (sc == 0 ? drt64 : drt16).as<int>();
+        A.rw = (sc == 0 ? drw64 : drw16).as<float>();
+        A.Yf = Yf.as<float>();
+        A.Yi = Yi.as<int>();
+        A.Yl = Yl.as<unsigned long long>();
+        A.scale = scale;
+        A.ovf = ovf.as<unsigned>();
+        (void)epi;
+        return A;
+      };
+      auto gemm = [&](int gm, int sc, int epi, const pkc::MoeArgs& A) {
+        UT& x = ut[gm][sc];
+        PP_CK(pkc::moe_tiles(64, epi, static_cast<int>(x.u64.size() / 4), x.d64.as(), A, s));
+        if (!x.u16.empty()) PP_CK(pkc::moe_tiles(16, epi, static_cast<int>(x.u16.size() / 4), x.d16.as(), A, s));
+        if (!x.uv.empty()) PP_CK(pkc::moe_vec(epi, static_cast<int>(x.uv.size() / 4), x.dv.as(), A, s));
+      };
+      auto act = [&](int P) {
+        PP_CK(pkc::silu_q8(H1.as<float>(), P, F, 1, qa8.as<int8_t>(), qsa.as<float>(), qs32.as<int>(), qx32.as<float>(), qdig.as<uint16_t>(), s));
+        PP_CK(pkc::dig_x32(qx32.as<float>(), qdig.as<uint16_t>(), P, F, s));
+      };
+      // ---- schedules: full pass per schedule (separate combine), outputs kept for the checks
+      std::vector<std::vector<float>> h1s(3), os(3), ys(3);
+      double t_g1[3], t_g2[3], t_sl[3];
+      for (int sc = 0; sc < 3; ++sc) {
+        const int P = sc == 0 ? P64 : P16;
+        const DevBuf& sidx = sc == 0 ? dsrc64 : dsrc16;
+        const DevBuf& pr = sc == 0 ? dprow64 : dprow16;
+        PP_CK(cudaMemsetAsync(H1.as(), 0, static_cast<size_t>(Pm) * 2 * F * 4, s));
+        PP_CK(cudaMemsetAsync(O.as(), 0, static_cast<size_t>(Pm) * H * 4, s));
+        gather(sidx, P);
+        gemm(0, sc, 0, args1());
+        act(P);
+        gemm(1, sc, 0, args2(sc, 0, 1.f));
+        PP_CK(pkc::combine_rows(O.as<float>(), pr.as<int>(), dwt.as<float>(), T, NU, H, Y0.as<float>(), s));
+        PP_CK(cudaStreamSynchronize(s));
+        h1s[sc].resize(static_cast<size_t>(P) * 2 * F);
+        os[sc].resize(static_cast<size_t>(P) * H);
+        ys[sc].resize(static_cast<size_t>(T) * H);
+        PP_CK(cudaMemcpy(h1s[sc].data(), H1.as(), h1s[sc].size() * 4, cudaMemcpyDeviceToHost));
+        PP_CK(cudaMemcpy(os[sc].data(), O.as(), os[sc].size() * 4, cudaMemcpyDeviceToHost));
+        PP_CK(cudaMemcpy(ys[sc].data(), Y0.as(), ys[sc].size() * 4, cudaMemcpyDeviceToHost));
+        t_g1[sc] = time_ms(s, [&] { gemm(0, sc, 0, args1()); }, 60.0);
+        act(P);
+        t_g2[sc] = time_ms(s, [&] { gemm(1, sc, 0, args2(sc, 0, 1.f)); }, 60.0);
+        t_sl[sc] = time_ms(s, [&] {
+          PP_CK(pkc::rmsnorm_q8x32(X.as<uint16_t>(), G.as<uint16_t>(), ta8.as<int8_t>(), tsa.as<float>(), tx32.as<float>(), T, H, s));
+          PP_CK(pkc::dig_x32(tx32.as<float>(), tdig.as<uint16_t>(), T, H, s));
+          gather(sidx, P);
+          gemm(0, sc, 0, args1());
+          act(P);
+          gemm(1, sc, 0, args2(sc, 0, 1.f));
+          PP_CK(pkc::combine_rows(O.as<float>(), pr.as<int>(), dwt.as<float>(), T, NU, H, Y0.as<float>(), s));
+        }, 100.0);
+      }
+      // checks: S1 = S0 bit for bit on every real row (gate|up and down); S2's vector rows within 1e-3 of S0 (max rel per row)
+      bool s1same = true;
+      double vec_err = 0.0;
+      for (int e = 0; e < E; ++e)
+        for (int i = 0; i < cnt[e]; ++i) {
+          const float* a0 = &h1s[0][static_cast<size_t>(off64[e] + i) * 2 * F];
+          const float* a1 = &h1s[1][static_cast<size_t>(off16[e] + i) * 2 * F];
+          const float* a2 = &h1s[2][static_cast<size_t>(off16[e] + i) * 2 * F];
+          const float* o0 = &os[0][static_cast<size_t>(off64[e] + i) * H];
+          const float* o1 = &os[1][static_cast<size_t>(off16[e] + i) * H];
+          s1same = s1same && std::memcmp(a0, a1, static_cast<size_t>(2 * F) * 4) == 0 && std::memcmp(o0, o1, static_cast<size_t>(H) * 4) == 0;
+          if (cnt[e] <= 8) {
+            double mx = 0.0, md = 0.0;
+            for (int cc = 0; cc < 2 * F; ++cc) {
+              mx = std::max(mx, static_cast<double>(std::fabs(a0[cc])));
+              md = std::max(md, static_cast<double>(std::fabs(a2[cc] - a0[cc])));
+            }
+            if (mx > 0) vec_err = std::max(vec_err, md / mx);
+          }
+        }
+      const bool vec_ok = vec_err <= 1e-3;
+      // ---- combine variants on the S2 schedule (the down GEMM with each epilogue), against C0 = S2's separate combine
+      const int sb = 2;
+      const DevBuf& pr16 = dprow16;
+      act(P16);
+      gather(dsrc16, P16);
+      gemm(0, sb, 0, args1());
+      act(P16);
+      gemm(1, sb, 0, args2(sb, 0, 1.f));
+      PP_CK(pkc::combine_rows(O.as<float>(), pr16.as<int>(), dwt.as<float>(), T, NU, H, Y0.as<float>(), s));
+      // the fixed-point scales from the measured bound of one contribution (|O| x max route weight)
+      double maxO = 0.0;
+      PP_CK(cudaStreamSynchronize(s));
+      {
+        std::vector<float> hO(static_cast<size_t>(P16) * H);
+        PP_CK(cudaMemcpy(hO.data(), O.as(), hO.size() * 4, cudaMemcpyDeviceToHost));
+        for (int p = 0; p < P16; ++p)
+          if (rtok16[p] >= 0)
+            for (int cc = 0; cc < H; ++cc) maxO = std::max(maxO, static_cast<double>(std::fabs(hO[static_cast<size_t>(p) * H + cc]) * rw16[p]));
+      }
+      const int k32 = maxO > 0 ? static_cast<int>(std::floor(std::log2(268435455.0 / maxO))) : 20;
+      const int k64 = maxO > 0 ? std::min(60, static_cast<int>(std::floor(std::log2(5.7e17 / maxO)))) : 40;
+      const float sc32 = std::ldexp(1.f, k32), sc64 = std::ldexp(1.f, std::min(k64, 100));
+      std::vector<float> y0(static_cast<size_t>(T) * H);
+      PP_CK(cudaMemcpy(y0.data(), Y0.as(), y0.size() * 4, cudaMemcpyDeviceToHost));
+      auto fold = [&](int epi) {
+        if (epi == 1) PP_CK(cudaMemsetAsync(Yf.as(), 0, static_cast<size_t>(T) * H * 4, s));
+        if (epi == 2) PP_CK(cudaMemsetAsync(Yi.as(), 0, static_cast<size_t>(T) * H * 4, s));
+        if (epi == 3) PP_CK(cudaMemsetAsync(Yl.as(), 0, static_cast<size_t>(T) * H * 8, s));
+        gemm(1, sb, epi, args2(sb, epi, epi == 2 ? sc32 : sc64));
+        if (epi == 2) PP_CK(pkc::fix_to_f32(Yi.as<int>(), nullptr, static_cast<size_t>(T) * H, 1.f / sc32, Yc.as<float>(), s));
+        if (epi == 3) PP_CK(pkc::fix_to_f32(nullptr, Yl.as<unsigned long long>(), static_cast<size_t>(T) * H, 1.f / sc64, Yc.as<float>(), s));
+      };
+      const double t_c0 = time_ms(s, [&] {
+        gemm(1, sb, 0, args2(sb, 0, 1.f));
+        PP_CK(pkc::combine_rows(O.as<float>(), pr16.as<int>(), dwt.as<float>(), T, NU, H, Y0.as<float>(), s));
+      }, 60.0);
+      std::vector<JW> cj;
+      bool comb_ok = true;
+      double t_c[4] = {t_c0, 0, 0, 0};
+      for (int epi = 1; epi <= 3; ++epi) {
+        PP_CK(cudaMemsetAsync(ovf.as(), 0, 16, s));
+        fold(epi);
+        PP_CK(cudaStreamSynchronize(s));
+        std::vector<float> ya(static_cast<size_t>(T) * H), yb(static_cast<size_t>(T) * H);
+        PP_CK(cudaMemcpy(ya.data(), (epi == 1 ? Yf : Yc).as(), ya.size() * 4, cudaMemcpyDeviceToHost));
+        unsigned nov = 0;
+        PP_CK(cudaMemcpy(&nov, ovf.as(), 4, cudaMemcpyDeviceToHost));
+        fold(epi);
+        PP_CK(cudaStreamSynchronize(s));
+        PP_CK(cudaMemcpy(yb.data(), (epi == 1 ? Yf : Yc).as(), yb.size() * 4, cudaMemcpyDeviceToHost));
+        const bool repeat_same = std::memcmp(ya.data(), yb.data(), ya.size() * 4) == 0;
+        double num = 0.0, den = 0.0, mabs = 0.0, ymax = 0.0;
+        for (size_t i = 0; i < ya.size(); ++i) {
+          const double d = static_cast<double>(ya[i]) - y0[i];
+          num += d * d;
+          den += static_cast<double>(y0[i]) * y0[i];
+          mabs = std::max(mabs, std::fabs(d));
+          ymax = std::max(ymax, static_cast<double>(std::fabs(y0[i])));
+        }
+        const double rl2 = den > 0 ? std::sqrt(num / den) : 0.0;
+        t_c[epi] = time_ms(s, [&] { fold(epi); }, 60.0);
+        const bool ok = rl2 <= 1e-4 && (epi == 1 || (repeat_same && nov == 0));
+        comb_ok = comb_ok && ok;
+        const char* nm = epi == 1 ? "fold f32 red" : (epi == 2 ? "fold int32 fixed" : "fold int64 fixed");
+        JW j;
+        j.kv("combine", nm).kv("ms_down_plus_combine", t_c[epi]).kv("rel_l2_vs_separate_combine", rl2).kv("max_abs_diff", mabs).kv("max_abs_output", ymax);
+        j.kv("repeat_bit_equal", repeat_same).kv("overflow_count", static_cast<long long>(nov)).kv("scale_log2", epi == 2 ? k32 : (epi == 3 ? k64 : 0)).kv("ok", ok);
+        cj.push_back(j);
+        std::printf("    %-17s down+combine %.4f ms (separate %.4f: %.2fx) | vs separate: rel L2 %.2e, max |diff| %.2e (max |y| %.2e) | repeat bit-equal %s%s%s\n", nm,
+                    t_c[epi], t_c0, t_c0 / t_c[epi], rl2, mabs, ymax, repeat_same ? "yes" : "no",
+                    epi == 2 ? (std::string(" | scale 2^") + std::to_string(k32) + ", overflows " + std::to_string(nov)).c_str() : "", ok ? "" : "  FAIL");
+        std::fflush(stdout);
+      }
+      const bool ok = s1same && vec_ok && comb_ok;
+      all_ok = all_ok && ok;
+      const double macs1 = static_cast<double>(T) * NU * 2 * F * H, macs2 = static_cast<double>(T) * NU * H * F;
+      const char* sn[3] = {"S0 pad-64", "S1 64 + 16 tails", "S2 S1 + vector 1-8"};
+      std::vector<JW> sj;
+      for (int sc = 0; sc < 3; ++sc) {
+        JW j;
+        j.kv("schedule", sn[sc]).kv("ms_gate_up", t_g1[sc]).kv("ms_down", t_g2[sc]).kv("ms_whole_slice", t_sl[sc]).kv("eps8_gate_up", tops(macs1, t_g1[sc]) / peak8);
+        j.kv("eps8_down", tops(macs2, t_g2[sc]) / peak8);
+        sj.push_back(j);
+        std::printf("    %-20s gate|up %.4f ms (%.3f of peak) | down %.4f ms | whole slice %.4f ms (%.2fx of S0)\n", sn[sc], t_g1[sc], tops(macs1, t_g1[sc]) / peak8, t_g2[sc],
+                    t_sl[sc], t_sl[0] / t_sl[sc]);
+      }
+      std::printf("    checks: S1 = S0 bit for bit %s; vector rows vs S0 max rel %.2e%s\n", s1same ? "yes" : "NO", vec_err, ok ? "" : "  FAIL");
+      std::fflush(stdout);
+      row.arr_obj("schedules", sj).arr_obj("combine", cj).kv("s1_bit_equal_s0", s1same).kv("vector_max_rel_vs_s0", vec_err).kv("ok", ok);
+      rows.push_back(row);
+    }
+  const std::vector<Sample> all = sampler.stop();
+  r.inputs.kv("routes", rpath).kv("first_chunk", chunk).kv("tokens_per_chunk", static_cast<int>(R.scored)).kv("int8_peak_tops", peak8);
+  r.inputs.kv("format", "per-32 (gpu256x8)").kv("weights_activations", "synthetic; routing real");
+  r.values.arr_obj("kernel_info", infos).arr_obj("layers", rows).kv("all_ok", all_ok).kv_obj("state_before", before).kv_obj("state_after", state_now(c));
+  r.values.kv_obj("nvml_whole_run", summarize(all));
+  r.pass = all_ok ? -1 : 0;
+  r.headline = std::string(all_ok ? "all checks passed" : "a check FAILED") + "; schedules and combine variants per layer in the JSON";
+  r.notes = std::string(g_abort.load() ? "ABORTED: " + abort_reason() : "");
+  write_result(c, r, "moe_slice_v2");
+  std::printf("  MOE-SLICE-V2 %s\n", r.headline.c_str());
+  return all_ok ? 0 : 3;
+}
+
 }  // namespace pp
