@@ -154,6 +154,45 @@ TEST(rung1_prompt_gemm_against_fp64) {
     }
     g::prompt_release(&pw);
   }
+  // N = K = 2048 (the TG2 probe's open dense case, 2026-10-30 22:33: 0.507 there): 2048 rows (130 under
+  // PELIAS_GPU_QUICK); fp64 on the first 16 and last 16 rows, every column
+  {
+    const bool quick = std::getenv("PELIAS_GPU_QUICK") != nullptr;
+    const std::int64_t n = 2048, k = 2048, rows = quick ? 130 : 2048;
+    const Q4K w(n, k, 4300u);
+    Dev<std::uint8_t> dw(w.bytes);
+    g::PromptWeights pw;
+    CHECK(g::prompt_prepare(static_cast<std::uint32_t>(q::Type::q4_k), dw.p, n, k, &pw));
+    const Act a(rows, k, 4400u);
+    Dev<float> y(static_cast<std::size_t>(rows * n));
+    CHECK(g::prompt_gemm(pw, n, a.qv.p, a.sc.p, a.dig.p, rows, y.p));
+    CHECK(g::sync());
+    const std::vector<float> hy = y.get();
+    double num = 0.0, den = 0.0, worst = 0.0;
+    std::int64_t worst_r = -1, worst_c = -1;
+    bool finite = true;
+    for (std::int64_t r = 0; r < rows; ++r) {
+      if (r >= 16 && r < rows - 16) continue;
+      for (std::int64_t c = 0; c < n; ++c) {
+        const double ref = dot_row(w.deq, c, k, a.eff.data() + r * k), v = hy[static_cast<std::size_t>(r * n + c)];
+        finite = finite && std::isfinite(v);
+        num += (v - ref) * (v - ref);
+        den += ref * ref;
+        if (std::fabs(v - ref) > worst) {
+          worst = std::fabs(v - ref);
+          worst_r = r;
+          worst_c = c;
+        }
+      }
+    }
+    const double e = den > 0 ? std::sqrt(num / den) : std::sqrt(num);
+    CHECK(finite);
+    CHECK(e <= kTol);
+    std::printf("    dense %4lld x %4lld, %4lld rows (32 checked): relative L2 vs fp64 %.3e (tolerance 1e-6); largest |diff| %.3e at row %lld col %lld\n",
+                static_cast<long long>(n), static_cast<long long>(k), static_cast<long long>(rows), e, worst, static_cast<long long>(worst_r),
+                static_cast<long long>(worst_c));
+    g::prompt_release(&pw);
+  }
   // refusals: not Q4_K, k not a multiple of 256, rows not a multiple of 128
   g::PromptWeights bad;
   Dev<std::uint8_t> junk(4096);

@@ -2907,16 +2907,33 @@ double rel_l2(const DevBuf& C, int N, const std::vector<Unit>& units, Ref ref, c
     for (int i = std::max(0, u1.rows - 16); i < u1.rows; ++i) pick.push_back({u1.row + i, u1.e});
   std::vector<float> y(static_cast<size_t>(N));
   double num = 0, den = 0;
+  std::vector<double> tn(static_cast<size_t>(N / 128 + 1), 0.0), td(tn.size(), 0.0), rn, rd;
   for (const auto& [row, e] : pick) {
     PP_CK(cudaMemcpyAsync(y.data(), C.as<float>() + static_cast<size_t>(row) * N, static_cast<size_t>(N) * 4, cudaMemcpyDeviceToHost, s));
     PP_CK(cudaStreamSynchronize(s));
+    double a = 0, b = 0;
     for (int n = 0; n < N; ++n) {
       const double r = ref(row, static_cast<size_t>(e) * N + n);
       num += (y[n] - r) * (y[n] - r);
       den += r * r;
+      tn[static_cast<size_t>(n / 128)] += (y[n] - r) * (y[n] - r);
+      td[static_cast<size_t>(n / 128)] += r * r;
+      a += (y[n] - r) * (y[n] - r);
+      b += r * r;
     }
+    rn.push_back(a);
+    rd.push_back(b);
   }
-  return den > 0 ? std::sqrt(num / den) : 0.0;
+  const double e = den > 0 ? std::sqrt(num / den) : 0.0;
+  if (!(e <= 1e-6)) {  // where the error sits: per column tile of 128 and per checked row
+    std::printf("      diag: per column tile:");
+    for (size_t t = 0; t < tn.size(); ++t)
+      if (td[t] > 0) std::printf(" %zu:%.1e", t, std::sqrt(tn[t] / td[t]));
+    std::printf("\n      diag: per checked row:");
+    for (size_t i = 0; i < pick.size(); ++i) std::printf(" %d:%.1e", pick[i].first, rd[i] > 0 ? std::sqrt(rn[i] / rd[i]) : 0.0);
+    std::printf("\n");
+  }
+  return e;
 }
 }  // namespace tg2p
 
