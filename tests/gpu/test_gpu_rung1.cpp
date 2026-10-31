@@ -8,6 +8,7 @@
 // attention <= 5e-4; DeltaNet <= 1e-4 per layer window). Run on the PC under compute-sanitizer (memcheck, racecheck,
 // initcheck, synccheck: the script runs each). Every measured error is printed, pass or fail.
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -269,6 +270,61 @@ TEST(rung1_act_q8x32_equals_the_reference_rounding) {
     std::printf("    %s: rounded values bit for bit equal to model::act_round_q8_256x8; int8, scales and sums consistent\n",
                 rot ? "rotated" : "plain");
   }
+}
+
+// the fused norm + rounding (rms_norm_q8x32) equals rms_norm then act_q8x32 bit for bit: normalized floats, rounded
+// floats, int8 values, scales, sums; with and without the weight, plain and rotated, rows of 512 / 2048 / 4096 (a row
+// longer than 256 blocks of 32 is not needed by the model; 4096 = 128 blocks). Both paths timed (information only).
+TEST(rung1_rms_norm_q8x32_fused_equals_two_kernels) {
+  if (!gpu_or_skip()) return;
+  for (const std::int64_t n : {512, 2048, 4096}) {
+    const std::int64_t rows = 7;
+    std::vector<float> x = wave(n * rows, 51u + static_cast<std::uint32_t>(n), 3.0f), w = wave(n, 52u, 1.0f);
+    for (float& v : w) v += 1.0f;
+    for (std::int64_t i = 0; i < n; ++i) x[static_cast<std::size_t>(3 * n + i)] = 0.0f;  // an all-zero row
+    x[static_cast<std::size_t>(n + 5)] = 2.0e20f;                                      // an outlier row
+    for (const bool rot : {false, true})
+      for (const bool hasw : {false, true}) {
+        const std::size_t nn = static_cast<std::size_t>(n * rows), nb = static_cast<std::size_t>(rows * n / 32);
+        Dev<float> dx(x), dw(w), y1(nn), r1(nn), s1(nb), y2(nn), r2(nn), s2(nb);
+        Dev<std::int8_t> q1(nn), q2(nn);
+        Dev<int> m1(nb), m2(nb);
+        const float* wp = hasw ? dw.p : nullptr;
+        CHECK(g::rms_norm(dx.p, wp, y1.p, n, 1, n, n, rows, 1e-6f));
+        CHECK(g::act_q8x32(y1.p, n, rows, n, rot, r1.p, n, q1.p, s1.p, m1.p));
+        CHECK(g::rms_norm_q8x32(dx.p, wp, n, n, rows, 1e-6f, rot, y2.p, n, r2.p, n, q2.p, s2.p, m2.p));
+        CHECK(g::sync());
+        const bool same = bits_equal(y1.get(), y2.get()) && bits_equal(r1.get(), r2.get()) && q1.get() == q2.get() && bits_equal(s1.get(), s2.get()) &&
+                          m1.get() == m2.get();
+        CHECK(same);
+        CHECK(all_finite(r2.get()));
+        if (!same || !hasw) continue;
+        // timing (warm, information only): the two kernels against the fused one, int8 outputs only (xr / y not written),
+        // at 1 row (decode) and 2,048 rows (a prompt)
+        const auto time_us = [&](int reps, const auto& fn) {
+          fn();
+          CHECK(g::sync());
+          const auto c0 = std::chrono::steady_clock::now();
+          for (int i = 0; i < reps; ++i) fn();
+          CHECK(g::sync());
+          return std::chrono::duration<double>(std::chrono::steady_clock::now() - c0).count() * 1e6 / reps;
+        };
+        const std::int64_t big = 2048;
+        Dev<float> bx(wave(n * big, 53u, 3.0f)), by(static_cast<std::size_t>(n * big)), bs(static_cast<std::size_t>(big * n / 32));
+        Dev<std::int8_t> bq(static_cast<std::size_t>(n * big));
+        Dev<int> bm(static_cast<std::size_t>(big * n / 32));
+        for (const std::int64_t tr : {std::int64_t{1}, big}) {
+          const double t2 = time_us(200, [&] {
+            CHECK(g::rms_norm(bx.p, wp, by.p, n, 1, n, n, tr, 1e-6f));
+            CHECK(g::act_q8x32(by.p, n, tr, n, rot, by.p, n, bq.p, bs.p, bm.p));
+          });
+          const double t1 = time_us(200, [&] { CHECK(g::rms_norm_q8x32(bx.p, wp, n, n, tr, 1e-6f, rot, nullptr, n, nullptr, n, bq.p, bs.p, bm.p)); });
+          std::printf("    n %4lld, %s, %4lld row(s): two kernels %8.2f us, fused %8.2f us (%.2fx)\n", static_cast<long long>(n), rot ? "rotated" : "plain  ",
+                      static_cast<long long>(tr), t2, t1, t1 > 0.0 ? t2 / t1 : 0.0);
+        }
+      }
+  }
+  std::printf("    fused = rms_norm then act_q8x32, bit for bit: normalized, rounded, int8, scales, sums (n 512 / 2048 / 4096, with and without w, plain and rotated)\n");
 }
 
 TEST(rung1_norms_and_elementwise) {

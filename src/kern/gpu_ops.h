@@ -52,6 +52,14 @@ bool gather_rows(std::uint32_t type, const void* w, std::uint64_t row_bytes, std
 bool act_q8x32(const float* x, std::int64_t n, std::int64_t rows, std::int64_t ldx, bool rot32, float* xr, std::int64_t ldr,
                std::int8_t* q, float* scale, int* sum, Stream s = nullptr);
 
+// rms_norm (whole rows: one segment of n, weight w or none) and act_q8x32 in one kernel: the norm's output stays in
+// registers and goes straight into the 8-bit rounding, so the normalized row is never written to memory and read back
+// (2026-10-30, author 20:30 "fuse the norms"). The same expressions in the same order as rms_norm followed by act_q8x32:
+// every output bit for bit equal to the two-kernel path. y (optional, may be null) receives the normalized floats before
+// rounding; xr / q / scale / sum as act_q8x32 (xr may be null when only the int8 form is needed; q, scale, sum may be null).
+bool rms_norm_q8x32(const float* x, const float* w, std::int64_t n, std::int64_t ldx, std::int64_t rows, float eps, bool rot32, float* y,
+                    std::int64_t ldy, float* xr, std::int64_t ldr, std::int8_t* q, float* scale, int* sum, Stream s = nullptr);
+
 // ---- elementwise
 // rms norm of segments: segment g of row t is the n floats at x + t * ld + g * seg_stride (n_seg per row); y likewise
 // (y may equal x); w (n floats) is applied to every segment, or none when w is null

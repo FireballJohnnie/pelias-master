@@ -32,6 +32,10 @@ bool gather_rows(std::uint32_t, const void*, std::uint64_t, std::int64_t, const 
 bool act_q8x32(const float*, std::int64_t, std::int64_t, std::int64_t, bool, float*, std::int64_t, std::int8_t*, float*, int*, Stream) {
   return false;
 }
+bool rms_norm_q8x32(const float*, const float*, std::int64_t, std::int64_t, std::int64_t, float, bool, float*, std::int64_t, float*, std::int64_t,
+                    std::int8_t*, float*, int*, Stream) {
+  return false;
+}
 bool rms_norm(const float*, const float*, float*, std::int64_t, std::int64_t, std::int64_t, std::int64_t, std::int64_t, float, Stream) {
   return false;
 }

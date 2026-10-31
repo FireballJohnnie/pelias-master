@@ -234,6 +234,59 @@ __global__ void __launch_bounds__(256) k_rms_norm(const float* x, const float* _
   }
 }
 
+// rms_norm + act_q8x32 fused: one block (256 threads) per row. The sum of squares exactly as k_rms_norm (same partial
+// order, same block_sum_d); then each thread takes whole 32-value blocks (b = threadIdx.x, + blockDim.x), forms the
+// normalized values in registers with k_rms_norm's expression and rounds them with k_act_q8x32's loops.
+__global__ void __launch_bounds__(256) k_rms_norm_q8x32(const float* __restrict__ x, const float* __restrict__ w, std::int64_t n, std::int64_t ldx,
+                                                        float eps, int rot, float norm, float* __restrict__ y, std::int64_t ldy, float* __restrict__ xr,
+                                                        std::int64_t ldr, std::int8_t* __restrict__ q, float* __restrict__ scale,
+                                                        int* __restrict__ sum) {
+  __shared__ double sh[33];
+  const std::int64_t t = blockIdx.x;
+  const float* xs = x + t * ldx;
+  double part = 0.0;
+  for (std::int64_t i = threadIdx.x; i < n; i += blockDim.x) part += static_cast<double>(mul(xs[i], xs[i]));
+  const double ssum = block_sum_d(part, sh);
+  const float mean = static_cast<float>(ssum / static_cast<double>(n));
+  const float rs = quo(1.0f, sqrtf(add(mean, eps)));
+  const std::int64_t nb = n / 32;
+  for (std::int64_t b = threadIdx.x; b < nb; b += blockDim.x) {
+    float v[32];
+#pragma unroll
+    for (int i = 0; i < 32; ++i) {
+      const std::int64_t c = 32 * b + i;
+      v[i] = w ? mul(mul(xs[c], rs), w[c]) : mul(xs[c], rs);
+    }
+    if (y) {
+#pragma unroll
+      for (int i = 0; i < 32; ++i) y[t * ldy + 32 * b + i] = v[i];
+    }
+    if (rot) {
+      for (int h = 1; h < 32; h *= 2)
+        for (int i = 0; i < 32; i += 2 * h)
+          for (int j = i; j < i + h; ++j) {
+            const float a = v[j], d = v[j + h];
+            v[j] = add(a, d);
+            v[j + h] = sub(a, d);
+          }
+      for (int j = 0; j < 32; ++j) v[j] = mul(v[j], norm);
+    }
+    float a = 0.0f;
+    for (int j = 0; j < 32; ++j) a = fmaxf(a, fabsf(v[j]));
+    const float sc = a > 0.0f ? quo(a, 127.0f) : 1.0f;
+    const float inv = quo(1.0f, sc);
+    int si = 0;
+    for (int j = 0; j < 32; ++j) {
+      const float qv = fminf(127.0f, fmaxf(-127.0f, rintf(mul(v[j], inv))));
+      if (xr) xr[t * ldr + 32 * b + j] = mul(sc, qv);
+      if (q) q[t * n + 32 * b + j] = static_cast<std::int8_t>(qv);
+      si += static_cast<int>(qv);
+    }
+    if (scale) scale[t * nb + b] = sc;
+    if (sum) sum[t * nb + b] = si;
+  }
+}
+
 // one thread per rotated pair; the angle grows by one multiply per pair, as model::rope_cache does
 __global__ void k_rope(float* v, std::int64_t n_heads, std::int64_t hs, std::int64_t ld, std::int64_t rows, std::int64_t pos0, int n_rot,
                        float theta_scale, int s0, int s1, int s2, int s3, int neox, const float* __restrict__ ff) {
@@ -854,6 +907,16 @@ bool act_q8x32(const float* x, std::int64_t n, std::int64_t rows, std::int64_t l
   const float norm = 1.0f / std::sqrt(32.0f);  // as quant::hadamard32 computes it
   k_act_q8x32<<<blocks_for(rows * (n / 32), 128), 128, 0, st(s)>>>(x, n, rows, ldx, rot32 ? 1 : 0, norm, xr, ldr, q, scale, sum);
   return launched("act_q8x32");
+}
+
+bool rms_norm_q8x32(const float* x, const float* w, std::int64_t n, std::int64_t ldx, std::int64_t rows, float eps, bool rot32, float* y,
+                    std::int64_t ldy, float* xr, std::int64_t ldr, std::int8_t* q, float* scale, int* sum, Stream s) {
+  if (n <= 0 || n % 32 != 0 || ldx < n || !x) return fail("rms_norm_q8x32: the row length must be whole 32-blocks");
+  if ((y && ldy < n) || (xr && ldr < n)) return fail("rms_norm_q8x32: an output stride is shorter than the row");
+  if (rows <= 0) return true;
+  const float norm = 1.0f / std::sqrt(32.0f);  // as act_q8x32
+  k_rms_norm_q8x32<<<static_cast<unsigned>(rows), 256, 0, st(s)>>>(x, w, n, ldx, eps, rot32 ? 1 : 0, norm, y, ldy, xr, ldr, q, scale, sum);
+  return launched("rms_norm_q8x32");
 }
 
 bool rms_norm(const float* x, const float* w, float* y, std::int64_t n, std::int64_t n_seg, std::int64_t seg_stride, std::int64_t ld,
