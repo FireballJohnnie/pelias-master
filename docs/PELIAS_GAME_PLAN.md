@@ -31,6 +31,8 @@ Copyright (c) 2026 John Lipka and the Pelias contributors
 
 **PDF update:** how the speedup works rev4 -> rev5; Section 21 calibrated gains rev4 -> rev5; 7-bit and 1-bit decoder plain language rev3 -> rev4; pathways whole project v6b -> v7. Skip pathways v5 (the older one, overlapping v6b). Sources and generators in the backup folder (2026-10-28). Content: the 10-30 evening work (fused norm, per-32 prompt format, the GPU work list, the locked MoE slice, gpu_prompt in src, the fp32 min term, the Q4_TG2 probe results). Slot: after the Q4_TG2 probe code ships, before the GP3-12 rungs.
 
+**DONE 2026-10-31 03:4x (author 03:37 "Update the PDFs"):** speedup rev5, Section 21 calibrated gains rev5, 7-bit / 1-bit decoder rev4, pathways v7 (pathways v5 skipped as asked); copies in docs/pdf/ and the backup folder. Content added: the GPU forward pass and the rounding floor, the new real-model gate, the activation-rounding cost and its 7x persistence, the tie rule and the block-energy plan, the one-copy weight layout, GP3-14 coded, the CPU heat and the code review.
+
 ## Integration status (2026-10-30 22:4x, MEASURED; BUILD_LOG 22:13-22:33)
 
 - v10b (ef9fb0b): the Q4_K prompt min term in fp32 FMAs: 1.4-2.4e-07 vs fp64, four sanitizers clean; TG2 probe: 1.00-1.02x the bf16 mma's time. Proposed LOCK (author's 22:09 condition met).
