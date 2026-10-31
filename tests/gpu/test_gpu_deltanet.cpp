@@ -396,3 +396,55 @@ TEST(rung1_deltanet_chunked_refuses_bad_shapes) {
   CHECK(g::deltanet_chunked(&dummy, 96, &dummy, &dummy, &dummy, 0, 1, 1, 32, &dummy));      // zero tokens: nothing to do
   std::printf("    bad shapes refused; zero tokens accepted as no work\n");
 }
+
+// GP3-14 (MTP rollback, author 2026-10-31 03:1x): deltanet_recurrent_reg_ckpt gives core and the final state bit for bit
+// equal to deltanet_recurrent_reg, and its checkpoint t equals the state after the batch's first t + 1 tokens run by
+// deltanet_recurrent_reg alone (bit for bit: the same expressions in the same order).
+TEST(rung1_deltanet_checkpoints_equal_a_shorter_batch) {
+  if (!g::available()) {
+    CHECK(g::available());
+    return;
+  }
+  const std::int64_t n = 5, ss = kNv * kDs * kDs;
+  const Window W(n + 7, 33u);
+  Dev<float> dm(W.mixed), dcw(W.cw), db(W.beta), da(W.alpha), ddt(W.dt), dA(W.a);
+  Dev<float> conv(static_cast<std::size_t>(W.n * kCh));
+  CHECK(g::deltanet_gates(db.p, da.p, ddt.p, dA.p, W.n, kNv));
+  CHECK(g::deltanet_conv(dm.p, nullptr, dcw.p, W.n, kCh, kTaps, conv.p, nullptr));
+  CHECK(g::l2_norm(conv.p, kDs, 2 * kNk, kDs, kCh, W.n, kEps));
+  // a non-zero start state: the first 7 tokens through the plain kernel
+  Dev<float> s0(static_cast<std::size_t>(ss)), core0(static_cast<std::size_t>(7 * kDin));
+  CHECK(g::dzero(s0.p, s0.n * sizeof(float)));
+  CHECK(g::deltanet_recurrent_reg(conv.p, kCh, db.p, da.p, s0.p, 7, kNk, kNv, kDs, core0.p));
+  const std::vector<float> start = s0.get();
+  const float* c7 = conv.p + 7 * kCh;
+  const float* b7 = db.p + 7 * kNv;
+  const float* a7 = da.p + 7 * kNv;
+  // the batch of n with checkpoints
+  Dev<float> sc(start), corec(static_cast<std::size_t>(n * kDin)), ck(static_cast<std::size_t>((n - 1) * ss));
+  CHECK(g::deltanet_recurrent_reg_ckpt(c7, kCh, b7, a7, sc.p, n, kNk, kNv, kDs, corec.p, ck.p));
+  // the plain kernel on the same batch, and on each prefix
+  Dev<float> sp(start), corep(static_cast<std::size_t>(n * kDin));
+  CHECK(g::deltanet_recurrent_reg(c7, kCh, b7, a7, sp.p, n, kNk, kNv, kDs, corep.p));
+  CHECK(g::sync());
+  const std::vector<float> fc = sc.get(), fp = sp.get(), cc = corec.get(), cp = corep.get(), cks = ck.get();
+  CHECK(std::memcmp(fc.data(), fp.data(), fc.size() * sizeof(float)) == 0);
+  CHECK(std::memcmp(cc.data(), cp.data(), cc.size() * sizeof(float)) == 0);
+  int prefixes_equal = 0;
+  for (std::int64_t k = 1; k < n; ++k) {
+    Dev<float> sk(start), corek(static_cast<std::size_t>(k * kDin));
+    CHECK(g::deltanet_recurrent_reg(c7, kCh, b7, a7, sk.p, k, kNk, kNv, kDs, corek.p));
+    CHECK(g::sync());
+    const std::vector<float> fk = sk.get();
+    const bool eq = std::memcmp(fk.data(), cks.data() + (k - 1) * ss, static_cast<std::size_t>(ss) * sizeof(float)) == 0;
+    CHECK(eq);
+    prefixes_equal += eq ? 1 : 0;
+  }
+  // n == 1 needs no checkpoint buffer
+  Dev<float> s1(start), core1(static_cast<std::size_t>(kDin));
+  CHECK(g::deltanet_recurrent_reg_ckpt(c7, kCh, b7, a7, s1.p, 1, kNk, kNv, kDs, core1.p, nullptr));
+  CHECK(!g::deltanet_recurrent_reg_ckpt(c7, kCh, b7, a7, s1.p, 2, kNk, kNv, kDs, core1.p, nullptr));  // n > 1 needs one
+  CHECK(g::sync());
+  std::printf("    checkpoint kernel: core and final state bit for bit equal to the plain kernel; %d / %lld prefix states bit for bit\n", prefixes_equal,
+              static_cast<long long>(n - 1));
+}

@@ -2082,7 +2082,7 @@ int cmd_engine_check(const Args& a) {
   if (path.empty()) {
     std::fprintf(stderr,
                  "usage: pelias engine-check --model FILE [--routes ROUTES.bin] [--prefill 64] [--decode 32] [--ctx 4096] [--batch 64] [--threads N]\n"
-                 "                           [--budget-gb G] [--hot-max N] [--fast-cpu] [--no-cpu] [--float-ref]\n");
+                 "                           [--budget-gb G] [--hot-max N] [--mtp-draft K] [--fast-cpu] [--no-cpu] [--float-ref]\n");
     return 1;
   }
   auto num = [&](const char* k, std::uint64_t d, std::uint64_t lo, std::uint64_t hi, std::uint64_t& out) {
@@ -2096,9 +2096,9 @@ int cmd_engine_check(const Args& a) {
     out = r.value;
     return true;
   };
-  std::uint64_t npre = 0, ndec = 0, ctx = 0, batch = 0, thr = 0, hmax = 0;
+  std::uint64_t npre = 0, ndec = 0, ctx = 0, batch = 0, thr = 0, hmax = 0, ndraft = 0;
   if (!num("prefill", 64, 1, 1 << 20, npre) || !num("decode", 32, 0, 1 << 20, ndec) || !num("ctx", 4096, 2, 1 << 20, ctx) || !num("batch", 64, 1, 4096, batch) ||
-      !num("threads", 0, 0, 4096, thr) || !num("hot-max", 256, 0, 4096, hmax))
+      !num("threads", 0, 0, 4096, thr) || !num("hot-max", 256, 0, 4096, hmax) || !num("mtp-draft", 0, 0, 16, ndraft))
     return 1;
   if (npre + ndec > ctx) {
     std::fprintf(stderr, "pelias: --prefill + --decode must fit --ctx\n");
@@ -2121,6 +2121,8 @@ int cmd_engine_check(const Args& a) {
   eo.cpu_threads = static_cast<int>(thr);
   eo.vram_budget = budget;
   eo.max_hot_per_layer = static_cast<int>(hmax);
+  eo.mtp = ndraft > 0;
+  eo.max_verify = static_cast<int>(ndraft) + 1;
   if (a.has("routes")) {
     auto ho = model::hot_order_from_routes(a.get("routes"), s.n_layer, s.n_expert);
     if (!ho.ok()) return fail_input(ho.status);
@@ -2172,6 +2174,43 @@ int cmd_engine_check(const Args& a) {
     std::printf("  decode %llu tokens: %.3f s = %.1f tokens/s (median step %.2f ms = %.1f tokens/s, slowest %.2f ms); picks on the GPU %.1f %%; CPU cold work %.2f ms, host waits %.2f ms per token\n",
                 static_cast<unsigned long long>(ndec), tot_dec.seconds, static_cast<double>(ndec) / tot_dec.seconds, med * 1e3, 1.0 / med, sorted.back() * 1e3,
                 share(tot_dec), tot_dec.cold_seconds * 1e3 / static_cast<double>(ndec), tot_dec.wait_seconds * 1e3 / static_cast<double>(ndec));
+  }
+  // --mtp-draft K: greedy decoding of --decode tokens from the made-up prompt, plain and with MTP drafting (K per step):
+  // the same tokens expected (the reference's generate_greedy_mtp contract), the kept share, and the speed of each
+  if (ndraft > 0 && ndec > 0) {
+    const std::vector<std::int32_t> prompt(ids.begin(), ids.begin() + static_cast<std::ptrdiff_t>(npre));
+    std::vector<std::int32_t> plain, drafted;
+    std::vector<float> row(nv);
+    if (Status st = eng.value->reset(); !st) return fail_input(st);
+    Timer tpl;
+    for (std::uint64_t t0 = 0; t0 < npre; t0 += batch) {
+      const int k = static_cast<int>(std::min<std::uint64_t>(batch, npre - t0));
+      if (Status st = eng.value->step(prompt.data() + t0, k, row.data(), true); !st) return fail_input(st);
+    }
+    const double pre_s = tpl.seconds();
+    Timer tdp;
+    for (std::uint64_t i = 0; i < ndec; ++i) {
+      std::int32_t best = 0;
+      for (std::size_t j = 1; j < nv; ++j)
+        if (row[j] > row[static_cast<std::size_t>(best)]) best = static_cast<std::int32_t>(j);
+      plain.push_back(best);
+      if (i + 1 == ndec) break;
+      if (Status st = eng.value->step(&best, 1, row.data(), true); !st) return fail_input(st);
+    }
+    const double plain_s = tdp.seconds();
+    model::MtpStats ms;
+    model::EngineStats emt;
+    Timer tmt;
+    if (Status st = model::engine_generate_greedy_mtp(*eng.value, s, prompt, static_cast<int>(ndec), static_cast<int>(ndraft), {}, drafted, &ms, &emt); !st)
+      return fail_input(st);
+    const double mtp_s = tmt.seconds() - pre_s;  // its prefill (trunk) is the same as the plain run's; the MTP catch-up stays in
+    std::size_t same = 0;
+    while (same < plain.size() && same < drafted.size() && plain[same] == drafted[same]) ++same;
+    std::printf("  greedy %llu tokens: plain %.3f s (%.1f tokens/s); MTP drafting %llu per step %.3f s (%.1f tokens/s, %.2fx), %lld steps, %lld drafted, %lld kept (%.1f %%); first %zu of %zu tokens equal to plain\n",
+                static_cast<unsigned long long>(ndec), plain_s, static_cast<double>(ndec) / plain_s, static_cast<unsigned long long>(ndraft), mtp_s,
+                static_cast<double>(ndec) / mtp_s, plain_s / mtp_s, static_cast<long long>(ms.steps), static_cast<long long>(ms.drafted),
+                static_cast<long long>(ms.accepted), ms.drafted > 0 ? 100.0 * static_cast<double>(ms.accepted) / static_cast<double>(ms.drafted) : 0.0, same,
+                plain.size());
   }
   if (a.has("no-cpu")) return 0;
   model::ForwardOptions o = model::GpuForward::matching_reference_options();
@@ -2447,8 +2486,8 @@ int cmd_generate(const Args& a) {
   // --engine (GP3-14): the GPU engine with the hot-expert bank and CPU cold experts, opened once for every prompt
   std::unique_ptr<model::GpuEngine> engine;
   if (a.has("engine")) {
-    if (a.has("mtp-draft") || a.has("planes") || a.has("planes-mode") || a.has("act-int8")) {
-      std::fprintf(stderr, "pelias: --engine runs the engine's own rounding (per-32 int8); --mtp-draft, planes and --act-int8 are reference options\n");
+    if (a.has("planes") || a.has("planes-mode") || a.has("act-int8")) {
+      std::fprintf(stderr, "pelias: --engine runs the engine's own rounding (per-32 int8); planes and --act-int8 are reference options\n");
       return 1;
     }
     model::EngineOptions eo2;
@@ -2456,6 +2495,15 @@ int cmd_generate(const Args& a) {
     eo2.max_batch = 64;
     eo2.cpu_threads = threads;
     if (!gib_option(a, "budget-gb", eo2.vram_budget)) return 1;
+    if (a.has("mtp-draft")) {
+      const Result<std::uint64_t> r = io::parse_whole(a.get("mtp-draft"), 16);
+      if (!r.ok()) {
+        std::fprintf(stderr, "pelias: --mtp-draft takes 0 to 16 drafted tokens per step\n");
+        return 1;
+      }
+      eo2.mtp = r.value > 0;
+      eo2.max_verify = static_cast<int>(r.value) + 1;
+    }
     if (a.has("routes")) {
       auto ho = model::hot_order_from_routes(a.get("routes"), spec.value.n_layer, spec.value.n_expert);
       if (!ho.ok()) return fail_input(ho.status);
@@ -2538,8 +2586,22 @@ int cmd_generate(const Args& a) {
     model::MtpStats ms;
     std::vector<std::int32_t> out;
     Timer tg;
-    s = model::generate_greedy_mtp(spec.value, w.value, ids, n_predict, static_cast<int>(r.value), stop, out, &ms, fo);
+    model::EngineStats emt;
+    if (engine) {
+      if (static_cast<int>(ids.size()) + n_predict + static_cast<int>(r.value) > n_ctx) {
+        std::fprintf(stderr, "pelias: the prompt and --n-predict do not fit --ctx (%d)\n", n_ctx);
+        return 1;
+      }
+      s = model::engine_generate_greedy_mtp(*engine, spec.value, ids, n_predict, static_cast<int>(r.value), stop, out, &ms, &emt);
+    } else {
+      s = model::generate_greedy_mtp(spec.value, w.value, ids, n_predict, static_cast<int>(r.value), stop, out, &ms, fo);
+    }
     if (!s) return fail_input(s);
+    if (engine) {
+      const double all = static_cast<double>(emt.hot_picks + emt.cold_picks);
+      std::fprintf(stderr, "pelias generate: engine picks on the GPU %.1f %% (trunk and MTP block); CPU cold work %.2f s, host waits %.2f s\n",
+                   all > 0 ? 100.0 * static_cast<double>(emt.hot_picks) / all : 0.0, emt.cold_seconds, emt.wait_seconds);
+    }
     const double gen_s = tg.seconds();
     for (const std::int32_t id : out)
       if (std::find(stop.begin(), stop.end(), id) == stop.end() && (show_special || tk.value.type(id) != tok::TokenType::control)) {

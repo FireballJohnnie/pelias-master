@@ -659,6 +659,60 @@ __global__ void __launch_bounds__(1024) k_dn_rec_reg(const float* __restrict__ c
   for (int c = 0; c < 32; ++c) grow[c * tpr + l] = M[c];
 }
 
+// GP3-14 (author 2026-10-31 03:1x, MTP rollback): k_dn_rec_reg with the state after each token t < n - 1 also written to
+// ckpt + t * nv * ds * ds (same layout as the state). The arithmetic is k_dn_rec_reg's, unchanged, so core and the final
+// state are bit for bit the same; a verify batch can then keep any prefix of its tokens without running them again.
+__global__ void __launch_bounds__(1024) k_dn_rec_reg_ck(const float* __restrict__ conv, std::int64_t ch, const float* __restrict__ beta,
+                                                     const float* __restrict__ alpha, float* __restrict__ state, std::int64_t n, std::int64_t nk,
+                                                     std::int64_t nv, std::int64_t ds, int tpr, float qscale, float* __restrict__ core,
+                                                        float* __restrict__ ckpt) {
+  extern __shared__ float smem[];
+  float* qv = smem;
+  float* kv = smem + ds;
+  const std::int64_t hv = blockIdx.x, hk = hv % nk;
+  const int tid = static_cast<int>(threadIdx.x), nth = static_cast<int>(blockDim.x);
+  const int l = tid % tpr;
+  const std::int64_t j = static_cast<std::int64_t>(blockIdx.y) * 32 + tid / tpr;  // state row (value index)
+  float* grow = state + hv * ds * ds + j * ds;
+  float M[32];
+#pragma unroll
+  for (int c = 0; c < 32; ++c) M[c] = grow[c * tpr + l];
+  const std::int64_t d_inner = nv * ds;
+  for (std::int64_t t = 0; t < n; ++t) {
+    const float* row = conv + t * ch;
+    for (std::int64_t i = tid; i < ds; i += nth) {
+      qv[i] = row[hk * ds + i];
+      kv[i] = row[nk * ds + hk * ds + i];
+    }
+    __syncthreads();
+    const float decay = expf(alpha[t * nv + hv]), b = beta[t * nv + hv];
+    float sum = 0.0f;
+#pragma unroll
+    for (int c = 0; c < 32; ++c) {
+      M[c] *= decay;
+      sum += M[c] * kv[c * tpr + l];
+    }
+    for (int o = tpr / 2; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o, tpr);
+    const float delta = (row[2 * nk * ds + hv * ds + j] - sum) * b;
+    float out = 0.0f;
+#pragma unroll
+    for (int c = 0; c < 32; ++c) {
+      M[c] += kv[c * tpr + l] * delta;
+      out += M[c] * qv[c * tpr + l];
+    }
+    for (int o = tpr / 2; o > 0; o >>= 1) out += __shfl_xor_sync(0xffffffffu, out, o, tpr);
+    if (l == 0) core[t * d_inner + hv * ds + j] = out * qscale;
+    if (t + 1 < n) {
+      float* crow = ckpt + t * nv * ds * ds + hv * ds * ds + j * ds;
+#pragma unroll
+      for (int c = 0; c < 32; ++c) crow[c * tpr + l] = M[c];
+    }
+    __syncthreads();
+  }
+#pragma unroll
+  for (int c = 0; c < 32; ++c) grow[c * tpr + l] = M[c];
+}
+
 // variant: chunked, each head split over ds / 32 blocks of 32 state rows (C2); decays once per chunk
 constexpr int kDnRows = 32;
 template <int C>
@@ -821,6 +875,9 @@ bool to_host(void* dst, const void* src, std::size_t bytes, Stream s) {
 }
 bool dzero(void* p, std::size_t bytes, Stream s) { return ck(cudaMemsetAsync(p, 0, bytes, st(s)), "cudaMemset"); }
 bool sync(Stream s) { return ck(cudaStreamSynchronize(st(s)), "synchronize"); }
+bool dcopy(void* dst, const void* src, std::size_t bytes, Stream s) {
+  return ck(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, st(s)), "device copy");
+}
 bool mem_info(std::size_t* free_bytes, std::size_t* total_bytes) {
   std::size_t f = 0, t = 0;
   if (!ck(cudaMemGetInfo(&f, &t), "cudaMemGetInfo")) return false;
@@ -1088,6 +1145,21 @@ bool deltanet_recurrent_reg(const float* conv, std::int64_t ch, const float* bet
   k_dn_rec_reg<<<grid, static_cast<unsigned>(32 * tpr), static_cast<std::size_t>(2 * ds) * sizeof(float), st(s)>>>(conv, ch, beta, alpha, state, n, nk, nv, ds,
                                                                                                                    tpr, qscale, core);
   return launched("deltanet recurrent (registers)");
+}
+
+bool deltanet_recurrent_reg_ckpt(const float* conv, std::int64_t ch, const float* beta, const float* alpha, float* state, std::int64_t n,
+                                 std::int64_t nk, std::int64_t nv, std::int64_t ds, float* core, float* ckpt, Stream s) {
+  const bool pow2 = ds >= 32 && ds <= 1024 && (ds & (ds - 1)) == 0;
+  if (nk <= 0 || nv <= 0 || nv % nk != 0 || !pow2 || ch < (2 * nk + nv) * ds || !conv || !beta || !alpha || !state || !core || (n > 1 && !ckpt))
+    return fail("deltanet_recurrent_reg_ckpt: bad shape or pointer (d_state a power of two, 32 to 1024; ckpt for n > 1)");
+  if (n <= 0) return true;
+  if (nv > 2147483647) return fail("deltanet_recurrent_reg_ckpt: too many heads");
+  const int tpr = static_cast<int>(ds / 32);
+  const float qscale = 1.0f / std::sqrt(static_cast<float>(ds));
+  const dim3 grid(static_cast<unsigned>(nv), static_cast<unsigned>(ds / 32));
+  k_dn_rec_reg_ck<<<grid, static_cast<unsigned>(32 * tpr), static_cast<std::size_t>(2 * ds) * sizeof(float), st(s)>>>(conv, ch, beta, alpha, state, n, nk, nv,
+                                                                                                                      ds, tpr, qscale, core, ckpt);
+  return launched("deltanet recurrent (registers, checkpoints)");
 }
 
 template <int C>

@@ -19,6 +19,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -40,6 +41,11 @@ struct EngineOptions {
   std::vector<std::vector<int>> hot_order;
   int max_hot_per_layer = 256;
   int cpu_threads = 0;  // workers for the cold experts (0: hardware threads)
+  // GP3-14 stage 3 (MTP drafting): the largest verify batch (1 + drafts); 0 = no rollback buffers. Needs the DeltaNet
+  // d_state a power of two (the checkpointing recurrence). mtp: run the file's MTP block on the GPU too (its experts on the
+  // CPU path, its own attention cache).
+  int max_verify = 0;
+  bool mtp = false;
 };
 
 struct EngineStats {
@@ -60,8 +66,21 @@ class GpuEngine {
   [[nodiscard]] std::int64_t pos() const;
   // tokens[0..n) at positions pos() .. pos() + n - 1 (n <= max_batch, pos() + n <= max_ctx); logits of every new token
   // (n rows of n_vocab) or, with last_only, of the last one (one row)
-  Status step(const std::int32_t* tokens, int n, float* logits, bool last_only, EngineStats* st = nullptr);
+  // hidden_out (optional, n x n_embd): every new token's post-norm hidden (output_norm of the trunk's last state), the MTP
+  // block's seed, as ForwardOptions::hidden_out gives it
+  Status step(const std::int32_t* tokens, int n, float* logits, bool last_only, EngineStats* st = nullptr, float* hidden_out = nullptr);
+  // MTP verify: as step (every row's logits and hidden) with the DeltaNet state of every prefix kept, n <= max_verify;
+  // then keep(k) keeps the first k tokens of that batch (1 <= k <= n): position pos0 + k, the state and the conv tails as
+  // if only those k had run (bit for bit), the attention cache's later rows dropped.
+  Status verify(const std::int32_t* tokens, int n, float* logits, float* hidden_out, EngineStats* st = nullptr);
+  Status keep(int k);
+  // The MTP block (EngineOptions::mtp): tokens[0..n) at MTP positions mtp_pos() .., token t paired with the hidden row
+  // h_prev + t x n_embd (host); as model::mtp_forward. logits (n x n_vocab) and h_out (n x n_embd) may be null.
+  Status mtp_step(const std::int32_t* tokens, const float* h_prev, int n, float* logits, float* h_out, EngineStats* st = nullptr);
+  void mtp_truncate(std::int64_t pos);
+  [[nodiscard]] std::int64_t mtp_pos() const;
   [[nodiscard]] std::uint64_t device_bytes() const;
+  [[nodiscard]] int max_batch() const;
   [[nodiscard]] int bank_experts() const;      // experts held on the GPU (all layers)
   [[nodiscard]] std::uint64_t bank_bytes() const;
   [[nodiscard]] std::string summary() const;   // one line: device bytes, dense, bank, cache, threads
@@ -72,6 +91,14 @@ class GpuEngine {
   explicit GpuEngine(std::unique_ptr<Impl> p);
   std::unique_ptr<Impl> p_;
 };
+
+// GP3-14 stage 3: greedy decoding with MTP drafting on the engine (model::generate_greedy_mtp's algorithm: draft up to
+// n_draft tokens with the MTP block, verify them with the trunk as one batch, keep a draft while it equals the trunk's own
+// greedy choice), the rejected drafts dropped by keep() instead of a re-run. The engine must be open with mtp and
+// max_verify >= n_draft + 1; it is reset first. drafted / accepted as MtpStats.
+Status engine_generate_greedy_mtp(GpuEngine& eng, const Qwen35MoeSpec& s, const std::vector<std::int32_t>& prompt, int n_predict, int n_draft,
+                                  const std::vector<std::int32_t>& stops, std::vector<std::int32_t>& out, MtpStats* stats, EngineStats* es = nullptr,
+                                  const std::function<void(std::int32_t)>& on_token = {});
 
 // The hot order from a routing record (pelias kld --route-dump, PELROUT1): per layer, experts by pick count, most picked
 // first (ties: lower index); experts never picked come last in index order.

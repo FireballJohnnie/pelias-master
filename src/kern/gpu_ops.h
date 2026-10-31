@@ -123,6 +123,13 @@ bool deltanet_recurrent_reg(const float* conv, std::int64_t ch, const float* bet
                             std::int64_t nk, std::int64_t nv, std::int64_t ds, float* core, Stream s = nullptr);
 bool deltanet_chunked_rows(const float* conv, std::int64_t ch, const float* beta, const float* alpha, float* state, std::int64_t n,
                            std::int64_t nk, std::int64_t nv, std::int64_t ds, int chunk, float* core, Stream s = nullptr);
+// GP3-14 (MTP rollback): deltanet_recurrent_reg, bit for bit, plus the state after each token t < n - 1 written to
+// ckpt + t * nv * ds * ds (ckpt may be null when n == 1). Keeping a prefix of k tokens of the batch = copying ckpt[k - 1]
+// back into the state (k = n: the state itself).
+bool deltanet_recurrent_reg_ckpt(const float* conv, std::int64_t ch, const float* beta, const float* alpha, float* state, std::int64_t n,
+                                 std::int64_t nk, std::int64_t nv, std::int64_t ds, float* core, float* ckpt, Stream s = nullptr);
+// device to device copy (stream ordered)
+bool dcopy(void* dst, const void* src, std::size_t bytes, Stream s = nullptr);
 // per value head: o = rms_norm(o) * w * silu(z), in place on core (n rows of nv * ds), z alike
 bool gated_norm(float* core, const float* z, const float* w, std::int64_t n, std::int64_t nv, std::int64_t ds, float eps,
                 Stream s = nullptr);

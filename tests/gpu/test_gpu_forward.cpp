@@ -345,3 +345,75 @@ TEST(rung4_engine_decode_against_the_reference) {
   engine_case(sm, 4, "engine, half the experts in the bank");
   engine_case(sm, 8, "engine, every expert in the bank");
 }
+
+// GP3-14 stage 3: verify batches and keep() (the MTP rollback) on the small model: after a 16-token prefill, batches of 4
+// are verified and only their first k tokens kept (k cycling 1 .. 4); the kept rows' logits against the reference's
+// fresh pass over the kept sequence, and the position after each keep.
+TEST(rung4_engine_verify_and_keep) {
+  if (!g::available()) return;
+  Small sm;
+  small_model(sm);
+  CHECK(sm.ok);
+  if (!sm.ok) return;
+  const m::Qwen35MoeSpec& s = sm.spec;
+  const int nv = static_cast<int>(s.n_vocab), n = std::getenv("PELIAS_GPU_QUICK") ? 26 : 46;
+  std::vector<std::int32_t> tok(static_cast<std::size_t>(n));
+  for (int t = 0; t < n; ++t) tok[static_cast<std::size_t>(t)] = static_cast<std::int32_t>((t * 71 + 5) % 1000);
+  std::vector<float> ref(static_cast<std::size_t>(n) * static_cast<std::size_t>(nv)), eng(ref.size());
+  m::ForwardOptions o = m::GpuForward::matching_reference_options();
+  o.threads = 4;
+  CHECK(m::forward_reference(s, sm.w, tok.data(), n, 0, n, ref.data(), o).ok());
+  m::EngineOptions eo;
+  eo.max_ctx = 128;
+  eo.max_batch = 16;
+  eo.max_verify = 4;
+  eo.cpu_threads = 4;
+  eo.hot_order.assign(s.n_layer, {});
+  for (auto& v : eo.hot_order)
+    for (int e = 0; e < static_cast<int>(s.n_expert); ++e) v.push_back(e);
+  eo.max_hot_per_layer = 4;
+  auto f = m::GpuEngine::open(s, sm.w, eo);
+  CHECK(f.ok());
+  if (!f.ok()) {
+    std::printf("    verify / keep: open failed: %s\n", f.status.text().c_str());
+    return;
+  }
+  m::GpuEngine& E = *f.value;
+  const std::size_t row = static_cast<std::size_t>(nv);
+  CHECK(E.step(tok.data(), 16, eng.data(), false).ok());
+  CHECK(!E.keep(1).ok());  // no verify batch pending
+  int t = 16, kk = 1, batches = 0;
+  std::vector<float> bl(4 * row), bh(4 * static_cast<std::size_t>(s.n_embd));
+  while (t < n) {
+    const int nb = std::min(4, n - t + 0), keepk = std::min(kk, nb);
+    // the batch: the next nb tokens of the sequence (as if drafted), of which keepk are kept
+    CHECK(E.verify(tok.data() + t, nb, bl.data(), bh.data()).ok());
+    CHECK(!E.keep(nb + 1).ok());
+    CHECK(E.keep(keepk).ok());
+    CHECK(E.pos() == t + keepk);
+    std::memcpy(eng.data() + static_cast<std::size_t>(t) * row, bl.data(), static_cast<std::size_t>(keepk) * row * sizeof(float));
+    t += keepk;
+    kk = kk % 4 + 1;
+    ++batches;
+  }
+  CHECK(E.verify(tok.data(), 5, bl.data(), bh.data()).ok() == false);  // above max_verify
+  double kl_sum = 0.0, kl_max = 0.0;
+  int top_same = 0;
+  for (int i = 0; i < n; ++i) {
+    const float* r = ref.data() + static_cast<std::size_t>(i) * row;
+    const float* gq = eng.data() + static_cast<std::size_t>(i) * row;
+    int ar = 0, ag = 0;
+    for (int j = 0; j < nv; ++j) {
+      if (r[j] > r[ar]) ar = j;
+      if (gq[j] > gq[ag]) ag = j;
+    }
+    top_same += ar == ag ? 1 : 0;
+    const double k = kl(r, gq, nv);
+    kl_sum += k;
+    kl_max = std::max(kl_max, k);
+  }
+  CHECK(kl_sum / n <= 1e-4);
+  CHECK(static_cast<double>(top_same) / n >= 0.95);
+  std::printf("    verify / keep: %d batches of up to 4 (kept 1, 2, 3, 4 in turn), %d tokens: KL mean %.3e max %.3e; top-1 equal %d / %d\n", batches, n,
+              kl_sum / n, kl_max, top_same, n);
+}

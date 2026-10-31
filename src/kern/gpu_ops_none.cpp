@@ -22,6 +22,7 @@ bool to_host(void*, const void*, std::size_t, Stream) { return false; }
 bool dzero(void*, std::size_t, Stream) { return false; }
 bool sync(Stream) { return false; }
 bool mem_info(std::size_t*, std::size_t*) { return false; }
+bool dcopy(void*, const void*, std::size_t, Stream) { return false; }
 bool matmul(std::uint32_t, const void*, std::uint64_t, std::int64_t, std::int64_t, const float*, std::int64_t, std::int64_t, float*, std::int64_t,
             Stream) {
   return false;
@@ -64,6 +65,10 @@ bool deltanet_chunked(const float*, std::int64_t, const float*, const float*, fl
 }
 bool deltanet_recurrent_reg(const float*, std::int64_t, const float*, const float*, float*, std::int64_t, std::int64_t, std::int64_t,
                             std::int64_t, float*, Stream) {
+  return false;
+}
+bool deltanet_recurrent_reg_ckpt(const float*, std::int64_t, const float*, const float*, float*, std::int64_t, std::int64_t, std::int64_t,
+                                 std::int64_t, float*, float*, Stream) {
   return false;
 }
 bool deltanet_chunked_rows(const float*, std::int64_t, const float*, const float*, float*, std::int64_t, std::int64_t, std::int64_t,
