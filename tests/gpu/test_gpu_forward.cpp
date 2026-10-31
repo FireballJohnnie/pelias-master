@@ -357,7 +357,7 @@ std::vector<float> engine_case(const Small& sm, int hot, const char* what, bool 
   CHECK(finite);
   CHECK(kl_mean <= 1e-4);
   CHECK(top >= 0.95);
-  if (hot == 0) CHECK(hp == 0);
+  if (hot == 0 && !reader) CHECK(hp == 0);  // v25: a reader step counts every pick as on the GPU
   if (hot == static_cast<int>(s.n_expert)) CHECK(cp == 0);
   if (hot > 0 && hot < static_cast<int>(s.n_expert)) CHECK(hp > 0 && cp > 0);
   if (timeline) {  // v19: every doorbell step counted (2 passes of 2 prefill pieces + the single tokens), times sane
