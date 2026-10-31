@@ -217,7 +217,10 @@ cudaError_t gemm_q8k_q4k_v12(const int8_t* a8, const float* sa256, const uint16_
 const char* v13_name(int variant);
 cudaError_t gemm_q8k_q4k_v13(const int8_t* a8, const float* sa256, const uint16_t* adig, const BlockQ4K* w, const void* rec, const uint16_t* wdig,
                              void* C, int M, int N, int K, int batch, int out_bf16, int variant, int raster, int blocks_per_sm_cap, int* grid_out,
-                             cudaStream_t s);
+                             cudaStream_t s, bool hoisted = false);
+// hoisted = true runs v13b: v13 with the per-step index divisions taken out of the loop (cursors advanced by increments,
+// row pointers set once per tile). Same results bit for bit.
+cudaError_t v12_13_info(int family, int variant, int* regs, int* local_bytes, int* smem, int* blocks_per_sm);
 // The bf16 GEMM on `batch` problems at once (A: batch x M x K, B: batch x N x K, C: batch x M x N), same tiles as gemm_bf16_tiled.
 cudaError_t gemm_bf16_batched(const uint16_t* A, const uint16_t* B, float* C, int M, int N, int K, int batch, int cfg, int raster, cudaStream_t s);
 // fp32 reference for v7's inputs (activation scale per 256).
