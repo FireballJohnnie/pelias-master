@@ -6,9 +6,10 @@
 // expert with more than 64 rows: body + partial tile; experts with 1-8 rows: the warp-vector path; experts with none),
 // the work list built on the GPU, gate / up checked row by row against fp64 through the device's row map, the down
 // projection + combine against fp64 of the device's own rounded silu x up, for the int32 (deterministic, repeat bit for
-// bit, no overflow), int64 and float combines. Each for Q4_K and Q4_TG2 weights (2026-10-30 23:3x; Q4_TG2: int8 x 3 tiles,
+// bit, no overflow), int64 and float combines. Each for Q4_K, Q5_K, Q6_K and Q4_TG2 weights (2026-10-30 23:3x; Q4_TG2: int8 x 3 tiles,
 // exact fp32 table on the warp-vector path); plus a dense N = K = 2048 case (2048 rows; 130 under PELIAS_GPU_QUICK).
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -198,11 +199,13 @@ TEST(rung1_prompt_gemm_against_fp64) {
     return;
   }
   dense_case(q::Type::q4_k, "Q4_K  ");
+  dense_case(q::Type::q5_k, "Q5_K  ");
+  dense_case(q::Type::q6_k, "Q6_K  ");
   dense_case(q::Type::q4_tg2, "Q4_TG2");
   // refusals: not Q4_K / Q4_TG2, k not a multiple of 256, rows not a multiple of 128
   g::PromptWeights bad;
   Dev<std::uint8_t> junk(4096);
-  CHECK(!g::prompt_prepare(static_cast<std::uint32_t>(q::Type::q6_k), junk.p, 128, 256, &bad));
+  CHECK(!g::prompt_prepare(static_cast<std::uint32_t>(q::Type::iq4_xs), junk.p, 128, 256, &bad));
   CHECK(!g::prompt_prepare(static_cast<std::uint32_t>(q::Type::q4_k), junk.p, 128, 320, &bad));
   CHECK(!g::prompt_prepare(static_cast<std::uint32_t>(q::Type::q4_k), junk.p, 100, 256, &bad));
   std::printf("    other types, widths and row counts refused\n");
@@ -344,6 +347,8 @@ TEST(rung1_moe_prompt_against_fp64) {
     return;
   }
   moe_case(q::Type::q4_k, "Q4_K  ");
+  moe_case(q::Type::q5_k, "Q5_K  ");
+  moe_case(q::Type::q6_k, "Q6_K  ");
   moe_case(q::Type::q4_tg2, "Q4_TG2");
 }
 
@@ -362,4 +367,38 @@ TEST(rung1_moe_prompt_refuses_bad_shapes) {
   CHECK(!g::moe_prompt(none, none, none, qv.p, sc.p, dg.p, 17, sel.p, wv.p, m, g::MoeCombine::kFixed32, 10, y.p));  // more tokens than the scratch
   g::moe_scratch_free(&m);
   std::printf("    bad shapes, mismatched stacks and too many tokens refused\n");
+}
+
+// Speed by weight type (2026-10-30 23:5x, author 23:45 "I would rather see the speed right now"): prompt_gemm at the
+// model's shapes, 2048 rows, mean of 20 calls after 3 warm-ups (host clock around a device sync). Skipped under
+// PELIAS_GPU_QUICK (the sanitizers).
+TEST(rung1_prompt_speed_by_type) {
+  if (!g::available() || std::getenv("PELIAS_GPU_QUICK") != nullptr) return;
+  struct Shape {
+    std::int64_t n, k;
+    const char* name;
+  };
+  const std::int64_t rows = 2048;
+  for (const Shape sh : {Shape{512, 2048, "expert gate/up shape 2048 -> 512"}, Shape{2048, 512, "expert down shape 512 -> 2048"},
+                         Shape{2048, 2048, "dense 2048 -> 2048"}}) {
+    const Act a(rows, sh.k, 4500u);
+    Dev<float> y(static_cast<std::size_t>(rows * sh.n));
+    double base = 0.0;
+    for (const q::Type ty : {q::Type::q4_k, q::Type::q5_k, q::Type::q6_k, q::Type::q4_tg2}) {
+      const QW w(ty, sh.n, sh.k, 4600u);
+      Dev<std::uint8_t> dw(w.bytes);
+      g::PromptWeights pw;
+      CHECK(g::prompt_prepare(static_cast<std::uint32_t>(ty), dw.p, sh.n, sh.k, &pw));
+      for (int i = 0; i < 3; ++i) CHECK(g::prompt_gemm(pw, sh.n, a.qv.p, a.sc.p, a.dig.p, rows, y.p));
+      CHECK(g::sync());
+      const auto t0 = std::chrono::steady_clock::now();
+      for (int i = 0; i < 20; ++i) CHECK(g::prompt_gemm(pw, sh.n, a.qv.p, a.sc.p, a.dig.p, rows, y.p));
+      CHECK(g::sync());
+      const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / 20.0;
+      if (ty == q::Type::q4_k) base = ms;
+      const double tops = 2.0 * static_cast<double>(rows * sh.n * sh.k) / (ms * 1e-3) / 1e12;
+      std::printf("    %-34s %-6s %8.4f ms %6.1f TOPS  %.3fx the Q4_K time\n", sh.name, q::type_info(static_cast<std::uint32_t>(ty)).name, ms, tops, base > 0 ? ms / base : 1.0);
+      g::prompt_release(&pw);
+    }
+  }
 }
