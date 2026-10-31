@@ -2132,7 +2132,7 @@ int cmd_engine_check(const Args& a) {
                  "usage: pelias engine-check --model FILE [--routes ROUTES.bin] [--prefill 64] [--decode 32] [--ctx 4096] [--batch 64] [--threads N]\n"
                  "                           [--budget-gb G] [--hot-max N] [--mtp-draft K] [--fast-cpu] [--no-cpu] [--float-ref]\n"
                  "                           [--text FILE [--skip-tokens N]] [--timeline] [--dump-top OUT.tsv] [--dump-split [--split-sizes 2,3,4] [--split-step]]\n"
-                 "                           [--no-doorbell] [--timeline-ops] [--split-ref] [--bank-selftest MIXES]\n");
+                 "                           [--no-doorbell] [--timeline-ops] [--split-ref] [--bank-selftest MIXES] [--probe-pos P]\n");
     return 1;
   }
   auto num = [&](const char* k, std::uint64_t d, std::uint64_t lo, std::uint64_t hi, std::uint64_t& out) {
@@ -2350,6 +2350,20 @@ int cmd_engine_check(const Args& a) {
     const double pre_s = tpl.seconds();
     const bool split = a.has("dump-split");
     std::vector<float> one_rows(split ? static_cast<std::size_t>(ndec) * nv : 0);
+    // v23 --probe-pos P: the row that predicts plain[P] is the step at position npre + P - 1; captured in the plain run
+    // (one token at a time), in the first verify replay, and in the CPU reference (--split-ref)
+    std::int64_t probe_p = -1;
+    if (a.has("probe-pos")) {
+      const Result<std::uint64_t> pr = io::parse_whole(a.get("probe-pos"), ndec > 1 ? ndec - 1 : 1);
+      if (!pr.ok() || pr.value < 1) {
+        std::fprintf(stderr, "pelias: --probe-pos takes 1 .. decode - 1\n");
+        return 1;
+      }
+      probe_p = static_cast<std::int64_t>(npre) + static_cast<std::int64_t>(pr.value) - 1;
+      eng.value->probe_set(probe_p);
+    }
+    std::vector<float> pxa, pxb, pwa, pwb;
+    std::vector<std::int32_t> psa, psb;
     Timer tdp;
     for (std::uint64_t i = 0; i < ndec; ++i) {
       std::int32_t best = 0;
@@ -2361,6 +2375,7 @@ int cmd_engine_check(const Args& a) {
       if (Status st = eng.value->step(&best, 1, row.data(), true); !st) return fail_input(st);
     }
     const double plain_s = tdp.seconds();
+    if (probe_p >= 0 && !eng.value->probe_get(&pxa, &psa, &pwa)) std::printf("  probe: nothing captured in the plain run\n");
     model::MtpStats ms;
     model::EngineStats emt;
     model::EngineMtpTiming tmg;
@@ -2415,6 +2430,7 @@ int cmd_engine_check(const Args& a) {
             const int k = static_cast<int>(std::min<std::uint64_t>(batch, npre - t0));
             if (Status st = eng.value->step(prompt.data() + t0, k, row.data(), true); !st) return fail_input(st);
           }
+          if (probe_p >= 0 && use_verify && !bat_have) eng.value->probe_set(probe_p);
           std::vector<float> vb(static_cast<std::size_t>(kb) * nv);
           std::vector<double> kl_r(static_cast<std::size_t>(kb), 0.0);
           std::vector<int> n_r(static_cast<std::size_t>(kb), 0);
@@ -2467,6 +2483,7 @@ int cmd_engine_check(const Args& a) {
           }
           std::printf("  split check, %s batches of %d vs one token at a time: KL mean %.3e max %.3e (position %zu); KL by place in the batch %s; top-1 equal %d / %d%s%s\n",
                       use_verify ? "verify" : "step", kb, cnt ? kl_s / cnt : 0.0, kl_m, worst_at, byr.c_str(), eq, cnt, diffs.empty() ? "" : "; differ at ", diffs.c_str());
+          if (use_verify && !bat_have && probe_p >= 0 && !eng.value->probe_get(&pxb, &psb, &pwb)) std::printf("  probe: nothing captured in the verify replay\n");
           if (use_verify) bat_have = true;
           if (use_verify && kb == static_cast<int>(ndraft) + 1 && same < plain.size()) {
             const Top2 ts = top2(one_rows.data() + same * nv, nv);
@@ -2483,6 +2500,15 @@ int cmd_engine_check(const Args& a) {
         std::vector<std::int32_t> seq(prompt);
         seq.insert(seq.end(), plain.begin(), plain.end() - 1);
         std::vector<float> rr(static_cast<std::size_t>(ndec) * nv);
+        std::vector<float> pxr;
+        std::vector<model::RouteRecord> rrec;
+        if (probe_p >= 0) {
+          pxr.assign(static_cast<std::size_t>(s.n_layer) * s.n_embd, 0.0f);
+          rrec.resize(seq.size() * s.n_layer);
+          orf.probe_pos = probe_p;
+          orf.probe_x = pxr.data();
+          orf.route = rrec.data();
+        }
         Timer trf;
         if (Status rs = model::forward_reference(s, w.value, seq.data(), static_cast<int>(seq.size()), static_cast<int>(npre) - 1,
                                                  static_cast<int>(npre) - 1 + static_cast<int>(ndec), rr.data(), orf);
@@ -2514,6 +2540,41 @@ int cmd_engine_check(const Args& a) {
         std::printf("  split ref at position %zu (largest one-token vs batched gap, KL %.3e): reference top-2 %zu / %zu margin %.4f; one-token %zu / %zu (KL from ref %.3e); batched %zu / %zu (KL from ref %.3e) -> %s is off\n",
                     at, kmx, tr.i1, tr.i2, tr.margin, t1.i1, t1.i2, kl_rows(rf, one_rows.data() + at * nv, nv), t2.i1, t2.i2, kl_rows(rf, bat_rows.data() + at * nv, nv),
                     kl_rows(rf, one_rows.data() + at * nv, nv) > kl_rows(rf, bat_rows.data() + at * nv, nv) ? "the one-token path" : "the batched path");
+        if (probe_p >= 0 && !pxa.empty() && !pxb.empty()) {  // v23: layer by layer at the probe position
+          const std::size_t e2 = s.n_embd, nuq = s.n_expert_used;
+          std::printf("  probe at position %lld (predicts plain[%lld]): residual after each layer vs the CPU reference (relative L2), router picks (* = differs from the reference), the reference's last-pick margin\n",
+                      static_cast<long long>(probe_p), static_cast<long long>(probe_p - static_cast<std::int64_t>(npre) + 1));
+          for (std::size_t il = 0; il < s.n_layer; ++il) {
+            auto rel = [&](const std::vector<float>& v) {
+              double nn2 = 0.0, dd2 = 0.0;
+              for (std::size_t i = 0; i < e2; ++i) {
+                const double d = static_cast<double>(v[il * e2 + i]) - pxr[il * e2 + i];
+                nn2 += d * d;
+                dd2 += static_cast<double>(pxr[il * e2 + i]) * pxr[il * e2 + i];
+              }
+              return dd2 > 0 ? std::sqrt(nn2 / dd2) : 0.0;
+            };
+            const model::RouteRecord& rc = rrec[static_cast<std::size_t>(probe_p) * s.n_layer + il];
+            std::vector<int> ref_s, a_s, b_s;
+            for (std::size_t j = 0; j < nuq; ++j) {
+              ref_s.push_back(rc.sel[j]);
+              a_s.push_back(psa[il * nuq + j]);
+              b_s.push_back(psb[il * nuq + j]);
+            }
+            std::sort(ref_s.begin(), ref_s.end());
+            std::sort(a_s.begin(), a_s.end());
+            std::sort(b_s.begin(), b_s.end());
+            double amax = 0.0;
+            for (std::size_t i = 0; i < e2; ++i) amax = std::max(amax, std::fabs(static_cast<double>(pxr[il * e2 + i])));
+            std::string pa, pb;
+            for (std::size_t j = 0; j < nuq; ++j) {
+              pa += std::to_string(a_s[j]) + (std::find(ref_s.begin(), ref_s.end(), a_s[j]) == ref_s.end() ? "*" : "") + (j + 1 < nuq ? "," : "");
+              pb += std::to_string(b_s[j]) + (std::find(ref_s.begin(), ref_s.end(), b_s[j]) == ref_s.end() ? "*" : "") + (j + 1 < nuq ? "," : "");
+            }
+            std::printf("    layer %2zu: one-token %.3e  batched %.3e | max |x| %.1f | margin %.2e | picks one-token %s | batched %s\n", il, rel(pxa), rel(pxb), amax,
+                        static_cast<double>(rc.p_last - rc.p_next), pa.c_str(), pb.c_str());
+          }
+        }
       }
     }
   }

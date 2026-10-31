@@ -60,7 +60,8 @@ Copyright (c) 2026 John Lipka and the Pelias contributors
 - ~~GP1-12~~ and ~~GP1-16~~: confirmed.
 - ~~R2-256 / R2-row~~: struck. Corrected reason: 0.000999 is the cost of one activation scale per 256, not the rotation size. The runs were conditional on Block C landing close to Unsloth, which never happened (tiered is 26.6 % below).
 
-**Step 0 (new): fix the bank slot that v22's self-test names; the split check must then match plain decode.**
+**Step 0 (new): the split fault.** v22 (MEASURED): no bank expert is wrong on its own: 5,496 / 5,302 checks + 2,560 mixes, worst gap 2.1e-03. The fault repeats bit for bit and is input-dependent. v23 probes the residual stream and the router picks at that position, layer by layer, in both paths against the CPU reference, to find the first layer that departs. Then fix; the split check must then match plain decode.
+**v22 standing (MEASURED):** decode 21.0 tok/s (from 16.2) with the shared-memory router and the expert grids sized for the picks, logits unchanged. Bank experts are still 15.1 ms per token, router + top-k 2.3. MTP stays below 1x, because the verify's CPU cold work (68-70 ms) now dominates. Step 1 (the CPU) and the drafts' cold experts on the GPU are the MTP levers.
 
 **Step 1: the CPU cold-expert gap.**
 - **Target:** cold work is 30 ms per token (v20) at 5.9-7.1 GB/s.

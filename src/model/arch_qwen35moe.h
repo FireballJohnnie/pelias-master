@@ -175,6 +175,10 @@ struct ForwardOptions {
   // (n_head + n_head_kv) x head_dim fp16 values: each token's query heads (per-head normed and roped; the gate half left
   // out) then its key heads (normed and roped), exactly what the attention scores use.
   std::uint16_t* qk_dump = nullptr;
+  // v23 probe: for token index probe_pos of this call (0-based within tokens), the residual stream after every layer
+  // (n_layer x n_embd floats) into probe_x
+  std::int64_t probe_pos = -1;
+  float* probe_x = nullptr;
   // Optional coin-flip counts (activation rounding near halfway; game plan, author 2026-10-31): n_tokens x 3 counters
   // (position-major), added to (not cleared): per token, over every gpu256x8-rounded trunk and expert input row, the
   // values within 1e-4, 1e-3 and 1e-2 of a step from halfway. The output layer is not counted.

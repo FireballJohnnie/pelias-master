@@ -289,6 +289,14 @@ struct GpuEngine::Impl {
   EngineTimeline tline;
   void* ts_hv = nullptr;  // pinned mapped: per layer [ring, wait enter, wait release, spare] GPU ns
   unsigned long long *ts_h = nullptr, *ts_d = nullptr;
+  // v23 probe
+  std::int64_t probe_pos = -1;
+  bool probe_have = false;
+  float* probe_xd = nullptr;
+  std::int32_t* probe_seld = nullptr;
+  float* probe_wd = nullptr;
+  std::vector<float> probe_xh, probe_wh;
+  std::vector<std::int32_t> probe_selh;
   // v21 per-operation stamps: pinned mapped, per layer kOps GPU ns; cur_ops = this layer's row while it is enqueued
   void* ops_hv = nullptr;
   unsigned long long *ops_h = nullptr, *ops_d = nullptr, *cur_ops = nullptr;
@@ -909,6 +917,9 @@ GpuEngine::~GpuEngine() {
   g::host_free(p_->bell_h);
   g::host_free(p_->ts_hv);
   g::host_free(p_->ops_hv);
+  g::dfree(p_->probe_xd);
+  g::dfree(p_->probe_seld);
+  g::dfree(p_->probe_wd);
   g::moe_scratch_free(&p_->moe);
   for (Layer& D : p_->L) g::dfree(D.bank_mem);
   g::dfree(p_->M.bank_mem);
@@ -932,6 +943,26 @@ int GpuEngine::max_batch() const { return p_ ? p_->o.max_batch : 0; }
 std::uint64_t GpuEngine::bank_bytes() const { return p_ ? p_->bank_bytes_total : 0; }
 Status GpuEngine::reset() { return p_->reset_state(); }
 const EngineTimeline& GpuEngine::timeline() const { return p_->tline; }
+void GpuEngine::probe_set(std::int64_t pos) {
+  Impl& I = *p_;
+  I.probe_have = false;
+  I.probe_pos = pos;
+  if (pos >= 0 && !I.probe_xd) {
+    const std::size_t nl = I.s.n_layer, nuq = I.s.n_expert_used;
+    I.probe_xd = static_cast<float*>(g::dalloc(nl * I.s.n_embd * sizeof(float)));
+    I.probe_seld = static_cast<std::int32_t*>(g::dalloc(nl * nuq * sizeof(std::int32_t)));
+    I.probe_wd = static_cast<float*>(g::dalloc(nl * nuq * sizeof(float)));
+    if (!I.probe_xd || !I.probe_seld || !I.probe_wd) I.probe_pos = -1;
+  }
+}
+bool GpuEngine::probe_get(std::vector<float>* x_layers, std::vector<std::int32_t>* picks, std::vector<float>* pick_w) {
+  Impl& I = *p_;
+  if (!I.probe_have) return false;
+  if (x_layers) *x_layers = I.probe_xh;
+  if (picks) *picks = I.probe_selh;
+  if (pick_w) *pick_w = I.probe_wh;
+  return true;
+}
 
 Status GpuEngine::bank_selftest(int combos, std::string* report, int* bad) {
   Impl& I = *p_;
@@ -1419,6 +1450,25 @@ Status GpuEngine::Impl::run(const std::int32_t* tokens, int n, float* logits, bo
     if (!(st = I.bell ? I.moe_block_bell(D, n, g0 + il, I.ts_d ? I.ts_d + 4 * il : nullptr) : I.moe_block(l, D, n, es))) return st;
     if (!g::add_rows(I.x, e, I.y, e, nullptr, e, n)) return gfail("engine: residual");
     if (!I.opstamp(15)) return gfail("engine: stamp");
+    if (I.probe_pos >= I.pos && I.probe_pos < I.pos + n && I.probe_xd) {  // v23: this row's residual and picks after the layer
+      const int64_t r = I.probe_pos - I.pos, nuq = s.n_expert_used;
+      if (!g::dcopy(I.probe_xd + static_cast<int64_t>(il) * e, I.x + r * e, z(e) * sizeof(float)) ||
+          !g::dcopy(I.probe_seld + static_cast<int64_t>(il) * nuq, I.sel + r * nuq, z(nuq) * sizeof(std::int32_t)) ||
+          !g::dcopy(I.probe_wd + static_cast<int64_t>(il) * nuq, I.wsel + r * nuq, z(nuq) * sizeof(float)))
+        return gfail("engine: probe copy");
+    }
+  }
+  if (I.probe_pos >= I.pos && I.probe_pos < I.pos + n && I.probe_xd) {
+    const std::size_t nl = s.n_layer, nuq = s.n_expert_used;
+    I.probe_xh.resize(nl * z(e));
+    I.probe_selh.resize(nl * nuq);
+    I.probe_wh.resize(nl * nuq);
+    if (!g::to_host(I.probe_xh.data(), I.probe_xd, I.probe_xh.size() * sizeof(float)) ||
+        !g::to_host(I.probe_selh.data(), I.probe_seld, I.probe_selh.size() * sizeof(std::int32_t)) ||
+        !g::to_host(I.probe_wh.data(), I.probe_wd, I.probe_wh.size() * sizeof(float)))
+      return gfail("engine: probe read");
+    I.probe_have = true;
+    I.probe_pos = -1;
   }
   const bool ops_this = I.cur_ops != nullptr;
   I.cur_ops = nullptr;

@@ -153,6 +153,10 @@ class GpuEngine {
   // against the CPU's cold-expert path on the same inputs, then `combos` random 8-pick mixes per layer (1 token). Call
   // between steps. report: a summary line and the worst cases; bad: results with a relative L2 gap above 1e-2.
   Status bank_selftest(int combos, std::string* report, int* bad);
+  // v23 probe: arm a capture at absolute position pos (-1: off); the next step that covers it copies, for that row, the
+  // residual stream after every layer and every layer's router picks. probe_get: the capture (false if none yet).
+  void probe_set(std::int64_t pos);
+  bool probe_get(std::vector<float>* x_layers, std::vector<std::int32_t>* picks, std::vector<float>* pick_w);
   // v19 timeline (empty unless EngineOptions::timeline and the doorbell are on)
   [[nodiscard]] const EngineTimeline& timeline() const;
   void timeline_reset();

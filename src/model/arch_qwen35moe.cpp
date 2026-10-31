@@ -1881,6 +1881,7 @@ Status forward_impl(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, const std
     if (s.dense) {  // GP3-09: one gated FFN (the profile line counts it as "experts")
       dense_ffn(c, l, xn.data(), y.data());
       for (int64_t i = 0; i < n * e; ++i) x[z(i)] += y[z(i)];
+      if (opt.probe_x && opt.probe_pos >= 0 && opt.probe_pos < n) std::copy(x.begin() + opt.probe_pos * e, x.begin() + (opt.probe_pos + 1) * e, opt.probe_x + il * e);
       continue;
     }
     if (opt.defer_experts > 0) {  // Block M: this layer's deferred experts wait; the previous layer's arrive now
@@ -1891,6 +1892,7 @@ Status forward_impl(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, const std
       moe(c, l, xn.data(), y.data());
       for (int64_t i = 0; i < n * e; ++i) x[z(i)] += y[z(i)];
     }
+    if (opt.probe_x && opt.probe_pos >= 0 && opt.probe_pos < n) std::copy(x.begin() + opt.probe_pos * e, x.begin() + (opt.probe_pos + 1) * e, opt.probe_x + il * e);
     tp = Clock::now();
     if (opt.route && il + 1 < s.n_layer) {
       // pre-gating prediction: the next layer's router on this layer's output, through the next layer's norm
