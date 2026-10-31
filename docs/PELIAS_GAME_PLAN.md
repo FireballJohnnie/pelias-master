@@ -40,6 +40,16 @@ Copyright (c) 2026 John Lipka and the Pelias contributors
 
 **Note (author 2026-10-31 00:15): the power / temperature watchdog (gp/watchdog_v1.sh) is a test-harness tool, not part of the program.** Its limits (200 W, the CPU's PPT) are this PC's. If the product ever guards power or temperature, it reads each machine's own limits from a probe (NVML power.limit and temperatures; the CPU's PPT / TDP from the platform) and never assumes these numbers; other GPUs and CPUs have other limits.
 
+## STANDING RULE: GPU first, exact CPU late (author 2026-10-31 01:16; the dual-act formula of 2026-10-29 17:44)
+
+Apply to every area the 1-bit accuracy + plane system does not cover:
+1. The GPU answers first, fast (rounded / approximate), inside step t.
+2. The CPU answers late with the more exact value (fp32, unrounded, or the higher-precision path), only where flagged.
+3. When the two disagree, the CPU's answer wins (it is the more exact one); weight the CPU more.
+4. A CPU answer too late for step t still counts: it makes t+1 careful ("careful+1"); hard deadline, never wait.
+5. Each use is measured first (does the flag at t predict a miss at t+1, as the 11 % vs 1 % miss pattern did), then wired.
+First use: the activation coin flips (next section).
+
 ## Activation coin flips: GPU first, exact CPU late (author 2026-10-31 01:07-01:14; dual-act logic of 2026-10-29 17:44)
 
 **Why (MEASURED, v16, 40 layers, 64 made-up tokens):** GPU and CPU round the same activations to int8 (per 32); values a hair
