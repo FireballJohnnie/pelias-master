@@ -36,7 +36,7 @@ Copyright (c) 2026 John Lipka and the Pelias contributors
 - v10b (ef9fb0b): the Q4_K prompt min term in fp32 FMAs: 1.4-2.4e-07 vs fp64, four sanitizers clean; TG2 probe: 1.00-1.02x the bf16 mma's time. Proposed LOCK (author's 22:09 condition met).
 - Q4_TG2 prompt path (TG2 probe, e0117db): int8 x 3 (24-bit fixed point, three int8 mmas) is the fastest variant under the 1e-6 gate (1.1-1.7e-07; 1.34-1.57x the Q4_K tile time); warp-vector rows with the exact fp32 table (1.1e-07; 1.7-1.9x the Q4_K vector). Proposed LOCK; awaiting the author.
 - Open before GP3-12: the probe's dense 2048 x 2048 Q4_K case at 0.507 relative L2 (both min variants); first check: a 2048 x 2048 dense case in src's GPU test.
-- Next (proposed order): lock -> the dense check -> Q4_TG2 into kern/gpu_prompt -> the queued PDF update -> GP3-12 rungs -> GP3-14.
+- Order (author 23:22 "Go ahead", 23:43 "Yes"): lock (done) -> the dense check (done: probe upload race; src 2.38e-07) -> Q4_TG2 into kern/gpu_prompt (v12 running) -> the queued PDF update -> **exact paths get the GPU work list, the int32 fold and the fused norm's float output; Q5_K and Q6_K int8 prompt tiles (exact: Q5_K 0-31 with Q4_K's min term, Q6_K -32..31 with int8 sub-block scales; DERIVED, to be measured)** -> GP3-12 rungs -> GP3-14.
 
 ## PRIORITY (author 2026-10-29 18:44): near-tie accuracy first; every other step waits until it is solved
 
