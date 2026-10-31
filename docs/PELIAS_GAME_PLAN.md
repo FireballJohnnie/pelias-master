@@ -38,6 +38,8 @@ Copyright (c) 2026 John Lipka and the Pelias contributors
 - Open before GP3-12: the probe's dense 2048 x 2048 Q4_K case at 0.507 relative L2 (both min variants); first check: a 2048 x 2048 dense case in src's GPU test.
 - Order (author 23:22 "Go ahead", 23:43 "Yes"): lock (done) -> the dense check (done: probe upload race; src 2.38e-07) -> Q4_TG2 into kern/gpu_prompt (v12 running) -> the queued PDF update -> **exact paths get the GPU work list, the int32 fold and the fused norm's float output; Q5_K and Q6_K int8 prompt tiles (exact: Q5_K 0-31 with Q4_K's min term, Q6_K -32..31 with int8 sub-block scales; DERIVED, to be measured)** -> GP3-12 rungs -> GP3-14.
 
+**Note (author 2026-10-31 00:15): the power / temperature watchdog (gp/watchdog_v1.sh) is a test-harness tool, not part of the program.** Its limits (200 W, the CPU's PPT) are this PC's. If the product ever guards power or temperature, it reads each machine's own limits from a probe (NVML power.limit and temperatures; the CPU's PPT / TDP from the platform) and never assumes these numbers; other GPUs and CPUs have other limits.
+
 ## PRIORITY (author 2026-10-29 18:44): near-tie accuracy first; every other step waits until it is solved
 
 **Problem.** The GP3-07 gate (v8, Pelias's own format, no wormhole) split from llama.cpp on 11 of 20 prompts: 8 at near-ties, 3 at end-of-text setup (MEASURED); 4 of the 11 splits are in the first 5 output tokens. The KL drift sits in few tokens: the top 1 % hold 23-52 % of it (MEASURED). Better or worse is decided by KL against the original model (scoreboard); agreement is the gate.

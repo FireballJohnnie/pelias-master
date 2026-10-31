@@ -52,6 +52,7 @@
 #include "quant/planes.h"
 #include "quant/quant_cpu.h"
 #include "model/arch_qwen35moe.h"
+#include "model/gpu_forward.h"
 #include "model/sampler.h"
 #include "model/spec.h"
 #include "tok/tokenizer.h"
@@ -130,6 +131,9 @@ void usage() {
       "pelias <command> [options]\n"
       "  version                         build version and backends\n"
       "  device [--index N]              what the GPU reports (CUDA and NVML), and the VRAM ceiling\n"
+      "  gpu-check --model FILE [--tokens 64] [--layers N] [--repeat 3] [--threads N] [--fast-cpu] [--no-cpu]\n"
+      "                                  GP3-12: the trunk on the GPU (prefill, fresh sequence) against the CPU reference with the\n"
+      "                                  same per-32 int8 rounding: KL, top-1, logits error; GPU time per call and tokens/s\n"
       "  mtp-logits --model FILE --ids 1,2,3 --out OUT.bin [--threads N] [--fast-cpu]\n"
       "                                  GP3-08 gate: the MTP block's logits and hidden for each position (format of tools/oracle/mtp_oracle)\n"
       "  logits --model FILE --ids 1,2,3 --out OUT.bin [--threads N] [--fast-cpu] [--decode]   every position's logits (oracle checks)\n"
@@ -1879,6 +1883,106 @@ int cmd_logits(const Args& a) {
   return 0;
 }
 
+// GP3-12 rungs 2-3 on a real file: the trunk (all of it, or its first --layers) on the GPU against the CPU reference
+int cmd_gpu_check(const Args& a) {
+  const std::string path = a.get("model");
+  if (path.empty()) {
+    std::fprintf(stderr, "usage: pelias gpu-check --model FILE [--tokens 64] [--layers N] [--repeat 3] [--threads N] [--fast-cpu] [--no-cpu]\n");
+    return 1;
+  }
+  auto num = [&](const char* k, std::uint64_t def, std::uint64_t lo, std::uint64_t hi, std::uint64_t& v) {
+    v = def;
+    if (!a.has(k)) return true;
+    const Result<std::uint64_t> r = io::parse_whole(a.get(k), hi);
+    if (!r.ok() || r.value < lo) {
+      std::fprintf(stderr, "pelias: --%s takes a whole number from %llu to %llu\n", k, static_cast<unsigned long long>(lo), static_cast<unsigned long long>(hi));
+      return false;
+    }
+    v = r.value;
+    return true;
+  };
+  std::uint64_t ntok = 0, nlay = 0, rep = 0, thr = 0;
+  if (!num("tokens", 64, 1, 4096, ntok) || !num("layers", 0, 0, 1000, nlay) || !num("repeat", 3, 1, 100, rep) || !num("threads", 0, 0, 4096, thr)) return 1;
+  os::FileMap m;
+  if (Status s = m.open(path); !s) return fail_input(s);
+  io::GgufReader g;
+  if (Status s = g.parse(m); !s) return fail_input(s);
+  const Result<model::Qwen35MoeSpec> spec = model::read_qwen35moe_spec(g);
+  if (!spec.ok()) return fail_input(spec.status);
+  Result<model::Qwen35MoeWeights> w = model::bind_qwen35moe(g, m.data(), spec.value);
+  if (!w.ok()) return fail_input(w.status);
+  model::Qwen35MoeSpec s = spec.value;
+  if (nlay > 0 && nlay < s.n_layer) {
+    w.value.layers.resize(static_cast<std::size_t>(nlay));
+    s.n_layer = static_cast<std::uint32_t>(nlay);
+  }
+  const int n = static_cast<int>(ntok);
+  std::vector<std::int32_t> ids(static_cast<std::size_t>(n));
+  for (int t = 0; t < n; ++t) ids[static_cast<std::size_t>(t)] = static_cast<std::int32_t>((static_cast<std::uint64_t>(t) * 7919u + 1011u) % s.n_vocab);
+  const std::size_t nv = s.n_vocab;
+  std::vector<float> lg_gpu(static_cast<std::size_t>(n) * nv), lg_ref;
+  Timer topen;
+  auto f = model::GpuForward::open(s, w.value, n);
+  if (!f.ok()) return fail_input(f.status);
+  std::printf("pelias gpu-check: %s, %u layers, %d tokens; GPU open %.2f s, %.2f GB on the device\n", s.arch.c_str(), s.n_layer, n, topen.seconds(),
+              static_cast<double>(f.value->device_bytes()) / 1e9);
+  double best = 1e30;
+  for (std::uint64_t r = 0; r < rep; ++r) {
+    model::GpuForwardStats st;
+    if (Status ps = f.value->prefill(ids.data(), n, 0, n, lg_gpu.data(), &st); !ps) return fail_input(ps);
+    best = std::min(best, st.seconds);
+    std::printf("  GPU prefill call %llu: %.3f s (%.1f tokens/s), weight uploads %.3f s for %.2f GB (%.2f GB/s), compute and the rest %.3f s\n",
+                static_cast<unsigned long long>(r + 1), st.seconds, n / st.seconds, st.upload_seconds, static_cast<double>(st.bytes_uploaded) / 1e9,
+                st.upload_seconds > 0 ? static_cast<double>(st.bytes_uploaded) / 1e9 / st.upload_seconds : 0.0, st.seconds - st.upload_seconds);
+  }
+  std::printf("  GPU prefill best: %.3f s = %.1f tokens/s (weights streamed layer by layer: the copies bound it; GP3-14's resident bank removes them)\n", best,
+              n / best);
+  if (a.has("no-cpu")) return 0;
+  model::ForwardOptions o = model::GpuForward::matching_reference_options();
+  o.threads = static_cast<int>(thr);
+  o.fast_cpu = a.has("fast-cpu");
+  lg_ref.resize(lg_gpu.size());
+  Timer tcpu;
+  if (Status rs = model::forward_reference(s, w.value, ids.data(), n, 0, n, lg_ref.data(), o); !rs) return fail_input(rs);
+  const double cpu_s = tcpu.seconds();
+  double num2 = 0.0, den = 0.0, worst = 0.0, kl_sum = 0.0, kl_max = 0.0;
+  int top = 0;
+  for (int t = 0; t < n; ++t) {
+    const float* r = lg_ref.data() + static_cast<std::size_t>(t) * nv;
+    const float* gq = lg_gpu.data() + static_cast<std::size_t>(t) * nv;
+    std::size_t ar = 0, ag = 0;
+    double mr = r[0], mg = gq[0];
+    for (std::size_t i = 0; i < nv; ++i) {
+      const double d = static_cast<double>(gq[i]) - r[i];
+      num2 += d * d;
+      den += static_cast<double>(r[i]) * r[i];
+      worst = std::max(worst, std::fabs(d));
+      if (r[i] > r[ar]) ar = i;
+      if (gq[i] > gq[ag]) ag = i;
+      mr = std::max(mr, static_cast<double>(r[i]));
+      mg = std::max(mg, static_cast<double>(gq[i]));
+    }
+    top += ar == ag ? 1 : 0;
+    double sr = 0.0, sg = 0.0;
+    for (std::size_t i = 0; i < nv; ++i) {
+      sr += std::exp(r[i] - mr);
+      sg += std::exp(gq[i] - mg);
+    }
+    const double lr = mr + std::log(sr), lgg = mg + std::log(sg);
+    double k = 0.0;
+    for (std::size_t i = 0; i < nv; ++i) {
+      const double pa = r[i] - lr, pb = gq[i] - lgg;
+      k += std::exp(pa) * (pa - pb);
+    }
+    kl_sum += k;
+    kl_max = std::max(kl_max, k);
+  }
+  std::printf("  CPU reference (same rounding%s): %.2f s = %.2f tokens/s\n", o.fast_cpu ? ", fast CPU kernels" : "", cpu_s, n / cpu_s);
+  std::printf("  GPU vs reference: logits rel L2 %.3e, largest |diff| %.3e; KL mean %.3e max %.3e; top-1 equal %d / %d; GPU %.1fx the reference's speed\n",
+              den > 0 ? std::sqrt(num2 / den) : 0.0, worst, kl_sum / n, kl_max, top, n, cpu_s / best);
+  return kl_sum / n <= 1e-4 && top * 100 >= n * 95 ? 0 : 3;
+}
+
 int cmd_mtp_logits(const Args& a) {
   const std::string path = a.get("model"), out = a.get("out"), idt = a.get("ids");
   if (path.empty() || out.empty() || idt.empty()) {
@@ -2310,6 +2414,7 @@ int main(int argc, char** argv) {
   if (cmd == "bench-dot") return cmd_bench_dot(a);
   if (cmd == "logits") return cmd_logits(a);
   if (cmd == "mtp-logits") return cmd_mtp_logits(a);
+  if (cmd == "gpu-check") return cmd_gpu_check(a);
   if (cmd == "inspect") return cmd_inspect(a);
   if (cmd == "key") return cmd_key(a);
   if (cmd == "plan") return cmd_plan(a);
