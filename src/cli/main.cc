@@ -2151,7 +2151,8 @@ int cmd_pin_probe(const Args& a) {
     std::fprintf(stderr, "pelias: the file is smaller than the region asked for\n");
     return 1;
   }
-  const std::uint64_t off = (m.size() / 2) & ~std::uint64_t{4095};
+  // v24 fix: the region must end inside the file (12 GiB from mid-file ran past the end of a 22.7 GB file: segfault)
+  const std::uint64_t off = std::min<std::uint64_t>(m.size() / 2, m.size() - bytes) & ~std::uint64_t{4095};
   auto* region = const_cast<std::uint8_t*>(m.data() + off);
   std::printf("pin-probe: %s region of %llu MiB at offset %llu of a %.2f GB file\n", path.c_str(), static_cast<unsigned long long>(mb),
               static_cast<unsigned long long>(off), static_cast<double>(m.size()) / 1e9);
