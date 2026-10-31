@@ -34,6 +34,7 @@ void usage() {
       "  k3    P-K3  streaming Q4_K / Q6_K dequantization against a plain read of the same bytes\n"
       "  q10   P-Q10 fp8 (e4m3 / e5m2) data-gradient cosine against fp32\n"
       "  all   k1, k2, k2b, k3, q10 with --cooldown-s seconds between them (default 30)\n"
+      "  moe3  S3: no padding + the work list built on the GPU (match_any / ballot / popc), warp-vector below --cuts 8,16,24,32, int32 folded combine (2026-10-30)\n"
       "  moe2  D v2: 64-row bodies + 16-row tails, warp-vector for 1-8 rows, down folded into the combine (f32 / int32 / int64 reductions) (2026-10-30)\n"
       "  moe   one MoE layer slice on real routing (--routes FILE --chunk 0 --layers 0,20,39): norm, gather, gate|up, silu, down, combine; per-256 vs per-32; work list vs padded vs ideal (2026-10-30)\n"
       "  act32 per-32 activation scales (v12x8) against per-256 (v12): speed and accuracy (2026-10-30); not part of all\n"
@@ -48,7 +49,7 @@ struct Entry {
   Fn fn;
 };
 const Entry kTable[] = {{"k1", p_k1}, {"k2", p_k2}, {"k2b", p_k2b}, {"k3", p_k3}, {"q10", p_q10}};
-const Entry kExtra[] = {{"k2prof", p_k2prof}, {"o13", p_o13}, {"act32", p_act32}, {"moe", p_moe}, {"moe2", p_moe2}};  // not part of "all"
+const Entry kExtra[] = {{"k2prof", p_k2prof}, {"o13", p_o13}, {"act32", p_act32}, {"moe", p_moe}, {"moe2", p_moe2}, {"moe3", p_moe3}};  // not part of "all"
 
 int run_one(Ctx& c, const Args& a, const Entry& e) {
   try {

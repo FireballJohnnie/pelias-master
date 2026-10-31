@@ -272,6 +272,17 @@ cudaError_t moe_tiles(int bmt, int epi, int nunits, const void* units, const Moe
 cudaError_t moe_vec(int epi, int nunits, const void* units, const MoeArgs& A, cudaStream_t s);
 cudaError_t fix_to_f32(const int* yi, const unsigned long long* yl, size_t n, float inv, float* y, cudaStream_t s);
 cudaError_t moe_tile_info(int bmt, int* regs, int* local_bytes, int* smem, int* blocks_per_sm);
+// S3 (2026-10-30, author 21:30 "remove the padding and add the popcnt"): the work list built on the GPU from the routing
+// picks (sel / wt: T x n_used): count (__match_any_sync + __popc, one atomic per group of lanes on the same expert), build
+// (one warp: __ballot_sync / __popc for the active experts, warp scans for offsets; experts with more than `cut` rows get
+// 64-row tile units (expert, first row, valid rows, 0), the others warp-vector units), place (each pick takes its row).
+// No padding: experts' rows are contiguous. meta (device): tile units, vector units, active experts, rows. ut must hold
+// sum ceil(count / 64) <= T x n_used / 64 + 256 units, uv 256. s3_tiles / s3_vec launch upper-bound grids whose extra
+// blocks read the device count and leave; tile rows past the valid count are not stored or added.
+cudaError_t route_list_gpu(const int16_t* sel, const float* wt, int T, int n_used, int cut, int* cnt, int* off, int* cursor, void* ut, void* uv, int* meta, int* src,
+                           int* rtok, float* rw, int* prow, cudaStream_t s);
+cudaError_t s3_tiles(int epi, int max_units, const int* nunits, const void* units, const MoeArgs& A, cudaStream_t s);
+cudaError_t s3_vec(int epi, int cut, int max_units, const int* nunits, const void* units, const MoeArgs& A, cudaStream_t s);
 // The bf16 GEMM on `batch` problems at once (A: batch x M x K, B: batch x N x K, C: batch x M x N), same tiles as gemm_bf16_tiled.
 cudaError_t gemm_bf16_batched(const uint16_t* A, const uint16_t* B, float* C, int M, int N, int K, int batch, int cfg, int raster, cudaStream_t s);
 // fp32 reference for v7's inputs (activation scale per 256).

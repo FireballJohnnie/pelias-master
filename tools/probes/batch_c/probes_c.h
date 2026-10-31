@@ -2441,4 +2441,318 @@ inline int p_moe2(Ctx& c, const Args& a) {
   return all_ok ? 0 : 3;
 }
 
+// ================================================================ S3 (2026-10-30 21:3x, author 21:30): no padding + the GPU work list
+// Per layer of real routing, per-32 format: S0 (D v1: every expert padded to 64, host-built list, separate combine) as
+// the reference and baseline; S3 at cut 8 / 16 / 24 / 32: the work list built on the GPU (match_any / ballot / popc),
+// experts' rows unpadded, 64-row tiles for experts above the cut, warp-vector below, the down projection folded into the
+// combine with fixed-point int32 reductions (deterministic) + conversion. Checks: the GPU list's counts equal the host's;
+// tile-path rows = S0 bit for bit (gate|up and down); vector rows within 1e-3 of S0; the int32 fold within 1e-4 of S0's
+// combine, the same bits on repeat, no overflow. Timed: the GPU list build vs the host build + copy + sync; the whole
+// slice, S3 at each cut against S0.
+inline int p_moe3(Ctx& c, const Args& a) {
+  using namespace k2b;
+  Result r;
+  r.probe = "MOE-SLICE-S3";
+  init_cuda(c);
+  const double peak8 = a.num("int8-peak", 259.5);
+  const std::string rpath = a.get("routes", "");
+  if (rpath.empty()) throw std::runtime_error("moe3: --routes FILE is required");
+  const dslice::Routes R = dslice::read_routes(rpath);
+  const int chunk = static_cast<int>(a.inum("chunk", 0));
+  std::vector<int> layers, nchs, cuts;
+  {
+    std::string tok;
+    std::stringstream s1(a.get("layers", "0,20,39"));
+    while (std::getline(s1, tok, ',')) layers.push_back(std::stoi(tok));
+    std::stringstream s2(a.get("nchunks", "1,8"));
+    while (std::getline(s2, tok, ',')) nchs.push_back(std::stoi(tok));
+    std::stringstream s3(a.get("cuts", "8,16,24,32"));
+    while (std::getline(s3, tok, ',')) cuts.push_back(std::stoi(tok));
+  }
+  int nmax = 1;
+  for (const int n : nchs) nmax = std::max(nmax, n);
+  if (chunk < 0 || static_cast<unsigned>(chunk + nmax) > R.chunks) throw std::runtime_error("moe3: --chunk / --nchunks out of range");
+  const int Tmax = static_cast<int>(R.scored) * nmax, E = 256, H = 2048, F = 512, NU = 8;
+  Stream s;
+  Sampler sampler(c.nvml);
+  sampler.start(200);
+  JW before = state_now(c);
+  JW why;
+  const double wneed = w8_bytes(E * 2 * F, H) + w8_bytes(E * H, F) + static_cast<double>(E) * 2 * F * (H / 256) * 32 + static_cast<double>(E) * H * (F / 256) * 32;
+  if (!fits(a, wneed + 3.0 * (1ull << 30), why)) throw std::runtime_error("moe3: would cross the VRAM ceiling");
+  W8 wgu(E * 2 * F, H, 9100u, s), wdn(E * H, F, 9200u, s);
+  DevBuf gu8(static_cast<size_t>(E) * 2 * F * (H / 256) * 32), dn8(static_cast<size_t>(E) * H * (F / 256) * 32);
+  PP_CK(pkc::prep_q4k_dig8(wgu.q.as<pkc::BlockQ4K>(), gu8.as<uint16_t>(), E * 2 * F, H, s));
+  PP_CK(pkc::prep_q4k_dig8(wdn.q.as<pkc::BlockQ4K>(), dn8.as<uint16_t>(), E * H, F, s));
+  DevBuf X(static_cast<size_t>(Tmax) * H * 2), G(static_cast<size_t>(H) * 2);
+  PP_CK(pkc::fill_bf16(X.as<uint16_t>(), static_cast<size_t>(Tmax) * H, 9300u, s));
+  PP_CK(pkc::fill_bf16(G.as<uint16_t>(), H, 9400u, s));
+  bool all_ok = true;
+  std::vector<JW> rows;
+  for (const int nch : nchs)
+    for (const int L : layers) {
+      if (g_abort.load()) break;
+      if (L < 0 || static_cast<unsigned>(L) >= R.n_layer) continue;
+      const int T = static_cast<int>(R.scored) * nch, NP = T * NU;
+      std::vector<int> cnt(E, 0);
+      std::vector<int16_t> sel16(static_cast<size_t>(NP));
+      std::vector<float> wt(static_cast<size_t>(NP));
+      for (int t = 0; t < T; ++t) {
+        const size_t rec = (static_cast<size_t>(chunk) * R.scored + t) * R.n_layer + L;
+        for (int k = 0; k < NU; ++k) {
+          const int e = R.sel[rec * 8 + k];
+          if (e < 0 || e >= E) throw std::runtime_error("moe3: expert index out of range");
+          sel16[static_cast<size_t>(t) * NU + k] = static_cast<int16_t>(e);
+          wt[static_cast<size_t>(t) * NU + k] = R.w[rec * 8 + k];
+          ++cnt[e];
+        }
+      }
+      // ---- S0 (reference / baseline): pad 64, host list
+      std::vector<int> off64(E, 0), src64, prow64(static_cast<size_t>(NP)), u1, u2;
+      int P64 = 0;
+      for (int e = 0; e < E; ++e) {
+        off64[e] = P64;
+        P64 += (cnt[e] + 63) / 64 * 64;
+      }
+      src64.assign(P64, -1);
+      {
+        std::vector<int> fill(E, 0);
+        for (int i = 0; i < NP; ++i) {
+          const int e = sel16[i], pr = off64[e] + fill[e]++;
+          src64[pr] = i / NU;
+          prow64[i] = pr;
+        }
+      }
+      const auto t_host0 = std::chrono::steady_clock::now();
+      for (int e = 0; e < E; ++e)
+        for (int mt = 0; mt < (cnt[e] + 63) / 64; ++mt) {
+          for (int nt = 0; nt < 2 * F / 128; ++nt) u1.insert(u1.end(), {e, off64[e] + mt * 64, nt * 128, 0});
+          for (int nt = 0; nt < H / 128; ++nt) u2.insert(u2.end(), {e, off64[e] + mt * 64, nt * 128, 0});
+        }
+      DevBuf du1(u1.size() * 4), du2(u2.size() * 4), dsrc64(src64.size() * 4), dprow64(prow64.size() * 4), dwt(wt.size() * 4), dsel(sel16.size() * 2);
+      PP_CK(cudaMemcpyAsync(du1.as(), u1.data(), u1.size() * 4, cudaMemcpyHostToDevice, s));
+      PP_CK(cudaMemcpyAsync(du2.as(), u2.data(), u2.size() * 4, cudaMemcpyHostToDevice, s));
+      PP_CK(cudaMemcpyAsync(dsrc64.as(), src64.data(), src64.size() * 4, cudaMemcpyHostToDevice, s));
+      PP_CK(cudaMemcpyAsync(dprow64.as(), prow64.data(), prow64.size() * 4, cudaMemcpyHostToDevice, s));
+      PP_CK(cudaStreamSynchronize(s));
+      const double t_host_list = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_host0).count() * 1e3;  // build + copy + sync (ms)
+      PP_CK(cudaMemcpyAsync(dwt.as(), wt.data(), wt.size() * 4, cudaMemcpyHostToDevice, s));
+      PP_CK(cudaMemcpyAsync(dsel.as(), sel16.data(), sel16.size() * 2, cudaMemcpyHostToDevice, s));
+      const int Pm = std::max(P64, NP + 64);
+      DevBuf ta8(static_cast<size_t>(T) * H), tsa(static_cast<size_t>(T) * (H / 32) * 4), tx32(static_cast<size_t>(T) * (H / 32) * 4),
+          tdig(static_cast<size_t>(T) * (H / 256) * 32), pa8(static_cast<size_t>(Pm) * H), psa(static_cast<size_t>(Pm) * (H / 32) * 4),
+          pdig(static_cast<size_t>(Pm) * (H / 256) * 32), H1(static_cast<size_t>(Pm) * 2 * F * 4), qa8(static_cast<size_t>(Pm) * F),
+          qsa(static_cast<size_t>(Pm) * (F / 32) * 4), qs32(static_cast<size_t>(Pm) * (F / 32) * 4), qx32(static_cast<size_t>(Pm) * (F / 32) * 4),
+          qdig(static_cast<size_t>(Pm) * (F / 256) * 32), O(static_cast<size_t>(Pm) * H * 4), Y0(static_cast<size_t>(T) * H * 4), Yi(static_cast<size_t>(T) * H * 4),
+          Yc(static_cast<size_t>(T) * H * 4), ovf(16);
+      PP_CK(cudaMemsetAsync(pa8.as(), 0, static_cast<size_t>(Pm) * H, s));
+      PP_CK(cudaMemsetAsync(psa.as(), 0, static_cast<size_t>(Pm) * (H / 32) * 4, s));
+      PP_CK(cudaMemsetAsync(pdig.as(), 0, static_cast<size_t>(Pm) * (H / 256) * 32, s));
+      PP_CK(cudaMemsetAsync(qa8.as(), 0, static_cast<size_t>(Pm) * F, s));
+      PP_CK(cudaMemsetAsync(qsa.as(), 0, static_cast<size_t>(Pm) * (F / 32) * 4, s));
+      PP_CK(cudaMemsetAsync(qdig.as(), 0, static_cast<size_t>(Pm) * (F / 256) * 32, s));
+      auto norm = [&] {
+        PP_CK(pkc::rmsnorm_q8x32(X.as<uint16_t>(), G.as<uint16_t>(), ta8.as<int8_t>(), tsa.as<float>(), tx32.as<float>(), T, H, s));
+        PP_CK(pkc::dig_x32(tx32.as<float>(), tdig.as<uint16_t>(), T, H, s));
+      };
+      auto gather = [&](const int* sidx, int P) {
+        PP_CK(pkc::gather_q8(sidx, P, H, H / 32, (H / 256) * 16, ta8.as<int8_t>(), tsa.as<float>(), tdig.as<uint16_t>(), pa8.as<int8_t>(), psa.as<float>(),
+                             pdig.as<uint16_t>(), s));
+      };
+      auto act = [&](int P) {
+        PP_CK(pkc::silu_q8(H1.as<float>(), P, F, 1, qa8.as<int8_t>(), qsa.as<float>(), qs32.as<int>(), qx32.as<float>(), qdig.as<uint16_t>(), s));
+        PP_CK(pkc::dig_x32(qx32.as<float>(), qdig.as<uint16_t>(), P, F, s));
+      };
+      auto A1 = [&] {
+        pkc::MoeArgs A;
+        A.a8 = pa8.as<int8_t>();
+        A.sa32 = psa.as<float>();
+        A.adig = pdig.as<uint16_t>();
+        A.w = wgu.q.as<pkc::BlockQ4K>();
+        A.rec = wgu.rec.as();
+        A.wdig8 = gu8.as<uint16_t>();
+        A.N = 2 * F;
+        A.K = H;
+        A.C = H1.as<float>();
+        return A;
+      };
+      auto A2 = [&](const int* rt, const float* rwp, float scale) {
+        pkc::MoeArgs A;
+        A.a8 = qa8.as<int8_t>();
+        A.sa32 = qsa.as<float>();
+        A.adig = qdig.as<uint16_t>();
+        A.w = wdn.q.as<pkc::BlockQ4K>();
+        A.rec = wdn.rec.as();
+        A.wdig8 = dn8.as<uint16_t>();
+        A.N = H;
+        A.K = F;
+        A.C = O.as<float>();
+        A.rtok = rt;
+        A.rw = rwp;
+        A.Yi = Yi.as<int>();
+        A.scale = scale;
+        A.ovf = ovf.as<unsigned>();
+        return A;
+      };
+      // S0 pass (reference)
+      auto s0_slice = [&] {
+        norm();
+        gather(dsrc64.as<int>(), P64);
+        PP_CK(pkc::moe_tiles(64, 0, static_cast<int>(u1.size() / 4), du1.as(), A1(), s));
+        act(P64);
+        PP_CK(pkc::moe_tiles(64, 0, static_cast<int>(u2.size() / 4), du2.as(), A2(nullptr, nullptr, 1.f), s));
+        PP_CK(pkc::combine_rows(O.as<float>(), dprow64.as<int>(), dwt.as<float>(), T, NU, H, Y0.as<float>(), s));
+      };
+      s0_slice();
+      PP_CK(cudaStreamSynchronize(s));
+      std::vector<float> h1s0(static_cast<size_t>(P64) * 2 * F), os0(static_cast<size_t>(P64) * H), y0(static_cast<size_t>(T) * H);
+      PP_CK(cudaMemcpy(h1s0.data(), H1.as(), h1s0.size() * 4, cudaMemcpyDeviceToHost));
+      PP_CK(cudaMemcpy(os0.data(), O.as(), os0.size() * 4, cudaMemcpyDeviceToHost));
+      PP_CK(cudaMemcpy(y0.data(), Y0.as(), y0.size() * 4, cudaMemcpyDeviceToHost));
+      double maxO = 0.0;
+      for (int i = 0; i < NP; ++i) {
+        const float* o = &os0[static_cast<size_t>(prow64[i]) * H];
+        for (int cc = 0; cc < H; ++cc) maxO = std::max(maxO, static_cast<double>(std::fabs(o[cc]) * wt[i]));
+      }
+      const int k32 = maxO > 0 ? static_cast<int>(std::floor(std::log2(268435455.0 / maxO))) : 20;
+      const float sc32 = std::ldexp(1.f, k32);
+      const double t_s0 = time_ms(s, s0_slice, 100.0);
+      int active = 0;
+      for (int e = 0; e < E; ++e) active += cnt[e] ? 1 : 0;
+      JW row;
+      row.kv("layer", L).kv("chunks", nch).kv("tokens", T).kv("picks", NP).kv("active_experts", active).kv("rows_pad64", P64).kv("ms_s0_slice", t_s0);
+      row.kv("ms_host_list_build_copy_sync", t_host_list).kv("int32_scale_log2", k32);
+      std::printf("  layer %2d, %4d tokens: %d of %d experts active; S0 (pad-64, host list, separate combine) whole slice %.4f ms; host list build + copy + sync %.4f ms\n", L, T,
+                  active, E, t_s0, t_host_list);
+      std::fflush(stdout);
+      // ---- S3 per cut
+      DevBuf dcnt(E * 4), doff(E * 4), dcur(E * 4), dmeta(16), dsrc(static_cast<size_t>(NP) * 4), drt(static_cast<size_t>(NP + 64) * 4),
+          drw(static_cast<size_t>(NP + 64) * 4), dprow(static_cast<size_t>(NP) * 4);
+      const int max_tiles = NP / 64 + E;
+      DevBuf dut(static_cast<size_t>(max_tiles) * 16), duv(static_cast<size_t>(E) * 16);
+      std::vector<JW> cj;
+      for (const int cut : cuts) {
+        if (g_abort.load()) break;
+        auto build = [&] {
+          PP_CK(pkc::route_list_gpu(dsel.as<int16_t>(), dwt.as<float>(), T, NU, cut, dcnt.as<int>(), doff.as<int>(), dcur.as<int>(), dut.as(), duv.as(), dmeta.as<int>(),
+                                    dsrc.as<int>(), drt.as<int>(), drw.as<float>(), dprow.as<int>(), s));
+        };
+        auto gemm1 = [&] {
+          PP_CK(pkc::s3_tiles(0, max_tiles, dmeta.as<int>(), dut.as(), A1(), s));
+          PP_CK(pkc::s3_vec(0, cut, E, dmeta.as<int>() + 1, duv.as(), A1(), s));
+        };
+        auto gemm2 = [&](int epi) {
+          const pkc::MoeArgs A = A2(drt.as<int>(), drw.as<float>(), sc32);
+          PP_CK(pkc::s3_tiles(epi, max_tiles, dmeta.as<int>(), dut.as(), A, s));
+          PP_CK(pkc::s3_vec(epi, cut, E, dmeta.as<int>() + 1, duv.as(), A, s));
+        };
+        auto fold = [&] {
+          PP_CK(cudaMemsetAsync(Yi.as(), 0, static_cast<size_t>(T) * H * 4, s));
+          gemm2(2);
+          PP_CK(pkc::fix_to_f32(Yi.as<int>(), nullptr, static_cast<size_t>(T) * H, 1.f / sc32, Yc.as<float>(), s));
+        };
+        auto s3_slice = [&] {
+          norm();
+          build();
+          gather(dsrc.as<int>(), NP);
+          gemm1();
+          act(NP);
+          fold();
+        };
+        // one pass with the store epilogue for the row checks, then the fold
+        PP_CK(cudaMemsetAsync(ovf.as(), 0, 16, s));
+        norm();
+        build();
+        gather(dsrc.as<int>(), NP);
+        gemm1();
+        act(NP);
+        gemm2(0);
+        PP_CK(cudaStreamSynchronize(s));
+        int meta[4] = {0, 0, 0, 0};
+        PP_CK(cudaMemcpy(meta, dmeta.as(), 16, cudaMemcpyDeviceToHost));
+        std::vector<int> prow3(static_cast<size_t>(NP));
+        std::vector<float> h1(static_cast<size_t>(NP) * 2 * F), o3(static_cast<size_t>(NP) * H);
+        PP_CK(cudaMemcpy(prow3.data(), dprow.as(), prow3.size() * 4, cudaMemcpyDeviceToHost));
+        PP_CK(cudaMemcpy(h1.data(), H1.as(), h1.size() * 4, cudaMemcpyDeviceToHost));
+        PP_CK(cudaMemcpy(o3.data(), O.as(), o3.size() * 4, cudaMemcpyDeviceToHost));
+        int exp_t = 0, exp_v = 0;
+        for (int e = 0; e < E; ++e) {
+          if (cnt[e] > cut) exp_t += (cnt[e] + 63) / 64;
+          else if (cnt[e]) ++exp_v;
+        }
+        const bool list_ok = meta[0] == exp_t && meta[1] == exp_v && meta[2] == active && meta[3] == NP;
+        bool tile_same = true;
+        double vec_err = 0.0;
+        std::vector<int> seen(static_cast<size_t>(NP), 0);
+        bool perm_ok = true;
+        for (int i = 0; i < NP; ++i) {
+          const int p3 = prow3[i];
+          if (p3 < 0 || p3 >= NP || seen[p3]++) {
+            perm_ok = false;
+            break;
+          }
+          const int e = sel16[i];
+          const float* a0 = &h1s0[static_cast<size_t>(prow64[i]) * 2 * F];
+          const float* a3 = &h1[static_cast<size_t>(p3) * 2 * F];
+          const float* b0 = &os0[static_cast<size_t>(prow64[i]) * H];
+          const float* b3 = &o3[static_cast<size_t>(p3) * H];
+          if (cnt[e] > cut) {
+            tile_same = tile_same && std::memcmp(a0, a3, static_cast<size_t>(2 * F) * 4) == 0 && std::memcmp(b0, b3, static_cast<size_t>(H) * 4) == 0;
+          } else {
+            double mx = 0.0, md = 0.0;
+            for (int cc = 0; cc < 2 * F; ++cc) {
+              mx = std::max(mx, static_cast<double>(std::fabs(a0[cc])));
+              md = std::max(md, static_cast<double>(std::fabs(a3[cc] - a0[cc])));
+            }
+            if (mx > 0) vec_err = std::max(vec_err, md / mx);
+          }
+        }
+        // the int32 fold: within 1e-4 of S0's combine, same bits on repeat, no overflow
+        fold();
+        PP_CK(cudaStreamSynchronize(s));
+        std::vector<float> ya(static_cast<size_t>(T) * H), yb(static_cast<size_t>(T) * H);
+        PP_CK(cudaMemcpy(ya.data(), Yc.as(), ya.size() * 4, cudaMemcpyDeviceToHost));
+        fold();
+        PP_CK(cudaStreamSynchronize(s));
+        PP_CK(cudaMemcpy(yb.data(), Yc.as(), yb.size() * 4, cudaMemcpyDeviceToHost));
+        unsigned nov = 0;
+        PP_CK(cudaMemcpy(&nov, ovf.as(), 4, cudaMemcpyDeviceToHost));
+        const bool rep = std::memcmp(ya.data(), yb.data(), ya.size() * 4) == 0;
+        double num = 0.0, den = 0.0;
+        for (size_t i = 0; i < ya.size(); ++i) {
+          const double d = static_cast<double>(ya[i]) - y0[i];
+          num += d * d;
+          den += static_cast<double>(y0[i]) * y0[i];
+        }
+        const double rl2 = den > 0 ? std::sqrt(num / den) : 0.0;
+        const bool ok = list_ok && perm_ok && tile_same && vec_err <= 1e-3 && rl2 <= 1e-4 && rep && nov == 0;
+        all_ok = all_ok && ok;
+        const double t_build = time_ms(s, build, 40.0), t_g1 = time_ms(s, gemm1, 60.0);
+        act(NP);
+        const double t_fold = time_ms(s, fold, 60.0), t_sl = time_ms(s, s3_slice, 100.0);
+        JW j;
+        j.kv("cut", cut).kv("tile_units", meta[0]).kv("vector_units", meta[1]).kv("ms_gpu_list_build", t_build).kv("ms_gate_up", t_g1).kv("ms_down_int32_fold", t_fold);
+        j.kv("ms_whole_slice", t_sl).kv("over_s0", t_s0 / t_sl).kv("list_counts_match_host", list_ok).kv("rows_permutation_ok", perm_ok).kv("tile_rows_bit_equal_s0", tile_same);
+        j.kv("vector_max_rel_vs_s0", vec_err).kv("fold_rel_l2_vs_s0", rl2).kv("fold_repeat_bit_equal", rep).kv("int32_overflows", static_cast<long long>(nov)).kv("ok", ok);
+        cj.push_back(j);
+        std::printf("    S3 cut %2d: %4d tile + %3d vector units | GPU list %.4f ms | gate|up %.4f | down + int32 fold %.4f | whole slice %.4f ms (%.2fx of S0) | list = host %s, "
+                    "tile rows = S0 bit for bit %s, vector %.1e, fold vs S0 %.1e, repeat %s, overflows %u%s\n",
+                    cut, meta[0], meta[1], t_build, t_g1, t_fold, t_sl, t_s0 / t_sl, list_ok ? "yes" : "NO", tile_same ? "yes" : "NO", vec_err, rl2, rep ? "same" : "DIFF",
+                    nov, ok ? "" : "  FAIL");
+        std::fflush(stdout);
+      }
+      row.arr_obj("s3", cj);
+      rows.push_back(row);
+    }
+  const std::vector<Sample> all = sampler.stop();
+  r.inputs.kv("routes", rpath).kv("first_chunk", chunk).kv("tokens_per_chunk", static_cast<int>(R.scored)).kv("int8_peak_tops", peak8).kv("format", "per-32");
+  r.values.arr_obj("layers", rows).kv("all_ok", all_ok).kv_obj("state_before", before).kv_obj("state_after", state_now(c)).kv_obj("nvml_whole_run", summarize(all));
+  r.pass = all_ok ? -1 : 0;
+  r.headline = std::string(all_ok ? "all checks passed" : "a check FAILED") + "; S3 per cut against S0 per layer in the JSON";
+  r.notes = std::string(g_abort.load() ? "ABORTED: " + abort_reason() : "");
+  write_result(c, r, "moe_slice_s3");
+  std::printf("  MOE-SLICE-S3 %s\n", r.headline.c_str());
+  return all_ok ? 0 : 3;
+}
+
 }  // namespace pp

@@ -2729,13 +2729,20 @@ __device__ __forceinline__ void moe_epi(int row, int col, float v, float* C, int
   }
 }
 
-template <int S, int BMT, int EPI>
+template <int S, int BMT, int EPI, bool kCompact = false>
 __global__ void __launch_bounds__(256, 2) k_moe_tile(const int8_t* __restrict__ a8, const float* __restrict__ sa32,
                                                                      const uint16_t* __restrict__ adig, const BlockQ4K* __restrict__ w,
                                                                      const uint4* __restrict__ rec, const uint16_t* __restrict__ wdig8,
                                                                      const int4* __restrict__ units, int N, int K, float* __restrict__ C,
                                                                      const int* __restrict__ rtok, const float* __restrict__ rw, float* Yf, int* Yi,
-                                                                     unsigned long long* Yl, float scale, unsigned* ovf) {
+                                                                     unsigned long long* Yl, float scale, unsigned* ovf,
+                                                                     const int* __restrict__ nunits = nullptr) {
+  // S3 (compact): units (expert, first row, valid rows, 0) built on the GPU; the column tile is blockIdx.y; the grid is an
+  // upper bound and blocks past the GPU-written unit count leave at once; rows past the valid count are neither stored nor
+  // added (they belong to the next expert in the unpadded layout)
+  if constexpr (kCompact) {
+    if (static_cast<int>(blockIdx.x) >= *nunits) return;
+  }
   constexpr int WMW = BMT >= 32 ? 2 : 1, WNW = 8 / WMW, NI = 128 / (WNW * 8), WR = BMT / WMW, MI = WR / 16;
   static_assert(MI >= 1 && NI >= 1, "tile layout");
   extern __shared__ __align__(16) uint8_t mt_smem[];
@@ -2747,7 +2754,7 @@ __global__ void __launch_bounds__(256, 2) k_moe_tile(const int8_t* __restrict__ 
   w += static_cast<size_t>(u.x) * N * bpr;
   rec += static_cast<size_t>(u.x) * N * bpr;
   wdig8 += static_cast<size_t>(u.x) * N * bpr * 16;
-  const int bm = u.y, bn = u.z;
+  const int bm = u.y, bn = kCompact ? static_cast<int>(blockIdx.y) * kBN : u.z, vrows = kCompact ? u.z : BMT;
   float acc[MI][NI][4];
 #pragma unroll
   for (int i = 0; i < MI; ++i)
@@ -2875,12 +2882,16 @@ __global__ void __launch_bounds__(256, 2) k_moe_tile(const int8_t* __restrict__ 
   for (int mi = 0; mi < MI; ++mi)
 #pragma unroll
     for (int ni = 0; ni < NI; ++ni) {
-      const int r0 = bm + wm * WR + mi * 16 + g;
+      const int lr = wm * WR + mi * 16 + g, r0 = bm + lr;
       const int c0 = bn + wn * NI * 8 + ni * 8 + 2 * t;
-      moe_epi<EPI>(r0, c0, acc[mi][ni][0], C, N, rtok, rw, Yf, Yi, Yl, scale, ovf);
-      moe_epi<EPI>(r0, c0 + 1, acc[mi][ni][1], C, N, rtok, rw, Yf, Yi, Yl, scale, ovf);
-      moe_epi<EPI>(r0 + 8, c0, acc[mi][ni][2], C, N, rtok, rw, Yf, Yi, Yl, scale, ovf);
-      moe_epi<EPI>(r0 + 8, c0 + 1, acc[mi][ni][3], C, N, rtok, rw, Yf, Yi, Yl, scale, ovf);
+      if (lr < vrows) {
+        moe_epi<EPI>(r0, c0, acc[mi][ni][0], C, N, rtok, rw, Yf, Yi, Yl, scale, ovf);
+        moe_epi<EPI>(r0, c0 + 1, acc[mi][ni][1], C, N, rtok, rw, Yf, Yi, Yl, scale, ovf);
+      }
+      if (lr + 8 < vrows) {
+        moe_epi<EPI>(r0 + 8, c0, acc[mi][ni][2], C, N, rtok, rw, Yf, Yi, Yl, scale, ovf);
+        moe_epi<EPI>(r0 + 8, c0 + 1, acc[mi][ni][3], C, N, rtok, rw, Yf, Yi, Yl, scale, ovf);
+      }
     }
 }
 
@@ -2888,17 +2899,20 @@ __global__ void __launch_bounds__(256, 2) k_moe_tile(const int8_t* __restrict__ 
 // the weight row in turn (sub-block = lane, lane + 32, ...), decode each once and use it for every row (dp4a on the
 // int8 activations, the per-32 activation scale and the integer sum by dp4a against ones), then a warp sum. No tensor
 // cores, no tile: the weight row is read once for all rows of the expert. units: (expert, first packed row, rows, 0).
-template <int EPI>
+template <int EPI, int kMaxRows = 8>
 __global__ void __launch_bounds__(256) k_moe_vec(const int8_t* __restrict__ a8, const float* __restrict__ sa32, const BlockQ4K* __restrict__ w,
                                                  const int4* __restrict__ units, int N, int K, float* __restrict__ C, const int* __restrict__ rtok,
                                                  const float* __restrict__ rw, float* Yf, int* Yi, unsigned long long* Yl, float scale,
-                                                 unsigned* ovf) {
+                                                 unsigned* ovf, const int* __restrict__ nunits = nullptr) {
+  if (nunits && static_cast<int>(blockIdx.x) >= *nunits) return;
   const int4 u = units[blockIdx.x];
   const int lane = threadIdx.x & 31, n = blockIdx.y * 8 + (threadIdx.x >> 5);
   if (n >= N) return;
   const int bpr = K / kQK, n32 = K / 32, rows = u.z;
   const BlockQ4K* wr = w + (static_cast<size_t>(u.x) * N + n) * bpr;
-  float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+  float acc[kMaxRows];
+#pragma unroll
+  for (int r = 0; r < kMaxRows; ++r) acc[r] = 0.f;
   for (int jj = lane; jj < n32; jj += 32) {
     const BlockQ4K& b = wr[jj >> 3];
     const int j = jj & 7;
@@ -2909,7 +2923,7 @@ __global__ void __launch_bounds__(256) k_moe_vec(const int8_t* __restrict__ a8, 
     const uint32_t qw[8] = {qa.x, qa.y, qa.z, qa.w, qb.x, qb.y, qb.z, qb.w};
     const int sh = 4 * (j & 1);
 #pragma unroll
-    for (int r = 0; r < 8; ++r) {
+    for (int r = 0; r < kMaxRows; ++r) {
       if (r >= rows) break;
       const int8_t* xr = a8 + static_cast<size_t>(u.y + r) * K + jj * 32;
       const uint4 xa = *reinterpret_cast<const uint4*>(xr), xb = *reinterpret_cast<const uint4*>(xr + 16);
@@ -2926,12 +2940,89 @@ __global__ void __launch_bounds__(256) k_moe_vec(const int8_t* __restrict__ a8, 
     }
   }
 #pragma unroll
-  for (int r = 0; r < 8; ++r) {
+  for (int r = 0; r < kMaxRows; ++r) {
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) acc[r] += __shfl_xor_sync(0xffffffffu, acc[r], o);
   }
   if (lane == 0)
     for (int r = 0; r < rows; ++r) moe_epi<EPI>(u.y + r, n, acc[r], C, N, rtok, rw, Yf, Yi, Yl, scale, ovf);
+}
+
+// ---------------------------------------------------------------- S3: the work list built on the GPU (author 21:27-21:30)
+// (1) count: each warp takes 32 picks; __match_any_sync groups the lanes holding the same expert, the group's lowest
+// lane adds __popc(group) with one atomic. (2) build: one warp; lane l owns experts 8l..8l+7; __ballot_sync / __popc
+// give the active mask and each lane's place, warp scans give the row offsets and the unit offsets; counts above the
+// cut go to 64-row tile units (count >> 6 bodies and one partial tile when count & 63), the rest to warp-vector units;
+// empty experts produce nothing. (3) place: each pick takes the next row of its expert (atomic cursor) and writes the
+// packed-row source token, routing weight and the token's row index. No host round trip: the counts of units are
+// written to the device and the GEMM grids are upper bounds whose extra blocks leave at once.
+__global__ void k_route_count(const int16_t* __restrict__ sel, int n, int* __restrict__ cnt) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  const unsigned live = __ballot_sync(0xffffffffu, i < n);
+  if (i >= n) return;
+  const int e = sel[i];
+  const unsigned grp = __match_any_sync(live, e);
+  if ((threadIdx.x & 31) == __ffs(grp) - 1) atomicAdd(cnt + e, __popc(grp));
+}
+
+__device__ __forceinline__ int warp_incl_scan(int v, int lane) {
+#pragma unroll
+  for (int o = 1; o < 32; o <<= 1) {
+    const int x = __shfl_up_sync(0xffffffffu, v, o);
+    if (lane >= o) v += x;
+  }
+  return v;
+}
+
+// meta[0] = tile units, meta[1] = vector units, meta[2] = active experts, meta[3] = rows
+__global__ void k_route_build(const int* __restrict__ cnt, int cut, int* __restrict__ off, int* __restrict__ cursor, int4* __restrict__ ut,
+                              int4* __restrict__ uv, int* __restrict__ meta) {
+  const int lane = threadIdx.x & 31;
+  int c[8], rows = 0, nt = 0, nv = 0;
+  unsigned act = 0;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    c[i] = cnt[lane * 8 + i];
+    rows += c[i];
+    if (c[i]) act |= 1u << i;
+    if (c[i] > cut) nt += (c[i] >> 6) + ((c[i] & 63) ? 1 : 0);
+    else if (c[i]) ++nv;
+  }
+  const unsigned any = __ballot_sync(0xffffffffu, act != 0);  // lanes with work
+  const int r_in = warp_incl_scan(rows, lane), t_in = warp_incl_scan(nt, lane), v_in = warp_incl_scan(nv, lane);
+  int r0 = r_in - rows, t0 = t_in - nt, v0 = v_in - nv;
+  const int nact = __popc(act);
+  const int a_in = warp_incl_scan(nact, lane);
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const int e = lane * 8 + i;
+    off[e] = r0;
+    cursor[e] = r0;
+    if (c[i] > cut) {
+      for (int m = 0; m < c[i]; m += 64) ut[t0++] = make_int4(e, r0 + m, min(64, c[i] - m), 0);
+    } else if (c[i]) {
+      uv[v0++] = make_int4(e, r0, c[i], 0);
+    }
+    r0 += c[i];
+  }
+  if (lane == 31) {
+    meta[0] = t_in;
+    meta[1] = v_in;
+    meta[2] = a_in;
+    meta[3] = r_in;
+  }
+  (void)any;
+}
+
+__global__ void k_route_place(const int16_t* __restrict__ sel, const float* __restrict__ wt, int n, int n_used, int* __restrict__ cursor,
+                              int* __restrict__ src, int* __restrict__ rtok, float* __restrict__ rw, int* __restrict__ prow) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const int e = sel[i], p = atomicAdd(cursor + e, 1), t = i / n_used;
+  src[p] = t;
+  rtok[p] = t;
+  rw[p] = wt[i];
+  prow[i] = p;
 }
 
 __global__ void k_fix_to_f32(const int* __restrict__ yi, const unsigned long long* __restrict__ yl, size_t n, float inv, float* __restrict__ y) {
@@ -3747,6 +3838,62 @@ cudaError_t moe_tile_info(int bmt, int* regs, int* local_bytes, int* smem, int* 
   *local_bytes = static_cast<int>(fa.localSizeBytes);
   *smem = static_cast<int>(fa.sharedSizeBytes) + dyn;
   return cudaOccupancyMaxActiveBlocksPerMultiprocessor(blocks_per_sm, f, 256, dyn);
+}
+cudaError_t route_list_gpu(const int16_t* sel, const float* wt, int T, int n_used, int cut, int* cnt, int* off, int* cursor, void* ut, void* uv, int* meta, int* src,
+                           int* rtok, float* rw, int* prow, cudaStream_t s) {
+  const int n = T * n_used;
+  cudaError_t e = cudaMemsetAsync(cnt, 0, 256 * sizeof(int), s);
+  if (e != cudaSuccess) return e;
+  k_route_count<<<(n + 255) / 256, 256, 0, s>>>(sel, n, cnt);
+  k_route_build<<<1, 32, 0, s>>>(cnt, cut, off, cursor, static_cast<int4*>(ut), static_cast<int4*>(uv), meta);
+  k_route_place<<<(n + 255) / 256, 256, 0, s>>>(sel, wt, n, n_used, cursor, src, rtok, rw, prow);
+  return cudaGetLastError();
+}
+namespace {
+template <int EPI>
+cudaError_t s3_tiles_launch(int max_units, const int* nunits, const int4* units, const MoeArgs& A, cudaStream_t s) {
+  static cudaError_t once = cudaFuncSetAttribute(k_moe_tile<3, 64, EPI, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                 static_cast<int>(3 * sizeof(V12x8Stage<64>)));
+  if (once != cudaSuccess) return once;
+  if (max_units < 1) return cudaSuccess;
+  k_moe_tile<3, 64, EPI, true><<<dim3(max_units, A.N / kBN), 256, 3 * sizeof(V12x8Stage<64>), s>>>(
+      A.a8, A.sa32, A.adig, A.w, static_cast<const uint4*>(A.rec), A.wdig8, units, A.N, A.K, A.C, A.rtok, A.rw, A.Yf, A.Yi, A.Yl, A.scale, A.ovf, nunits);
+  return cudaGetLastError();
+}
+template <int EPI, int MR>
+cudaError_t s3_vec_launch(int max_units, const int* nunits, const int4* units, const MoeArgs& A, cudaStream_t s) {
+  if (max_units < 1) return cudaSuccess;
+  k_moe_vec<EPI, MR><<<dim3(max_units, (A.N + 7) / 8), 256, 0, s>>>(A.a8, A.sa32, A.w, units, A.N, A.K, A.C, A.rtok, A.rw, A.Yf, A.Yi, A.Yl, A.scale, A.ovf,
+                                                                   nunits);
+  return cudaGetLastError();
+}
+template <int EPI>
+cudaError_t s3_vec_pick(int cut, int max_units, const int* nunits, const int4* units, const MoeArgs& A, cudaStream_t s) {
+  if (cut <= 8) return s3_vec_launch<EPI, 8>(max_units, nunits, units, A, s);
+  if (cut <= 16) return s3_vec_launch<EPI, 16>(max_units, nunits, units, A, s);
+  if (cut <= 24) return s3_vec_launch<EPI, 24>(max_units, nunits, units, A, s);
+  return s3_vec_launch<EPI, 32>(max_units, nunits, units, A, s);
+}
+}  // namespace
+cudaError_t s3_tiles(int epi, int max_units, const int* nunits, const void* units, const MoeArgs& A, cudaStream_t s) {
+  if (A.N % kBN || A.K % kQK || epi < 0 || epi > 3) return cudaErrorInvalidValue;
+  const int4* u = static_cast<const int4*>(units);
+  switch (epi) {
+    case 0: return s3_tiles_launch<0>(max_units, nunits, u, A, s);
+    case 1: return s3_tiles_launch<1>(max_units, nunits, u, A, s);
+    case 2: return s3_tiles_launch<2>(max_units, nunits, u, A, s);
+    default: return s3_tiles_launch<3>(max_units, nunits, u, A, s);
+  }
+}
+cudaError_t s3_vec(int epi, int cut, int max_units, const int* nunits, const void* units, const MoeArgs& A, cudaStream_t s) {
+  if (A.K % kQK || epi < 0 || epi > 3 || cut < 1 || cut > 32) return cudaErrorInvalidValue;
+  const int4* u = static_cast<const int4*>(units);
+  switch (epi) {
+    case 0: return s3_vec_pick<0>(cut, max_units, nunits, u, A, s);
+    case 1: return s3_vec_pick<1>(cut, max_units, nunits, u, A, s);
+    case 2: return s3_vec_pick<2>(cut, max_units, nunits, u, A, s);
+    default: return s3_vec_pick<3>(cut, max_units, nunits, u, A, s);
+  }
 }
 cudaError_t kernel_info(int which, int* regs, int* local_bytes, int* static_smem, int* blocks_per_sm) {
   const void* f = nullptr;
