@@ -1606,4 +1606,136 @@ inline int p_o13(Ctx& c, const Args& a) {
   return all_ok ? 0 : 3;
 }
 
+// ================================================================ B: per-32 activation scales in the prompt GEMM (2026-10-30)
+// v12 (one activation scale per 256, the 10-26 kernels) against v12x8 (one per 32: the adopted gpu256x8 format) on the
+// dense shapes that run (attn_qkv 2048->8192, ssm_out 4096->2048, gate/up 2048->512, expert down 512->2048) at M 2048
+// and 4096, and grouped (256 experts x M 64: expert gate/up and down). Each kernel checked against fp32 of its own
+// rounded inputs (16 rows); both compared with the bf16 path (Q4_K dequantized to bf16, bf16 activations, fp32
+// accumulate) as the accuracy view: what the 8-bit activations cost against unrounded activations. Speed: best of every
+// variant and both tile orders, warm, as P-K2b.
+inline int p_act32(Ctx& c, const Args& a) {
+  using namespace k2b;
+  Result r;
+  r.probe = "ACT32";
+  init_cuda(c);
+  const double peak8 = a.num("int8-peak", 259.5);
+  Stream s;
+  Sampler sampler(c.nvml);
+  sampler.start(200);
+  JW before = state_now(c);
+  const int ref_rows = 16;
+  const int E = static_cast<int>(a.inum("experts", 256));
+  const int Me = static_cast<int>(a.inum("expert-m", 64));
+  auto tops = [](double M, double N, double K, double ms) { return 2.0 * M * N * K / (ms * 1e-3) / 1e12; };
+  std::vector<JW> infos;
+  for (int v = 0; v < pkc::kV12Variants; ++v) {
+    int regs = 0, loc = 0, sm = 0, bps = 0;
+    PP_CK(pkc::v12x8_info(v, &regs, &loc, &sm, &bps));
+    JW j;
+    j.kv("kernel", pkc::v12x8_name(v)).kv("registers", regs).kv("local_spill_bytes", loc).kv("shared_bytes", sm).kv("blocks_per_sm", bps);
+    infos.push_back(j);
+    std::printf("    %-24s %3d registers, %4d spill bytes, %6d shared bytes, %d blocks per SM\n", pkc::v12x8_name(v), regs, loc, sm, bps);
+  }
+  struct Case {
+    int si, M, batch;
+  };
+  std::vector<Case> cases;
+  for (const int si : {0, 2, 3, 4})
+    for (const int M : {2048, 4096}) cases.push_back({si, M, 1});
+  for (const int si : {3, 4}) cases.push_back({si, Me, E});
+  bool all_ok = true;
+  std::vector<JW> rows;
+  for (const Case& cs : cases) {
+    if (g_abort.load()) break;
+    const Shape& sh = kShapes[cs.si];
+    const int M = cs.M, B = cs.batch, rowsA = M * B, wrows = sh.N * B, rc = std::min(sh.N, 1024), bpr = sh.K / pkc::kQK;
+    JW row, why;
+    row.kv("shape", sh.name).kv("M", M).kv("problems", B).kv("K", sh.K).kv("N", sh.N);
+    const double need = static_cast<double>(rowsA) * sh.K * 2 + 2 * a8_bytes(rowsA, sh.K) + w8_bytes(wrows, sh.K) + static_cast<double>(wrows) * bpr * 32 +
+                        static_cast<double>(wrows) * sh.K * 2 + static_cast<double>(rowsA) * sh.N * 4 * 3 + ref_rows * rc * 4.0 * 2;
+    if (!fits(a, need, why)) {
+      row.kv("status", "skipped: would cross the VRAM ceiling").kv_obj("cap", why);
+      rows.push_back(row);
+      continue;
+    }
+    DevBuf A(static_cast<size_t>(rowsA) * sh.K * 2), C256(static_cast<size_t>(rowsA) * sh.N * 4), C32(static_cast<size_t>(rowsA) * sh.N * 4),
+        Cbf(static_cast<size_t>(rowsA) * sh.N * 4), Wb(static_cast<size_t>(wrows) * sh.K * 2), R256(static_cast<size_t>(ref_rows) * rc * 4),
+        R32(static_cast<size_t>(ref_rows) * rc * 4);
+    PP_CK(pkc::fill_bf16(A.as<uint16_t>(), static_cast<size_t>(rowsA) * sh.K, 7100u + sh.K + M, s));
+    W8 w(wrows, sh.K, 8100u + sh.N, s);
+    DevBuf wd8(static_cast<size_t>(wrows) * bpr * 32);
+    PP_CK(pkc::prep_q4k_dig8(w.q.as<pkc::BlockQ4K>(), wd8.as<uint16_t>(), wrows, sh.K, s));
+    A8 x(rowsA, sh.K);  // per 256 (v12's)
+    x.quantize(A, rowsA, sh.K, s);
+    DevBuf a32(static_cast<size_t>(rowsA) * sh.K), s32(static_cast<size_t>(rowsA) * (sh.K / 32) * 4), m32(static_cast<size_t>(rowsA) * (sh.K / 32) * 4),
+        x32(static_cast<size_t>(rowsA) * (sh.K / 32) * 4), d32(static_cast<size_t>(rowsA) * bpr * 32);
+    PP_CK(pkc::quantize_rows_q8(A.as<uint16_t>(), a32.as<int8_t>(), s32.as<float>(), m32.as<int>(), x32.as<float>(), rowsA, sh.K, s));
+    PP_CK(pkc::dig_x32(x32.as<float>(), d32.as<uint16_t>(), rowsA, sh.K, s));
+    // references of each kernel's own inputs (first rows of problem 0), and the bf16 path for all rows
+    PP_CK(pkc::ref_q8k_q4k_rows(x.a8.as<int8_t>(), x.sa.as<float>(), w.q.as<pkc::BlockQ4K>(), R256.as<float>(), ref_rows, rc, sh.K, s));
+    PP_CK(pkc::ref_q8_q4k_rows(a32.as<int8_t>(), s32.as<float>(), w.q.as<pkc::BlockQ4K>(), R32.as<float>(), ref_rows, rc, sh.K, s));
+    PP_CK(pkc::dequant_q4k_to_bf16(w.q.as<pkc::BlockQ4K>(), Wb.as<uint16_t>(), wrows, sh.K, s));
+    PP_CK(pkc::gemm_bf16_batched(A.as<uint16_t>(), Wb.as<uint16_t>(), Cbf.as<float>(), M, sh.N, sh.K, B, M % 128 ? 2 : 0, 0, s));
+    double t256 = 1e30, t32 = 1e30;
+    std::string n256, n32;
+    std::vector<JW> kj;
+    for (int fam = 0; fam < 2; ++fam)
+      for (int v = 0; v < pkc::kV12Variants; ++v) {
+        if (M % pkc::v12_tile_m(v)) continue;
+        double best = 1e30;
+        int rgb = 0;
+        for (int rg = 0; rg < 2; ++rg) {
+          auto run = [&] {
+            if (fam == 0)
+              PP_CK(pkc::gemm_q8k_q4k_v12(x.a8.as<int8_t>(), x.sa.as<float>(), x.dig.as<uint16_t>(), w.q.as<pkc::BlockQ4K>(), w.rec.as(), w.dig.as<uint16_t>(),
+                                          C256.as(), M, sh.N, sh.K, B, 1, 0, nullptr, v, rg, s));
+            else
+              PP_CK(pkc::gemm_q8x32_q4k_v12x8(a32.as<int8_t>(), s32.as<float>(), d32.as<uint16_t>(), w.q.as<pkc::BlockQ4K>(), w.rec.as(), wd8.as<uint16_t>(),
+                                              C32.as<float>(), M, sh.N, sh.K, B, v, rg, s));
+          };
+          const double t = time_ms(s, run, 80.0);
+          if (t < best) { best = t; rgb = rg; }
+        }
+        const char* nm = fam == 0 ? pkc::v12_name(v) : pkc::v12x8_name(v);
+        DevBuf& Co = fam == 0 ? C256 : C32;
+        if (fam == 1) PP_CK(cudaMemsetAsync(C32.as(), 0xFF, static_cast<size_t>(rowsA) * sh.N * 4, s));
+        if (fam == 0)
+          PP_CK(pkc::gemm_q8k_q4k_v12(x.a8.as<int8_t>(), x.sa.as<float>(), x.dig.as<uint16_t>(), w.q.as<pkc::BlockQ4K>(), w.rec.as(), w.dig.as<uint16_t>(), C256.as(),
+                                      M, sh.N, sh.K, B, 1, 0, nullptr, v, rgb, s));
+        else
+          PP_CK(pkc::gemm_q8x32_q4k_v12x8(a32.as<int8_t>(), s32.as<float>(), d32.as<uint16_t>(), w.q.as<pkc::BlockQ4K>(), w.rec.as(), wd8.as<uint16_t>(),
+                                          C32.as<float>(), M, sh.N, sh.K, B, v, rgb, s));
+        const double eref = err_rows(Co.as(), false, sh.N, fam == 0 ? R256 : R32, ref_rows, rc, s);
+        const Cos cb = cosine(Co.as<float>(), Cbf.as<float>(), static_cast<size_t>(rowsA) * sh.N, s);
+        const bool ok = eref <= 1e-3 && std::isfinite(cb.rel_l2);
+        all_ok = all_ok && ok;
+        JW j;
+        j.kv("kernel", nm).kv("raster", rgb).kv("ms", best).kv("tops", tops(rowsA, sh.N, sh.K, best)).kv("eps8", tops(rowsA, sh.N, sh.K, best) / peak8);
+        j.kv("max_rel_err_vs_fp32_own_inputs", eref).kv("rel_l2_vs_bf16_path", cb.rel_l2).kv("correct", ok);
+        kj.push_back(j);
+        std::printf("    %-34s M=%4d x%3d  %-24s %.4f ms %6.1f TOPS (%.3f of peak); vs fp32 own inputs %.2e; vs bf16 path rel L2 %.3e%s\n", sh.name, M, B, nm, best,
+                    tops(rowsA, sh.N, sh.K, best), tops(rowsA, sh.N, sh.K, best) / peak8, eref, cb.rel_l2, ok ? "" : "  FAIL");
+        std::fflush(stdout);
+        if (ok && fam == 0 && best < t256) { t256 = best; n256 = nm; }
+        if (ok && fam == 1 && best < t32) { t32 = best; n32 = nm; }
+      }
+    row.kv("status", "ok").arr_obj("kernels", kj).kv("per256_best", n256).kv("per256_best_eps8", tops(rowsA, sh.N, sh.K, t256) / peak8);
+    row.kv("per32_best", n32).kv("per32_best_eps8", tops(rowsA, sh.N, sh.K, t32) / peak8).kv("per32_over_per256_speed", t256 / t32);
+    rows.push_back(row);
+    std::printf("  %-34s M=%4d x%3d: per-256 best %.3f of peak, per-32 best %.3f of peak: per-32 speed %.3fx of per-256\n", sh.name, M, B,
+                tops(rowsA, sh.N, sh.K, t256) / peak8, tops(rowsA, sh.N, sh.K, t32) / peak8, t256 / t32);
+    std::fflush(stdout);
+  }
+  const std::vector<Sample> all = sampler.stop();
+  r.inputs.kv("int8_peak_tops", peak8).kv("experts", E).kv("expert_m", Me).kv("weights_activations", "synthetic (fill_q4k / fill_bf16)");
+  r.values.arr_obj("kernel_info", infos).arr_obj("cases", rows).kv("all_correct", all_ok);
+  r.values.kv_obj("state_before", before).kv_obj("state_after", state_now(c)).kv_obj("nvml_whole_run", summarize(all));
+  r.pass = all_ok ? -1 : 0;
+  r.headline = std::string(all_ok ? "per-256 and per-32 kernels correct" : "a kernel FAILED its check") + "; per-32 speed ratios in the cases";
+  r.notes = std::string(g_abort.load() ? "ABORTED: " + abort_reason() : "");
+  write_result(c, r, "act32");
+  std::printf("  ACT32 %s\n", r.headline.c_str());
+  return all_ok ? 0 : 3;
+}
+
 }  // namespace pp

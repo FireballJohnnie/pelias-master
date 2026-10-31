@@ -34,6 +34,7 @@ void usage() {
       "  k3    P-K3  streaming Q4_K / Q6_K dequantization against a plain read of the same bytes\n"
       "  q10   P-Q10 fp8 (e4m3 / e5m2) data-gradient cosine against fp32\n"
       "  all   k1, k2, k2b, k3, q10 with --cooldown-s seconds between them (default 30)\n"
+      "  act32 per-32 activation scales (v12x8) against per-256 (v12): speed and accuracy (2026-10-30); not part of all\n"
       "  o13   persistent v13 against v12 on expert down / gate,up, dense and grouped (2026-10-30); not part of all\n"
       "  k2prof  one launch of each GEMM kernel on one shape (--shape NAME, --m N) for Nsight Compute; not part of all\n"
       "options: --ceiling-gib 10.7  --m N (one row count)  --experts 256  --expert-m 64  --bf16-peak 65.2  --int8-peak 259.5  --fp8-peak 129.8  --k3-mib 1024");
@@ -45,7 +46,7 @@ struct Entry {
   Fn fn;
 };
 const Entry kTable[] = {{"k1", p_k1}, {"k2", p_k2}, {"k2b", p_k2b}, {"k3", p_k3}, {"q10", p_q10}};
-const Entry kExtra[] = {{"k2prof", p_k2prof}, {"o13", p_o13}};  // not part of "all"
+const Entry kExtra[] = {{"k2prof", p_k2prof}, {"o13", p_o13}, {"act32", p_act32}};  // not part of "all"
 
 int run_one(Ctx& c, const Args& a, const Entry& e) {
   try {

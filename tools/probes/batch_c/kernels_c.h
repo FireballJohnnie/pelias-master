@@ -221,6 +221,15 @@ cudaError_t gemm_q8k_q4k_v13(const int8_t* a8, const float* sa256, const uint16_
 // hoisted = true runs v13b: v13 with the per-step index divisions taken out of the loop (cursors advanced by increments,
 // row pointers set once per tile). Same results bit for bit.
 cudaError_t v12_13_info(int family, int variant, int* regs, int* local_bytes, int* smem, int* blocks_per_sm);
+// B (2026-10-30): v12 with per-32 activation scales (the adopted gpu256x8 format). Inputs from quantize_rows_q8 (a8, sa
+// per 32, sas = scale x sum per 32); dig_x32 turns sas into the two-bf16-digit min-term input (M x K/256 x 16);
+// prep_q4k_dig8 the matching weight digits (m_j, m_j). Grouped (batch) like v12; no split-K; fp32 output.
+cudaError_t dig_x32(const float* sas, uint16_t* dig, int M, int K, cudaStream_t s);
+cudaError_t prep_q4k_dig8(const BlockQ4K* w, uint16_t* wd, int N, int K, cudaStream_t s);
+const char* v12x8_name(int variant);
+cudaError_t gemm_q8x32_q4k_v12x8(const int8_t* a8, const float* sa32, const uint16_t* adig32, const BlockQ4K* w, const void* rec, const uint16_t* wdig8,
+                                 float* C, int M, int N, int K, int batch, int variant, int raster, cudaStream_t s);
+cudaError_t v12x8_info(int variant, int* regs, int* local_bytes, int* smem, int* blocks_per_sm);
 // The bf16 GEMM on `batch` problems at once (A: batch x M x K, B: batch x N x K, C: batch x M x N), same tiles as gemm_bf16_tiled.
 cudaError_t gemm_bf16_batched(const uint16_t* A, const uint16_t* B, float* C, int M, int N, int K, int batch, int cfg, int raster, cudaStream_t s);
 // fp32 reference for v7's inputs (activation scale per 256).
