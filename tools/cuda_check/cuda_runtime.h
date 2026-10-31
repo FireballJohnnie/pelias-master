@@ -40,6 +40,10 @@ struct __attribute__((aligned(4))) ushort2 { unsigned short x, y; };
 struct __attribute__((aligned(8))) ushort4 { unsigned short x, y, z, w; };
 struct __attribute__((aligned(8))) uint2 { unsigned int x, y; };
 struct __attribute__((aligned(16))) uint4 { unsigned int x, y, z, w; };
+__host__ __device__ inline uint4 make_uint4(unsigned a, unsigned b, unsigned c, unsigned d) { uint4 r; r.x = a; r.y = b; r.z = c; r.w = d; return r; }
+#ifndef __align__
+#define __align__(n) __attribute__((aligned(n)))
+#endif
 struct __attribute__((aligned(16))) ulonglong2 { unsigned long long x, y; };
 struct __attribute__((aligned(8))) float2 { float x, y; };
 struct __attribute__((aligned(16))) float4 { float x, y, z, w; };

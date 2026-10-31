@@ -6,7 +6,6 @@
 // Copyright (c) 2026 John Lipka and the Pelias contributors
 //
 // kern/cuda/gpu_prompt.cu - the int8 prompt path behind kern/gpu_prompt.h.
-#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -35,7 +34,7 @@ bool pck(cudaError_t e, const char* what) {
 cudaStream_t pst(Stream s) { return static_cast<cudaStream_t>(s); }
 
 constexpr int kQK = 256, kBN = 128, kTile = 64, kVecMax = 8, kStages = 3;
-constexpr int kQ8Lda = 64 + 16, kQsLd = 32 + 16, kDigLd = 24;
+constexpr int kQ8Lda = 64 + 16, kQsLd = 32 + 16, kMinLd = 12;  // kMinLd: 8 floats + 4 (48-byte rows, float4 reads without bank conflicts)
 
 struct BlockQ4K {
   std::uint16_t d, dmin;
@@ -44,8 +43,6 @@ struct BlockQ4K {
 };
 static_assert(sizeof(BlockQ4K) == 144, "block_q4_K is 144 bytes");
 
-__device__ __forceinline__ std::uint16_t f2bf(float f) { return __bfloat16_as_ushort(__float2bfloat16_rn(f)); }
-__device__ __forceinline__ float bf2f(std::uint16_t b) { return __bfloat162float(__ushort_as_bfloat16(b)); }
 __device__ __forceinline__ float h2f(std::uint16_t h) { return __half2float(__ushort_as_half(h)); }
 __device__ __forceinline__ void scale_min_k4_d(int j, const std::uint8_t* q, int& d, int& m) {  // get_scale_min_k4 (ggml-quants.c)
   if (j < 4) {
@@ -74,11 +71,6 @@ __device__ __forceinline__ void ldsm_x4(std::uint32_t (&r)[4], const void* p) {
   const unsigned sa = static_cast<unsigned>(__cvta_generic_to_shared(p));
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(sa));
 }
-__device__ __forceinline__ void mma_bf16(float (&d)[4], const std::uint32_t (&a)[4], const std::uint32_t (&b)[2]) {
-  asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-               : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-               : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
-}
 __device__ __forceinline__ void mma_s8(int (&d)[4], const std::uint32_t (&a)[4], const std::uint32_t (&b)[2]) {
   asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
@@ -102,25 +94,22 @@ __global__ void k_prep_rec(const BlockQ4K* __restrict__ w, uint4* __restrict__ r
     rec[i] = make_uint4(__float_as_uint(h2f(b.d)), lo, hi, __float_as_uint(h2f(b.dmin)));
   }
 }
-__global__ void k_prep_dig(const BlockQ4K* __restrict__ w, std::uint16_t* __restrict__ wd, std::size_t nb) {
+// the weight side of the min term in fp32: dmin x m_j per 32-block (fp16 x 6-bit integer, exact in fp32), [rows][k / 32]
+__global__ void k_prep_dig(const BlockQ4K* __restrict__ w, float* __restrict__ wd, std::size_t nb) {
   for (std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x; i < nb; i += static_cast<std::size_t>(gridDim.x) * blockDim.x) {
     const BlockQ4K& b = w[i];
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
       int sc, m;
       scale_min_k4_d(j, b.scales, sc, m);
-      wd[i * 16 + j] = f2bf(static_cast<float>(m));
-      wd[i * 16 + 8 + j] = f2bf(static_cast<float>(m));
+      wd[i * 8 + j] = h2f(b.dmin) * static_cast<float>(m);
     }
   }
 }
-__global__ void k_act_digits(const float* __restrict__ scale, const int* __restrict__ sum, std::size_t n32, std::uint16_t* __restrict__ dig) {
-  for (std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x; i < n32; i += static_cast<std::size_t>(gridDim.x) * blockDim.x) {
-    const float x = scale[i] * static_cast<float>(sum[i]);
-    const std::uint16_t hi = f2bf(x);
-    dig[(i >> 3) * 16 + (i & 7)] = hi;
-    dig[(i >> 3) * 16 + 8 + (i & 7)] = f2bf(x - bf2f(hi));
-  }
+// the activation side of the min term in fp32: scale x float(sum) per 32-block, [rows][k / 32]
+__global__ void k_act_digits(const float* __restrict__ scale, const int* __restrict__ sum, std::size_t n32, float* __restrict__ dig) {
+  for (std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x; i < n32; i += static_cast<std::size_t>(gridDim.x) * blockDim.x)
+    dig[i] = scale[i] * static_cast<float>(sum[i]);
 }
 
 // ------------------------------------------------------------------------------------------------ the tile kernel
@@ -130,8 +119,8 @@ struct alignas(16) Stage {
   std::uint8_t Qs[kBN][kQsLd];
   uint4 Wr[kBN];
   float S2[kTile][2];
-  std::uint16_t Ad[kTile][kDigLd];
-  std::uint16_t Bd[kBN][kDigLd];
+  float Am[kTile][kMinLd];  // activation min factors of the super-block (8 used)
+  float Bm[kBN][kMinLd];    // weight min factors dmin x m_j (8 used)
 };
 constexpr int kSmem = kStages * static_cast<int>(sizeof(Stage));
 
@@ -170,8 +159,8 @@ __device__ __forceinline__ void epi_store(int row, int col, float v, int N, cons
 // 64-row tiles, 3 stages, column tile in blockIdx.x. kDense: the row tile is blockIdx.y (rows `nrows_total`); else the
 // unit is blockIdx.y of a device unit table (expert, first row, valid rows, 0) with a device count (extra blocks leave).
 template <int EPI, bool kDense>
-__global__ void __launch_bounds__(256, 2) k_tile(const std::int8_t* __restrict__ a8, const float* __restrict__ sa32, const std::uint16_t* __restrict__ adig,
-                                                const BlockQ4K* __restrict__ w, const uint4* __restrict__ rec, const std::uint16_t* __restrict__ wdig8,
+__global__ void __launch_bounds__(256, 2) k_tile(const std::int8_t* __restrict__ a8, const float* __restrict__ sa32, const float* __restrict__ adig,
+                                                const BlockQ4K* __restrict__ w, const uint4* __restrict__ rec, const float* __restrict__ wdig8,
                                                 const int4* __restrict__ units, const int* __restrict__ nunits, int nrows_total, int N, int K, Epi E) {
   constexpr int WMW = 2, WNW = 4, NI = 4, WR = 32, MI = 2;
   extern __shared__ __align__(16) std::uint8_t p_smem[];
@@ -193,7 +182,7 @@ __global__ void __launch_bounds__(256, 2) k_tile(const std::int8_t* __restrict__
   const int bpr = K / kQK, n32 = K / 32;
   w += static_cast<std::size_t>(ex) * N * bpr;
   rec += static_cast<std::size_t>(ex) * N * bpr;
-  wdig8 += static_cast<std::size_t>(ex) * N * bpr * 16;
+  wdig8 += static_cast<std::size_t>(ex) * N * bpr * 8;
   const int bn = cblk * kBN;
   float acc[MI][NI][4];
 #pragma unroll
@@ -223,8 +212,8 @@ __global__ void __launch_bounds__(256, 2) k_tile(const std::int8_t* __restrict__
     }
     if (((k0 + 64) % kQK) == 0) {
       const int r = tid >> 1, h = tid & 1;
-      if (r < kTile) cp_async16(&T.Ad[r][h * 8], adig + (static_cast<std::size_t>(bm + r) * bpr + sb) * 16 + h * 8);
-      cp_async16(&T.Bd[r][h * 8], wdig8 + (static_cast<std::size_t>(bn + r) * bpr + sb) * 16 + h * 8);
+      if (r < kTile) cp_async16(&T.Am[r][h * 4], adig + (static_cast<std::size_t>(bm + r) * bpr + sb) * 8 + h * 4);
+      cp_async16(&T.Bm[r][h * 4], wdig8 + (static_cast<std::size_t>(bn + r) * bpr + sb) * 8 + h * 4);
     }
   };
   const int kt_n = K / 64;
@@ -289,29 +278,28 @@ __global__ void __launch_bounds__(256, 2) k_tile(const std::int8_t* __restrict__
         }
       }
     }
-    if (((k0 + 64) % kQK) == 0) {  // the min term of the super-block: sum_j (scale x sum)_j x m_j by one bf16 mma
+    if (((k0 + 64) % kQK) == 0) {  // the min term of the super-block in fp32: sum_j (scale x sum)_j x (dmin x m_j), 8 FMAs per output
 #pragma unroll
       for (int mi = 0; mi < MI; ++mi) {
         const int r0 = wm * WR + mi * 16 + g, r1 = r0 + 8;
-        std::uint32_t ad[4];
-        ad[0] = ld32(&T.Ad[r0][2 * t]);
-        ad[1] = ld32(&T.Ad[r1][2 * t]);
-        ad[2] = ld32(&T.Ad[r0][2 * t + 8]);
-        ad[3] = ld32(&T.Ad[r1][2 * t + 8]);
+        const float4 a0l = *reinterpret_cast<const float4*>(&T.Am[r0][0]), a0h = *reinterpret_cast<const float4*>(&T.Am[r0][4]);
+        const float4 a1l = *reinterpret_cast<const float4*>(&T.Am[r1][0]), a1h = *reinterpret_cast<const float4*>(&T.Am[r1][4]);
+        const float a0[8] = {a0l.x, a0l.y, a0l.z, a0l.w, a0h.x, a0h.y, a0h.z, a0h.w};
+        const float a1[8] = {a1l.x, a1l.y, a1l.z, a1l.w, a1h.x, a1h.y, a1h.z, a1h.w};
 #pragma unroll
         for (int ni = 0; ni < NI; ++ni) {
-          const int cb = wn * NI * 8 + ni * 8 + g;
-          std::uint32_t bd[2];
-          bd[0] = ld32(&T.Bd[cb][2 * t]);
-          bd[1] = ld32(&T.Bd[cb][2 * t + 8]);
-          float mn[4] = {0.f, 0.f, 0.f, 0.f};
-          mma_bf16(mn, ad, bd);
           const int col0 = wn * NI * 8 + ni * 8 + 2 * t;
-          const float m0 = __uint_as_float(T.Wr[col0].w), m1 = __uint_as_float(T.Wr[col0 + 1].w);
-          acc[mi][ni][0] = fmaf(-m0, mn[0], acc[mi][ni][0]);
-          acc[mi][ni][1] = fmaf(-m1, mn[1], acc[mi][ni][1]);
-          acc[mi][ni][2] = fmaf(-m0, mn[2], acc[mi][ni][2]);
-          acc[mi][ni][3] = fmaf(-m1, mn[3], acc[mi][ni][3]);
+          const float4 b0l = *reinterpret_cast<const float4*>(&T.Bm[col0][0]), b0h = *reinterpret_cast<const float4*>(&T.Bm[col0][4]);
+          const float4 b1l = *reinterpret_cast<const float4*>(&T.Bm[col0 + 1][0]), b1h = *reinterpret_cast<const float4*>(&T.Bm[col0 + 1][4]);
+          const float b0[8] = {b0l.x, b0l.y, b0l.z, b0l.w, b0h.x, b0h.y, b0h.z, b0h.w};
+          const float b1[8] = {b1l.x, b1l.y, b1l.z, b1l.w, b1h.x, b1h.y, b1h.z, b1h.w};
+#pragma unroll
+          for (int j = 0; j < 8; ++j) {
+            acc[mi][ni][0] = fmaf(-a0[j], b0[j], acc[mi][ni][0]);
+            acc[mi][ni][1] = fmaf(-a0[j], b1[j], acc[mi][ni][1]);
+            acc[mi][ni][2] = fmaf(-a1[j], b0[j], acc[mi][ni][2]);
+            acc[mi][ni][3] = fmaf(-a1[j], b1[j], acc[mi][ni][3]);
+          }
         }
       }
     }
@@ -450,16 +438,16 @@ __global__ void k_route_place(const std::int32_t* __restrict__ sel, const float*
   rw[p] = wt[i];
   prow[i] = p;
 }
-// packed row p = token src[p]: K int8, K / 32 scales, K / 256 x 16 digits
+// packed row p = token src[p]: K int8, K / 32 scales, K / 32 min factors
 __global__ void k_gather(const int* __restrict__ src, int P, int K, const std::int8_t* __restrict__ q, const float* __restrict__ sc,
-                         const std::uint16_t* __restrict__ dg, std::int8_t* __restrict__ oq, float* __restrict__ osc, std::uint16_t* __restrict__ odg) {
+                         const float* __restrict__ dg, std::int8_t* __restrict__ oq, float* __restrict__ osc, float* __restrict__ odg) {
   const int p = blockIdx.x;
   if (p >= P) return;
   const int r = src[p];
   for (int i = threadIdx.x; i < K / 16; i += blockDim.x)
     reinterpret_cast<uint4*>(oq + static_cast<std::size_t>(p) * K)[i] = reinterpret_cast<const uint4*>(q + static_cast<std::size_t>(r) * K)[i];
   for (int i = threadIdx.x; i < K / 32; i += blockDim.x) osc[static_cast<std::size_t>(p) * (K / 32) + i] = sc[static_cast<std::size_t>(r) * (K / 32) + i];
-  for (int i = threadIdx.x; i < (K / 256) * 16; i += blockDim.x) odg[static_cast<std::size_t>(p) * (K / 256) * 16 + i] = dg[static_cast<std::size_t>(r) * (K / 256) * 16 + i];
+  for (int i = threadIdx.x; i < K / 32; i += blockDim.x) odg[static_cast<std::size_t>(p) * (K / 32) + i] = dg[static_cast<std::size_t>(r) * (K / 32) + i];
 }
 // silu(gate) x up, rounded per 32 exactly as act_q8x32 rounds (one thread per 32-block), for the down projection
 __global__ void k_silu_q8x32(const float* __restrict__ hg, const float* __restrict__ hu, std::int64_t rows, std::int64_t F, std::int8_t* __restrict__ q,
@@ -494,12 +482,12 @@ unsigned grid_of(std::size_t n, int per, unsigned cap = 65535) {
 }
 
 template <int EPI, bool kDense>
-bool tile_launch(dim3 grid, const std::int8_t* a8, const float* sa32, const std::uint16_t* adig, const PromptWeights& W, const int4* units, const int* nunits,
+bool tile_launch(dim3 grid, const std::int8_t* a8, const float* sa32, const float* adig, const PromptWeights& W, const int4* units, const int* nunits,
                  int nrows, int N, int K, const Epi& E, Stream s) {
   static const cudaError_t once = cudaFuncSetAttribute(k_tile<EPI, kDense>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem);
   if (!pck(once, "prompt tile: shared memory opt-in")) return false;
   k_tile<EPI, kDense><<<grid, 256, kSmem, pst(s)>>>(a8, sa32, adig, static_cast<const BlockQ4K*>(W.w), static_cast<const uint4*>(W.rec),
-                                                    static_cast<const std::uint16_t*>(W.dig), units, nunits, nrows, N, K, E);
+                                                    static_cast<const float*>(W.dig), units, nunits, nrows, N, K, E);
   return pck(cudaGetLastError(), "prompt tile");
 }
 template <int EPI>
@@ -510,7 +498,7 @@ bool vec_launch(dim3 grid, const std::int8_t* a8, const float* sa32, const Promp
 }
 // expert GEMM over the device lists (tiles + vectors) with epilogue EPI
 template <int EPI>
-bool experts(const MoeScratch& m, const std::int8_t* a8, const float* sa32, const std::uint16_t* adig, const PromptWeights& W, int N, int K, const Epi& E,
+bool experts(const MoeScratch& m, const std::int8_t* a8, const float* sa32, const float* adig, const PromptWeights& W, int N, int K, const Epi& E,
              std::int64_t picks, Stream s) {
   const int max_tiles = static_cast<int>(picks / kTile) + m.n_expert;
   const int4* ut = static_cast<const int4*>(m.units_t);
@@ -540,7 +528,7 @@ bool prompt_prepare(std::uint32_t type, const void* w_dev, std::int64_t rows, st
     return pfail("prompt_prepare: device memory");
   }
   k_prep_rec<<<grid_of(nb, 256, 4096), 256, 0, pst(s)>>>(static_cast<const BlockQ4K*>(w_dev), static_cast<uint4*>(rec), nb);
-  k_prep_dig<<<grid_of(nb, 256, 4096), 256, 0, pst(s)>>>(static_cast<const BlockQ4K*>(w_dev), static_cast<std::uint16_t*>(dg), nb);
+  k_prep_dig<<<grid_of(nb, 256, 4096), 256, 0, pst(s)>>>(static_cast<const BlockQ4K*>(w_dev), static_cast<float*>(dg), nb);
   if (!pck(cudaGetLastError(), "prompt_prepare")) {
     dfree(rec);
     dfree(dg);
@@ -562,7 +550,7 @@ void prompt_release(PromptWeights* w) {
   *w = PromptWeights{};
 }
 
-bool act_digits(const float* scale, const int* sum, std::int64_t rows, std::int64_t k, std::uint16_t* dig, Stream s) {
+bool act_digits(const float* scale, const int* sum, std::int64_t rows, std::int64_t k, float* dig, Stream s) {
   if (!scale || !sum || !dig || rows < 0 || k % kQK != 0) return pfail("act_digits: bad arguments");
   if (rows == 0) return true;
   const std::size_t n32 = static_cast<std::size_t>(rows) * static_cast<std::size_t>(k / 32);
@@ -570,7 +558,7 @@ bool act_digits(const float* scale, const int* sum, std::int64_t rows, std::int6
   return pck(cudaGetLastError(), "act_digits");
 }
 
-bool prompt_gemm(const PromptWeights& w, std::int64_t n_out, const std::int8_t* q, const float* scale, const std::uint16_t* dig, std::int64_t rows, float* y,
+bool prompt_gemm(const PromptWeights& w, std::int64_t n_out, const std::int8_t* q, const float* scale, const float* dig, std::int64_t rows, float* y,
                  Stream s) {
   if (!w.w || !w.rec || !q || !scale || !dig || !y || n_out <= 0 || n_out % kBN != 0 || n_out > w.rows || rows < 0 || rows > 64 * 65535)
     return pfail("prompt_gemm: bad arguments (n_out a multiple of 128, within the weight)");
@@ -590,9 +578,9 @@ bool moe_scratch_alloc(std::int64_t max_tokens, int n_used, int n_expert, std::i
   const std::size_t sizes[] = {al(256 * 4), al(256 * 4), al(256 * 4), al(16),  // cnt, off, cursor, meta
                                al((np / kTile + 256) * 16), al(256 * 16),     // units
                                al(np * 4), al(pr * 4), al(np * 4), al(pr * 4),  // src, rtok, prow, rw
-                               al(pr * H), al(pr * (H / 32) * 4), al(pr * (H / 256) * 32),  // pq, psc, pdig
+                               al(pr * H), al(pr * (H / 32) * 4), al(pr * (H / 32) * 4),  // pq, psc, pdig
                                al(pr * F * 4), al(pr * F * 4),  // hg, hu
-                               al(pr * F), al(pr * (F / 32) * 4), al(pr * (F / 32) * 4), al(pr * (F / 256) * 32),  // q2, sc2, sum2, dig2
+                               al(pr * F), al(pr * (F / 32) * 4), al(pr * (F / 32) * 4), al(pr * (F / 32) * 4),  // q2, sc2, sum2, dig2
                                al(T * H * 8), al(16)};  // yfix (int64 capable), ovf
   std::size_t total = 0;
   for (const std::size_t z : sizes) total += z;
@@ -621,13 +609,13 @@ bool moe_scratch_alloc(std::int64_t max_tokens, int n_used, int n_expert, std::i
   out->rw = static_cast<float*>(take());
   out->pq = static_cast<std::int8_t*>(take());
   out->psc = static_cast<float*>(take());
-  out->pdig = static_cast<std::uint16_t*>(take());
+  out->pdig = static_cast<float*>(take());
   out->hg = static_cast<float*>(take());
   out->hu = static_cast<float*>(take());
   out->q2 = static_cast<std::int8_t*>(take());
   out->sc2 = static_cast<float*>(take());
   out->sum2 = static_cast<int*>(take());
-  out->dig2 = static_cast<std::uint16_t*>(take());
+  out->dig2 = static_cast<float*>(take());
   out->yfix = take();
   out->ovf = static_cast<unsigned*>(take());
   out->mem = base;
@@ -645,7 +633,7 @@ void moe_scratch_free(MoeScratch* m) {
   *m = MoeScratch{};
 }
 
-bool moe_prompt(const PromptWeights& gate, const PromptWeights& up, const PromptWeights& down, const std::int8_t* q, const float* scale, const std::uint16_t* dig,
+bool moe_prompt(const PromptWeights& gate, const PromptWeights& up, const PromptWeights& down, const std::int8_t* q, const float* scale, const float* dig,
                 std::int64_t tokens, const std::int32_t* sel, const float* wsel, MoeScratch& m, MoeCombine combine, int scale_log2, float* y, Stream s) {
   if (!m.mem || tokens < 0 || tokens > m.max_tokens || !q || !scale || !dig || !sel || !wsel || !y) return pfail("moe_prompt: bad arguments");
   const std::int64_t H = m.hidden, F = m.ffn, E = m.n_expert;

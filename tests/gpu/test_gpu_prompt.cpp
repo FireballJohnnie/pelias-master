@@ -89,11 +89,11 @@ struct Act {
   Dev<std::int8_t> qv;
   Dev<float> sc;
   Dev<int> sum;
-  Dev<std::uint16_t> dig;
+  Dev<float> dig;
   std::vector<double> eff;
   Act(std::int64_t r, std::int64_t kk, std::uint32_t seed)
       : rows(r), k(kk), pad((r + 63) / 64 * 64), qv(static_cast<std::size_t>(pad * kk)), sc(static_cast<std::size_t>(pad * kk / 32)),
-        sum(static_cast<std::size_t>(pad * kk / 32)), dig(static_cast<std::size_t>(pad * (kk / 256) * 16)) {
+        sum(static_cast<std::size_t>(pad * kk / 32)), dig(static_cast<std::size_t>(pad * kk / 32)) {
     Dev<float> x(wave(rows * k, seed, 2.0f)), xr(static_cast<std::size_t>(rows * k));
     CHECK(g::act_q8x32(x.p, k, rows, k, false, xr.p, k, qv.p, sc.p, sum.p));
     CHECK(g::act_digits(sc.p, sum.p, rows, k, dig.p));
@@ -306,7 +306,7 @@ TEST(rung1_moe_prompt_refuses_bad_shapes) {
   g::PromptWeights none;
   Dev<std::int8_t> qv(64 * 512);
   Dev<float> sc(64 * 16), y(16 * 512), wv(16 * 8);
-  Dev<std::uint16_t> dg(64 * 32);
+  Dev<float> dg(64 * 16);
   Dev<std::int32_t> sel(16 * 8);
   CHECK(!g::moe_prompt(none, none, none, qv.p, sc.p, dg.p, 16, sel.p, wv.p, m, g::MoeCombine::kFixed32, 10, y.p));  // stacks do not match
   CHECK(!g::moe_prompt(none, none, none, qv.p, sc.p, dg.p, 17, sel.p, wv.p, m, g::MoeCombine::kFixed32, 10, y.p));  // more tokens than the scratch
