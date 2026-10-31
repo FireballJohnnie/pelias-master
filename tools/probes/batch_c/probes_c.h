@@ -3014,6 +3014,9 @@ inline int p_tg2(Ctx& c, const Args& a) {
     PP_CK(cudaMemcpy(dU.as(), uh.data(), uh.size() * sizeof(int4), cudaMemcpyHostToDevice));
     PP_CK(cudaMemcpy(dwt.as(), wt.data(), wt.size(), cudaMemcpyHostToDevice));
     PP_CK(cudaMemcpy(dwk.as(), wk.data(), wk.size(), cudaMemcpyHostToDevice));
+    // pageable cudaMemcpy may return before its DMA lands, and stream s is non-blocking: wait for the uploads before
+    // the prep kernels read them (TG2 v1's dense Q4_K 0.507, 2026-10-30, did not reproduce in the next run)
+    PP_CK(cudaDeviceSynchronize());
     PP_CK(ptg::tg2_prep(dwt.as(), dsc.as<float>(), nb, s));
     PP_CK(ptg::q4k_prep(dwk.as(), drec.as<uint4>(), dwb.as(), dwf.as<float>(), nb, s));
     PP_CK(ptg::q4k_act_min(dxs.as<float>(), dsum.as<int>(), ac.xs.size(), dab.as(), daf.as<float>(), s));
