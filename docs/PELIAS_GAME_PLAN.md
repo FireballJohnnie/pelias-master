@@ -1466,6 +1466,14 @@ Each PC run first matches the reference to our code's exact format (docs/PELIAS_
 
 **Gates:** E4–E9, G3 (≥ 55.0 tok/s at 12 k), K3 (GP2-01).
 
+**Status 2026-10-31 03:3x (sandbox, not yet run on the GPU):** stages 1-3 coded: GpuEngine (resident dense, hot bank from
+a routing record, CPU cold experts on a persistent pool, cache and state carried), generate --engine, engine-check, MTP
+drafting with verify / keep (checkpointing recurrence, author 03:1x). Not yet: the doorbell (a device sync per layer for
+now), the MTP block's own bank, the chunked DeltaNet kernel for long prompts, the int32 fold with a calibrated scale,
+residual planes in the engine, NVML at start and peak. First PC run (when the author allows): build, pelias_gpu_test
+(rung1 checkpoint, rung4 engine + verify / keep), sanitizers, then engine-check on the tiered file with --routes
+TIER/tier_v1_x8_routes.bin (prefill 512, decode 128, --mtp-draft 1-3, --float-ref).
+
 ### GP3-14c Infinite context loop (author 2026-10-30 12:01-12:15; after the first engine build)
 
 **Idea (author):** a document or an agent's history of any length is read once and kept; the model is never stuck at its window. MEASURED from the served file: context_length 262,144; RoPE on 64 of each attention head's 256 key dims (rope.dimension_count 64, sections 11/11/10/0, freq_base 1e7); 30 of the 41 blocks are DeltaNet (fixed-size state, no positions); KV grows only in the 10 full-attention trunk layers (2 KV heads x 256): about 10.9 KB per token at q8 (DERIVED).
