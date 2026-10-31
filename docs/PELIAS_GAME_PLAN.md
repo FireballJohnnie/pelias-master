@@ -1470,7 +1470,10 @@ Each PC run first matches the reference to our code's exact format (docs/PELIAS_
 a routing record, CPU cold experts on a persistent pool, cache and state carried), generate --engine, engine-check, MTP
 drafting with verify / keep (checkpointing recurrence, author 03:1x). Not yet: the doorbell (a device sync per layer for
 now), the MTP block's own bank, the chunked DeltaNet kernel for long prompts, the int32 fold with a calibrated scale,
-residual planes in the engine, NVML at start and peak. First PC run (when the author allows): build, pelias_gpu_test
+residual planes in the engine, NVML at start and peak. **Order (author 03:18):** (1) the doorbell as designed (pinned host-mapped
+flags, the GPU writes the router's picks, a spinning CPU thread runs the cold experts and rings back, the GPU waits on
+the flag in-stream; no cudaMemcpy syncs), (2) the MTP block's bank by live pick counts with idle-time promotion (U2;
+option 1 of 03:14), (3) DeltaNet: see the per-token kernel in action in the first engine runs, then decide the prefill path. First PC run (when the author allows): build, pelias_gpu_test
 (rung1 checkpoint, rung4 engine + verify / keep), sanitizers, then engine-check on the tiered file with --routes
 TIER/tier_v1_x8_routes.bin (prefill 512, decode 128, --mtp-draft 1-3, --float-ref).
 
