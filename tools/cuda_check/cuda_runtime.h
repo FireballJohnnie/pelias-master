@@ -114,6 +114,10 @@ typedef struct CUevent_st* cudaEvent_t;
 #define cudaStreamNonBlocking 1
 #define cudaHostRegisterDefault 0
 #define cudaHostAllocDefault 0
+#define cudaHostAllocMapped 2
+#define cudaHostAllocPortable 1
+cudaError_t cudaHostGetDevicePointer(void**, void*, unsigned);
+__device__ void __threadfence_system();
 struct cudaDeviceProp { char name[256]; size_t totalGlobalMem; int multiProcessorCount; int major, minor; int clockRate; int memoryClockRate; int memoryBusWidth; size_t l2CacheSize; int sharedMemPerBlockOptin; size_t sharedMemPerMultiprocessor; int regsPerMultiprocessor; char uuid[16]; int pciBusID; int pciDeviceID; int pciDomainID; size_t sharedMemPerBlock; int maxThreadsPerMultiProcessor; int warpSize; int asyncEngineCount; int persistingL2CacheMaxSize; };
 cudaError_t cudaStreamDestroy(cudaStream_t);
 cudaError_t cudaStreamCreateWithFlags(cudaStream_t*, unsigned);

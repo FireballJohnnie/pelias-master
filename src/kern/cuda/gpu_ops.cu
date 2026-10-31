@@ -875,6 +875,47 @@ bool to_host(void* dst, const void* src, std::size_t bytes, Stream s) {
 }
 bool dzero(void* p, std::size_t bytes, Stream s) { return ck(cudaMemsetAsync(p, 0, bytes, st(s)), "cudaMemset"); }
 bool sync(Stream s) { return ck(cudaStreamSynchronize(st(s)), "synchronize"); }
+__global__ void k_bell_ring(volatile unsigned* f, unsigned v) {
+  __threadfence_system();
+  *f = v;
+  __threadfence_system();
+}
+__global__ void k_bell_wait(const volatile unsigned* f, unsigned v) {
+  unsigned ns = 64;
+  while (static_cast<int>(*f - v) < 0) {
+    __nanosleep(ns);
+    if (ns < 200) ns += 32;
+  }
+  __threadfence_system();
+}
+void* host_alloc_mapped(std::size_t bytes, void** dev) {
+  void* h = nullptr;
+  if (!ck(cudaHostAlloc(&h, bytes ? bytes : 1, cudaHostAllocMapped | cudaHostAllocPortable), "cudaHostAlloc (mapped)")) return nullptr;
+  std::memset(h, 0, bytes ? bytes : 1);
+  void* d = nullptr;
+  if (!ck(cudaHostGetDevicePointer(&d, h, 0), "cudaHostGetDevicePointer")) {
+    cudaFreeHost(h);
+    return nullptr;
+  }
+  if (dev) *dev = d;
+  return h;
+}
+void host_free(void* p) {
+  if (p) cudaFreeHost(p);
+}
+bool bell_ring(unsigned* flag, unsigned value, Stream s) {
+  if (!flag) return fail("bell_ring: no flag");
+  k_bell_ring<<<1, 1, 0, st(s)>>>(flag, value);
+  return launched("doorbell ring");
+}
+bool bell_wait(const unsigned* flag, unsigned value, Stream s) {
+  if (!flag) return fail("bell_wait: no flag");
+  k_bell_wait<<<1, 1, 0, st(s)>>>(flag, value);
+  return launched("doorbell wait");
+}
+bool to_host_async(void* dst, const void* src, std::size_t bytes, Stream s) {
+  return ck(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, st(s)), "copy to the host (async)");
+}
 bool dcopy(void* dst, const void* src, std::size_t bytes, Stream s) {
   return ck(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, st(s)), "device copy");
 }

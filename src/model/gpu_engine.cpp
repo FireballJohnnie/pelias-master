@@ -150,6 +150,9 @@ struct Layer {
   int cur = 0;
   float* ckpt = nullptr;        // DeltaNet, verify: the state after each of the first max_verify - 1 tokens
   float* mixed_save = nullptr;  // DeltaNet, verify: the batch's conv inputs (max_verify x ch), to rebuild the tail of a prefix
+  std::size_t bank_cap = 0;     // > 0: bank_mem is a fixed arena of this many bytes (rebuilt in place by promotion)
+  int bank_slots = 0;           // experts the fixed arena may hold
+  std::vector<std::uint64_t> picks;  // picks per expert (the MTP block counts them for promotion)
 };
 
 // one routed expert's rows of one projection
@@ -220,6 +223,22 @@ struct GpuEngine::Impl {
   std::int64_t mtp_pos = 0;
   float* cat = nullptr;  // max_batch x 2 n_embd
   std::vector<float> cat_h;
+  // the doorbell
+  bool bell = false;
+  void* bell_h = nullptr;  // one pinned mapped block: two flags, then the picks, the normed rows and the cold sum
+  unsigned *fa_h = nullptr, *fa_d = nullptr, *fb_h = nullptr, *fb_d = nullptr;  // GPU -> CPU (picks ready), CPU -> GPU (cold sum ready)
+  std::int32_t* sel_m = nullptr;
+  float *wsel_m = nullptr, *xn_m = nullptr, *yc_m = nullptr, *yc_md = nullptr;  // host addresses; yc_md: the cold sum's device address
+  unsigned gen = 0;
+  std::thread bell_th;
+  std::mutex bmu;
+  std::condition_variable bcv;
+  bool bstop = false, bjob = false, bbusy = false;
+  int bn = 0;
+  unsigned bg0 = 0;
+  std::atomic<bool> bcancel{false};
+  EngineStats bst;
+  std::string berr;
 
   // ---- weights
   static std::size_t view_bytes(const WeightView& v) {
@@ -321,12 +340,19 @@ struct GpuEngine::Impl {
                   al(g::prompt_table_bytes(t, static_cast<int64_t>(c) * n_out, k)) + al(z(ne) * sizeof(int)) + 768;
       }
     }
+    D.bg.clear();
+    D.bu.clear();
+    D.bd.clear();
     if (need_b == 0) return Status::good();
-    D.bank_mem = g::dalloc(need_b);
-    if (!D.bank_mem) return gfail("engine: bank memory");
-    dev_bytes += need_b;
-    bank_bytes_total += need_b;
-    Arena A{static_cast<std::uint8_t*>(D.bank_mem), need_b, 0};
+    if (D.bank_cap > 0) {
+      if (need_b > D.bank_cap) return Status::fail(Code::internal, "engine: the MTP bank arena is too small");
+    } else {
+      D.bank_mem = g::dalloc(need_b);
+      if (!D.bank_mem) return gfail("engine: bank memory");
+      dev_bytes += need_b;
+      bank_bytes_total += need_b;
+    }
+    Arena A{static_cast<std::uint8_t*>(D.bank_mem), D.bank_cap > 0 ? D.bank_cap : need_b, 0};
     auto stacks = [&](const WeightView& v, std::vector<g::PromptWeights>& dst) -> Status {
       std::map<std::uint32_t, std::vector<int>> by;
       for (int e = 0; e < ne; ++e)
@@ -417,13 +443,14 @@ struct GpuEngine::Impl {
   }
 
   // the cold picks on the CPU: ycold_h (n x e) = sum over cold picks of weight x down(round32(silu(gate x) * up x))
-  void cold_experts(const Qwen35MoeLayer& l, int64_t n) {
+  void cold_experts(const Qwen35MoeLayer& l, int64_t n) { cold_experts_io(l, n, xn_h.data(), ycold_h.data()); }
+  void cold_experts_io(const Qwen35MoeLayer& l, int64_t n, const float* xsrc, float* ydst) {
     const int64_t e = s.n_embd, ff = s.n_ff_exp;
     const int64_t np = static_cast<int64_t>(cold.size());
     std::fill(need.begin(), need.begin() + n, std::uint8_t{0});
     for (const ColdPick& c : cold) need[z(c.t)] = 1;
     pool->run(n, [&](int64_t t) {
-      if (need[z(t)]) kern::act_q8x32_quantize(xn_h.data() + t * e, e, actx[z(t)]);
+      if (need[z(t)]) kern::act_q8x32_quantize(xsrc + t * e, e, actx[z(t)]);
     });
     constexpr int64_t kRowsUp = 64, kRowsDown = 128;
     const int64_t ub = (ff + kRowsUp - 1) / kRowsUp;  // row blocks per projection (gate, up)
@@ -451,7 +478,7 @@ struct GpuEngine::Impl {
     });
     // per token, the picks in slot order (deterministic)
     pool->run(n, [&](int64_t t) {
-      float* yt = ycold_h.data() + t * e;
+      float* yt = ydst + t * e;
       std::fill(yt, yt + e, 0.0f);
       for (int64_t p = 0; p < np; ++p) {
         if (cold[z(p)].t != t) continue;
@@ -478,6 +505,7 @@ struct GpuEngine::Impl {
       for (int64_t j = 0; j < nu; ++j) {
         const int ex = sel_h[z(t * nu + j)];
         if (ex < 0 || ex >= ne) return Status::fail(Code::internal, "engine: a router pick outside the experts");
+        if (!D.picks.empty()) ++D.picks[z(ex)];
         if (D.hot[z(ex)]) ++hot_here;
         else cold.push_back(ColdPick{static_cast<int>(t), ex, wsel_h[z(t * nu + j)]});
       }
@@ -533,6 +561,94 @@ struct GpuEngine::Impl {
     return g::to_device(dst, xe_h.data(), xe_h.size() * sizeof(float)) ? Status::good() : gfail("engine: embedding upload");
   }
 
+  // the doorbell's CPU side: for each layer of the step, wait for the GPU's ring, run the cold picks into pinned memory,
+  // ring back. On a cancel or a stall it still rings (zeros), so the GPU never waits forever.
+  void bell_loop() {
+    for (;;) {
+      int n = 0;
+      unsigned g0 = 0;
+      {
+        std::unique_lock<std::mutex> lk(bmu);
+        bcv.wait(lk, [&] { return bstop || bjob; });
+        if (bstop) return;
+        bjob = false;
+        n = bn;
+        g0 = bg0;
+      }
+      EngineStats es;
+      std::string err;
+      const int64_t e = s.n_embd, ne = s.n_expert, nu = s.n_expert_used;
+      for (std::uint32_t il = 0; il < s.n_layer; ++il) {
+        const unsigned g = g0 + il;
+        const Clock::time_point tw = Clock::now();
+        std::atomic_ref<unsigned> fa(*fa_h);
+        for (std::uint64_t spin = 0; static_cast<int>(fa.load(std::memory_order_acquire) - g) < 0; ++spin) {
+          if (bcancel.load(std::memory_order_relaxed)) break;
+          if ((spin & 1023) == 1023 && since(tw) > 30.0) {
+            err = "engine: doorbell stall (layer " + std::to_string(il) + ")";
+            bcancel.store(true, std::memory_order_relaxed);
+            break;
+          }
+        }
+        es.wait_seconds += since(tw);
+        float* yd = yc_m;
+        if (bcancel.load(std::memory_order_relaxed)) {
+          std::fill(yd, yd + n * e, 0.0f);
+        } else {
+          cold.clear();
+          for (int64_t t = 0; t < n; ++t)
+            for (int64_t j = 0; j < nu; ++j) {
+              const int ex = sel_m[z(t * nu + j)];
+              if (ex < 0 || ex >= ne) continue;
+              if (L[il].hot[z(ex)]) ++es.hot_picks;
+              else cold.push_back(ColdPick{static_cast<int>(t), ex, wsel_m[z(t * nu + j)]});
+            }
+          es.cold_picks += cold.size();
+          const Clock::time_point tc = Clock::now();
+          if (cold.empty()) std::fill(yd, yd + n * e, 0.0f);
+          else cold_experts_io(w->layers[il], n, xn_m, yd);
+          es.cold_seconds += since(tc);
+        }
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        std::atomic_ref<unsigned>(*fb_h).store(g, std::memory_order_release);
+      }
+      {
+        std::lock_guard<std::mutex> lk(bmu);
+        bst = es;
+        berr = err;
+        bbusy = false;
+      }
+      bcv.notify_all();
+    }
+  }
+  // the MoE block with the doorbell: everything enqueued, no host wait
+  Status moe_block_bell(Layer& D, int64_t n, unsigned g) {
+    const int64_t e = s.n_embd, ne = s.n_expert, nu = s.n_expert_used, ffs = s.n_ff_shexp;
+    Status st;
+    if (!(st = prod(D.gate_inp, xn, n, logits_r))) return st;
+    if (!g::router_topk(logits_r, ne, n, static_cast<int>(nu), s.expert_weights_scale, sel, wsel)) return gfail("engine: router");
+    if (!g::to_host_async(sel_m, sel, z(n * nu) * sizeof(std::int32_t)) || !g::to_host_async(wsel_m, wsel, z(n * nu) * sizeof(float)) ||
+        !g::to_host_async(xn_m, xn, z(n * e) * sizeof(float)) || !g::bell_ring(fa_d, g))
+      return gfail("engine: doorbell (picks)");
+    if (!D.bg.empty()) {
+      if (!g::act_q8x32(xn, e, n, e, false, xr, e, q, scale, sum) || !g::act_digits(scale, sum, n, e, dig)) return gfail("engine: expert input rounding");
+      const g::MoeStacks sg{D.bg.data(), static_cast<int>(D.bg.size())}, su{D.bu.data(), static_cast<int>(D.bu.size())},
+          sd{D.bd.data(), static_cast<int>(D.bd.size())};
+      if (!g::moe_prompt_multi(sg, su, sd, q, scale, dig, n, sel, wsel, moe, g::MoeCombine::kFixed64, 32, y)) return gfail("engine: bank experts");
+    } else if (!g::dzero(y, z(n * e) * sizeof(float))) {
+      return gfail("engine: clear y");
+    }
+    if (!(st = prod(D.gate_sh, xn, n, gs)) || !(st = prod(D.up_sh, xn, n, us))) return st;
+    if (!g::silu_mul(gs, us, gs, n * ffs)) return gfail("engine: shared silu");
+    if (!(st = prod(D.down_sh, gs, n, sh))) return st;
+    if (!g::matmul(static_cast<std::uint32_t>(quant::Type::f32), D.gate_inp_sh, static_cast<std::uint64_t>(e) * sizeof(float), 1, e, xn, n, e, gsh, 1) ||
+        !g::deltanet_gates(gsh, galpha, zero2, zero2, n, 1))
+      return gfail("engine: shared gate");
+    if (!g::add_rows(y, e, sh, e, gsh, e, n)) return gfail("engine: shared add");
+    if (!g::bell_wait(fb_d, g) || !g::add_rows(y, e, yc_md, e, nullptr, e, n)) return gfail("engine: doorbell (cold sum)");
+    return Status::good();
+  }
+
   Status reset_state() {
     pos = 0;
     mtp_pos = 0;
@@ -551,8 +667,18 @@ GpuEngine::GpuEngine(std::unique_ptr<Impl> p) : p_(std::move(p)) {}
 
 GpuEngine::~GpuEngine() {
   if (!p_) return;
+  if (p_->bell_th.joinable()) {
+    {
+      std::lock_guard<std::mutex> lk(p_->bmu);
+      p_->bstop = true;
+    }
+    p_->bcv.notify_all();
+    p_->bell_th.join();
+  }
+  g::host_free(p_->bell_h);
   g::moe_scratch_free(&p_->moe);
   for (Layer& D : p_->L) g::dfree(D.bank_mem);
+  g::dfree(p_->M.bank_mem);
   g::dfree(p_->act_mem);
   g::dfree(p_->dense_mem);
   g::dfree(p_->state_mem);
@@ -568,9 +694,10 @@ Status GpuEngine::reset() { return p_->reset_state(); }
 std::string GpuEngine::summary() const {
   const Impl& I = *p_;
   char b[512];
-  std::snprintf(b, sizeof b, "engine: %.2f GB on the device (dense + output %.2f GB, bank %.2f GB = %d experts of %u, cache + state %.2f GB); %d CPU threads; ctx %d, batch %d",
+  std::snprintf(b, sizeof b, "engine: %.2f GB on the device (dense + output %.2f GB, bank %.2f GB = %d experts of %u, cache + state %.2f GB); %d CPU threads; ctx %d, batch %d; hand-off %s",
                 static_cast<double>(I.dev_bytes) / 1e9, static_cast<double>(I.dense_bytes_total) / 1e9, static_cast<double>(I.bank_bytes_total) / 1e9, I.bank_count,
-                I.s.n_layer * I.s.n_expert, static_cast<double>(I.cache_bytes) / 1e9, I.pool ? I.pool->threads() : 0, I.o.max_ctx, I.o.max_batch);
+                I.s.n_layer * I.s.n_expert, static_cast<double>(I.cache_bytes) / 1e9, I.pool ? I.pool->threads() : 0, I.o.max_ctx, I.o.max_batch,
+                I.bell ? "doorbell" : "device sync per layer");
   return b;
 }
 
@@ -716,11 +843,39 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
   }
   // the bank: what is left of the budget, filled rank by rank across the layers
   for (Layer& D : I.L) D.hot.assign(z(ne), 0);
+  std::size_t free_b = 0, total_b = 0;
+  if (!g::sync() || !g::mem_info(&free_b, &total_b)) return R::fail(Status::fail(Code::internal, std::string("engine: device memory: ") + g::last_error()));
+  std::uint64_t left = free_b > o.vram_reserve ? free_b - o.vram_reserve : 0;
+  if (o.vram_budget > 0) left = std::min<std::uint64_t>(left, o.vram_budget > I.dev_bytes ? o.vram_budget - I.dev_bytes : 0);
+  if (o.mtp && o.mtp_bank != 0) {  // the MTP block's fixed arena, for promotion
+    const Qwen35MoeLayer& ml = w.mtp.layer;
+    std::uint64_t eb = 0;
+    int bankable_n = 0;
+    for (int ex = 0; ex < static_cast<int>(ne); ++ex)
+      if (I.bankable(ml, ex)) {
+        eb = std::max<std::uint64_t>(eb, I.expert_bytes(ml, ex));
+        ++bankable_n;
+      }
+    int k = o.mtp_bank;
+    if (k < 0 && eb > 0) k = static_cast<int>(std::min<std::uint64_t>(static_cast<std::uint64_t>(ne), left / (eb * (s.n_layer + 1))));
+    k = std::min(k, bankable_n);
+    if (k > 0 && eb > 0) {
+      // matrices of k experts plus their side tables (per stack, rounded) and up to 3 x 4 stacks' maps and alignment
+      const std::size_t cap = static_cast<std::size_t>(eb) * static_cast<std::size_t>(k) + 12 * (al(z(ne) * sizeof(int)) + 1024) + 3 * 4 * 4096;
+      if (cap < left) {
+        I.M.bank_mem = g::dalloc(cap);
+        if (I.M.bank_mem) {
+          I.M.bank_cap = cap;
+          I.M.bank_slots = k;
+          I.dev_bytes += cap;
+          I.bank_bytes_total += cap;
+          left -= cap;
+        }
+      }
+    }
+  }
+  if (o.mtp) I.M.picks.assign(z(ne), 0);
   if (!o.hot_order.empty()) {
-    std::size_t free_b = 0, total_b = 0;
-    if (!g::sync() || !g::mem_info(&free_b, &total_b)) return R::fail(Status::fail(Code::internal, std::string("engine: device memory: ") + g::last_error()));
-    std::uint64_t left = free_b > o.vram_reserve ? free_b - o.vram_reserve : 0;
-    if (o.vram_budget > 0) left = std::min<std::uint64_t>(left, o.vram_budget > I.dev_bytes ? o.vram_budget - I.dev_bytes : 0);
     // stack overhead per layer (alignment, maps, table rounding): ESTIMATE, kept out of the budget
     const std::uint64_t per_layer_slack = 3 * 4 * (2048 + 256 * 4) + 64 * 1024;
     left = left > per_layer_slack * s.n_layer ? left - per_layer_slack * s.n_layer : 0;
@@ -759,6 +914,28 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
   I.dbuf.assign(z(maxp * e), 0.0f);
   I.cold.reserve(z(maxp));
   I.need.assign(z(mb), 0);
+  if (o.doorbell) {
+    const std::size_t sel_b = al(z(maxp) * 4), xn_b = al(z(mb * e) * 4);
+    const std::size_t bell_b = 512 + 2 * sel_b + 2 * xn_b;
+    void* dev = nullptr;
+    I.bell_h = g::host_alloc_mapped(bell_b, &dev);
+    if (I.bell_h) {
+      auto* hb = static_cast<std::uint8_t*>(I.bell_h);
+      auto* db2 = static_cast<std::uint8_t*>(dev);
+      I.fa_h = reinterpret_cast<unsigned*>(hb);
+      I.fa_d = reinterpret_cast<unsigned*>(db2);
+      I.fb_h = reinterpret_cast<unsigned*>(hb + 256);
+      I.fb_d = reinterpret_cast<unsigned*>(db2 + 256);
+      I.sel_m = reinterpret_cast<std::int32_t*>(hb + 512);
+      I.wsel_m = reinterpret_cast<float*>(hb + 512 + sel_b);
+      I.xn_m = reinterpret_cast<float*>(hb + 512 + 2 * sel_b);
+      I.yc_m = reinterpret_cast<float*>(hb + 512 + 2 * sel_b + xn_b);
+      I.yc_md = reinterpret_cast<float*>(db2 + 512 + 2 * sel_b + xn_b);
+      I.bell = true;
+      Impl* ip = &I;
+      I.bell_th = std::thread([ip] { ip->bell_loop(); });
+    }
+  }
   const Status rs = I.reset_state();
   if (!rs) return R::fail(rs);
   return R::good(std::unique_ptr<GpuEngine>(new GpuEngine(std::move(p))));
@@ -811,6 +988,30 @@ Status GpuEngine::Impl::run(const std::int32_t* tokens, int n, float* logits, bo
   EngineStats es;
   const int64_t e = s.n_embd;
   if (Status es0 = I.embed(wt.tok_embd, tokens, n, I.x, e); !es0) return es0;
+  const unsigned g0 = I.gen + 1;
+  if (I.bell) {  // the CPU side starts waiting for this step's rings
+    {
+      std::lock_guard<std::mutex> lk(I.bmu);
+      I.bn = n;
+      I.bg0 = g0;
+      I.bjob = true;
+      I.bbusy = true;
+      I.bcancel.store(false, std::memory_order_relaxed);
+    }
+    I.bcv.notify_all();
+    I.gen += s.n_layer;
+  }
+  // on an early return the CPU side is told to stop waiting (it rings zeros, so nothing on the GPU waits forever)
+  struct BellGuard {
+    Impl& I;
+    bool armed;
+    ~BellGuard() {
+      if (!armed) return;
+      I.bcancel.store(true, std::memory_order_relaxed);
+      std::unique_lock<std::mutex> lk(I.bmu);
+      I.bcv.wait(lk, [&] { return !I.bbusy; });
+    }
+  } guard{I, I.bell};
   Status st;
   for (std::uint32_t il = 0; il < s.n_layer; ++il) {
     const Qwen35MoeLayer& l = wt.layers[il];
@@ -819,7 +1020,7 @@ Status GpuEngine::Impl::run(const std::int32_t* tokens, int n, float* logits, bo
     if (!(st = l.recurrent ? I.deltanet_block(D, n) : I.attention_block(D, n, I.pos))) return st;
     if (!g::add_rows(I.x, e, I.y, e, nullptr, e, n)) return gfail("engine: residual");
     if (!g::rms_norm(I.x, D.post_norm, I.xn, e, 1, e, e, n, s.rms_eps)) return gfail("engine: post norm");
-    if (!(st = I.moe_block(l, D, n, es))) return st;
+    if (!(st = I.bell ? I.moe_block_bell(D, n, g0 + il) : I.moe_block(l, D, n, es))) return st;
     if (!g::add_rows(I.x, e, I.y, e, nullptr, e, n)) return gfail("engine: residual");
   }
   const int64_t nvoc = s.n_vocab;
@@ -837,6 +1038,16 @@ Status GpuEngine::Impl::run(const std::int32_t* tokens, int n, float* logits, bo
       return gfail("engine: logits");
   }
   if (!g::sync()) return gfail("engine: sync");
+  if (I.bell) {
+    guard.armed = false;
+    std::unique_lock<std::mutex> lk(I.bmu);
+    I.bcv.wait(lk, [&] { return !I.bbusy; });
+    if (!I.berr.empty()) return Status::fail(Code::internal, I.berr);
+    es.wait_seconds += I.bst.wait_seconds;
+    es.cold_seconds += I.bst.cold_seconds;
+    es.hot_picks += I.bst.hot_picks;
+    es.cold_picks += I.bst.cold_picks;
+  }
   I.pos += n;
   es.seconds = since(t0);
   if (stats) *stats = es;
@@ -892,6 +1103,38 @@ Status GpuEngine::mtp_step(const std::int32_t* tokens, const float* h_prev, int 
   return Status::good();
 }
 
+Result<int> GpuEngine::mtp_promote() {
+  using R = Result<int>;
+  Impl& I = *p_;
+  Layer& M = I.M;
+  if (!I.has_mtp || M.bank_cap == 0 || M.bank_slots <= 0) return R::good(0);
+  const Qwen35MoeLayer& ml = I.w->mtp.layer;
+  const int ne = static_cast<int>(I.s.n_expert);
+  std::vector<int> order;
+  for (int e = 0; e < ne; ++e)
+    if (M.picks[static_cast<std::size_t>(e)] > 0 && I.bankable(ml, e)) order.push_back(e);
+  std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return M.picks[static_cast<std::size_t>(a)] > M.picks[static_cast<std::size_t>(b)]; });
+  std::vector<std::uint8_t> want(static_cast<std::size_t>(ne), 0);
+  std::uint64_t used = 0;
+  int count = 0;
+  for (const int e : order) {
+    if (count >= M.bank_slots) break;
+    const std::uint64_t b = I.expert_bytes(ml, e);
+    if (used + b > M.bank_cap - 12 * (al(static_cast<std::size_t>(ne) * sizeof(int)) + 1024) - 3 * 4 * 4096) continue;
+    used += b;
+    want[static_cast<std::size_t>(e)] = 1;
+    ++count;
+  }
+  int swapped = 0;
+  for (int e = 0; e < ne; ++e) swapped += want[static_cast<std::size_t>(e)] && !M.hot[static_cast<std::size_t>(e)] ? 1 : 0;
+  if (want == M.hot) return R::good(0);
+  M.hot = want;
+  M.n_hot = count;
+  if (Status st = I.build_bank(ml, M); !st) return R::fail(st);
+  if (!g::sync()) return R::fail(gfail("engine: MTP bank sync"));
+  return R::good(swapped);
+}
+
 void GpuEngine::mtp_truncate(std::int64_t p) {
   if (p >= 0 && p < p_->mtp_pos) p_->mtp_pos = p;
 }
@@ -945,6 +1188,7 @@ Status engine_generate_greedy_mtp(GpuEngine& eng, const Qwen35MoeSpec& s, const 
       if (Status r = eng.mtp_step(prompt.data() + t0, hp.data() + t0 * e, k, nullptr, nullptr, &x); !r) return r;
       add_stats(tot, x);
     }
+    if (auto pr = eng.mtp_promote(); !pr.ok()) return pr.status;  // the MTP bank from the prompt's picks
   }
   std::int32_t last = argmax_of(lg.data(), nv);
   out.push_back(last);
@@ -952,6 +1196,8 @@ Status engine_generate_greedy_mtp(GpuEngine& eng, const Qwen35MoeSpec& s, const 
   std::vector<float> dl(z(nv)), hn(z(e)), h(z(e)), bl, bh;
   while (static_cast<int>(out.size()) < n_predict && !is_stop(last)) {
     ++stt.steps;
+    if (n_draft > 0 && stt.steps % 32 == 0)  // idle-time promotion: the MTP bank follows the block's own picks
+      if (auto pr = eng.mtp_promote(); !pr.ok()) return pr.status;
     const int room = n_predict - static_cast<int>(out.size()) - 1;
     const int k = std::max(0, std::min(n_draft, room));
     std::vector<std::int32_t> drafts;

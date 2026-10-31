@@ -128,6 +128,18 @@ bool deltanet_chunked_rows(const float* conv, std::int64_t ch, const float* beta
 // back into the state (k = n: the state itself).
 bool deltanet_recurrent_reg_ckpt(const float* conv, std::int64_t ch, const float* beta, const float* alpha, float* state, std::int64_t n,
                                  std::int64_t nk, std::int64_t nv, std::int64_t ds, float* core, float* ckpt, Stream s = nullptr);
+// ---- the doorbell (GP3-14, game plan U2 / masterwork: CPU and GPU hand off through flags in pinned host memory mapped
+// into the device; no cudaMemcpy wait, no host callback). host_alloc_mapped: pinned, mapped, zeroed host memory; *dev
+// receives its device address. bell_ring: a one-thread kernel, in stream order, makes every earlier write visible system
+// wide (__threadfence_system) and then stores value into the flag (a device address of mapped memory). bell_wait: a
+// one-thread kernel spins (__nanosleep 64 -> 200 ns backoff) until the flag holds value or later (flags only grow,
+// compared modulo 2^32), then fences, so the stream's next work reads what the CPU wrote before ringing.
+// to_host_async: device -> pinned host memory, stream ordered, no wait.
+void* host_alloc_mapped(std::size_t bytes, void** dev);
+void host_free(void* p);
+bool bell_ring(unsigned* flag, unsigned value, Stream s = nullptr);
+bool bell_wait(const unsigned* flag, unsigned value, Stream s = nullptr);
+bool to_host_async(void* dst, const void* src, std::size_t bytes, Stream s = nullptr);
 // device to device copy (stream ordered)
 bool dcopy(void* dst, const void* src, std::size_t bytes, Stream s = nullptr);
 // per value head: o = rms_norm(o) * w * silu(z), in place on core (n rows of nv * ds), z alike

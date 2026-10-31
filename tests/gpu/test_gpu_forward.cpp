@@ -246,7 +246,7 @@ namespace {
 // GP3-14 stages 1-2: the engine over a sequence fed in pieces (prefill chunks, then one token at a time) against the
 // reference's fresh pass with the same roundings. hot: experts 0 .. hot-1 of every layer in the GPU bank, the rest on
 // the CPU (0: every expert on the CPU; 8: every expert on the GPU).
-void engine_case(const Small& sm, int hot, const char* what) {
+std::vector<float> engine_case(const Small& sm, int hot, const char* what, bool bell = true) {
   const m::Qwen35MoeSpec& s = sm.spec;
   const int n = std::getenv("PELIAS_GPU_QUICK") ? 20 : 48, nv = static_cast<int>(s.n_vocab);
   std::vector<std::int32_t> tok(static_cast<std::size_t>(n));
@@ -259,6 +259,7 @@ void engine_case(const Small& sm, int hot, const char* what) {
   eo.max_ctx = 128;
   eo.max_batch = 16;
   eo.cpu_threads = 4;
+  eo.doorbell = bell;
   if (hot > 0) {
     eo.hot_order.assign(s.n_layer, {});
     for (auto& v : eo.hot_order)
@@ -269,9 +270,10 @@ void engine_case(const Small& sm, int hot, const char* what) {
   CHECK(f.ok());
   if (!f.ok()) {
     std::printf("    %s: open failed: %s\n", what, f.status.text().c_str());
-    return;
+    return {};
   }
   CHECK(f.value->bank_experts() == static_cast<int>(s.n_layer) * hot);
+  CHECK((f.value->summary().find("doorbell") != std::string::npos) == bell);
   // two passes: the second after reset() must give the same logits bit for bit (the state is carried, not leaked)
   std::vector<float> first;
   std::uint64_t hp = 0, cp = 0;
@@ -286,7 +288,7 @@ void engine_case(const Small& sm, int hot, const char* what) {
       CHECK(ps.ok());
       if (!ps.ok()) {
         std::printf("    %s: step failed: %s\n", what, ps.text().c_str());
-        return;
+        return {};
       }
       hp += es.hot_picks;
       cp += es.cold_picks;
@@ -331,6 +333,7 @@ void engine_case(const Small& sm, int hot, const char* what) {
   if (hot > 0 && hot < static_cast<int>(s.n_expert)) CHECK(hp > 0 && cp > 0);
   std::printf("    %-34s %3d tokens: logits rel L2 %.3e; KL mean %.3e max %.3e; top-1 equal %d / %d; picks GPU %llu CPU %llu; reset repeat bit for bit\n", what, n,
               den > 0 ? std::sqrt(num / den) : 0.0, kl_mean, kl_max, top_same, n, static_cast<unsigned long long>(hp / 2), static_cast<unsigned long long>(cp / 2));
+  return eng;
 }
 
 }  // namespace
@@ -342,8 +345,12 @@ TEST(rung4_engine_decode_against_the_reference) {
   CHECK(sm.ok);
   if (!sm.ok) return;
   engine_case(sm, 0, "engine, every expert on the CPU");
-  engine_case(sm, 4, "engine, half the experts in the bank");
+  const std::vector<float> a = engine_case(sm, 4, "engine, half the experts in the bank");
   engine_case(sm, 8, "engine, every expert in the bank");
+  // the doorbell and the per-layer device syncs run the same arithmetic: the same logits bit for bit
+  const std::vector<float> b = engine_case(sm, 4, "engine, half in the bank, device syncs", false);
+  CHECK(!a.empty() && a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0);
+  std::printf("    doorbell vs device syncs: logits bit for bit %s\n", !a.empty() && a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0 ? "equal" : "DIFFERENT");
 }
 
 // GP3-14 stage 3: verify batches and keep() (the MTP rollback) on the small model: after a 16-token prefill, batches of 4

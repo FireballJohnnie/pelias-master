@@ -14,8 +14,11 @@
 // the CPU runs the cold picks; the cold sum goes back and is added. The roundings are the reference's
 // (GpuForward::matching_reference_options); the sum orders differ (rung tolerance; real-model gate: gpu-check
 // --float-ref, DECISIONS_LOG 2026-10-31 00:5x).
-// Not yet: MTP drafting, the doorbell (the hand-off is a plain device sync per layer in this first cut), residual planes,
-// the chunked DeltaNet kernel for long prompts, the KV page selector. qwen35moe only.
+// Hand-off (EngineOptions::doorbell): flags in pinned mapped memory; the router's picks and the normed rows are copied
+// to pinned memory and the GPU rings; a CPU thread waiting on that flag runs the cold experts into pinned memory and rings
+// back; the GPU waits in-stream and reads the cold sum straight from host memory. The MTP block uses the plain syncs.
+// Not yet: the CUDA Graph per step (U8), BAR1 write-combining (Windows build), the MTP block's bank, residual planes, the
+// chunked DeltaNet kernel for long prompts, the KV page selector. qwen35moe only.
 #pragma once
 
 #include <cstdint>
@@ -46,6 +49,14 @@ struct EngineOptions {
   // CPU path, its own attention cache).
   int max_verify = 0;
   bool mtp = false;
+  // the doorbell (author 03:18): the trunk's CPU/GPU hand-offs through flags in pinned mapped memory, a CPU thread that
+  // runs each layer's cold experts as its flag rings, the GPU waiting in-stream; a whole step is enqueued without a host
+  // wait. false: one device sync per layer (the first cut). Falls back to the syncs if mapped memory is not available.
+  bool doorbell = true;
+  // the MTP block's bank (author 03:18, option 1: live pick counts, idle-time promotion): experts it can hold; -1 = as
+  // many as the trunk's average per layer would get if the bank budget were spread over n_layer + 1 layers (DERIVED at
+  // open); 0 = none (the MTP experts stay on the CPU path)
+  int mtp_bank = -1;
 };
 
 struct EngineStats {
@@ -78,6 +89,9 @@ class GpuEngine {
   // h_prev + t x n_embd (host); as model::mtp_forward. logits (n x n_vocab) and h_out (n x n_embd) may be null.
   Status mtp_step(const std::int32_t* tokens, const float* h_prev, int n, float* logits, float* h_out, EngineStats* st = nullptr);
   void mtp_truncate(std::int64_t pos);
+  // idle-time promotion: the MTP block's bank is refilled with its most picked experts so far (picks counted on every MTP
+  // step); nothing is uploaded when the set is unchanged. Returns the experts swapped in.
+  Result<int> mtp_promote();
   [[nodiscard]] std::int64_t mtp_pos() const;
   [[nodiscard]] std::uint64_t device_bytes() const;
   [[nodiscard]] int max_batch() const;
