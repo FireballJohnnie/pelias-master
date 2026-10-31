@@ -63,6 +63,9 @@ struct EngineOptions {
   // Q4_K / Q5_K / Q4_TG2 shared as stored; Q6_K, IQ4_XS and Q7_ZT dense weights (none in the tiered file) keep a second,
   // GGUF copy for the batched kernels. false: no R3.
   bool r3 = true;
+  // v19 (author 15:27): per-layer timeline of the doorbell steps: GPU timestamps (globaltimer) at the ring and around the
+  // wait, CPU times of the wait and of each cold-path stage, worker wake-up and busy time. Off by default (timing costs).
+  bool timeline = false;
 };
 
 struct EngineStats {
@@ -70,6 +73,22 @@ struct EngineStats {
   double cold_seconds = 0.0; // the CPU's cold-expert work (inside the step; overlaps the GPU's bank experts)
   double wait_seconds = 0.0; // host waiting on the device (router picks, the cold sum's hand-back)
   std::uint64_t hot_picks = 0, cold_picks = 0;
+};
+
+// v19 timeline (EngineOptions::timeline), summed over the steps since timeline_reset(). Per layer, GPU clock: dense = from
+// the previous layer's release to this layer's ring (norms, attention / DeltaNet, router; layer 0 not counted), hot = from
+// the ring to the wait (the bank's experts and the shared expert), idle = the GPU waiting for the CPU's cold sum. CPU
+// clock: wait = the cold-path thread waiting for the ring, cold = its cold-expert work. stage[0..4] = the cold path's
+// input rounding, gate / up, silu + rounding, down, combine (wall time); busy[] = item time summed over every thread;
+// wake = how long the first worker took to start after a gate / up or down job opened (summed over wake_n jobs).
+struct EngineTimeline {
+  int steps = 0, threads = 0;
+  std::vector<double> gpu_dense, gpu_hot, gpu_idle, cpu_wait, cpu_cold;
+  double stage[5] = {}, busy[5] = {};
+  double wake = 0.0;
+  int wake_n = 0;
+  double cold_bytes = 0.0;
+  std::uint64_t cold_picks = 0, hot_picks = 0;
 };
 
 class GpuEngine {
@@ -104,6 +123,9 @@ class GpuEngine {
   [[nodiscard]] int bank_experts() const;      // experts held on the GPU (all layers)
   [[nodiscard]] std::uint64_t bank_bytes() const;
   [[nodiscard]] std::string summary() const;   // one line: device bytes, dense, bank, cache, threads
+  // v19 timeline (empty unless EngineOptions::timeline and the doorbell are on)
+  [[nodiscard]] const EngineTimeline& timeline() const;
+  void timeline_reset();
 
   struct Impl;
 

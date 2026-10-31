@@ -135,10 +135,12 @@ bool deltanet_recurrent_reg_ckpt(const float* conv, std::int64_t ch, const float
 // one-thread kernel spins (__nanosleep 64 -> 200 ns backoff) until the flag holds value or later (flags only grow,
 // compared modulo 2^32), then fences, so the stream's next work reads what the CPU wrote before ringing.
 // to_host_async: device -> pinned host memory, stream ordered, no wait.
+// ts (optional, a device address, e.g. of mapped memory; v19 timeline): bell_ring writes the GPU's globaltimer (ns) at the
+// ring to ts[0]; bell_wait writes it on entry to ts[0] and on release to ts[1]. Null: no timestamps (the default).
 void* host_alloc_mapped(std::size_t bytes, void** dev);
 void host_free(void* p);
-bool bell_ring(unsigned* flag, unsigned value, Stream s = nullptr);
-bool bell_wait(const unsigned* flag, unsigned value, Stream s = nullptr);
+bool bell_ring(unsigned* flag, unsigned value, Stream s = nullptr, unsigned long long* ts = nullptr);
+bool bell_wait(const unsigned* flag, unsigned value, Stream s = nullptr, unsigned long long* ts = nullptr);
 bool to_host_async(void* dst, const void* src, std::size_t bytes, Stream s = nullptr);
 // device to device copy (stream ordered)
 bool dcopy(void* dst, const void* src, std::size_t bytes, Stream s = nullptr);

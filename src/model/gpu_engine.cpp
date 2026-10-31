@@ -65,10 +65,17 @@ class Pool {
   Pool(const Pool&) = delete;
   Pool& operator=(const Pool&) = delete;
   [[nodiscard]] int threads() const { return static_cast<int>(th_.size()) + 1; }
-  void run(int64_t n, const std::function<void(int64_t)>& fn) {
+  // v19 timeline: summed item time over every thread, and the first worker's start after the job opened (-1: none)
+  struct RunStats {
+    std::atomic<std::int64_t> busy_ns{0};
+    std::atomic<std::int64_t> wake_ns{-1};
+  };
+  void run(int64_t n, const std::function<void(int64_t)>& fn, RunStats* rs = nullptr) {
     if (n <= 0) return;
+    rs_ = rs;
+    t0_ = Clock::now();
     if (th_.empty() || n == 1) {
-      for (int64_t i = 0; i < n; ++i) fn(i);
+      work(fn, n, false);
       return;
     }
     fn_ = &fn;
@@ -80,15 +87,37 @@ class Pool {
       gen_.fetch_add(1, std::memory_order_release);
     }
     cv_.notify_all();
-    work(fn, n);
+    work(fn, n, false);
     for (int spin = 0; active_.load(std::memory_order_acquire) != 0; ++spin)
       if (spin > kSpin) std::this_thread::yield();
   }
 
  private:
   static constexpr int kSpin = 4000;
-  void work(const std::function<void(int64_t)>& fn, int64_t n) {
-    for (int64_t i = next_.fetch_add(1, std::memory_order_relaxed); i < n; i = next_.fetch_add(1, std::memory_order_relaxed)) fn(i);
+  static std::int64_t ns(Clock::duration d) { return std::chrono::duration_cast<std::chrono::nanoseconds>(d).count(); }
+  void work(const std::function<void(int64_t)>& fn, int64_t n, bool worker) {
+    RunStats* rs = rs_;
+    if (!worker && (th_.empty() || n == 1)) {  // inline job: the caller alone, no counter
+      for (int64_t i = 0; i < n; ++i) {
+        const Clock::time_point t = Clock::now();
+        fn(i);
+        if (rs) rs->busy_ns.fetch_add(ns(Clock::now() - t), std::memory_order_relaxed);
+      }
+      return;
+    }
+    for (int64_t i = next_.fetch_add(1, std::memory_order_relaxed); i < n; i = next_.fetch_add(1, std::memory_order_relaxed)) {
+      if (!rs) {
+        fn(i);
+        continue;
+      }
+      const Clock::time_point t = Clock::now();
+      if (worker) {
+        std::int64_t none = -1;
+        rs->wake_ns.compare_exchange_strong(none, ns(t - t0_), std::memory_order_relaxed);
+      }
+      fn(i);
+      rs->busy_ns.fetch_add(ns(Clock::now() - t), std::memory_order_relaxed);
+    }
   }
   void loop() {
     std::uint64_t seen = 0;
@@ -101,7 +130,7 @@ class Pool {
       }
       if (stop_.load(std::memory_order_acquire)) return;
       seen = gen_.load(std::memory_order_acquire);
-      work(*fn_, n_);
+      work(*fn_, n_, true);
       active_.fetch_sub(1, std::memory_order_acq_rel);
     }
   }
@@ -110,6 +139,8 @@ class Pool {
   std::condition_variable cv_;
   const std::function<void(int64_t)>* fn_ = nullptr;
   int64_t n_ = 0;
+  RunStats* rs_ = nullptr;  // written before the job's generation is released; read by the workers after they see it
+  Clock::time_point t0_{};
   std::atomic<int64_t> next_{0};
   std::atomic<int> active_{0};
   std::atomic<std::uint64_t> gen_{0};
@@ -245,6 +276,11 @@ struct GpuEngine::Impl {
   std::atomic<bool> bcancel{false};
   EngineStats bst;
   std::string berr;
+  // v19 timeline
+  bool tl_on = false;
+  EngineTimeline tline;
+  void* ts_hv = nullptr;  // pinned mapped: per layer [ring, wait enter, wait release, spare] GPU ns
+  unsigned long long *ts_h = nullptr, *ts_d = nullptr;
 
   // ---- weights
   static std::size_t view_bytes(const WeightView& v) {
@@ -528,14 +564,39 @@ struct GpuEngine::Impl {
 
   // the cold picks on the CPU: ycold_h (n x e) = sum over cold picks of weight x down(round32(silu(gate x) * up x))
   void cold_experts(const Qwen35MoeLayer& l, int64_t n) { cold_experts_io(l, n, xn_h.data(), ycold_h.data()); }
-  void cold_experts_io(const Qwen35MoeLayer& l, int64_t n, const float* xsrc, float* ydst) {
+  // tlp (v19 timeline, the doorbell thread only): each stage's wall time, item time over all threads, the first worker's
+  // wake-up on the two big jobs, and the expert bytes read
+  void cold_experts_io(const Qwen35MoeLayer& l, int64_t n, const float* xsrc, float* ydst, EngineTimeline* tlp = nullptr) {
     const int64_t e = s.n_embd, ff = s.n_ff_exp;
     const int64_t np = static_cast<int64_t>(cold.size());
+    Pool::RunStats rs[5];
+    Clock::time_point ts = Clock::now();
+    auto mark = [&](int k) {
+      if (!tlp) return;
+      const Clock::time_point now = Clock::now();
+      tlp->stage[k] += std::chrono::duration<double>(now - ts).count();
+      tlp->busy[k] += static_cast<double>(rs[k].busy_ns.load(std::memory_order_relaxed)) * 1e-9;
+      const std::int64_t w8 = rs[k].wake_ns.load(std::memory_order_relaxed);
+      if ((k == 1 || k == 3) && w8 >= 0) {
+        tlp->wake += static_cast<double>(w8) * 1e-9;
+        ++tlp->wake_n;
+      }
+      ts = now;
+    };
+    Pool::RunStats* rp0 = tlp ? &rs[0] : nullptr;
+    Pool::RunStats* rp1 = tlp ? &rs[1] : nullptr;
+    Pool::RunStats* rp2 = tlp ? &rs[2] : nullptr;
+    Pool::RunStats* rp3 = tlp ? &rs[3] : nullptr;
+    Pool::RunStats* rp4 = tlp ? &rs[4] : nullptr;
+    if (tlp)
+      for (const ColdPick& c : cold)
+        for (const WeightView* v : {&l.gate_exps, &l.up_exps, &l.down_exps}) tlp->cold_bytes += static_cast<double>(exp_rows(*v, c.e).rb) * static_cast<double>(v == &l.down_exps ? e : ff);
     std::fill(need.begin(), need.begin() + n, std::uint8_t{0});
     for (const ColdPick& c : cold) need[z(c.t)] = 1;
     pool->run(n, [&](int64_t t) {
       if (need[z(t)]) kern::act_q8x32_quantize(xsrc + t * e, e, actx[z(t)]);
-    });
+    }, rp0);
+    mark(0);
     constexpr int64_t kRowsUp = 64, kRowsDown = 128;
     const int64_t ub = (ff + kRowsUp - 1) / kRowsUp;  // row blocks per projection (gate, up)
     pool->run(np * 2 * ub, [&](int64_t u) {
@@ -545,13 +606,15 @@ struct GpuEngine::Impl {
       float* o_row = (proj == 0 ? gbuf.data() : ubuf.data()) + p * ff;
       const kern::ActQ8x32* a = &actx[z(c.t)];
       for (int64_t r = r0; r < r1; ++r) kern::dot_row_q8(R.t, R.base + static_cast<std::uint64_t>(r) * R.rb, e, nullptr, &a, 1, o_row + r);
-    });
+    }, rp1);
+    mark(1);
     pool->run(np, [&](int64_t p) {
       float* gg = gbuf.data() + p * ff;
       const float* uu = ubuf.data() + p * ff;
       for (int64_t i = 0; i < ff; ++i) gg[i] = silu(gg[i]) * uu[i];
       kern::act_q8x32_quantize(gg, ff, acth[z(p)]);
-    });
+    }, rp2);
+    mark(2);
     const int64_t db = (e + kRowsDown - 1) / kRowsDown;
     pool->run(np * db, [&](int64_t u) {
       const int64_t p = u / db, r0 = (u % db) * kRowsDown, r1 = std::min(e, r0 + kRowsDown);
@@ -559,7 +622,8 @@ struct GpuEngine::Impl {
       const kern::ActQ8x32* a = &acth[z(p)];
       float* o_row = dbuf.data() + p * e;
       for (int64_t r = r0; r < r1; ++r) kern::dot_row_q8(R.t, R.base + static_cast<std::uint64_t>(r) * R.rb, ff, nullptr, &a, 1, o_row + r);
-    });
+    }, rp3);
+    mark(3);
     // per token, the picks in slot order (deterministic)
     pool->run(n, [&](int64_t t) {
       float* yt = ydst + t * e;
@@ -570,7 +634,8 @@ struct GpuEngine::Impl {
         const float* d = dbuf.data() + p * e;
         for (int64_t i = 0; i < e; ++i) yt[i] += wgt * d[i];
       }
-    });
+    }, rp4);
+    mark(4);
   }
 
   Status moe_block(const Qwen35MoeLayer& l, Layer& D, int64_t n, EngineStats& es) {
@@ -678,7 +743,10 @@ struct GpuEngine::Impl {
             break;
           }
         }
-        es.wait_seconds += since(tw);
+        const double wt_l = since(tw);
+        es.wait_seconds += wt_l;
+        EngineTimeline* tlp = tl_on ? &tline : nullptr;
+        if (tlp) tlp->cpu_wait[il] += wt_l;
         float* yd = yc_m;
         if (bcancel.load(std::memory_order_relaxed)) {
           std::fill(yd, yd + n * e, 0.0f);
@@ -694,8 +762,10 @@ struct GpuEngine::Impl {
           es.cold_picks += cold.size();
           const Clock::time_point tc = Clock::now();
           if (cold.empty()) std::fill(yd, yd + n * e, 0.0f);
-          else cold_experts_io(w->layers[il], n, xn_m, yd);
-          es.cold_seconds += since(tc);
+          else cold_experts_io(w->layers[il], n, xn_m, yd, tlp);
+          const double ct_l = since(tc);
+          es.cold_seconds += ct_l;
+          if (tlp) tlp->cpu_cold[il] += ct_l;
         }
         std::atomic_thread_fence(std::memory_order_seq_cst);
         std::atomic_ref<unsigned>(*fb_h).store(g, std::memory_order_release);
@@ -710,13 +780,13 @@ struct GpuEngine::Impl {
     }
   }
   // the MoE block with the doorbell: everything enqueued, no host wait
-  Status moe_block_bell(Layer& D, int64_t n, unsigned g) {
+  Status moe_block_bell(Layer& D, int64_t n, unsigned g, unsigned long long* tsd) {
     const int64_t e = s.n_embd, ne = s.n_expert, nu = s.n_expert_used, ffs = s.n_ff_shexp;
     Status st;
     if (!(st = prod(D.gate_inp, xn, n, logits_r))) return st;
     if (!g::router_topk(logits_r, ne, n, static_cast<int>(nu), s.expert_weights_scale, sel, wsel)) return gfail("engine: router");
     if (!g::to_host_async(sel_m, sel, z(n * nu) * sizeof(std::int32_t)) || !g::to_host_async(wsel_m, wsel, z(n * nu) * sizeof(float)) ||
-        !g::to_host_async(xn_m, xn, z(n * e) * sizeof(float)) || !g::bell_ring(fa_d, g))
+        !g::to_host_async(xn_m, xn, z(n * e) * sizeof(float)) || !g::bell_ring(fa_d, g, nullptr, tsd))
       return gfail("engine: doorbell (picks)");
     if (!D.bg.empty()) {
       if (!g::act_q8x32(xn, e, n, e, false, xr, e, q, scale, sum) || !g::act_digits(scale, sum, n, e, dig)) return gfail("engine: expert input rounding");
@@ -737,7 +807,7 @@ struct GpuEngine::Impl {
         !g::deltanet_gates(gsh, galpha, zero2, zero2, n, 1))
       return gfail("engine: shared gate");
     if (!g::add_rows(y, e, sh, e, gsh, e, n)) return gfail("engine: shared add");
-    if (!g::bell_wait(fb_d, g) || !g::add_rows(y, e, yc_md, e, nullptr, e, n)) return gfail("engine: doorbell (cold sum)");
+    if (!g::bell_wait(fb_d, g, nullptr, tsd ? tsd + 1 : nullptr) || !g::add_rows(y, e, yc_md, e, nullptr, e, n)) return gfail("engine: doorbell (cold sum)");
     return Status::good();
   }
 
@@ -768,6 +838,7 @@ GpuEngine::~GpuEngine() {
     p_->bell_th.join();
   }
   g::host_free(p_->bell_h);
+  g::host_free(p_->ts_hv);
   g::moe_scratch_free(&p_->moe);
   for (Layer& D : p_->L) g::dfree(D.bank_mem);
   g::dfree(p_->M.bank_mem);
@@ -790,6 +861,15 @@ int GpuEngine::bank_experts() const { return p_ ? p_->bank_count : 0; }
 int GpuEngine::max_batch() const { return p_ ? p_->o.max_batch : 0; }
 std::uint64_t GpuEngine::bank_bytes() const { return p_ ? p_->bank_bytes_total : 0; }
 Status GpuEngine::reset() { return p_->reset_state(); }
+const EngineTimeline& GpuEngine::timeline() const { return p_->tline; }
+void GpuEngine::timeline_reset() {
+  EngineTimeline& t = p_->tline;
+  const int th = t.threads;
+  const std::size_t nl = t.gpu_dense.size();
+  t = EngineTimeline{};
+  t.threads = th;
+  for (std::vector<double>* v : {&t.gpu_dense, &t.gpu_hot, &t.gpu_idle, &t.cpu_wait, &t.cpu_cold}) v->assign(nl, 0.0);
+}
 
 std::string GpuEngine::summary() const {
   const Impl& I = *p_;
@@ -1035,6 +1115,17 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
       I.yc_m = reinterpret_cast<float*>(hb + 512 + 2 * sel_b + xn_b);
       I.yc_md = reinterpret_cast<float*>(db2 + 512 + 2 * sel_b + xn_b);
       I.bell = true;
+      if (o.timeline) {
+        void* tdev = nullptr;
+        I.ts_hv = g::host_alloc_mapped(z(s.n_layer) * 4 * sizeof(unsigned long long), &tdev);
+        if (I.ts_hv) {
+          I.ts_h = static_cast<unsigned long long*>(I.ts_hv);
+          I.ts_d = static_cast<unsigned long long*>(tdev);
+          I.tl_on = true;
+        }
+      }
+      I.tline.threads = I.pool->threads();
+      for (std::vector<double>* v : {&I.tline.gpu_dense, &I.tline.gpu_hot, &I.tline.gpu_idle, &I.tline.cpu_wait, &I.tline.cpu_cold}) v->assign(s.n_layer, 0.0);
       Impl* ip = &I;
       I.bell_th = std::thread([ip] { ip->bell_loop(); });
     }
@@ -1123,7 +1214,7 @@ Status GpuEngine::Impl::run(const std::int32_t* tokens, int n, float* logits, bo
     if (!(st = l.recurrent ? I.deltanet_block(D, n) : I.attention_block(D, n, I.pos))) return st;
     if (!g::add_rows(I.x, e, I.y, e, nullptr, e, n)) return gfail("engine: residual");
     if (!g::rms_norm(I.x, D.post_norm, I.xn, e, 1, e, e, n, s.rms_eps)) return gfail("engine: post norm");
-    if (!(st = I.bell ? I.moe_block_bell(D, n, g0 + il) : I.moe_block(l, D, n, es))) return st;
+    if (!(st = I.bell ? I.moe_block_bell(D, n, g0 + il, I.ts_d ? I.ts_d + 4 * il : nullptr) : I.moe_block(l, D, n, es))) return st;
     if (!g::add_rows(I.x, e, I.y, e, nullptr, e, n)) return gfail("engine: residual");
   }
   const int64_t nvoc = s.n_vocab;
@@ -1150,6 +1241,18 @@ Status GpuEngine::Impl::run(const std::int32_t* tokens, int n, float* logits, bo
     es.cold_seconds += I.bst.cold_seconds;
     es.hot_picks += I.bst.hot_picks;
     es.cold_picks += I.bst.cold_picks;
+    if (I.tl_on && I.ts_h) {  // the GPU's timestamps of this step (synced above), per layer
+      auto d = [](unsigned long long a, unsigned long long b) { return static_cast<double>(static_cast<std::int64_t>(b - a)) * 1e-9; };
+      for (std::uint32_t il = 0; il < s.n_layer; ++il) {
+        const unsigned long long* q4 = I.ts_h + 4 * il;
+        if (il > 0) I.tline.gpu_dense[il] += d(I.ts_h[4 * (il - 1) + 2], q4[0]);
+        I.tline.gpu_hot[il] += d(q4[0], q4[1]);
+        I.tline.gpu_idle[il] += d(q4[1], q4[2]);
+      }
+      I.tline.hot_picks += I.bst.hot_picks;
+      I.tline.cold_picks += I.bst.cold_picks;
+      ++I.tline.steps;
+    }
   }
   I.pos += n;
   es.seconds = since(t0);

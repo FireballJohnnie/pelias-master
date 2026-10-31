@@ -875,17 +875,25 @@ bool to_host(void* dst, const void* src, std::size_t bytes, Stream s) {
 }
 bool dzero(void* p, std::size_t bytes, Stream s) { return ck(cudaMemsetAsync(p, 0, bytes, st(s)), "cudaMemset"); }
 bool sync(Stream s) { return ck(cudaStreamSynchronize(st(s)), "synchronize"); }
-__global__ void k_bell_ring(volatile unsigned* f, unsigned v) {
+__device__ __forceinline__ unsigned long long gtimer() {
+  unsigned long long t;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+  return t;
+}
+__global__ void k_bell_ring(volatile unsigned* f, unsigned v, volatile unsigned long long* ts) {
   __threadfence_system();
+  if (ts) ts[0] = gtimer();
   *f = v;
   __threadfence_system();
 }
-__global__ void k_bell_wait(const volatile unsigned* f, unsigned v) {
+__global__ void k_bell_wait(const volatile unsigned* f, unsigned v, volatile unsigned long long* ts) {
+  if (ts) ts[0] = gtimer();
   unsigned ns = 64;
   while (static_cast<int>(*f - v) < 0) {
     __nanosleep(ns);
     if (ns < 200) ns += 32;
   }
+  if (ts) ts[1] = gtimer();
   __threadfence_system();
 }
 void* host_alloc_mapped(std::size_t bytes, void** dev) {
@@ -903,14 +911,14 @@ void* host_alloc_mapped(std::size_t bytes, void** dev) {
 void host_free(void* p) {
   if (p) cudaFreeHost(p);
 }
-bool bell_ring(unsigned* flag, unsigned value, Stream s) {
+bool bell_ring(unsigned* flag, unsigned value, Stream s, unsigned long long* ts) {
   if (!flag) return fail("bell_ring: no flag");
-  k_bell_ring<<<1, 1, 0, st(s)>>>(flag, value);
+  k_bell_ring<<<1, 1, 0, st(s)>>>(flag, value, ts);
   return launched("doorbell ring");
 }
-bool bell_wait(const unsigned* flag, unsigned value, Stream s) {
+bool bell_wait(const unsigned* flag, unsigned value, Stream s, unsigned long long* ts) {
   if (!flag) return fail("bell_wait: no flag");
-  k_bell_wait<<<1, 1, 0, st(s)>>>(flag, value);
+  k_bell_wait<<<1, 1, 0, st(s)>>>(flag, value, ts);
   return launched("doorbell wait");
 }
 bool to_host_async(void* dst, const void* src, std::size_t bytes, Stream s) {

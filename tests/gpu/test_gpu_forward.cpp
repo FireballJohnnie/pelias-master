@@ -246,7 +246,7 @@ namespace {
 // GP3-14 stages 1-2: the engine over a sequence fed in pieces (prefill chunks, then one token at a time) against the
 // reference's fresh pass with the same roundings. hot: experts 0 .. hot-1 of every layer in the GPU bank, the rest on
 // the CPU (0: every expert on the CPU; 8: every expert on the GPU).
-std::vector<float> engine_case(const Small& sm, int hot, const char* what, bool bell = true) {
+std::vector<float> engine_case(const Small& sm, int hot, const char* what, bool bell = true, bool timeline = false) {
   const m::Qwen35MoeSpec& s = sm.spec;
   const int n = std::getenv("PELIAS_GPU_QUICK") ? 20 : 48, nv = static_cast<int>(s.n_vocab);
   std::vector<std::int32_t> tok(static_cast<std::size_t>(n));
@@ -260,6 +260,7 @@ std::vector<float> engine_case(const Small& sm, int hot, const char* what, bool 
   eo.max_batch = 16;
   eo.cpu_threads = 4;
   eo.doorbell = bell;
+  eo.timeline = timeline;
   if (hot > 0) {
     eo.hot_order.assign(s.n_layer, {});
     for (auto& v : eo.hot_order)
@@ -331,6 +332,24 @@ std::vector<float> engine_case(const Small& sm, int hot, const char* what, bool 
   if (hot == 0) CHECK(hp == 0);
   if (hot == static_cast<int>(s.n_expert)) CHECK(cp == 0);
   if (hot > 0 && hot < static_cast<int>(s.n_expert)) CHECK(hp > 0 && cp > 0);
+  if (timeline) {  // v19: every doorbell step counted (2 passes of 2 prefill pieces + the single tokens), times sane
+    const m::EngineTimeline& T = f.value->timeline();
+    const int steps_per_pass = 2 + std::max(0, n - 29);
+    double idle = 0.0, cold = 0.0, hotg = 0.0;
+    bool sane = true;
+    for (std::size_t il = 0; il < T.gpu_idle.size(); ++il) {
+      idle += T.gpu_idle[il];
+      cold += T.cpu_cold[il];
+      hotg += T.gpu_hot[il];
+      sane = sane && T.gpu_idle[il] >= 0.0 && T.gpu_hot[il] >= 0.0 && T.gpu_dense[il] >= 0.0 && T.cpu_wait[il] >= 0.0 && std::isfinite(T.gpu_idle[il]);
+    }
+    CHECK(T.steps == 2 * steps_per_pass);
+    CHECK(T.gpu_idle.size() == s.n_layer);
+    CHECK(sane);
+    CHECK(cold > 0.0 && hotg > 0.0 && T.cold_bytes > 0.0 && T.cold_picks > 0 && T.hot_picks > 0);
+    std::printf("    timeline: %d steps; GPU idle %.3f ms, bank + shared %.3f ms; CPU cold %.3f ms (whole run); stages %.3f / %.3f / %.3f / %.3f / %.3f ms\n", T.steps,
+                idle * 1e3, hotg * 1e3, cold * 1e3, T.stage[0] * 1e3, T.stage[1] * 1e3, T.stage[2] * 1e3, T.stage[3] * 1e3, T.stage[4] * 1e3);
+  }
   std::printf("    %-34s %3d tokens: logits rel L2 %.3e; KL mean %.3e max %.3e; top-1 equal %d / %d; picks GPU %llu CPU %llu; reset repeat bit for bit\n", what, n,
               den > 0 ? std::sqrt(num / den) : 0.0, kl_mean, kl_max, top_same, n, static_cast<unsigned long long>(hp / 2), static_cast<unsigned long long>(cp / 2));
   return eng;
@@ -349,6 +368,9 @@ TEST(rung4_engine_decode_against_the_reference) {
   engine_case(sm, 8, "engine, every expert in the bank");
   // the doorbell and the per-layer device syncs run the same arithmetic: the same logits bit for bit
   const std::vector<float> b = engine_case(sm, 4, "engine, half in the bank, device syncs", false);
+  // v19: the timeline only reads clocks; the logits stay bit for bit
+  const std::vector<float> c = engine_case(sm, 4, "engine, half in the bank, timeline", true, true);
+  CHECK(!a.empty() && a.size() == c.size() && std::memcmp(a.data(), c.data(), a.size() * sizeof(float)) == 0);
   CHECK(!a.empty() && a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0);
   std::printf("    doorbell vs device syncs: logits bit for bit %s\n", !a.empty() && a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0 ? "equal" : "DIFFERENT");
 }

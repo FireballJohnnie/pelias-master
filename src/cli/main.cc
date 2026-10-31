@@ -2077,12 +2077,61 @@ int cmd_gpu_check(const Args& a) {
 // steps) over made-up tokens: prefill in chunks, then decode one token at a time; speed, the bank's share of the picks,
 // and the logits of every position against the CPU reference with the same roundings (and, with --float-ref, against the
 // unrounded model: the real-model gate of DECISIONS_LOG 2026-10-31 00:5x).
+// v19 helpers: a row's two best ids and their logit gap; the exact two-sided McNemar p for b vs c discordant pairs
+struct Top2 {
+  std::size_t i1 = 0, i2 = 0;
+  double margin = 0.0;
+};
+Top2 top2(const float* r, std::size_t nv) {
+  Top2 o;
+  o.i1 = 0;
+  o.i2 = nv > 1 ? 1 : 0;
+  if (nv > 1 && r[1] > r[0]) std::swap(o.i1, o.i2);
+  for (std::size_t i = 2; i < nv; ++i) {
+    if (r[i] > r[o.i1]) {
+      o.i2 = o.i1;
+      o.i1 = i;
+    } else if (r[i] > r[o.i2]) {
+      o.i2 = i;
+    }
+  }
+  o.margin = static_cast<double>(r[o.i1]) - static_cast<double>(r[o.i2]);
+  return o;
+}
+double mcnemar_p(int b, int c) {
+  const int nn = b + c, k = std::min(b, c);
+  if (nn == 0) return 1.0;
+  double sum = 0.0;
+  for (int i = 0; i <= k; ++i) sum += std::exp(std::lgamma(nn + 1.0) - std::lgamma(i + 1.0) - std::lgamma(nn - i + 1.0) - nn * std::log(2.0));
+  return std::min(1.0, 2.0 * sum);
+}
+double kl_rows(const float* ra, const float* rb, std::size_t nv) {
+  double ma = ra[0], mb = rb[0];
+  for (std::size_t i = 0; i < nv; ++i) {
+    ma = std::max(ma, static_cast<double>(ra[i]));
+    mb = std::max(mb, static_cast<double>(rb[i]));
+  }
+  double sa = 0.0, sb = 0.0;
+  for (std::size_t i = 0; i < nv; ++i) {
+    sa += std::exp(ra[i] - ma);
+    sb += std::exp(rb[i] - mb);
+  }
+  const double la = ma + std::log(sa), lb = mb + std::log(sb);
+  double k = 0.0;
+  for (std::size_t i = 0; i < nv; ++i) {
+    const double pa = ra[i] - la;
+    k += std::exp(pa) * (pa - (rb[i] - lb));
+  }
+  return k;
+}
+
 int cmd_engine_check(const Args& a) {
   const std::string path = a.get("model");
   if (path.empty()) {
     std::fprintf(stderr,
                  "usage: pelias engine-check --model FILE [--routes ROUTES.bin] [--prefill 64] [--decode 32] [--ctx 4096] [--batch 64] [--threads N]\n"
-                 "                           [--budget-gb G] [--hot-max N] [--mtp-draft K] [--fast-cpu] [--no-cpu] [--float-ref]\n");
+                 "                           [--budget-gb G] [--hot-max N] [--mtp-draft K] [--fast-cpu] [--no-cpu] [--float-ref]\n"
+                 "                           [--text FILE [--skip-tokens N]] [--timeline] [--dump-top OUT.tsv] [--dump-split]\n");
     return 1;
   }
   auto num = [&](const char* k, std::uint64_t d, std::uint64_t lo, std::uint64_t hi, std::uint64_t& out) {
@@ -2096,10 +2145,22 @@ int cmd_engine_check(const Args& a) {
     out = r.value;
     return true;
   };
-  std::uint64_t npre = 0, ndec = 0, ctx = 0, batch = 0, thr = 0, hmax = 0, ndraft = 0;
+  std::uint64_t npre = 0, ndec = 0, ctx = 0, batch = 0, thr = 0, hmax = 0, ndraft = 0, skip = 0;
   if (!num("prefill", 64, 1, 1 << 20, npre) || !num("decode", 32, 0, 1 << 20, ndec) || !num("ctx", 4096, 2, 1 << 20, ctx) || !num("batch", 64, 1, 4096, batch) ||
-      !num("threads", 0, 0, 4096, thr) || !num("hot-max", 256, 0, 4096, hmax) || !num("mtp-draft", 0, 0, 16, ndraft))
+      !num("threads", 0, 0, 4096, thr) || !num("hot-max", 256, 0, 4096, hmax) || !num("mtp-draft", 0, 0, 16, ndraft) ||
+      !num("skip-tokens", 0, 0, std::uint64_t{1} << 40, skip))
     return 1;
+  const std::string dump_top = a.get("dump-top");
+  if (!dump_top.empty()) {
+    if (!a.has("float-ref") || a.has("no-cpu")) {
+      std::fprintf(stderr, "pelias: --dump-top needs --float-ref (and the CPU reference)\n");
+      return 1;
+    }
+    if (std::ifstream(dump_top).good()) {
+      std::fprintf(stderr, "pelias: %s exists (nothing is overwritten)\n", dump_top.c_str());
+      return 1;
+    }
+  }
   if (npre + ndec > ctx) {
     std::fprintf(stderr, "pelias: --prefill + --decode must fit --ctx\n");
     return 1;
@@ -2123,6 +2184,7 @@ int cmd_engine_check(const Args& a) {
   eo.max_hot_per_layer = static_cast<int>(hmax);
   eo.mtp = ndraft > 0;
   eo.max_verify = static_cast<int>(ndraft) + 1;
+  eo.timeline = a.has("timeline");
   if (a.has("routes")) {
     auto ho = model::hot_order_from_routes(a.get("routes"), s.n_layer, s.n_expert);
     if (!ho.ok()) return fail_input(ho.status);
@@ -2134,7 +2196,22 @@ int cmd_engine_check(const Args& a) {
   std::printf("pelias engine-check: %s, %u layers; open %.2f s\n  %s\n", s.arch.c_str(), s.n_layer, topen.seconds(), eng.value->summary().c_str());
   const int n = static_cast<int>(npre + ndec);
   std::vector<std::int32_t> ids(static_cast<std::size_t>(n));
-  for (int t = 0; t < n; ++t) ids[static_cast<std::size_t>(t)] = static_cast<std::int32_t>((static_cast<std::uint64_t>(t) * 7919u + 1011u) % s.n_vocab);
+  if (a.has("text")) {  // v19: real text, tokens skip .. skip + n of the file (decode steps are fed the text's next tokens)
+    Result<tok::Tokenizer> tk = tok::Tokenizer::from_gguf(g);
+    if (!tk.ok()) return fail_input(tk.status);
+    Result<std::string> txt = io::read_text_file(a.get("text"));
+    if (!txt.ok()) return fail_input(txt.status);
+    tok::EncodeOptions eopt;
+    const std::vector<std::int32_t> all = tk.value.encode(txt.value, eopt);
+    if (all.size() < skip + static_cast<std::uint64_t>(n)) {
+      std::fprintf(stderr, "pelias: the text has %zu tokens; --skip-tokens %llu + %d do not fit\n", all.size(), static_cast<unsigned long long>(skip), n);
+      return 1;
+    }
+    for (int t = 0; t < n; ++t) ids[static_cast<std::size_t>(t)] = all[static_cast<std::size_t>(skip) + static_cast<std::size_t>(t)];
+    std::printf("  text: %zu tokens in the file; positions %llu .. %llu used\n", all.size(), static_cast<unsigned long long>(skip), static_cast<unsigned long long>(skip) + static_cast<unsigned long long>(n) - 1);
+  } else {
+    for (int t = 0; t < n; ++t) ids[static_cast<std::size_t>(t)] = static_cast<std::int32_t>((static_cast<std::uint64_t>(t) * 7919u + 1011u) % s.n_vocab);
+  }
   const std::size_t nv = s.n_vocab;
   std::vector<float> lg(static_cast<std::size_t>(n) * nv);
   model::EngineStats tot_pre, tot_dec;
@@ -2154,6 +2231,7 @@ int cmd_engine_check(const Args& a) {
     t += k;
   }
   std::vector<double> per;
+  eng.value->timeline_reset();
   for (; t < n; ++t) {
     model::EngineStats es;
     if (Status st = eng.value->step(ids.data() + t, 1, lg.data() + static_cast<std::size_t>(t) * nv, true, &es); !st) return fail_input(st);
@@ -2175,6 +2253,32 @@ int cmd_engine_check(const Args& a) {
                 static_cast<unsigned long long>(ndec), tot_dec.seconds, static_cast<double>(ndec) / tot_dec.seconds, med * 1e3, 1.0 / med, sorted.back() * 1e3,
                 share(tot_dec), tot_dec.cold_seconds * 1e3 / static_cast<double>(ndec), tot_dec.wait_seconds * 1e3 / static_cast<double>(ndec));
   }
+  if (a.has("timeline") && ndec > 0) {
+    const model::EngineTimeline& T = eng.value->timeline();
+    if (T.steps == 0) {
+      std::printf("  timeline: no steps recorded (needs the doorbell and mapped memory)\n");
+    } else {
+      const double k = 1e3 / T.steps;  // ms per token
+      auto sum = [](const std::vector<double>& v) {
+        double q = 0.0;
+        for (double x : v) q += x;
+        return q;
+      };
+      const double cold = sum(T.cpu_cold);
+      const double picks = static_cast<double>(T.hot_picks + T.cold_picks);
+      std::printf("  timeline, %d decode steps, ms per token (GPU clock): dense %.2f, bank + shared experts %.2f, idle waiting for the CPU %.2f\n", T.steps,
+                  sum(T.gpu_dense) * k, sum(T.gpu_hot) * k, sum(T.gpu_idle) * k);
+      std::printf("  timeline, ms per token (CPU clock): waiting for the ring %.2f, cold experts %.2f = input rounding %.2f + gate/up %.2f + silu %.2f + down %.2f + combine %.2f\n",
+                  sum(T.cpu_wait) * k, cold * k, T.stage[0] * k, T.stage[1] * k, T.stage[2] * k, T.stage[3] * k, T.stage[4] * k);
+      std::printf("  timeline: cold %.1f MB per token, %.1f GB/s over the cold time; thread use (item time / (wall x %d threads)) gate/up %.0f %%, down %.0f %%; first worker starts %.1f us after a job opens (mean of %d); picks on the GPU %.1f %%\n",
+                  T.cold_bytes / T.steps / 1e6, cold > 0 ? T.cold_bytes / cold / 1e9 : 0.0, T.threads,
+                  T.stage[1] > 0 ? 100.0 * T.busy[1] / (T.stage[1] * T.threads) : 0.0, T.stage[3] > 0 ? 100.0 * T.busy[3] / (T.stage[3] * T.threads) : 0.0,
+                  T.wake_n ? 1e6 * T.wake / T.wake_n : 0.0, T.wake_n, picks > 0 ? 100.0 * static_cast<double>(T.hot_picks) / picks : 0.0);
+      for (std::size_t il = 0; il < T.gpu_dense.size(); ++il)
+        std::printf("    layer %2zu: GPU dense %.3f, bank + shared %.3f, idle %.3f | CPU wait %.3f, cold %.3f ms\n", il, T.gpu_dense[il] * k, T.gpu_hot[il] * k, T.gpu_idle[il] * k,
+                    T.cpu_wait[il] * k, T.cpu_cold[il] * k);
+    }
+  }
   // --mtp-draft K: greedy decoding of --decode tokens from the made-up prompt, plain and with MTP drafting (K per step):
   // the same tokens expected (the reference's generate_greedy_mtp contract), the kept share, and the speed of each
   if (ndraft > 0 && ndec > 0) {
@@ -2188,11 +2292,14 @@ int cmd_engine_check(const Args& a) {
       if (Status st = eng.value->step(prompt.data() + t0, k, row.data(), true); !st) return fail_input(st);
     }
     const double pre_s = tpl.seconds();
+    const bool split = a.has("dump-split");
+    std::vector<float> one_rows(split ? static_cast<std::size_t>(ndec) * nv : 0);
     Timer tdp;
     for (std::uint64_t i = 0; i < ndec; ++i) {
       std::int32_t best = 0;
       for (std::size_t j = 1; j < nv; ++j)
         if (row[j] > row[static_cast<std::size_t>(best)]) best = static_cast<std::int32_t>(j);
+      if (split) std::copy(row.begin(), row.end(), one_rows.begin() + static_cast<std::ptrdiff_t>(i * nv));
       plain.push_back(best);
       if (i + 1 == ndec) break;
       if (Status st = eng.value->step(&best, 1, row.data(), true); !st) return fail_input(st);
@@ -2211,6 +2318,51 @@ int cmd_engine_check(const Args& a) {
                 static_cast<double>(ndec) / mtp_s, plain_s / mtp_s, static_cast<long long>(ms.steps), static_cast<long long>(ms.drafted),
                 static_cast<long long>(ms.accepted), ms.drafted > 0 ? 100.0 * static_cast<double>(ms.accepted) / static_cast<double>(ms.drafted) : 0.0, same,
                 plain.size());
+    // v19 --dump-split: the plain tokens again, through verify batches of 1 + drafts (the MTP's batched path), each row
+    // against the one-token row for the same position; and the one-token margin where plain and drafted first differ
+    if (split && ndec > 1) {
+      const int kb = static_cast<int>(ndraft) + 1;
+      if (Status st = eng.value->reset(); !st) return fail_input(st);
+      for (std::uint64_t t0 = 0; t0 < npre; t0 += batch) {
+        const int k = static_cast<int>(std::min<std::uint64_t>(batch, npre - t0));
+        if (Status st = eng.value->step(prompt.data() + t0, k, row.data(), true); !st) return fail_input(st);
+      }
+      std::vector<float> vb(static_cast<std::size_t>(kb) * nv);
+      double kl_s = 0.0, kl_m = 0.0;
+      int eq = 0, cnt = 0;
+      std::string diffs;
+      int split_eq = -1;
+      for (int i = 0; i + 1 < static_cast<int>(ndec);) {
+        const int mm = std::min(kb, static_cast<int>(ndec) - 1 - i);
+        if (Status st = eng.value->verify(plain.data() + i, mm, vb.data(), nullptr); !st) return fail_input(st);
+        if (Status st = eng.value->keep(mm); !st) return fail_input(st);
+        for (int r = 0; r < mm; ++r) {
+          const std::size_t pidx = static_cast<std::size_t>(i + r + 1);  // the row predicts plain[pidx]
+          const float* ob = one_rows.data() + pidx * nv;
+          const float* bb = vb.data() + static_cast<std::size_t>(r) * nv;
+          const double kl = kl_rows(ob, bb, nv);
+          kl_s += kl;
+          kl_m = std::max(kl_m, kl);
+          const Top2 to = top2(ob, nv), tb = top2(bb, nv);
+          ++cnt;
+          if (to.i1 == tb.i1) ++eq;
+          else {
+            char buf[96];
+            std::snprintf(buf, sizeof buf, "%s%zu (one-token margin %.3f)", diffs.empty() ? "" : ", ", pidx, to.margin);
+            diffs += buf;
+          }
+          if (pidx == same) split_eq = to.i1 == tb.i1 ? 1 : 0;
+        }
+        i += mm;
+      }
+      std::printf("  split check: the plain tokens through verify batches of %d vs one token at a time: KL mean %.3e max %.3e; top-1 equal %d / %d%s%s\n", kb,
+                  cnt ? kl_s / cnt : 0.0, kl_m, eq, cnt, diffs.empty() ? "" : "; differ at ", diffs.c_str());
+      if (same < plain.size()) {
+        const Top2 ts = top2(one_rows.data() + same * nv, nv);
+        std::printf("  split check: first MTP difference at token %zu: one-token top-2 %zu / %zu, margin %.4f; the verify batch's top-1 there %s\n", same, ts.i1, ts.i2,
+                    ts.margin, split_eq < 0 ? "(token 0: from the prefill, same path)" : split_eq ? "agrees with one-token" : "differs from one-token");
+      }
+    }
   }
   if (a.has("no-cpu")) return 0;
   model::ForwardOptions o = model::GpuForward::matching_reference_options();
@@ -2234,6 +2386,43 @@ int cmd_engine_check(const Args& a) {
     const Cmp rf = compare_logits(lf, ref, n, nv), ef = compare_logits(lf, lg, n, nv);
     show("rounded CPU reference vs float", rf);
     show("engine vs float", ef);
+    {  // v19: paired top-1 (McNemar on the positions only one side gets right) and the margins of the flips
+      int b = 0, c = 0;
+      int fe[3] = {}, fc[3] = {}, fec[3] = {}, ne = 0, nc = 0, nec = 0;
+      const double th[3] = {0.1, 0.5, 1.0};
+      std::FILE* fo = nullptr;
+      if (!dump_top.empty()) {
+        fo = std::fopen(dump_top.c_str(), "w");
+        if (!fo) {
+          std::fprintf(stderr, "pelias: cannot write %s\n", dump_top.c_str());
+          return 1;
+        }
+        std::fprintf(fo, "pos\tinput\teng1\teng2\teng_margin\tcpu1\tcpu2\tcpu_margin\tflt1\tflt2\tflt_margin\n");
+      }
+      for (int t2 = 0; t2 < n; ++t2) {
+        const std::size_t off = static_cast<std::size_t>(t2) * nv;
+        const Top2 te = top2(lg.data() + off, nv), tc = top2(ref.data() + off, nv), tf = top2(lf.data() + off, nv);
+        const bool eok = te.i1 == tf.i1, cok = tc.i1 == tf.i1;
+        if (eok && !cok) ++b;
+        if (!eok && cok) ++c;
+        for (int q = 0; q < 3; ++q) {
+          if (!eok && tf.margin < th[q]) ++fe[q];
+          if (!cok && tf.margin < th[q]) ++fc[q];
+          if (te.i1 != tc.i1 && tc.margin < th[q]) ++fec[q];
+        }
+        ne += eok ? 0 : 1;
+        nc += cok ? 0 : 1;
+        nec += te.i1 != tc.i1 ? 1 : 0;
+        if (fo)
+          std::fprintf(fo, "%d\t%d\t%zu\t%zu\t%.6f\t%zu\t%zu\t%.6f\t%zu\t%zu\t%.6f\n", t2, ids[static_cast<std::size_t>(t2)], te.i1, te.i2, te.margin, tc.i1, tc.i2,
+                       tc.margin, tf.i1, tf.i2, tf.margin);
+      }
+      if (fo) std::fclose(fo);
+      std::printf("  top-1 paired vs float: engine right / CPU wrong %d, engine wrong / CPU right %d, McNemar exact p %.3f\n", b, c, mcnemar_p(b, c));
+      std::printf("  float's top-2 margin (logits) where the engine misses float: < 0.1 %d, < 0.5 %d, < 1.0 %d of %d; where the CPU misses: %d, %d, %d of %d; "
+                  "CPU's margin where engine and CPU differ: %d, %d, %d of %d%s%s\n",
+                  fe[0], fe[1], fe[2], ne, fc[0], fc[1], fc[2], nc, fec[0], fec[1], fec[2], nec, dump_top.empty() ? "" : "; per position in ", dump_top.c_str());
+    }
     const bool ok = ef.kl_mean <= 1.25 * rf.kl_mean && ef.top >= rf.top - 3;
     std::printf("  gate (engine vs float within 1.25x KL and 3 top-1 of the rounded reference vs float): %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 3;
