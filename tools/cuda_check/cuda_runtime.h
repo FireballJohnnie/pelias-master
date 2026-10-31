@@ -65,7 +65,10 @@ struct dim3 {
 #include <__clang_cuda_intrinsics.h>
 #pragma pop_macro("__DEVICE__")
 
-typedef enum cudaError { cudaSuccess = 0, cudaErrorUnknown = 999 } cudaError_t;
+typedef enum cudaError { cudaSuccess = 0, cudaErrorInvalidValue = 1, cudaErrorInvalidConfiguration = 9, cudaErrorMemoryAllocation = 2, cudaErrorNotReady = 600, cudaErrorUnknown = 999 } cudaError_t;
+__device__ unsigned atomicMax(unsigned*, unsigned);
+__device__ int atomicMax(int*, int);
+__device__ double atomicAdd(double*, double);
 typedef struct CUstream_st* cudaStream_t;
 enum cudaMemcpyKind { cudaMemcpyHostToHost, cudaMemcpyHostToDevice, cudaMemcpyDeviceToHost, cudaMemcpyDeviceToDevice };
 enum cudaDeviceAttr { cudaDevAttrMultiProcessorCount = 16, cudaDevAttrCooperativeLaunch = 95, cudaDevAttrMaxSharedMemoryPerBlockOptin = 97 };
@@ -99,3 +102,38 @@ cudaError_t cudaMemcpyToSymbol(const T& sym, const void* src, size_t n) { return
 __device__ int __dp4a(int, int, int);
 __device__ void __nanosleep(unsigned);
 __device__ unsigned long long atomicAdd(unsigned long long*, unsigned long long);
+struct cudaFuncAttributes { int numRegs; size_t localSizeBytes; size_t sharedSizeBytes; int maxThreadsPerBlock; };
+cudaError_t cudaFuncGetAttributes(cudaFuncAttributes*, const void*);
+typedef struct CUevent_st* cudaEvent_t;
+#define cudaStreamNonBlocking 1
+#define cudaHostRegisterDefault 0
+#define cudaHostAllocDefault 0
+struct cudaDeviceProp { char name[256]; size_t totalGlobalMem; int multiProcessorCount; int major, minor; int clockRate; int memoryClockRate; int memoryBusWidth; size_t l2CacheSize; int sharedMemPerBlockOptin; size_t sharedMemPerMultiprocessor; int regsPerMultiprocessor; char uuid[16]; int pciBusID; int pciDeviceID; int pciDomainID; size_t sharedMemPerBlock; int maxThreadsPerMultiProcessor; int warpSize; int asyncEngineCount; int persistingL2CacheMaxSize; };
+cudaError_t cudaStreamDestroy(cudaStream_t);
+cudaError_t cudaStreamCreateWithFlags(cudaStream_t*, unsigned);
+cudaError_t cudaSetDevice(int);
+cudaError_t cudaHostUnregister(void*);
+cudaError_t cudaHostRegister(void*, size_t, unsigned);
+cudaError_t cudaHostAlloc(void**, size_t, unsigned);
+cudaError_t cudaMallocHost(void**, size_t);
+cudaError_t cudaFreeHost(void*);
+cudaError_t cudaGetDeviceProperties(cudaDeviceProp*, int);
+cudaError_t cudaEventCreate(cudaEvent_t*);
+cudaError_t cudaEventDestroy(cudaEvent_t);
+cudaError_t cudaEventRecord(cudaEvent_t, cudaStream_t = 0);
+cudaError_t cudaEventSynchronize(cudaEvent_t);
+cudaError_t cudaEventElapsedTime(float*, cudaEvent_t, cudaEvent_t);
+cudaError_t cudaMemGetInfo(size_t*, size_t*);
+cudaError_t cudaDeviceSynchronize();
+cudaError_t cudaMemcpy(void*, const void*, size_t, cudaMemcpyKind);
+cudaError_t cudaMemset(void*, int, size_t);
+cudaError_t cudaDriverGetVersion(int*);
+cudaError_t cudaRuntimeGetVersion(int*);
+cudaError_t cudaStreamQuery(cudaStream_t);
+cudaError_t cudaEventQuery(cudaEvent_t);
+__device__ float atomicAdd(float*, float);
+__device__ int atomicAdd(int*, int);
+__device__ unsigned atomicAdd(unsigned*, unsigned);
+__device__ long long __float2ll_rn(float);
+__device__ unsigned __match_any_sync(unsigned, int);
+__host__ __device__ inline int4 make_int4(int a, int b, int c, int d) { int4 r; r.x = a; r.y = b; r.z = c; r.w = d; return r; }

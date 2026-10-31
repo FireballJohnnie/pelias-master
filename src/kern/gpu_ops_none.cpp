@@ -4,6 +4,7 @@
 // kern/gpu_ops_none.cpp - the GPU kernels' interface in a build without the CUDA backend (PELIAS_CUDA off): every call
 // reports that there is no GPU backend, so callers fall back to the CPU path.
 #include "kern/gpu_ops.h"
+#include "kern/gpu_prompt.h"
 #include "kern/gpu_stream.h"
 
 namespace pelias::kern::gpu {
@@ -86,5 +87,23 @@ StreamPlan::~StreamPlan() {  // nothing was allocated; the fields are named so e
 bool StreamPlan::build(const StreamJob*, int, const int*, int, int) { return false; }
 bool StreamPlan::run(Stream) { return false; }
 bool StreamPlan::run_unstaged(Stream) { return false; }
+
+// the int8 prompt path (kern/gpu_prompt.h)
+bool prompt_type_ok(std::uint32_t, std::int64_t) { return false; }
+bool prompt_prepare(std::uint32_t, const void*, std::int64_t, std::int64_t, PromptWeights*, Stream) { return false; }
+void prompt_release(PromptWeights* w) {
+  if (w) *w = PromptWeights{};
+}
+const char* prompt_last_error() { return "built without the CUDA backend (configure with -DPELIAS_CUDA=ON)"; }
+bool act_digits(const float*, const int*, std::int64_t, std::int64_t, std::uint16_t*, Stream) { return false; }
+bool prompt_gemm(const PromptWeights&, std::int64_t, const std::int8_t*, const float*, const std::uint16_t*, std::int64_t, float*, Stream) { return false; }
+bool moe_scratch_alloc(std::int64_t, int, int, std::int64_t, std::int64_t, MoeScratch*) { return false; }
+void moe_scratch_free(MoeScratch* m) {
+  if (m) *m = MoeScratch{};
+}
+bool moe_prompt(const PromptWeights&, const PromptWeights&, const PromptWeights&, const std::int8_t*, const float*, const std::uint16_t*, std::int64_t,
+                const std::int32_t*, const float*, MoeScratch&, MoeCombine, int, float*, Stream) {
+  return false;
+}
 
 }  // namespace pelias::kern::gpu
