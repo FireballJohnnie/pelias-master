@@ -58,6 +58,7 @@ Copyright (c) 2026 John Lipka and the Pelias contributors
   - The 0.52 µs is the grid sync itself.
   - "19.2 ms vs 24.0 ms": 19.2 ms is graph replay of path (a) on both WSL and Windows. 24 is the µs drain/ramp per stage boundary, not a ms figure.
 - Test: real-token time against 5.685 ms; v18's host waits against 24-26 ms per token.
+- **v19 timeline (real text, decode, MEASURED, ms per token):** GPU dense 22.64, bank + shared experts 27.12, idle waiting for the CPU 15.02; CPU waiting for the ring 28.03, cold 37.11 (gate/up 17.62, silu + rounding 7.30, down 11.62); cold 218 MB per token at 5.9 GB/s; thread use 39 % (gate/up) / 36 % (down) of 16; first worker starts 21.9 us after a job opens. The GPU is busy ~50 ms of a 65 ms step, so the GPU's own path (dense on separate launches, the bank's experts through the batched prompt kernels at n = 1) is as large a cost as the CPU's; R3 streams a whole token in 5.685 ms (MEASURED). Line A's one-launch R3 + the bank's experts on R3 come first; Line C's CPU fixes target the 37 ms (fused per-expert jobs: the silu stage alone costs 7.3 ms of barrier time).
 
 **Line B: second text (Q4, GP1-10, B4, GP2-11, the locked file on a second text) + hot-set re-profile + MTP bank delta swaps**
 - WikiText's top 64 experts per layer cover 35.9 % of chat+code picks, against 72.2 % of its own. The rank correlation averages 0.41 per layer, lowest 0.22 (MEASURED).
@@ -118,8 +119,9 @@ Copyright (c) 2026 John Lipka and the Pelias contributors
 
 ### Still open outside the lines
 - **GP3-14 engine, v18 follow-ups:**
-  - The batched verify path drifts from the one-token R3 path: verify/keep KL 6.3e-05 vs 1.0e-05; under memcheck 1.07e-04 over the 1e-4 test limit. MTP plain vs drafted split after token 16 (draft 1, 2) and after token 1 (draft 3) (MEASURED).
-  - Float gate top-1 555 vs 566, 11 short of the "within 3" gate, while engine KL 6.69e-3 is below the CPU's 7.06e-3 (MEASURED). Check the 11 flipped positions against their logits (the prompt is made-up IDs).
+  - The batched verify path drifts from the one-token R3 path: verify/keep KL 6.3e-05 vs 1.0e-05; under memcheck 1.07e-04 over the 1e-4 test limit. MTP plain vs drafted split after token 16 (draft 1, 2) and after token 1 (draft 3) (MEASURED v18, made-up IDs).
+  - **v19 split check (real text, MEASURED):** verify batches of 2 and 3 vs one token: KL 2.3e-03 / 2.2e-03, top-1 126 / 127 and 127 / 127, i.e. the rounding floor; the draft-1 split sits at a one-token margin of 0.108 (a near-tie), draft 2 equals plain for all 128. **Batches of 4 are a fault:** KL mean 1.43e-02, max 1.17; the draft-3 split at token 114 has a one-token margin of 10.93 logits, which no rounding explains. Find it before any MTP tuning.
+  - ~~Float gate top-1 555 vs 566 on made-up IDs~~: resolved by v19 on real text (WikiText, held out). Gate PASS: engine 623 / 640 vs CPU 619 / 640 against float; KL 2.906e-03 vs 3.780e-03; McNemar 12 vs 8, p 0.503; all 17 engine misses sit where float's top-2 margin is under 1.0 logit (15 under 0.1) (MEASURED). The v18 fail was the made-up prompt.
   - ~~The 3 skipped unit tests~~: the usual data-file skips (the Unsloth header file is kept on the author's drive).
   - O13 (down projection at 0.27-0.29 of peak); gates E4-E9, G3, K3.
 - **GP1-14:** spec checks recorded as DONE in the docs.
