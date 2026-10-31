@@ -6,7 +6,8 @@
 // expert with more than 64 rows: body + partial tile; experts with 1-8 rows: the warp-vector path; experts with none),
 // the work list built on the GPU, gate / up checked row by row against fp64 through the device's row map, the down
 // projection + combine against fp64 of the device's own rounded silu x up, for the int32 (deterministic, repeat bit for
-// bit, no overflow), int64 and float combines.
+// bit, no overflow), int64 and float combines. Each for Q4_K and Q4_TG2 weights (2026-10-30 23:3x; Q4_TG2: int8 x 3 tiles,
+// exact fp32 table on the warp-vector path); plus a dense N = K = 2048 case (2048 rows; 130 under PELIAS_GPU_QUICK).
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -64,21 +65,21 @@ std::vector<T> pull(const T* p, std::size_t n) {
   return v;
 }
 
-// Q4_K rows: the GGUF bytes and their exact floats
-struct Q4K {
+// weight rows of type ty (Q4_K or Q4_TG2): the GGUF bytes and their exact floats
+struct QW {
   std::int64_t rows, k;
   std::vector<std::uint8_t> bytes;
   std::vector<float> deq;
-  Q4K(std::int64_t r, std::int64_t kk, std::uint32_t seed) : rows(r), k(kk) {
-    const auto id = static_cast<std::uint32_t>(q::Type::q4_k);
+  QW(q::Type ty, std::int64_t r, std::int64_t kk, std::uint32_t seed) : rows(r), k(kk) {
+    const auto id = static_cast<std::uint32_t>(ty);
     const std::uint64_t rb = q::row_bytes(id, static_cast<std::uint64_t>(k));
     bytes.resize(static_cast<std::size_t>(rb * static_cast<std::uint64_t>(rows)));
     deq.resize(static_cast<std::size_t>(rows * k));
     for (std::int64_t i = 0; i < rows; ++i) {
       const std::uint32_t rs = seed + static_cast<std::uint32_t>(i) * 7919u;
-      const std::vector<std::uint8_t> row = pelias::test_gpu::make_row(q::Type::q4_k, wave(k, rs, 0.05f), rs);
+      const std::vector<std::uint8_t> row = pelias::test_gpu::make_row(ty, wave(k, rs, 0.05f), rs);
       std::memcpy(bytes.data() + static_cast<std::size_t>(i) * rb, row.data(), static_cast<std::size_t>(rb));
-      (void)q::dequantize_row(q::Type::q4_k, row.data(), deq.data() + i * k, k);
+      (void)q::dequantize_row(ty, row.data(), deq.data() + i * k, k);
     }
   }
 };
@@ -116,21 +117,15 @@ constexpr double kTol = 1e-6;
 
 }  // namespace
 
-TEST(rung1_prompt_gemm_against_fp64) {
-  CHECK(g::compiled());
-  if (!g::available()) {
-    std::printf("    no GPU: %s\n", g::last_error());
-    CHECK(g::available());
-    return;
-  }
+static void dense_case(q::Type ty, const char* nm) {
   struct Shape {
     std::int64_t n, k;
   };
   for (const Shape sh : {Shape{256, 2048}, Shape{512, 512}}) {
-    const Q4K w(sh.n, sh.k, 4100u + static_cast<std::uint32_t>(sh.k));
+    const QW w(ty, sh.n, sh.k, 4100u + static_cast<std::uint32_t>(sh.k));
     Dev<std::uint8_t> dw(w.bytes);
     g::PromptWeights pw;
-    CHECK(g::prompt_prepare(static_cast<std::uint32_t>(q::Type::q4_k), dw.p, sh.n, sh.k, &pw));
+    CHECK(g::prompt_prepare(static_cast<std::uint32_t>(ty), dw.p, sh.n, sh.k, &pw));
     for (const std::int64_t rows : {std::int64_t{1}, std::int64_t{37}, std::int64_t{130}}) {
       const Act a(rows, sh.k, 4200u + static_cast<std::uint32_t>(rows));
       Dev<float> y(static_cast<std::size_t>(rows * sh.n));
@@ -149,7 +144,7 @@ TEST(rung1_prompt_gemm_against_fp64) {
       const double e = den > 0 ? std::sqrt(num / den) : std::sqrt(num);
       CHECK(finite);
       CHECK(e <= kTol);
-      std::printf("    dense %4lld x %4lld, %3lld rows: relative L2 vs fp64 %.3e (tolerance 1e-6)\n", static_cast<long long>(sh.n), static_cast<long long>(sh.k),
+      std::printf("    %s dense %4lld x %4lld, %3lld rows: relative L2 vs fp64 %.3e (tolerance 1e-6)\n", nm, static_cast<long long>(sh.n), static_cast<long long>(sh.k),
                   static_cast<long long>(rows), e);
     }
     g::prompt_release(&pw);
@@ -159,10 +154,10 @@ TEST(rung1_prompt_gemm_against_fp64) {
   {
     const bool quick = std::getenv("PELIAS_GPU_QUICK") != nullptr;
     const std::int64_t n = 2048, k = 2048, rows = quick ? 130 : 2048;
-    const Q4K w(n, k, 4300u);
+    const QW w(ty, n, k, 4300u);
     Dev<std::uint8_t> dw(w.bytes);
     g::PromptWeights pw;
-    CHECK(g::prompt_prepare(static_cast<std::uint32_t>(q::Type::q4_k), dw.p, n, k, &pw));
+    CHECK(g::prompt_prepare(static_cast<std::uint32_t>(ty), dw.p, n, k, &pw));
     const Act a(rows, k, 4400u);
     Dev<float> y(static_cast<std::size_t>(rows * n));
     CHECK(g::prompt_gemm(pw, n, a.qv.p, a.sc.p, a.dig.p, rows, y.p));
@@ -188,12 +183,23 @@ TEST(rung1_prompt_gemm_against_fp64) {
     const double e = den > 0 ? std::sqrt(num / den) : std::sqrt(num);
     CHECK(finite);
     CHECK(e <= kTol);
-    std::printf("    dense %4lld x %4lld, %4lld rows (32 checked): relative L2 vs fp64 %.3e (tolerance 1e-6); largest |diff| %.3e at row %lld col %lld\n",
-                static_cast<long long>(n), static_cast<long long>(k), static_cast<long long>(rows), e, worst, static_cast<long long>(worst_r),
+    std::printf("    %s dense %4lld x %4lld, %4lld rows (32 checked): relative L2 vs fp64 %.3e (tolerance 1e-6); largest |diff| %.3e at row %lld col %lld\n",
+                nm, static_cast<long long>(n), static_cast<long long>(k), static_cast<long long>(rows), e, worst, static_cast<long long>(worst_r),
                 static_cast<long long>(worst_c));
     g::prompt_release(&pw);
   }
-  // refusals: not Q4_K, k not a multiple of 256, rows not a multiple of 128
+}
+
+TEST(rung1_prompt_gemm_against_fp64) {
+  CHECK(g::compiled());
+  if (!g::available()) {
+    std::printf("    no GPU: %s\n", g::last_error());
+    CHECK(g::available());
+    return;
+  }
+  dense_case(q::Type::q4_k, "Q4_K  ");
+  dense_case(q::Type::q4_tg2, "Q4_TG2");
+  // refusals: not Q4_K / Q4_TG2, k not a multiple of 256, rows not a multiple of 128
   g::PromptWeights bad;
   Dev<std::uint8_t> junk(4096);
   CHECK(!g::prompt_prepare(static_cast<std::uint32_t>(q::Type::q6_k), junk.p, 128, 256, &bad));
@@ -202,11 +208,7 @@ TEST(rung1_prompt_gemm_against_fp64) {
   std::printf("    other types, widths and row counts refused\n");
 }
 
-TEST(rung1_moe_prompt_against_fp64) {
-  if (!g::available()) {
-    CHECK(g::available());
-    return;
-  }
+static void moe_case(q::Type ty, const char* nm) {
   // a small expert layer with the model's structure: 32 experts, hidden 512, ffn 256, 8 picks per token
   const int E = 32, NU = 8;
   const std::int64_t H = 512, F = 256;
@@ -239,12 +241,12 @@ TEST(rung1_moe_prompt_against_fp64) {
     else if (cnt[static_cast<std::size_t>(e)]) ++n_vec;
     else ++n_none;
   }
-  const Q4K wg(E * F, H, 5100u), wu(E * F, H, 5200u), wd(E * H, F, 5300u);
+  const QW wg(ty, E * F, H, 5100u), wu(ty, E * F, H, 5200u), wd(ty, E * H, F, 5300u);
   Dev<std::uint8_t> dg(wg.bytes), du(wu.bytes), dd(wd.bytes);
   g::PromptWeights pg, pu, pd;
-  CHECK(g::prompt_prepare(static_cast<std::uint32_t>(q::Type::q4_k), dg.p, E * F, H, &pg));
-  CHECK(g::prompt_prepare(static_cast<std::uint32_t>(q::Type::q4_k), du.p, E * F, H, &pu));
-  CHECK(g::prompt_prepare(static_cast<std::uint32_t>(q::Type::q4_k), dd.p, E * H, F, &pd));
+  CHECK(g::prompt_prepare(static_cast<std::uint32_t>(ty), dg.p, E * F, H, &pg));
+  CHECK(g::prompt_prepare(static_cast<std::uint32_t>(ty), du.p, E * F, H, &pu));
+  CHECK(g::prompt_prepare(static_cast<std::uint32_t>(ty), dd.p, E * H, F, &pd));
   const Act a(T, H, 5400u);
   Dev<std::int32_t> dsel(sel);
   Dev<float> dw(wsel), y(static_cast<std::size_t>(T * H));
@@ -326,14 +328,23 @@ TEST(rung1_moe_prompt_against_fp64) {
   CHECK(g::sync());
   const double e_64 = rel_y(y.get());
   CHECK(e_64 <= kTol);
-  std::printf("    %lld tokens x %d picks over %d experts (%d on tiles, %d on the warp-vector path, %d empty); GPU list: %d tile + %d vector units, rows permuted %s\n",
-              static_cast<long long>(T), NU, E, n_tile, n_vec, n_none, meta[0], meta[1], perm ? "once each" : "WRONG");
-  std::printf("    gate / up vs fp64 %.3e; y vs fp64: float combine %.3e, int32 (2^%d) %.3e repeat %s overflows %u, int64 (2^%d) %.3e (tolerance 1e-6)\n", e_gu, e_f,
+  std::printf("    %s %lld tokens x %d picks over %d experts (%d on tiles, %d on the warp-vector path, %d empty); GPU list: %d tile + %d vector units, rows permuted %s\n",
+              nm, static_cast<long long>(T), NU, E, n_tile, n_vec, n_none, meta[0], meta[1], perm ? "once each" : "WRONG");
+  std::printf("    %s gate / up vs fp64 %.3e; y vs fp64: float combine %.3e, int32 (2^%d) %.3e repeat %s overflows %u, int64 (2^%d) %.3e (tolerance 1e-6)\n", nm, e_gu, e_f,
               k32, e_32, same ? "bit for bit" : "DIFFERENT", ovf, k64, e_64);
   g::moe_scratch_free(&m);
   g::prompt_release(&pg);
   g::prompt_release(&pu);
   g::prompt_release(&pd);
+}
+
+TEST(rung1_moe_prompt_against_fp64) {
+  if (!g::available()) {
+    CHECK(g::available());
+    return;
+  }
+  moe_case(q::Type::q4_k, "Q4_K  ");
+  moe_case(q::Type::q4_tg2, "Q4_TG2");
 }
 
 TEST(rung1_moe_prompt_refuses_bad_shapes) {

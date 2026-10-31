@@ -16,7 +16,9 @@
 //   (5) the down projection folded into the combine by fixed-point int32 global reductions (deterministic), then a
 //       conversion to float. The int32 scale is the caller's (2^k); an overflow counter is kept (values above 2^31 / 8
 //       per addend); fixed-point int64 and float reductions are the fallbacks.
-// Other weight types use the exact paths of kern/gpu_ops.h (matmul / moe_matmul) until they get their own int8 step.
+// Q4_TG2 (locked 2026-10-30 23:22): the same tiles with each grid value as 24-bit fixed point in three int8 digits (three
+// int8 mmas per 32-block), and the warp-vector path with the exact fp32 grid table. Other weight types use the exact paths
+// of kern/gpu_ops.h (matmul / moe_matmul) until they get their own int8 step.
 // Host API only, no CUDA types; stubs in gpu_ops_none.cpp.
 #pragma once
 
@@ -26,8 +28,9 @@
 
 namespace pelias::kern::gpu {
 
-// Q4_K (rows x k) on the device in GGUF storage (not owned), with the prepared side tables (owned): one 16-byte record
-// per 256 (d, eight 6-bit scales, dmin) and 8 fp32 min factors dmin x m_j per 256 (32 bytes). For an expert stack, rows = experts x
+// Q4_K or Q4_TG2 (rows x k) on the device in GGUF storage (not owned), with the prepared side tables (owned). Q4_K: one
+// 16-byte record per 256 (d, eight 6-bit scales, dmin) and 8 fp32 min factors dmin x m_j per 256 (32 bytes). Q4_TG2: rec
+// = 8 fp32 sub-block scales per 256; dig = 512 bytes (64 three-byte digit words, 64 fp32 grid values). For an expert stack, rows = experts x
 // n_out (expert-major, as GGUF stores ffn_*_exps).
 struct PromptWeights {
   std::uint32_t type = 0;
@@ -36,7 +39,7 @@ struct PromptWeights {
   void* rec = nullptr;
   void* dig = nullptr;
 };
-// Q4_K with k a multiple of 256
+// Q4_K or Q4_TG2 with k a multiple of 256
 bool prompt_type_ok(std::uint32_t type, std::int64_t k);
 bool prompt_prepare(std::uint32_t type, const void* w_dev, std::int64_t rows, std::int64_t k, PromptWeights* out, Stream s = nullptr);
 void prompt_release(PromptWeights* w);
