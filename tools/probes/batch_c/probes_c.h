@@ -23,6 +23,7 @@
 
 #include "cudautil.h"
 #include "kernels_c.h"
+#include "kernels_tg2.h"
 
 namespace pp {
 
@@ -2760,6 +2761,311 @@ inline int p_moe3(Ctx& c, const Args& a) {
   r.notes = std::string(g_abort.load() ? "ABORTED: " + abort_reason() : "");
   write_result(c, r, "moe_slice_s3");
   std::printf("  MOE-SLICE-S3 %s\n", r.headline.c_str());
+  return all_ok ? 0 : 3;
+}
+
+
+// ================================================================ TG2: the int8 prompt path for Q4_TG2 (2026-10-30 22:2x)
+// Author 22:17 "go ahead with the five-point probe": Q4_TG2's grids are fp32 values (1.3 / 1.45 log grids), so the Q4_K
+// int8 trick is not exact. Five tile variants (kernels_tg2.h) on 64-row tiles, each against fp64 of the dequantized
+// weights and rounded activations (relative L2, the src gate 1e-6), timed; the warp-vector path (1-8 rows) with the exact
+// fp32 table next to the Q4_K vector kernel; the Q4_K tile with the v10 bf16 two-digit min term against v10b's fp32 FMAs
+// (speed; accuracy against fp64 too). Weights and activations synthetic (random codes, tags, levels); shapes of the real
+// model (expert gate/up 2048 -> 512, down 512 -> 2048, a dense 2048 x 2048).
+namespace tg2p {
+inline float h2f_host(uint16_t h) {  // fp16 bits to float (normal numbers and zero; the generator makes only those)
+  const int e = (h >> 10) & 31, m = h & 1023;
+  if (e == 0) return std::ldexp(static_cast<float>(m), -24) * ((h & 0x8000) ? -1.f : 1.f);
+  const float v = std::ldexp(1.0f + static_cast<float>(m) / 1024.0f, e - 15);
+  return (h & 0x8000) ? -v : v;
+}
+struct Lcg {
+  uint64_t x;
+  explicit Lcg(uint64_t s) : x(s * 6364136223846793005ULL + 1442695040888963407ULL) {}
+  uint32_t next() {
+    x = x * 6364136223846793005ULL + 1442695040888963407ULL;
+    return static_cast<uint32_t>(x >> 33);
+  }
+};
+struct Acts {
+  int rows = 0, K = 0;
+  std::vector<int8_t> q;
+  std::vector<float> xs;
+  std::vector<int> sum;
+};
+inline Acts make_acts(int rows, int K, uint64_t seed) {
+  Acts a;
+  a.rows = rows;
+  a.K = K;
+  Lcg r(seed);
+  a.q.resize(static_cast<size_t>(rows) * K);
+  a.xs.resize(static_cast<size_t>(rows) * (K / 32));
+  a.sum.resize(a.xs.size());
+  for (auto& v : a.q) v = static_cast<int8_t>(static_cast<int>(r.next() % 255u) - 127);
+  for (size_t i = 0; i < a.xs.size(); ++i) {
+    a.xs[i] = 0.005f + 0.015f * static_cast<float>(r.next() % 1000u) / 1000.0f;
+    int s = 0;
+    for (int k = 0; k < 32; ++k) s += a.q[i * 32 + k];
+    a.sum[i] = s;
+  }
+  return a;
+}
+inline std::vector<uint8_t> make_tg2(size_t nb, uint64_t seed) {
+  std::vector<uint8_t> w(nb * 144);
+  Lcg r(seed);
+  for (size_t i = 0; i < nb; ++i) {
+    uint8_t* b = &w[i * 144];
+    const uint16_t d = static_cast<uint16_t>(0x2000u + (r.next() & 1023u));  // 2^-7 .. 2^-6
+    b[0] = static_cast<uint8_t>(d & 0xFF);
+    b[1] = static_cast<uint8_t>(d >> 8);
+    uint64_t lv = 0;
+    for (int j = 0; j < 8; ++j) lv |= static_cast<uint64_t>(1u + r.next() % 63u) << (6 * j);
+    for (int k = 0; k < 6; ++k) b[2 + k] = static_cast<uint8_t>(lv >> (8 * k));
+    for (int k = 8; k < 144; ++k) b[k] = static_cast<uint8_t>(r.next() & 0xFF);
+  }
+  return w;
+}
+inline std::vector<uint8_t> make_q4k(size_t nb, uint64_t seed) {
+  std::vector<uint8_t> w(nb * 144);
+  Lcg r(seed);
+  for (size_t i = 0; i < nb; ++i) {
+    uint8_t* b = &w[i * 144];
+    const uint16_t d = static_cast<uint16_t>(0x1C00u + (r.next() & 1023u)), dm = static_cast<uint16_t>(0x1800u + (r.next() & 1023u));
+    b[0] = static_cast<uint8_t>(d & 0xFF);
+    b[1] = static_cast<uint8_t>(d >> 8);
+    b[2] = static_cast<uint8_t>(dm & 0xFF);
+    b[3] = static_cast<uint8_t>(dm >> 8);
+    for (int k = 4; k < 144; ++k) b[k] = static_cast<uint8_t>(r.next() & 0xFF);
+  }
+  return w;
+}
+inline void q4k_sm(int j, const uint8_t* q, int& d, int& m) {
+  if (j < 4) {
+    d = q[j] & 63;
+    m = q[j + 4] & 63;
+  } else {
+    d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+    m = (q[j + 4] >> 4) | ((q[j - 0] >> 6) << 4);
+  }
+}
+// fp64 reference of one output: row `row` of the activations, weight row `wrow` (expert-major)
+inline double ref_tg2(const Acts& a, int row, const std::vector<uint8_t>& w, size_t wrow, const float g[4][16]) {
+  const int K = a.K, bpr = K / 256;
+  double acc = 0;
+  for (int sb = 0; sb < bpr; ++sb) {
+    const uint8_t* b = &w[(wrow * bpr + sb) * 144];
+    const float d = h2f_host(static_cast<uint16_t>(b[0] | (b[1] << 8)));
+    uint64_t lv = 0;
+    for (int k = 0; k < 6; ++k) lv |= static_cast<uint64_t>(b[2 + k]) << (8 * k);
+    for (int j = 0; j < 8; ++j) {
+      volatile float dl = d * static_cast<float>((lv >> (6 * j)) & 63u);
+      const float s = dl / 63.0f;
+      double dot = 0;
+      for (int i = 0; i < 32; ++i) {
+        const int idx = 32 * j + i;
+        const int code = (b[16 + idx / 2] >> (4 * (idx & 1))) & 15, tag = (b[8 + j] >> (2 * (i >> 3))) & 3;
+        dot += static_cast<double>(g[tag][code]) * a.q[static_cast<size_t>(row) * K + sb * 256 + idx];
+      }
+      acc += static_cast<double>(a.xs[static_cast<size_t>(row) * (K / 32) + sb * 8 + j]) * static_cast<double>(s) * dot;
+    }
+  }
+  return acc;
+}
+inline double ref_q4k(const Acts& a, int row, const std::vector<uint8_t>& w, size_t wrow) {
+  const int K = a.K, bpr = K / 256;
+  double acc = 0;
+  for (int sb = 0; sb < bpr; ++sb) {
+    const uint8_t* b = &w[(wrow * bpr + sb) * 144];
+    const float d = h2f_host(static_cast<uint16_t>(b[0] | (b[1] << 8))), dmin = h2f_host(static_cast<uint16_t>(b[2] | (b[3] << 8)));
+    for (int j = 0; j < 8; ++j) {
+      int sc, m;
+      q4k_sm(j, b + 4, sc, m);
+      const float d1 = d * static_cast<float>(sc), m1 = dmin * static_cast<float>(m);
+      long long qq = 0, qs = 0;
+      for (int i = 0; i < 32; ++i) {
+        const int qw = (b[16 + (j / 2) * 32 + i] >> (4 * (j & 1))) & 15, qx = a.q[static_cast<size_t>(row) * K + sb * 256 + 32 * j + i];
+        qq += static_cast<long long>(qw) * qx;
+        qs += qx;
+      }
+      acc += static_cast<double>(a.xs[static_cast<size_t>(row) * (K / 32) + sb * 8 + j]) *
+             (static_cast<double>(d1) * static_cast<double>(qq) - static_cast<double>(m1) * static_cast<double>(qs));
+    }
+  }
+  return acc;
+}
+struct Unit {
+  int e, row, rows;
+};
+// relative L2 of C (device, rows x N) against fp64 on the sampled rows (first 16 rows of the first unit, last 16 of the last)
+template <class Ref>
+double rel_l2(const DevBuf& C, int N, const std::vector<Unit>& units, Ref ref, cudaStream_t s) {
+  std::vector<std::pair<int, int>> pick;  // (row, expert)
+  const Unit& u0 = units.front();
+  const Unit& u1 = units.back();
+  for (int i = 0; i < std::min(16, u0.rows); ++i) pick.push_back({u0.row + i, u0.e});
+  if (units.size() > 1)
+    for (int i = std::max(0, u1.rows - 16); i < u1.rows; ++i) pick.push_back({u1.row + i, u1.e});
+  std::vector<float> y(static_cast<size_t>(N));
+  double num = 0, den = 0;
+  for (const auto& [row, e] : pick) {
+    PP_CK(cudaMemcpyAsync(y.data(), C.as<float>() + static_cast<size_t>(row) * N, static_cast<size_t>(N) * 4, cudaMemcpyDeviceToHost, s));
+    PP_CK(cudaStreamSynchronize(s));
+    for (int n = 0; n < N; ++n) {
+      const double r = ref(row, static_cast<size_t>(e) * N + n);
+      num += (y[n] - r) * (y[n] - r);
+      den += r * r;
+    }
+  }
+  return den > 0 ? std::sqrt(num / den) : 0.0;
+}
+}  // namespace tg2p
+
+inline int p_tg2(Ctx& c, const Args& a) {
+  using namespace tg2p;
+  Result r;
+  r.probe = "TG2";
+  init_cuda(c);
+  const double peak8 = a.num("int8-peak", 259.5);
+  Stream s;
+  Sampler sampler(c.nvml);
+  sampler.start(200);
+  JW before = state_now(c);
+  float grid[4][16];
+  ptg::tg2_grids(grid);
+  constexpr double kGate = 1e-6;
+  std::vector<JW> infos;
+  for (int v = 0; v < ptg::kTg2Vars; ++v) {
+    int regs = 0, spill = 0, sm = 0, bps = 0;
+    PP_CK(ptg::tg2_tile_info(v, &regs, &spill, &sm, &bps));
+    JW j;
+    j.kv("kernel", ptg::var_name(v)).kv("registers", regs).kv("local_spill_bytes", spill).kv("shared_bytes", sm).kv("blocks_per_sm", bps);
+    infos.push_back(j);
+    std::printf("    %-30s %3d registers, %4d spill bytes, %6d shared bytes, %d blocks per SM\n", ptg::var_name(v), regs, spill, sm, bps);
+  }
+  for (int f = 0; f < 2; ++f) {
+    int regs = 0, spill = 0, sm = 0, bps = 0;
+    PP_CK(ptg::q4k_tile_info(f == 1, &regs, &spill, &sm, &bps));
+    JW j;
+    const char* nm = f ? "q4k tile, fp32 min (v10b)" : "q4k tile, bf16 min (v10)";
+    j.kv("kernel", nm).kv("registers", regs).kv("local_spill_bytes", spill).kv("shared_bytes", sm).kv("blocks_per_sm", bps);
+    infos.push_back(j);
+    std::printf("    %-30s %3d registers, %4d spill bytes, %6d shared bytes, %d blocks per SM\n", nm, regs, spill, sm, bps);
+  }
+  // fixed tables, uploaded once
+  std::vector<DevBuf> luts;
+  for (int v = 0; v < ptg::kTg2Vars; ++v) {
+    uint32_t t[64];
+    ptg::tg2_table(v, t);
+    luts.emplace_back(sizeof t);
+    PP_CK(cudaMemcpy(luts.back().as(), t, sizeof t, cudaMemcpyHostToDevice));
+  }
+  struct Case {
+    const char* name;
+    int E, N, K, units, rows_per_unit;  // tile cases: rows_per_unit 64; vector cases 1-8
+    bool vec;
+  };
+  std::vector<Case> cases = {{"expert gate/up grouped (64 experts x 64 rows)", 64, 512, 2048, 64, 64, false},
+                             {"expert down grouped (64 experts x 64 rows)", 64, 2048, 512, 64, 64, false},
+                             {"dense 2048 x 2048, 2048 rows", 1, 2048, 2048, 32, 64, false}};
+  for (const int rows : {1, 4, 8}) {
+    cases.push_back({"vector gate/up (64 experts)", 64, 512, 2048, 64, rows, true});
+    cases.push_back({"vector down (64 experts)", 64, 2048, 512, 64, rows, true});
+  }
+  if (c.quick) cases = {cases[0], cases[3]};
+  bool all_ok = true;
+  std::vector<JW> rows_out;
+  for (const Case& cs : cases) {
+    if (g_abort.load()) break;
+    const int bpr = cs.K / 256;
+    const size_t nb = static_cast<size_t>(cs.E) * cs.N * bpr;
+    std::vector<Unit> units;
+    std::vector<int4> uh;
+    for (int u = 0; u < cs.units; ++u) {
+      const Unit un{cs.E == 1 ? 0 : u % cs.E, u * cs.rows_per_unit, cs.rows_per_unit};
+      units.push_back(un);
+      uh.push_back(make_int4(un.e, un.row, un.rows, 0));
+    }
+    const int arows = cs.units * cs.rows_per_unit + 64;
+    const Acts ac = make_acts(arows, cs.K, 9100u + static_cast<uint64_t>(cs.N) + static_cast<uint64_t>(cs.rows_per_unit));
+    const std::vector<uint8_t> wt = make_tg2(nb, 9200u + static_cast<uint64_t>(cs.K)), wk = make_q4k(nb, 9300u + static_cast<uint64_t>(cs.K));
+    DevBuf dq(ac.q.size()), dxs(ac.xs.size() * 4), dsum(ac.sum.size() * 4), dU(uh.size() * sizeof(int4)), dwt(wt.size()), dwk(wk.size()), dsc(nb * 32),
+        drec(nb * 16), dwb(nb * 32), dwf(nb * 32), dab(ac.xs.size() * 4), daf(ac.xs.size() * 4),
+        dC(static_cast<size_t>(arows) * cs.N * 4);
+    PP_CK(cudaMemcpy(dq.as(), ac.q.data(), ac.q.size(), cudaMemcpyHostToDevice));
+    PP_CK(cudaMemcpy(dxs.as(), ac.xs.data(), ac.xs.size() * 4, cudaMemcpyHostToDevice));
+    PP_CK(cudaMemcpy(dsum.as(), ac.sum.data(), ac.sum.size() * 4, cudaMemcpyHostToDevice));
+    PP_CK(cudaMemcpy(dU.as(), uh.data(), uh.size() * sizeof(int4), cudaMemcpyHostToDevice));
+    PP_CK(cudaMemcpy(dwt.as(), wt.data(), wt.size(), cudaMemcpyHostToDevice));
+    PP_CK(cudaMemcpy(dwk.as(), wk.data(), wk.size(), cudaMemcpyHostToDevice));
+    PP_CK(ptg::tg2_prep(dwt.as(), dsc.as<float>(), nb, s));
+    PP_CK(ptg::q4k_prep(dwk.as(), drec.as<uint4>(), dwb.as(), dwf.as<float>(), nb, s));
+    PP_CK(ptg::q4k_act_min(dxs.as<float>(), dsum.as<int>(), ac.xs.size(), dab.as(), daf.as<float>(), s));
+    s.sync();
+    const double mac = 2.0 * cs.units * cs.rows_per_unit * static_cast<double>(cs.N) * cs.K;
+    const double wbytes = static_cast<double>(std::min(cs.E, cs.units)) * cs.N * bpr * 144.0;
+    auto ref_t = [&](int row, size_t wrow) { return ref_tg2(ac, row, wt, wrow, grid); };
+    auto ref_k = [&](int row, size_t wrow) { return ref_q4k(ac, row, wk, wrow); };
+    JW row;
+    row.kv("case", cs.name).kv("experts", cs.E).kv("N", cs.N).kv("K", cs.K).kv("units", cs.units).kv("rows_per_unit", cs.rows_per_unit);
+    std::vector<JW> kj;
+    auto record = [&](const char* nm, const std::function<void()>& run, bool is_tg2, int v) {
+      const double ms = time_ms(s, run, 80.0);
+      PP_CK(cudaMemsetAsync(dC.as(), 0xFF, static_cast<size_t>(arows) * cs.N * 4, s));
+      run();
+      PP_CK(cudaStreamSynchronize(s));
+      const double e = is_tg2 ? rel_l2(dC, cs.N, units, ref_t, s) : rel_l2(dC, cs.N, units, ref_k, s);
+      const double tops = mac / (ms * 1e-3) / 1e12, gbs = wbytes / (ms * 1e-3) / 1e9;
+      const bool pass = std::isfinite(e) && e <= kGate;
+      JW j;
+      j.kv("kernel", nm).kv("ms", ms).kv("tops", tops).kv("eps8", tops / peak8).kv("weight_gb_s", gbs).kv("rel_l2_vs_fp64", e).kv("passes_1e-6", pass);
+      if (v >= 0) j.kv("variant", v);
+      kj.push_back(j);
+      std::printf("    %-44s %-30s %8.4f ms %6.1f TOPS (%.3f of peak) %6.1f GB/s weights; vs fp64 rel L2 %.3e %s\n", cs.name, nm, ms, tops, tops / peak8, gbs, e,
+                  pass ? "<= 1e-6" : "> 1e-6");
+      std::fflush(stdout);
+      return ms;
+    };
+    char lbl[64];
+    if (!cs.vec) {
+      const double tb = record("q4k tile, bf16 min (v10)", [&] {
+        PP_CK(ptg::q4k_tile(false, dq.as<int8_t>(), dxs.as<float>(), dab.as(), dwk.as(), drec.as<uint4>(), dwb.as(), dU.as<int4>(), cs.units, cs.N, cs.K, dC.as<float>(), s));
+      }, false, -1);
+      const double tf = record("q4k tile, fp32 min (v10b)", [&] {
+        PP_CK(ptg::q4k_tile(true, dq.as<int8_t>(), dxs.as<float>(), daf.as(), dwk.as(), drec.as<uint4>(), dwf.as(), dU.as<int4>(), cs.units, cs.N, cs.K, dC.as<float>(), s));
+      }, false, -1);
+      row.kv("q4k_fp32min_over_bf16min_time", tf / tb);
+      std::printf("  %-44s min term: fp32 FMAs take %.3fx the time of the bf16 mma\n", cs.name, tf / tb);
+      for (int v = 0; v < ptg::kTg2Vars; ++v) {
+        const double tv = record(ptg::var_name(v), [&] {
+          PP_CK(ptg::tg2_tile(v, dq.as<int8_t>(), dxs.as<float>(), dwt.as(), dsc.as<float>(), luts[v].as<uint32_t>(), dU.as<int4>(), cs.units, cs.N, cs.K, dC.as<float>(), s));
+        }, true, v);
+        std::snprintf(lbl, sizeof lbl, "time_over_q4k_v10b_%d", v);
+        row.kv(lbl, tv / tf);
+        std::printf("  %-44s %-30s %.3fx the Q4_K v10b tile time\n", cs.name, ptg::var_name(v), tv / tf);
+      }
+    } else {
+      const double tk = record("q4k vector", [&] {
+        PP_CK(ptg::q4k_vec(dq.as<int8_t>(), dxs.as<float>(), dwk.as(), dU.as<int4>(), cs.units, cs.N, cs.K, dC.as<float>(), s));
+      }, false, -1);
+      const double tt = record("tg2 vector, exact fp32 table", [&] {
+        PP_CK(ptg::tg2_vec(dq.as<int8_t>(), dxs.as<float>(), dwt.as(), dsc.as<float>(), luts[ptg::kF32Lut].as<uint32_t>(), dU.as<int4>(), cs.units, cs.N, cs.K,
+                           dC.as<float>(), s));
+      }, true, ptg::kF32Lut);
+      row.kv("tg2_vec_over_q4k_vec_time", tt / tk);
+      std::printf("  %-44s rows %d: tg2 exact vector %.3fx the Q4_K vector time\n", cs.name, cs.rows_per_unit, tt / tk);
+    }
+    row.arr_obj("kernels", kj);
+    rows_out.push_back(row);
+  }
+  const std::vector<Sample> all = sampler.stop();
+  r.inputs.kv("int8_peak_tops", peak8).kv("gate_rel_l2", kGate).kv("weights_activations", "synthetic (random codes, tags, levels; int8 activations, per-32 scales)");
+  r.values.arr_obj("kernel_info", infos).arr_obj("cases", rows_out);
+  r.values.kv_obj("state_before", before).kv_obj("state_after", state_now(c)).kv_obj("nvml_whole_run", summarize(all));
+  r.pass = -1;
+  r.headline = "TG2 variants timed and checked against fp64 (gate 1e-6 relative L2); min-term sweep recorded";
+  r.notes = std::string(g_abort.load() ? "ABORTED: " + abort_reason() : "");
+  write_result(c, r, "tg2");
+  std::printf("  TG2 %s\n", r.headline.c_str());
   return all_ok ? 0 : 3;
 }
 

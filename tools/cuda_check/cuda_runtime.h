@@ -108,6 +108,8 @@ __device__ void __nanosleep(unsigned);
 __device__ unsigned long long atomicAdd(unsigned long long*, unsigned long long);
 struct cudaFuncAttributes { int numRegs; size_t localSizeBytes; size_t sharedSizeBytes; int maxThreadsPerBlock; };
 cudaError_t cudaFuncGetAttributes(cudaFuncAttributes*, const void*);
+template <typename T>
+cudaError_t cudaFuncGetAttributes(cudaFuncAttributes* at, T* f) { return cudaFuncGetAttributes(at, reinterpret_cast<const void*>(f)); }
 typedef struct CUevent_st* cudaEvent_t;
 #define cudaStreamNonBlocking 1
 #define cudaHostRegisterDefault 0

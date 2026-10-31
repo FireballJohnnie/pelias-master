@@ -10,4 +10,10 @@ __device__ inline __half __ushort_as_half(unsigned short v) {
   h.x = v;
   return h;
 }
-__device__ float __half2float(__half h);
+__host__ __device__ float __half2float(__half h);
+__host__ __device__ __half __float2half_rn(float);
+struct __attribute__((aligned(4))) __half2 {
+  __half x, y;
+};
+__device__ __half2 __hsub2(__half2, __half2);
+__device__ __half2 __float2half2_rn(float);
