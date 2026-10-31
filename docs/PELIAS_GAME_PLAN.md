@@ -63,6 +63,12 @@ still counts: it makes t+1 careful ("careful+1": planes read, flagged values kep
 hit did in the dual act. Spotting the coin flips is nearly free: the rounding kernel already has |frac - 0.5|; ballot + popc
 counts them per token.
 
+**First measurement (MEASURED 2026-10-31 v17b, tiered file, WikiText 100 x 512):** rounding cost +0.001009 KL (t 8.27; 10.7 %
+of the file's 0.009404). The COUNT of coin flips per token predicts nothing (rho about 0, AUROC 0.51-0.55 at t and t+1). The
+damage itself persists: worst-1 % rounding damage at t -> t+1 7.09 % vs 1 % (7x), worst-1 % KL 9.06 % (9x). So careful+1 holds,
+but its trigger must come from where the flips land (their effect), not how many there are. Next forms (UNMEASURED): per-value
+count; flips weighted by the following weight row's magnitude; the late exact CPU pass priced as the 0.001 it can win back.
+
 **First measurement (UNMEASURED; offline, existing tools):** per token, the count of coin-flip roundings (|frac - 0.5| < eps)
 against that token's KL and the next token's KL on WikiText; and the activation-rounding cost itself on WikiText (kld with
 and without act rounding). It says whether a token's coin flips predict a miss at t+1 (the author assumes it follows the
