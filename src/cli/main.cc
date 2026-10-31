@@ -2131,7 +2131,8 @@ int cmd_engine_check(const Args& a) {
     std::fprintf(stderr,
                  "usage: pelias engine-check --model FILE [--routes ROUTES.bin] [--prefill 64] [--decode 32] [--ctx 4096] [--batch 64] [--threads N]\n"
                  "                           [--budget-gb G] [--hot-max N] [--mtp-draft K] [--fast-cpu] [--no-cpu] [--float-ref]\n"
-                 "                           [--text FILE [--skip-tokens N]] [--timeline] [--dump-top OUT.tsv] [--dump-split]\n");
+                 "                           [--text FILE [--skip-tokens N]] [--timeline] [--dump-top OUT.tsv] [--dump-split [--split-sizes 2,3,4] [--split-step]]\n"
+                 "                           [--no-doorbell]\n");
     return 1;
   }
   auto num = [&](const char* k, std::uint64_t d, std::uint64_t lo, std::uint64_t hi, std::uint64_t& out) {
@@ -2185,6 +2186,28 @@ int cmd_engine_check(const Args& a) {
   eo.mtp = ndraft > 0;
   eo.max_verify = static_cast<int>(ndraft) + 1;
   eo.timeline = a.has("timeline");
+  eo.doorbell = !a.has("no-doorbell");
+  // v20: the split check's batch sizes (default 1 + drafts)
+  std::vector<int> split_sizes;
+  if (a.has("split-sizes")) {
+    std::stringstream ss(a.get("split-sizes"));
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+      const Result<std::uint64_t> r = io::parse_whole(item, 64);
+      if (!r.ok() || r.value < 2) {
+        std::fprintf(stderr, "pelias: --split-sizes takes batch sizes from 2 to 64, comma separated\n");
+        return 1;
+      }
+      split_sizes.push_back(static_cast<int>(r.value));
+      eo.max_verify = std::max(eo.max_verify, static_cast<int>(r.value));
+    }
+  } else {
+    split_sizes.push_back(static_cast<int>(ndraft) + 1);
+  }
+  if (eo.max_verify > static_cast<int>(batch)) {
+    std::fprintf(stderr, "pelias: the split sizes and drafts need --batch %d or more\n", eo.max_verify);
+    return 1;
+  }
   if (a.has("routes")) {
     auto ho = model::hot_order_from_routes(a.get("routes"), s.n_layer, s.n_expert);
     if (!ho.ok()) return fail_input(ho.status);
@@ -2307,8 +2330,10 @@ int cmd_engine_check(const Args& a) {
     const double plain_s = tdp.seconds();
     model::MtpStats ms;
     model::EngineStats emt;
+    model::EngineMtpTiming tmg;
+    eng.value->timeline_reset();
     Timer tmt;
-    if (Status st = model::engine_generate_greedy_mtp(*eng.value, s, prompt, static_cast<int>(ndec), static_cast<int>(ndraft), {}, drafted, &ms, &emt); !st)
+    if (Status st = model::engine_generate_greedy_mtp(*eng.value, s, prompt, static_cast<int>(ndec), static_cast<int>(ndraft), {}, drafted, &ms, &emt, {}, &tmg); !st)
       return fail_input(st);
     const double mtp_s = tmt.seconds() - pre_s;  // its prefill (trunk) is the same as the plain run's; the MTP catch-up stays in
     std::size_t same = 0;
@@ -2318,50 +2343,97 @@ int cmd_engine_check(const Args& a) {
                 static_cast<double>(ndec) / mtp_s, plain_s / mtp_s, static_cast<long long>(ms.steps), static_cast<long long>(ms.drafted),
                 static_cast<long long>(ms.accepted), ms.drafted > 0 ? 100.0 * static_cast<double>(ms.accepted) / static_cast<double>(ms.drafted) : 0.0, same,
                 plain.size());
-    // v19 --dump-split: the plain tokens again, through verify batches of 1 + drafts (the MTP's batched path), each row
-    // against the one-token row for the same position; and the one-token margin where plain and drafted first differ
-    if (split && ndec > 1) {
-      const int kb = static_cast<int>(ndraft) + 1;
-      if (Status st = eng.value->reset(); !st) return fail_input(st);
-      for (std::uint64_t t0 = 0; t0 < npre; t0 += batch) {
-        const int k = static_cast<int>(std::min<std::uint64_t>(batch, npre - t0));
-        if (Status st = eng.value->step(prompt.data() + t0, k, row.data(), true); !st) return fail_input(st);
+    {  // v20: where the MTP run's time went
+      double vs = 0.0;
+      std::string vb_s;
+      for (int b2 = 1; b2 < 10; ++b2) {
+        if (tmg.verify_n[b2] == 0) continue;
+        vs += tmg.verify_s[b2];
+        char buf[96];
+        std::snprintf(buf, sizeof buf, "%s%s%d: %d x %.1f ms", vb_s.empty() ? "" : ", ", b2 == 9 ? ">" : "", b2 == 9 ? 8 : b2, tmg.verify_n[b2], 1e3 * tmg.verify_s[b2] / tmg.verify_n[b2]);
+        vb_s += buf;
       }
-      std::vector<float> vb(static_cast<std::size_t>(kb) * nv);
-      double kl_s = 0.0, kl_m = 0.0;
-      int eq = 0, cnt = 0;
-      std::string diffs;
-      int split_eq = -1;
-      for (int i = 0; i + 1 < static_cast<int>(ndec);) {
-        const int mm = std::min(kb, static_cast<int>(ndec) - 1 - i);
-        if (Status st = eng.value->verify(plain.data() + i, mm, vb.data(), nullptr); !st) return fail_input(st);
-        if (Status st = eng.value->keep(mm); !st) return fail_input(st);
-        for (int r = 0; r < mm; ++r) {
-          const std::size_t pidx = static_cast<std::size_t>(i + r + 1);  // the row predicts plain[pidx]
-          const float* ob = one_rows.data() + pidx * nv;
-          const float* bb = vb.data() + static_cast<std::size_t>(r) * nv;
-          const double kl = kl_rows(ob, bb, nv);
-          kl_s += kl;
-          kl_m = std::max(kl_m, kl);
-          const Top2 to = top2(ob, nv), tb = top2(bb, nv);
-          ++cnt;
-          if (to.i1 == tb.i1) ++eq;
-          else {
-            char buf[96];
-            std::snprintf(buf, sizeof buf, "%s%zu (one-token margin %.3f)", diffs.empty() ? "" : ", ", pidx, to.margin);
-            diffs += buf;
-          }
-          if (pidx == same) split_eq = to.i1 == tb.i1 ? 1 : 0;
+      std::printf("  MTP time: prompt %.3f s; drafts %d x %.1f ms = %.3f s; verify %.3f s (by batch size %s); keep %.3f s; MTP catch-up %.3f s; promote %.3f s; host argmax %.3f s\n",
+                  tmg.prompt_s, tmg.drafts, tmg.drafts ? 1e3 * tmg.draft_s / tmg.drafts : 0.0, tmg.draft_s, vs, vb_s.c_str(), tmg.keep_s, tmg.catchup_s, tmg.promote_s,
+                  tmg.argmax_s);
+      if (a.has("timeline")) {
+        const model::EngineTimeline& T = eng.value->timeline();
+        for (int b2 = 1; b2 < 10; ++b2) {
+          const double c = T.by_n_steps[b2];
+          if (c <= 0) continue;
+          std::printf("  timeline, trunk steps of %s%d tokens: %.0f steps, per step wall %.2f ms, GPU busy %.2f, GPU idle %.2f | CPU cold %.2f, CPU wait %.2f ms\n",
+                      b2 == 9 ? "more than " : "", b2 == 9 ? 8 : b2, c, 1e3 * T.by_n_wall[b2] / c, 1e3 * T.by_n_gpu_busy[b2] / c, 1e3 * T.by_n_gpu_idle[b2] / c,
+                      1e3 * T.by_n_cpu_cold[b2] / c, 1e3 * T.by_n_cpu_wait[b2] / c);
         }
-        i += mm;
       }
-      std::printf("  split check: the plain tokens through verify batches of %d vs one token at a time: KL mean %.3e max %.3e; top-1 equal %d / %d%s%s\n", kb,
-                  cnt ? kl_s / cnt : 0.0, kl_m, eq, cnt, diffs.empty() ? "" : "; differ at ", diffs.c_str());
-      if (same < plain.size()) {
-        const Top2 ts = top2(one_rows.data() + same * nv, nv);
-        std::printf("  split check: first MTP difference at token %zu: one-token top-2 %zu / %zu, margin %.4f; the verify batch's top-1 there %s\n", same, ts.i1, ts.i2,
-                    ts.margin, split_eq < 0 ? "(token 0: from the prefill, same path)" : split_eq ? "agrees with one-token" : "differs from one-token");
-      }
+    }
+    // v19 / v20 --dump-split: the plain tokens again, through batches of each split size (verify: the MTP's path with the
+    // DeltaNet checkpoints; with --split-step also plain step() batches, no checkpoints), each row against the one-token
+    // row for the same position: KL by the row's place in its batch, top-1, margins; the one-token margin where plain and
+    // drafted first differ
+    if (split && ndec > 1) {
+      for (const int kb : split_sizes)
+        for (int mode = 0; mode < (a.has("split-step") ? 2 : 1); ++mode) {
+          const bool use_verify = mode == 0;
+          if (Status st = eng.value->reset(); !st) return fail_input(st);
+          for (std::uint64_t t0 = 0; t0 < npre; t0 += batch) {
+            const int k = static_cast<int>(std::min<std::uint64_t>(batch, npre - t0));
+            if (Status st = eng.value->step(prompt.data() + t0, k, row.data(), true); !st) return fail_input(st);
+          }
+          std::vector<float> vb(static_cast<std::size_t>(kb) * nv);
+          std::vector<double> kl_r(static_cast<std::size_t>(kb), 0.0);
+          std::vector<int> n_r(static_cast<std::size_t>(kb), 0);
+          double kl_s = 0.0, kl_m = 0.0;
+          int eq = 0, cnt = 0;
+          std::size_t worst_at = 0;
+          std::string diffs;
+          int split_eq = -1;
+          for (int i = 0; i + 1 < static_cast<int>(ndec);) {
+            const int mm = std::min(kb, static_cast<int>(ndec) - 1 - i);
+            if (use_verify) {
+              if (Status st = eng.value->verify(plain.data() + i, mm, vb.data(), nullptr); !st) return fail_input(st);
+              if (Status st = eng.value->keep(mm); !st) return fail_input(st);
+            } else if (Status st = eng.value->step(plain.data() + i, mm, vb.data(), false); !st) {
+              return fail_input(st);
+            }
+            for (int r = 0; r < mm; ++r) {
+              const std::size_t pidx = static_cast<std::size_t>(i + r + 1);  // the row predicts plain[pidx]
+              const float* ob = one_rows.data() + pidx * nv;
+              const float* bb = vb.data() + static_cast<std::size_t>(r) * nv;
+              const double kl = kl_rows(ob, bb, nv);
+              kl_s += kl;
+              if (kl > kl_m) {
+                kl_m = kl;
+                worst_at = pidx;
+              }
+              kl_r[static_cast<std::size_t>(r)] += kl;
+              ++n_r[static_cast<std::size_t>(r)];
+              const Top2 to = top2(ob, nv), tb = top2(bb, nv);
+              ++cnt;
+              if (to.i1 == tb.i1) ++eq;
+              else {
+                char buf[96];
+                std::snprintf(buf, sizeof buf, "%s%zu (one-token margin %.3f)", diffs.empty() ? "" : ", ", pidx, to.margin);
+                diffs += buf;
+              }
+              if (pidx == same) split_eq = to.i1 == tb.i1 ? 1 : 0;
+            }
+            i += mm;
+          }
+          std::string byr;
+          for (int r = 0; r < kb; ++r) {
+            char buf[48];
+            std::snprintf(buf, sizeof buf, "%s%.2e", r ? " / " : "", n_r[static_cast<std::size_t>(r)] ? kl_r[static_cast<std::size_t>(r)] / n_r[static_cast<std::size_t>(r)] : 0.0);
+            byr += buf;
+          }
+          std::printf("  split check, %s batches of %d vs one token at a time: KL mean %.3e max %.3e (position %zu); KL by place in the batch %s; top-1 equal %d / %d%s%s\n",
+                      use_verify ? "verify" : "step", kb, cnt ? kl_s / cnt : 0.0, kl_m, worst_at, byr.c_str(), eq, cnt, diffs.empty() ? "" : "; differ at ", diffs.c_str());
+          if (use_verify && kb == static_cast<int>(ndraft) + 1 && same < plain.size()) {
+            const Top2 ts = top2(one_rows.data() + same * nv, nv);
+            std::printf("  split check: first MTP difference at token %zu: one-token top-2 %zu / %zu, margin %.4f; the verify batch's top-1 there %s\n", same, ts.i1,
+                        ts.i2, ts.margin, split_eq < 0 ? "(token 0: from the prefill, same path)" : split_eq ? "agrees with one-token" : "differs from one-token");
+          }
+        }
     }
   }
   if (a.has("no-cpu")) return 0;

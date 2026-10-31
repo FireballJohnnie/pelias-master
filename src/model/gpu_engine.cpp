@@ -248,6 +248,14 @@ struct GpuEngine::Impl {
   std::vector<float> gbuf, ubuf, dbuf;
   std::vector<ColdPick> cold;
   std::vector<std::uint8_t> need;
+  // v20: cold picks grouped by expert (up to 4 tokens each) and each group's gate / up blocks still to finish
+  struct PickGroup {
+    int e = 0, m = 0;
+    int p[4] = {};
+  };
+  std::vector<PickGroup> grp;
+  std::vector<int> ord;
+  std::unique_ptr<std::atomic<int>[]> grp_left;
   // verify / keep (stage 3)
   bool ckpt_mode = false;
   int last_n = 0;            // tokens of the last verify batch (0: none pending)
@@ -597,31 +605,71 @@ struct GpuEngine::Impl {
       if (need[z(t)]) kern::act_q8x32_quantize(xsrc + t * e, e, actx[z(t)]);
     }, rp0);
     mark(0);
-    constexpr int64_t kRowsUp = 64, kRowsDown = 128;
+    // v20 (author 15:57, from the v19 timeline): the picks grouped by expert, up to 4 tokens per group, so a weight row is
+    // read once for every token that picked it (dot_row_q8 takes 1-4 activation rows; each token's sum is the same as
+    // alone); and the silu + rounding of a group done by the thread that finishes its last gate / up block (one thread
+    // hand-off less per layer). Outputs stay per pick (gbuf / ubuf / dbuf at the pick's index), so the combine below is
+    // unchanged and deterministic.
+    constexpr int64_t kRowsUp = 64, kRowsDown = 128, kGroup = 4;
+    grp.clear();
+    {
+      ord.resize(z(np));
+      for (int64_t p = 0; p < np; ++p) ord[z(p)] = static_cast<int>(p);
+      std::stable_sort(ord.begin(), ord.end(), [&](int pa, int pb) { return cold[z(pa)].e < cold[z(pb)].e; });
+      for (int64_t i = 0; i < np;) {
+        const int ex = cold[z(ord[z(i)])].e;
+        PickGroup gp;
+        gp.e = ex;
+        while (i < np && cold[z(ord[z(i)])].e == ex && gp.m < kGroup) gp.p[gp.m++] = ord[z(i++)];
+        grp.push_back(gp);
+      }
+    }
+    const int64_t ng = static_cast<int64_t>(grp.size());
     const int64_t ub = (ff + kRowsUp - 1) / kRowsUp;  // row blocks per projection (gate, up)
-    pool->run(np * 2 * ub, [&](int64_t u) {
-      const int64_t p = u / (2 * ub), rem = u % (2 * ub), proj = rem / ub, r0 = (rem % ub) * kRowsUp, r1 = std::min(ff, r0 + kRowsUp);
-      const ColdPick& c = cold[z(p)];
-      const ExpRows R = exp_rows(proj == 0 ? l.gate_exps : l.up_exps, c.e);
-      float* o_row = (proj == 0 ? gbuf.data() : ubuf.data()) + p * ff;
-      const kern::ActQ8x32* a = &actx[z(c.t)];
-      for (int64_t r = r0; r < r1; ++r) kern::dot_row_q8(R.t, R.base + static_cast<std::uint64_t>(r) * R.rb, e, nullptr, &a, 1, o_row + r);
+    for (int64_t gi = 0; gi < ng; ++gi) grp_left[z(gi)].store(static_cast<int>(2 * ub), std::memory_order_relaxed);
+    pool->run(ng * 2 * ub, [&](int64_t u) {
+      const int64_t gi = u / (2 * ub), rem = u % (2 * ub), proj = rem / ub, r0 = (rem % ub) * kRowsUp, r1 = std::min(ff, r0 + kRowsUp);
+      const PickGroup& gp = grp[z(gi)];
+      const ExpRows R = exp_rows(proj == 0 ? l.gate_exps : l.up_exps, gp.e);
+      const kern::ActQ8x32* acts[kGroup] = {};
+      float* outs[kGroup] = {};
+      for (int j = 0; j < gp.m; ++j) {
+        acts[j] = &actx[z(cold[z(gp.p[j])].t)];
+        outs[j] = (proj == 0 ? gbuf.data() : ubuf.data()) + static_cast<int64_t>(gp.p[j]) * ff;
+      }
+      float o4[kGroup];
+      for (int64_t r = r0; r < r1; ++r) {
+        kern::dot_row_q8(R.t, R.base + static_cast<std::uint64_t>(r) * R.rb, e, nullptr, acts, gp.m, o4);
+        for (int j = 0; j < gp.m; ++j) outs[j][r] = o4[j];
+      }
+      if (grp_left[z(gi)].fetch_sub(1, std::memory_order_acq_rel) == 1)  // the group's last block: its silu and rounding
+        for (int j = 0; j < gp.m; ++j) {
+          const int64_t pk = gp.p[j];
+          float* gg = gbuf.data() + pk * ff;
+          const float* uu = ubuf.data() + pk * ff;
+          for (int64_t i = 0; i < ff; ++i) gg[i] = silu(gg[i]) * uu[i];
+          kern::act_q8x32_quantize(gg, ff, acth[z(pk)]);
+        }
     }, rp1);
     mark(1);
-    pool->run(np, [&](int64_t p) {
-      float* gg = gbuf.data() + p * ff;
-      const float* uu = ubuf.data() + p * ff;
-      for (int64_t i = 0; i < ff; ++i) gg[i] = silu(gg[i]) * uu[i];
-      kern::act_q8x32_quantize(gg, ff, acth[z(p)]);
-    }, rp2);
+    (void)rp2;
     mark(2);
     const int64_t db = (e + kRowsDown - 1) / kRowsDown;
-    pool->run(np * db, [&](int64_t u) {
-      const int64_t p = u / db, r0 = (u % db) * kRowsDown, r1 = std::min(e, r0 + kRowsDown);
-      const ExpRows R = exp_rows(l.down_exps, cold[z(p)].e);
-      const kern::ActQ8x32* a = &acth[z(p)];
-      float* o_row = dbuf.data() + p * e;
-      for (int64_t r = r0; r < r1; ++r) kern::dot_row_q8(R.t, R.base + static_cast<std::uint64_t>(r) * R.rb, ff, nullptr, &a, 1, o_row + r);
+    pool->run(ng * db, [&](int64_t u) {
+      const int64_t gi = u / db, r0 = (u % db) * kRowsDown, r1 = std::min(e, r0 + kRowsDown);
+      const PickGroup& gp = grp[z(gi)];
+      const ExpRows R = exp_rows(l.down_exps, gp.e);
+      const kern::ActQ8x32* acts[kGroup] = {};
+      float* outs[kGroup] = {};
+      for (int j = 0; j < gp.m; ++j) {
+        acts[j] = &acth[z(gp.p[j])];
+        outs[j] = dbuf.data() + static_cast<int64_t>(gp.p[j]) * e;
+      }
+      float o4[kGroup];
+      for (int64_t r = r0; r < r1; ++r) {
+        kern::dot_row_q8(R.t, R.base + static_cast<std::uint64_t>(r) * R.rb, ff, nullptr, acts, gp.m, o4);
+        for (int j = 0; j < gp.m; ++j) outs[j][r] = o4[j];
+      }
     }, rp3);
     mark(3);
     // per token, the picks in slot order (deterministic)
@@ -1096,6 +1144,9 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
   I.ubuf.assign(z(maxp * ff), 0.0f);
   I.dbuf.assign(z(maxp * e), 0.0f);
   I.cold.reserve(z(maxp));
+  I.grp.reserve(z(maxp));
+  I.ord.reserve(z(maxp));
+  I.grp_left = std::make_unique<std::atomic<int>[]>(z(maxp));
   I.need.assign(z(mb), 0);
   if (o.doorbell) {
     const std::size_t sel_b = al(z(maxp) * 4), xn_b = al(z(mb * e) * 4);
@@ -1252,6 +1303,20 @@ Status GpuEngine::Impl::run(const std::int32_t* tokens, int n, float* logits, bo
       I.tline.hot_picks += I.bst.hot_picks;
       I.tline.cold_picks += I.bst.cold_picks;
       ++I.tline.steps;
+      double busy = 0.0, idle = 0.0;
+      for (std::uint32_t il = 0; il < s.n_layer; ++il) {
+        const unsigned long long* q4 = I.ts_h + 4 * il;
+        if (il > 0) busy += d(I.ts_h[4 * (il - 1) + 2], q4[0]);
+        busy += d(q4[0], q4[1]);
+        idle += d(q4[1], q4[2]);
+      }
+      const int b = n > 8 ? 9 : n;
+      I.tline.by_n_steps[b] += 1.0;
+      I.tline.by_n_wall[b] += since(t0);
+      I.tline.by_n_gpu_busy[b] += busy;
+      I.tline.by_n_gpu_idle[b] += idle;
+      I.tline.by_n_cpu_cold[b] += I.bst.cold_seconds;
+      I.tline.by_n_cpu_wait[b] += I.bst.wait_seconds;
     }
   }
   I.pos += n;
@@ -1364,7 +1429,11 @@ void add_stats(EngineStats& a, const EngineStats& b) {
 
 Status engine_generate_greedy_mtp(GpuEngine& eng, const Qwen35MoeSpec& s, const std::vector<std::int32_t>& prompt, int n_predict, int n_draft,
                                   const std::vector<std::int32_t>& stops, std::vector<std::int32_t>& out, MtpStats* stats, EngineStats* es,
-                                  const std::function<void(std::int32_t)>& on_token) {
+                                  const std::function<void(std::int32_t)>& on_token, EngineMtpTiming* tm) {
+  EngineMtpTiming tm_local;
+  EngineMtpTiming& T = tm ? *tm : tm_local;
+  auto secs = [](Clock::time_point a) { return std::chrono::duration<double>(Clock::now() - a).count(); };
+  const Clock::time_point tp0 = Clock::now();
   out.clear();
   const auto is_stop = [&stops](std::int32_t t) { return std::find(stops.begin(), stops.end(), t) != stops.end(); };
   if (prompt.empty()) return Status::fail(Code::invalid_argument, "an empty prompt");
@@ -1396,14 +1465,18 @@ Status engine_generate_greedy_mtp(GpuEngine& eng, const Qwen35MoeSpec& s, const 
     }
     if (auto pr = eng.mtp_promote(); !pr.ok()) return pr.status;  // the MTP bank from the prompt's picks
   }
+  T.prompt_s += secs(tp0);
   std::int32_t last = argmax_of(lg.data(), nv);
   out.push_back(last);
   if (on_token) on_token(last);
   std::vector<float> dl(z(nv)), hn(z(e)), h(z(e)), bl, bh;
   while (static_cast<int>(out.size()) < n_predict && !is_stop(last)) {
     ++stt.steps;
-    if (n_draft > 0 && stt.steps % 32 == 0)  // idle-time promotion: the MTP bank follows the block's own picks
+    if (n_draft > 0 && stt.steps % 32 == 0) {  // idle-time promotion: the MTP bank follows the block's own picks
+      const Clock::time_point tq = Clock::now();
       if (auto pr = eng.mtp_promote(); !pr.ok()) return pr.status;
+      T.promote_s += secs(tq);
+    }
     const int room = n_predict - static_cast<int>(out.size()) - 1;
     const int k = std::max(0, std::min(n_draft, room));
     std::vector<std::int32_t> drafts;
@@ -1413,9 +1486,14 @@ Status engine_generate_greedy_mtp(GpuEngine& eng, const Qwen35MoeSpec& s, const 
       std::int32_t tok = last;
       for (int i = 0; i < k; ++i) {
         EngineStats x;
+        const Clock::time_point tq = Clock::now();
         if (Status r = eng.mtp_step(&tok, h.data(), 1, dl.data(), hn.data(), &x); !r) return r;
+        T.draft_s += secs(tq);
+        ++T.drafts;
         add_stats(tot, x);
+        const Clock::time_point ta = Clock::now();
         tok = argmax_of(dl.data(), nv);
+        T.argmax_s += secs(ta);
         drafts.push_back(tok);
         h = hn;
       }
@@ -1428,21 +1506,30 @@ Status engine_generate_greedy_mtp(GpuEngine& eng, const Qwen35MoeSpec& s, const 
     bl.resize(z(nb * nv));
     bh.resize(z(nb * e));
     EngineStats x;
+    const Clock::time_point tv = Clock::now();
     if (Status r = k > 0 ? eng.verify(batch.data(), nb, bl.data(), bh.data(), &x) : eng.step(batch.data(), 1, bl.data(), true, &x, bh.data()); !r) return r;
+    T.verify_s[nb > 8 ? 9 : nb] += secs(tv);
+    ++T.verify_n[nb > 8 ? 9 : nb];
     add_stats(tot, x);
+    const Clock::time_point ta2 = Clock::now();
     int a = 0;
     while (a < k && argmax_of(bl.data() + a * nv, nv) == drafts[z(a)] && !is_stop(drafts[z(a)])) ++a;
     if (a < k && is_stop(drafts[z(a)]) && argmax_of(bl.data() + a * nv, nv) == drafts[z(a)]) ++a;
     const std::int32_t next = argmax_of(bl.data() + a * nv, nv);
+    T.argmax_s += secs(ta2);
+    const Clock::time_point tk = Clock::now();
     if (k > 0)
       if (Status r = eng.keep(a + 1); !r) return r;
+    T.keep_s += secs(tk);
     stt.accepted += a;
     if (n_draft > 0) {
       std::vector<float> hp(z((a + 1) * e));
       std::copy(pending.begin(), pending.end(), hp.begin());
       std::copy(bh.begin(), bh.begin() + a * e, hp.begin() + e);
       EngineStats y;
+      const Clock::time_point tc = Clock::now();
       if (Status r = eng.mtp_step(batch.data(), hp.data(), a + 1, nullptr, nullptr, &y); !r) return r;
+      T.catchup_s += secs(tc);
       add_stats(tot, y);
     }
     pending.assign(bh.begin() + a * e, bh.begin() + (a + 1) * e);

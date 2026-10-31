@@ -397,3 +397,55 @@ TEST(cpu_dot_batches_equal_groups_of_four_bit_for_bit) {
   CHECK(run_batch(static_cast<std::uint32_t>(q::Type::q8_0), 96, nullptr, 3));  // not whole segments: the groups themselves
   std::printf("    dot_row_n: %d type/length/plane cases, batch = groups of four bit for bit (one row and blocks of three)\n", cases + 1);
 }
+
+// v20 (the engine's cold experts grouped by expert, author 2026-10-31 15:57): dot_row_q8 with 2, 3 or 4 activation rows
+// gives each token exactly what it gives that token alone (nt = 1), bit for bit, on every readable type, so grouping the
+// tokens that picked the same expert changes no value.
+TEST(cpu_dot_q8_rows_together_equal_alone_bit_for_bit) {
+  int cases = 0;
+  bool all = true;
+  for (std::uint32_t id = 0; id < 256; ++id) {
+    const q::Type t = static_cast<q::Type>(id);
+    if (!q::can_dequantize(t)) continue;
+    for (std::int64_t k : {512, 2048}) {
+      const std::uint64_t rb = q::row_bytes(id, static_cast<std::uint64_t>(k));
+      if (rb == 0) continue;
+      std::vector<std::uint8_t> row(static_cast<std::size_t>(rb), 0);
+      if (q::can_quantize(t)) {
+        const std::vector<float> src = noise(k, id * 7u + 5u, 0.05f);
+        if (!q::quantize_row(t, src.data(), row.data(), k)) continue;
+      } else {
+        std::uint32_t r = id * 977u + 3u;
+        for (std::uint8_t& b : row) {
+          r = r * 1664525u + 1013904223u;
+          b = static_cast<std::uint8_t>(r >> 24);
+        }
+        std::vector<float> chk(static_cast<std::size_t>(k));
+        if (!q::dequantize_row(t, row.data(), chk.data(), k)) continue;
+        bool fin = true;
+        for (float v : chk) fin = fin && std::isfinite(v);
+        if (!fin) continue;
+      }
+      kn::ActQ8x32 ax[4];
+      for (int j = 0; j < 4; ++j) {
+        const std::vector<float> x = noise(k, 100u + static_cast<std::uint32_t>(j) * 17u + id, 1.0f);
+        kn::act_q8x32_quantize(x.data(), k, ax[j]);
+      }
+      float alone[4];
+      for (int j = 0; j < 4; ++j) {
+        const kn::ActQ8x32* a1 = &ax[j];
+        kn::dot_row_q8(t, row.data(), k, nullptr, &a1, 1, &alone[j]);
+      }
+      for (int m = 2; m <= 4; ++m) {
+        const kn::ActQ8x32* as[4] = {&ax[0], &ax[1], &ax[2], &ax[3]};
+        float tog[4] = {};
+        kn::dot_row_q8(t, row.data(), k, nullptr, as, m, tog);
+        for (int j = 0; j < m; ++j) all = all && std::memcmp(&tog[j], &alone[j], sizeof(float)) == 0;
+        ++cases;
+      }
+    }
+  }
+  CHECK(all);
+  CHECK(cases > 30);
+  std::printf("    dot_row_q8: %d type/length/row-count cases, 2-4 rows together equal each row alone bit for bit%s\n", cases, all ? "" : " (NOT)");
+}

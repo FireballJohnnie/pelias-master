@@ -89,6 +89,19 @@ struct EngineTimeline {
   int wake_n = 0;
   double cold_bytes = 0.0;
   std::uint64_t cold_picks = 0, hot_picks = 0;
+  // v20: per step size (index n for n = 1 .. 8, 9 for larger batches): steps, wall time, GPU busy (dense + bank + shared,
+  // summed over layers), GPU idle waiting for the CPU, CPU cold work, CPU waiting for the ring
+  double by_n_steps[10] = {}, by_n_wall[10] = {}, by_n_gpu_busy[10] = {}, by_n_gpu_idle[10] = {}, by_n_cpu_cold[10] = {}, by_n_cpu_wait[10] = {};
+};
+
+// v20: where an MTP greedy run spends its time (engine_generate_greedy_mtp): drafting (the MTP block, one token per
+// draft), the trunk's verify by batch size (index 1 .. 8), keep(), the MTP block's catch-up on the kept tokens,
+// promotion, and the host's argmax over the vocabulary
+struct EngineMtpTiming {
+  double draft_s = 0.0, keep_s = 0.0, catchup_s = 0.0, promote_s = 0.0, argmax_s = 0.0, prompt_s = 0.0;
+  double verify_s[10] = {};
+  int verify_n[10] = {};
+  int drafts = 0;
 };
 
 class GpuEngine {
@@ -140,7 +153,7 @@ class GpuEngine {
 // max_verify >= n_draft + 1; it is reset first. drafted / accepted as MtpStats.
 Status engine_generate_greedy_mtp(GpuEngine& eng, const Qwen35MoeSpec& s, const std::vector<std::int32_t>& prompt, int n_predict, int n_draft,
                                   const std::vector<std::int32_t>& stops, std::vector<std::int32_t>& out, MtpStats* stats, EngineStats* es = nullptr,
-                                  const std::function<void(std::int32_t)>& on_token = {});
+                                  const std::function<void(std::int32_t)>& on_token = {}, EngineMtpTiming* tm = nullptr);
 
 // The hot order from a routing record (pelias kld --route-dump, PELROUT1): per layer, experts by pick count, most picked
 // first (ties: lower index); experts never picked come last in index order.
