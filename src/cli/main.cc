@@ -2016,9 +2016,17 @@ int cmd_gpu_check(const Args& a) {
     Timer t3;
     if (Status rs = model::forward_reference(s, w.value, ids.data(), n, 0, n, lg_f.data(), o3); !rs) return fail_input(rs);
     std::printf("  float reference (no activation rounding%s): %.2f s\n", o3.fast_cpu ? ", fast CPU kernels" : "", t3.seconds());
-    show("rounded CPU reference vs float", compare(lg_f, lg_ref));
-    show("GPU vs float", compare(lg_f, lg_gpu));
+    const Cmp rf = compare(lg_f, lg_ref), gf = compare(lg_f, lg_gpu);
+    show("rounded CPU reference vs float", rf);
+    show("GPU vs float", gf);
+    // the real-model gate (author 2026-10-31 00:5x, DECISIONS_LOG): the GPU as close to the unrounded model as the CPU reference,
+    // KL within 1.25x and top-1 within 3 tokens. Two implementations of the same rounding differ by flips the layers carry (v16:
+    // CPU fast vs plain KL 5.3e-3 at 40 layers), so a fixed bound on GPU vs reference holds only for one layer and the small rungs.
+    const bool ok = gf.kl_mean <= 1.25 * rf.kl_mean && gf.top >= rf.top - 3;
+    std::printf("  gate (GPU vs float within 1.25x KL and 3 top-1 of the rounded reference vs float): %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 3;
   }
+  // without --float-ref: the fixed bound, meant for one layer (KL mean 1e-4, top-1 95 %)
   return main_cmp.kl_mean <= 1e-4 && main_cmp.top * 100 >= n * 95 ? 0 : 3;
 }
 
