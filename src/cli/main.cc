@@ -215,6 +215,9 @@ void usage() {
       "      [--temp 1.0] [--top-k 20] [--top-p 0.95] [--min-p 0] [--repeat-penalty 1] [--repeat-last-n 64]\n"
       "      [--presence-penalty 0] [--frequency-penalty 0] [--seed 20261019 | -1] [--ignore-eos] [--show-special]\n"
       "      [--ids-out FILE] [--no-nfc] [--no-special] [--act-int8 GROUPS] [--act-int8-path ...] [--act-rot h32] [--no-mmap] [--chat]\n"
+      "      [--engine [--routes ROUTES.bin] [--budget-gb G]]\n"
+      "                                  --engine: the GPU engine (GP3-14: resident dense weights, the hot-expert bank chosen by\n"
+      "                                  the routing record's pick counts, cold experts on the CPU)\n"
       "                                  --chat wraps the prompt as one user turn in the model family's chat format\n"
       "                                  text from the fp32 reference pass on the CPU (slow; a correctness reference, not the\n"
       "                                  engine): the prompt once, then one token per step on the carried KV cache and\n"
@@ -2441,6 +2444,29 @@ int cmd_generate(const Args& a) {
     }
     jobs.push_back({text, ids_out, ""});
   }
+  // --engine (GP3-14): the GPU engine with the hot-expert bank and CPU cold experts, opened once for every prompt
+  std::unique_ptr<model::GpuEngine> engine;
+  if (a.has("engine")) {
+    if (a.has("mtp-draft") || a.has("planes") || a.has("planes-mode") || a.has("act-int8")) {
+      std::fprintf(stderr, "pelias: --engine runs the engine's own rounding (per-32 int8); --mtp-draft, planes and --act-int8 are reference options\n");
+      return 1;
+    }
+    model::EngineOptions eo2;
+    eo2.max_ctx = n_ctx;
+    eo2.max_batch = 64;
+    eo2.cpu_threads = threads;
+    if (!gib_option(a, "budget-gb", eo2.vram_budget)) return 1;
+    if (a.has("routes")) {
+      auto ho = model::hot_order_from_routes(a.get("routes"), spec.value.n_layer, spec.value.n_expert);
+      if (!ho.ok()) return fail_input(ho.status);
+      eo2.hot_order = std::move(ho.value);
+    }
+    Timer te;
+    auto eng = model::GpuEngine::open(spec.value, w.value, eo2);
+    if (!eng.ok()) return fail_input(eng.status);
+    engine = std::move(eng.value);
+    std::fprintf(stderr, "pelias generate: %s (open %.1f s)\n", engine->summary().c_str(), te.seconds());
+  }
   for (std::size_t job = 0; job < jobs.size(); ++job) {
   // --chat: one user turn in the family's chat format, the assistant's turn opened (READ-SRC: the files' own
   // tokenizer.chat_template, the plain case without a system message or tools). Qwen (qwen35moe, qwen3, qwen2): ChatML;
@@ -2548,7 +2574,26 @@ int cmd_generate(const Args& a) {
   std::vector<std::int32_t> history = ids, out;
   std::vector<float> gap;  // per output token: the largest raw logit minus the second (how near a greedy tie was)
   Timer tp;
-  s = model::forward_decode(spec.value, w.value, st, ids.data(), n_prompt, logits.data(), true, fo);
+  model::EngineStats es_tot;
+  auto engine_step = [&](const std::int32_t* tk2, int n2) -> Status {
+    model::EngineStats es;
+    const Status r2 = engine->step(tk2, n2, logits.data(), true, &es);
+    es_tot.cold_seconds += es.cold_seconds;
+    es_tot.wait_seconds += es.wait_seconds;
+    es_tot.hot_picks += es.hot_picks;
+    es_tot.cold_picks += es.cold_picks;
+    return r2;
+  };
+  if (engine) {
+    if (n_prompt + n_predict > n_ctx) {
+      std::fprintf(stderr, "pelias: the prompt and --n-predict do not fit --ctx (%d)\n", n_ctx);
+      return 1;
+    }
+    s = engine->reset();
+    for (int t0 = 0; s && t0 < n_prompt; t0 += 64) s = engine_step(ids.data() + t0, std::min(64, n_prompt - t0));
+  } else {
+    s = model::forward_decode(spec.value, w.value, st, ids.data(), n_prompt, logits.data(), true, fo);
+  }
   if (!s) return fail_input(s);
   const double prefill_s = tp.seconds();
   Timer td;
@@ -2577,10 +2622,15 @@ int cmd_generate(const Args& a) {
     }
     if (i + 1 == n_predict) break;
     fo.planes = planes_until < 0 || i + 1 < planes_until;  // this step gives output token i + 1
-    s = model::forward_decode(spec.value, w.value, st, &next, 1, logits.data(), true, fo);
+    s = engine ? engine_step(&next, 1) : model::forward_decode(spec.value, w.value, st, &next, 1, logits.data(), true, fo);
     if (!s) return fail_input(s);
   }
   const double decode_s = td.seconds();
+  if (engine) {
+    const double all = static_cast<double>(es_tot.hot_picks + es_tot.cold_picks);
+    std::fprintf(stderr, "pelias generate: engine picks on the GPU %.1f %%; CPU cold work %.2f s, host waits %.2f s\n",
+                 all > 0 ? 100.0 * static_cast<double>(es_tot.hot_picks) / all : 0.0, es_tot.cold_seconds, es_tot.wait_seconds);
+  }
   std::fputs("\n", tout);
   std::fflush(tout);
   if (tout != stdout) std::fclose(tout);
