@@ -37,7 +37,7 @@ Copyright (c) 2026 John Lipka and the Pelias contributors
 - ~~GP1-12 per-layer ffn_down sweep~~: confirmed. The 40-layer slope rerun found Q4_K relative error nearly flat over layers, with down 10-35 % above gate/up only in layers 32-39 (MEASURED). That is built into the tiered quantizer.
 - ~~GP1-16 CPU speed of the shared format~~: confirmed. AVX2 decoders at 16 threads, float / int8 GB/s: Q8_0 35 / 39, Q6_K 38 / 36, Q5_K 31 / 27, Q4_K 22 / 28, IQ4_XS 24 / 29, against 8.5 for the reference path (MEASURED). Q4_TG2 17 / 17 and IQ2_XXS 10 / 11 are below the 27 GB/s gate (DERIVED gate); they move into Line C.
 - ~~R2-256 / R2-row~~: struck. **Corrected reason:** the +0.000999 in the draft is the cost of one *activation scale* per 256 (the gpu256 format, MEASURED), a different thing from the *weight rotation* block size these two runs would test. They were to run "only if Block C lands close to Unsloth". The tiered file is 26.6 % below Unsloth (0.009404 vs 0.012808, MEASURED), so the condition never came up.
-- ~~v18 first engine run~~: done 2026-10-31 from 14:50 (MEASURED, gp/ENGINE; sanitizers finishing). Build clean in 38 s; 27 / 27 GPU tests; decode 12.1-13.0 tok/s. Its follow-ups are in the GP3-14 section below.
+- ~~v18 first engine run~~: done 2026-10-31 14:50-15:13 (MEASURED, gp/ENGINE). Build clean in 38 s; 27 / 27 GPU tests; decode 12.1-13.0 tok/s; sanitizers 0 errors from all four tools (the only test failure under them is verify/keep at 1.07e-4 over 1e-4, the drift below). Its follow-ups are in the GP3-14 section below.
 
 ### Execution lines (the author's grouping, 15:09)
 **Run order:** unchanged from the game plan: A, then C (CPU), then D, then F; B and E follow. A change of order is the author's call.
@@ -120,7 +120,7 @@ Copyright (c) 2026 John Lipka and the Pelias contributors
 - **GP3-14 engine, v18 follow-ups:**
   - The batched verify path drifts from the one-token R3 path: verify/keep KL 6.3e-05 vs 1.0e-05; under memcheck 1.07e-04 over the 1e-4 test limit. MTP plain vs drafted split after token 16 (draft 1, 2) and after token 1 (draft 3) (MEASURED).
   - Float gate top-1 555 vs 566, 11 short of the "within 3" gate, while engine KL 6.69e-3 is below the CPU's 7.06e-3 (MEASURED). Check the 11 flipped positions against their logits (the prompt is made-up IDs).
-  - The 3 skipped unit tests (confirm they are the usual CPU-only skips).
+  - ~~The 3 skipped unit tests~~: the usual data-file skips (the Unsloth header file is kept on the author's drive).
   - O13 (down projection at 0.27-0.29 of peak); gates E4-E9, G3, K3.
 - **GP1-14:** spec checks recorded as DONE in the docs.
 - **Appendix B:**
