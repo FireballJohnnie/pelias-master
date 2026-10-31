@@ -40,6 +40,29 @@ Copyright (c) 2026 John Lipka and the Pelias contributors
 
 **Note (author 2026-10-31 00:15): the power / temperature watchdog (gp/watchdog_v1.sh) is a test-harness tool, not part of the program.** Its limits (200 W, the CPU's PPT) are this PC's. If the product ever guards power or temperature, it reads each machine's own limits from a probe (NVML power.limit and temperatures; the CPU's PPT / TDP from the platform) and never assumes these numbers; other GPUs and CPUs have other limits.
 
+## CPU path speed items (Fable read-only review 2026-10-31 01:4x-01:55; author 02:36 "add"; measure first, results unchanged)
+
+Context (MEASURED): kld on the tiered file, 16 threads, 14.1-14.35 s per 512-token chunk; CPU pinned at Tctl 91 C (its 90 C
+limit), 102-104 W, CPU fan at its ceiling; the chip regulates temperature, so these items shorten runs (energy), not peak heat.
+They also sit in the CPU expert path GP3-14's cold experts use. Every item keeps every reported number bit for bit (same
+summation order). Savings are Fable's ESTIMATES against the PELIAS_PROF split of 2026-10-30 (experts 8.0 s, DeltaNet 4.5 s per
+chunk); first step: `PELIAS_PROF=1 pelias kld ... --chunks 2` on the tiered file (about 1 min) to measure the split.
+1. **Persistent thread pool** (author priority): parallel_items spawns and joins a thread team per product, about 7,200
+   clone/join per chunk (DERIVED). ESTIMATE 0.2-0.5 s per chunk.
+2. **AVX2 for the dequantizers** (author priority): pelias_quant is compiled without -mavx2 (CMakeLists.txt), so Q4_TG2 / Q5_K /
+   Q6_K row decodes run scalar; keep -ffp-contract=off / no fast-math. ESTIMATE 1-1.5 s per chunk.
+3. **Drop the 3.2 GB of zeroed buffers per chunk** (author priority): per-layer std::vector buffers value-initialised then fully
+   overwritten (DeltaNet about 86 MB, attention about 64 MB per layer; ys 32 MB mmap'd and faulted each layer); one workspace
+   per call sized to the largest layer. ESTIMATE 0.5-0.8 s per chunk.
+4. **Drop the 128 KB fp32 copy buffer in the expert tile** (author priority): load_tile decodes each row to fp32 and scatters
+   it into a 2048 x 16 x 4 B tile (4x L1); transpose per 256-value block in L1 and carry the accumulators. ESTIMATE 2-4 s per chunk.
+5. **Round a shared input once** (author 02:36): mm() rounds the same normed input 3x for wq / wk / wv, 2x for the DeltaNet
+   wqkv / wgate and 2x for the shared expert gate / up; round once, reuse (identical values). Small time; also makes the flip
+   counter per value instead of per product.
+6. Next by size: dense tile_dot at 20-30 % of peak (check the disassembly for accumulator spills, 2-3 s if so); DeltaNet and
+   attention dot products as latency chains (transposed state / K, same i-order, 0.6-1.2 s); base-file read serial (prefetch).
+Parked (author 02:36): the 8 / 12 / 16-thread CPU sweep, until another CPU sweep is needed.
+
 ## STANDING RULE: GPU first, exact CPU late (author 2026-10-31 01:16; the dual-act formula of 2026-10-29 17:44)
 
 Apply to every area the 1-bit accuracy + plane system does not cover:
@@ -68,6 +91,12 @@ of the file's 0.009404). The COUNT of coin flips per token predicts nothing (rho
 damage itself persists: worst-1 % rounding damage at t -> t+1 7.09 % vs 1 % (7x), worst-1 % KL 9.06 % (9x). So careful+1 holds,
 but its trigger must come from where the flips land (their effect), not how many there are. Next forms (UNMEASURED): per-value
 count; flips weighted by the following weight row's magnitude; the late exact CPU pass priced as the 0.001 it can win back.
+Author 02:36: the counter is unweighted (a value near halfway in a block of scale 1e-5 counts as one in a block of scale 10),
+while the damage is the rounding error itself, (r - round(r)) x scale, on every value; the next form measures that error
+energy per token (and per projection), not the count near 0.5. Router: NOT rounded (MEASURED 2026-10-31 02:4x, pelias inspect:
+ffn_gate_inp F32 [2048,256], ssm_alpha / ssm_beta F32 [2048,32]; act_format never rounds float weights, CPU and GPU alike), so
+the +0.001009 comes from the quantized-weight inputs (attention, DeltaNet projections, shared and routed experts). Which of them
+carries it: kld with --act-int8 per group (UNMEASURED; a CPU run, parked with the sweep).
 
 **First measurement (UNMEASURED; offline, existing tools):** per token, the count of coin-flip roundings (|frac - 0.5| < eps)
 against that token's KL and the next token's KL on WikiText; and the activation-rounding cost itself on WikiText (kld with
