@@ -19,7 +19,9 @@
 
 #include "kern/cpu_dot.h"
 #include "kern/gpu_ops.h"
+#include "kern/gpu_decode.h"
 #include "kern/gpu_prompt.h"
+#include "kern/gpu_stream.h"
 #include "quant/block_types.h"
 #include "quant/quant_cpu.h"
 
@@ -132,6 +134,10 @@ struct DevW {
   int64_t n_out = 0, k = 0;
   bool int8 = false;
   g::PromptWeights pw;
+  std::uint32_t dtype = 0;   // the type the batched kernels read d as (g_q8_0r for Q8_0 held in R3's layout)
+  std::uint64_t drb = 0;     // its row bytes
+  bool r3 = false;           // sw holds this weight for R3 (one-token steps)
+  g::StreamWeights sw;
 };
 
 struct Layer {
@@ -250,15 +256,24 @@ struct GpuEngine::Impl {
     return static_cast<std::size_t>(v.ne[1] * v.ne[2] * v.row_bytes);
   }
   static bool int8_ok(std::uint32_t type, int64_t n_out, int64_t k) { return g::prompt_type_ok(type, k) && n_out % 128 == 0; }
-  static std::size_t dense_bytes(const WeightView& v) {
+  bool use_r3 = false;  // EngineOptions::r3
+  // R3 holds the matrix and the batched kernels read that same copy
+  static bool r3_shared(std::uint32_t t) {
+    return t == static_cast<std::uint32_t>(quant::Type::q8_0) || t == static_cast<std::uint32_t>(quant::Type::q4_k) ||
+           t == static_cast<std::uint32_t>(quant::Type::q5_k) || t == static_cast<std::uint32_t>(quant::Type::q4_tg2);
+  }
+  bool r3_takes(const WeightView& v) const {
+    return use_r3 && v.present() && !v.rot32 && v.slots.empty() && v.ne[2] == 1 && g::stream_type_ok(v.type, static_cast<int64_t>(v.ne[0]));
+  }
+  std::size_t dense_bytes(const WeightView& v) const {
     if (!v.present()) return 0;
     const int64_t n_out = static_cast<int64_t>(v.ne[1]), k = static_cast<int64_t>(v.ne[0]);
-    std::size_t b = al(view_bytes(v)) + 256;
+    std::size_t b = r3_takes(v) && r3_shared(v.type) ? 256 : al(view_bytes(v)) + 256;
     if (int8_ok(v.type, n_out, k)) b += al(g::prompt_table_bytes(v.type, n_out, k)) + 256;
     return b;
   }
   static std::size_t vec_bytes(const std::vector<float>& f) { return f.empty() ? 0 : al(f.size() * sizeof(float)) + 256; }
-  static std::size_t layer_dense_bytes(const Qwen35MoeLayer& l) {
+  std::size_t layer_dense_bytes(const Qwen35MoeLayer& l) const {
     std::size_t b = 0;
     for (const WeightView* v : {&l.wq, &l.wk, &l.wv, &l.wo, &l.wqkv, &l.wgate, &l.wbeta, &l.walpha, &l.ssm_out, &l.gate_inp, &l.gate_shexp, &l.up_shexp,
                                 &l.down_shexp})
@@ -273,9 +288,28 @@ struct GpuEngine::Impl {
     dw.v = &v;
     dw.n_out = static_cast<int64_t>(v.ne[1]);
     dw.k = static_cast<int64_t>(v.ne[0]);
-    const std::size_t bytes = view_bytes(v);
-    void* d = arena.take(bytes);
-    if (!d || !g::to_device(d, v.data, bytes)) return Status::fail(Code::internal, "engine: weight upload " + v.name);
+    dw.dtype = v.type;
+    dw.drb = v.row_bytes;
+    const void* d = nullptr;
+    if (r3_takes(v)) {
+      if (!g::stream_upload(v.type, v.data, dw.n_out, dw.k, &dw.sw)) return Status::fail(Code::internal, std::string("engine: R3 upload ") + v.name + ": " + g::stream_last_error());
+      dw.r3 = true;
+      dev_bytes += dw.sw.bytes;
+      dense_bytes_total += dw.sw.bytes;
+      if (r3_shared(v.type)) {  // the batched kernels read R3's copy
+        d = dw.sw.w;
+        if (v.type == static_cast<std::uint32_t>(quant::Type::q8_0)) {
+          dw.dtype = g::g_q8_0r;
+          dw.drb = static_cast<std::uint64_t>(dw.k / 256) * 272;
+        }
+      }
+    }
+    if (!d) {
+      const std::size_t bytes = view_bytes(v);
+      void* dd = arena.take(bytes);
+      if (!dd || !g::to_device(dd, v.data, bytes)) return Status::fail(Code::internal, "engine: weight upload " + v.name);
+      d = dd;
+    }
     dw.d = d;
     if (int8_ok(v.type, dw.n_out, dw.k)) {
       void* tb = arena.take(g::prompt_table_bytes(v.type, dw.n_out, dw.k));
@@ -392,15 +426,57 @@ struct GpuEngine::Impl {
     const WeightView& v = *W.v;
     if (is_float_type(v.type)) {
       if (v.rot32) return Status::fail(Code::unsupported, "engine: a rotated float weight (" + v.name + ")");
-      if (!g::matmul(v.type, W.d, v.row_bytes, W.n_out, W.k, xin, n, W.k, yout, W.n_out)) return gfail("engine: product " + v.name);
+      if (!g::matmul(W.dtype, W.d, W.drb, W.n_out, W.k, xin, n, W.k, yout, W.n_out)) return gfail("engine: product " + v.name);
       return Status::good();
     }
+    if (n == 1 && W.r3) return prod_r3({{&W, yout}}, xin);
     if (!g::act_q8x32(xin, W.k, n, W.k, v.rot32, xr, W.k, q, scale, sum)) return gfail("engine: rounding for " + v.name);
     if (W.int8) {
       if (!g::act_digits(scale, sum, n, W.k, dig) || !g::prompt_gemm(W.pw, W.n_out, q, scale, dig, n, yout)) return gfail("engine: int8 product " + v.name);
       return Status::good();
     }
-    if (!g::matmul(v.type, W.d, v.row_bytes, W.n_out, W.k, xr, n, W.k, yout, W.n_out)) return gfail("engine: product " + v.name);
+    if (!g::matmul(W.dtype, W.d, W.drb, W.n_out, W.k, xr, n, W.k, yout, W.n_out)) return gfail("engine: product " + v.name);
+    return Status::good();
+  }
+  // one token through R3: the products of one input, grouped into one plan (built once per group, kept), outputs into a
+  // fixed scratch and then copied to where each belongs (the attention cache's row moves with the position)
+  struct R3Group {
+    std::unique_ptr<g::StreamPlan> plan;
+    std::vector<int64_t> off;  // each job's output offset in r3y
+  };
+  std::map<const DevW*, R3Group> r3plans;
+  float* r3y = nullptr;
+  std::size_t r3y_floats = 0;
+  Status prod_r3(std::initializer_list<std::pair<const DevW*, float*>> jobs, const float* xin) {
+    const DevW& W0 = *jobs.begin()->first;
+    R3Group& G = r3plans[&W0];
+    if (!G.plan) {
+      std::vector<g::StreamJob> js;
+      int64_t at = 0;
+      for (const auto& [W, yo] : jobs) {
+        (void)yo;
+        if (!W->r3 || W->k != W0.k || W->v->rot32 != W0.v->rot32) return Status::fail(Code::internal, "engine: an R3 group with unlike inputs");
+        g::StreamJob j;
+        j.w = &W->sw;
+        j.xq = q;
+        j.xs = scale;
+        j.xsum = sum;
+        if (static_cast<std::size_t>(at + W->n_out) > r3y_floats) return Status::fail(Code::internal, "engine: R3 scratch too small");
+        j.y = r3y + at;
+        G.off.push_back(at);
+        at += (W->n_out + 63) / 64 * 64;
+        js.push_back(j);
+      }
+      const int stage_end[1] = {static_cast<int>(js.size())};
+      G.plan = std::make_unique<g::StreamPlan>();
+      if (!G.plan->build(js.data(), static_cast<int>(js.size()), stage_end, 1, 0))
+        return Status::fail(Code::internal, std::string("engine: R3 plan: ") + g::stream_last_error());
+    }
+    if (!g::act_q8x32(xin, W0.k, 1, W0.k, W0.v->rot32, xr, W0.k, q, scale, sum)) return gfail("engine: rounding for R3");
+    if (!G.plan->run()) return Status::fail(Code::internal, std::string("engine: R3 run: ") + g::stream_last_error());
+    std::size_t i = 0;
+    for (const auto& [W, yo] : jobs)
+      if (!g::dcopy(yo, r3y + G.off[i++], z(W->n_out) * sizeof(float))) return gfail("engine: R3 output");
     return Status::good();
   }
 
@@ -410,7 +486,11 @@ struct GpuEngine::Impl {
     float* kn = D.K + p0 * kv_w;  // the new keys and values go straight into the cache
     float* vn = D.V + p0 * kv_w;
     Status st;
-    if (!(st = prod(D.wq, xn, n, qg)) || !(st = prod(D.wk, xn, n, kn)) || !(st = prod(D.wv, xn, n, vn))) return st;
+    if (n == 1 && D.wq.r3 && D.wk.r3 && D.wv.r3 && D.wq.k == D.wk.k && D.wk.k == D.wv.k) {
+      if (!(st = prod_r3({{&D.wq, qg}, {&D.wk, kn}, {&D.wv, vn}}, xn))) return st;
+    } else if (!(st = prod(D.wq, xn, n, qg)) || !(st = prod(D.wk, xn, n, kn)) || !(st = prod(D.wv, xn, n, vn))) {
+      return st;
+    }
     if (D.q_norm && !g::rms_norm(qg, D.q_norm, qg, hd, nh, qh, q_w, n, s.rms_eps)) return gfail("engine: q norm");
     if (D.k_norm && !g::rms_norm(kn, D.k_norm, kn, hd, nkv, hd, kv_w, n, s.rms_eps)) return gfail("engine: k norm");
     const int sec[4] = {s.rope_sections[0], s.rope_sections[1], s.rope_sections[2], s.rope_sections[3]};
@@ -425,8 +505,12 @@ struct GpuEngine::Impl {
   Status deltanet_block(Layer& D, int64_t n) {
     const int64_t ch = s.conv_channels(), ds = s.ssm_d_state, nk = s.ssm_n_group, nv = s.ssm_dt_rank, taps = s.ssm_d_conv;
     Status st;
-    if (!(st = prod(D.wqkv, xn, n, mixed)) || !(st = prod(D.wgate, xn, n, zg)) || !(st = prod(D.wbeta, xn, n, beta)) || !(st = prod(D.walpha, xn, n, alpha)))
+    if (n == 1 && D.wqkv.r3 && D.wgate.r3 && D.wqkv.k == D.wgate.k) {
+      if (!(st = prod_r3({{&D.wqkv, mixed}, {&D.wgate, zg}}, xn))) return st;
+    } else if (!(st = prod(D.wqkv, xn, n, mixed)) || !(st = prod(D.wgate, xn, n, zg))) {
       return st;
+    }
+    if (!(st = prod(D.wbeta, xn, n, beta)) || !(st = prod(D.walpha, xn, n, alpha))) return st;
     if (!g::deltanet_gates(beta, alpha, D.ssm_dt, D.ssm_a, n, nv)) return gfail("engine: deltanet gates");
     const bool ck = ckpt_mode && n > 1;
     if (ck && !g::dcopy(D.mixed_save, mixed, z(n * ch) * sizeof(float))) return gfail("engine: verify inputs");
@@ -528,7 +612,11 @@ struct GpuEngine::Impl {
     } else if (!g::dzero(y, z(n * e) * sizeof(float))) {
       return gfail("engine: clear y");
     }
-    if (!(st = prod(D.gate_sh, xn, n, gs)) || !(st = prod(D.up_sh, xn, n, us))) return st;
+    if (n == 1 && D.gate_sh.r3 && D.up_sh.r3 && D.gate_sh.k == D.up_sh.k) {
+      if (!(st = prod_r3({{&D.gate_sh, gs}, {&D.up_sh, us}}, xn))) return st;
+    } else if (!(st = prod(D.gate_sh, xn, n, gs)) || !(st = prod(D.up_sh, xn, n, us))) {
+      return st;
+    }
     if (!g::silu_mul(gs, us, gs, n * ffs)) return gfail("engine: shared silu");
     if (!(st = prod(D.down_sh, gs, n, sh))) return st;
     if (!g::matmul(static_cast<std::uint32_t>(quant::Type::f32), D.gate_inp_sh, static_cast<std::uint64_t>(e) * sizeof(float), 1, e, xn, n, e, gsh, 1) ||
@@ -638,7 +726,11 @@ struct GpuEngine::Impl {
     } else if (!g::dzero(y, z(n * e) * sizeof(float))) {
       return gfail("engine: clear y");
     }
-    if (!(st = prod(D.gate_sh, xn, n, gs)) || !(st = prod(D.up_sh, xn, n, us))) return st;
+    if (n == 1 && D.gate_sh.r3 && D.up_sh.r3 && D.gate_sh.k == D.up_sh.k) {
+      if (!(st = prod_r3({{&D.gate_sh, gs}, {&D.up_sh, us}}, xn))) return st;
+    } else if (!(st = prod(D.gate_sh, xn, n, gs)) || !(st = prod(D.up_sh, xn, n, us))) {
+      return st;
+    }
     if (!g::silu_mul(gs, us, gs, n * ffs)) return gfail("engine: shared silu");
     if (!(st = prod(D.down_sh, gs, n, sh))) return st;
     if (!g::matmul(static_cast<std::uint32_t>(quant::Type::f32), D.gate_inp_sh, static_cast<std::uint64_t>(e) * sizeof(float), 1, e, xn, n, e, gsh, 1) ||
@@ -679,6 +771,14 @@ GpuEngine::~GpuEngine() {
   g::moe_scratch_free(&p_->moe);
   for (Layer& D : p_->L) g::dfree(D.bank_mem);
   g::dfree(p_->M.bank_mem);
+  p_->r3plans.clear();
+  auto rel = [](DevW& d) {
+    if (d.r3) g::stream_release(&d.sw);
+  };
+  for (Layer& D : p_->L)
+    for (DevW* d : {&D.wq, &D.wk, &D.wv, &D.wo, &D.wqkv, &D.wgate, &D.wbeta, &D.walpha, &D.ssm_out, &D.gate_inp, &D.gate_sh, &D.up_sh, &D.down_sh}) rel(*d);
+  for (DevW* d : {&p_->M.wq, &p_->M.wk, &p_->M.wv, &p_->M.wo, &p_->M.gate_inp, &p_->M.gate_sh, &p_->M.up_sh, &p_->M.down_sh, &p_->eh, &p_->out}) rel(*d);
+  if (p_->head.r3 && p_->head.sw.w != p_->out.sw.w) rel(p_->head);
   g::dfree(p_->act_mem);
   g::dfree(p_->dense_mem);
   g::dfree(p_->state_mem);
@@ -726,6 +826,7 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
   const int64_t ffs = s.n_ff_shexp, ff = s.n_ff_exp, taps = s.ssm_d_conv;
   I.kv_w = hd * nkv;
   I.has_mtp = o.mtp;
+  I.use_r3 = o.r3;
   if (o.mtp && !w.mtp.present) return R::fail(Status::fail(Code::unsupported, "engine: this file has no MTP block"));
   if (o.max_verify > 1 && !(ds >= 32 && ds <= 1024 && (ds & (ds - 1)) == 0))
     return R::fail(Status::fail(Code::unsupported, "engine: verify batches need the DeltaNet d_state a power of two (the checkpointing recurrence)"));
@@ -753,9 +854,11 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
       {reinterpret_cast<void**>(&I.gsh), np * 4},               {reinterpret_cast<void**>(&I.galpha), np * 4},
       {reinterpret_cast<void**>(&I.zero2), 256},                {reinterpret_cast<void**>(&I.yc), np * z(e) * 4},
       {reinterpret_cast<void**>(&I.cat), o.mtp ? np * z(2 * e) * 4 : 256},
+      {reinterpret_cast<void**>(&I.r3y), (z(s.n_vocab) + z(qh * nh) + z(4 * I.kv_w) + z(2 * ch) + z(2 * di) + z(4 * ffs) + 1024) * 4},
       {reinterpret_cast<void**>(&I.lg), z(Impl::kOutRows) * z(s.n_vocab) * 4}};
   std::size_t total = 0;
   for (const Buf& b : bufs) total += al(b.bytes);
+  I.r3y_floats = z(s.n_vocab) + z(qh * nh) + z(4 * I.kv_w) + z(2 * ch) + z(2 * di) + z(4 * ffs) + 1024;
   I.act_mem = g::dalloc(total);
   if (!I.act_mem || !g::dzero(I.act_mem, total)) return R::fail(Status::fail(Code::over_ceiling, "engine: activation memory"));
   auto* cur = static_cast<std::uint8_t*>(I.act_mem);
@@ -812,12 +915,12 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
     return R::fail(Status::fail(Code::over_ceiling, std::string("engine: expert scratch: ") + g::prompt_last_error()));
   // the dense weights of every layer and the output layer, resident
   {
-    std::size_t db = Impl::dense_bytes(w.output) + Impl::vec_bytes(w.output_norm) + Impl::vec_bytes(w.rope_freqs) + 1024;
-    for (const Qwen35MoeLayer& l : w.layers) db += Impl::layer_dense_bytes(l);
+    std::size_t db = I.dense_bytes(w.output) + Impl::vec_bytes(w.output_norm) + Impl::vec_bytes(w.rope_freqs) + 1024;
+    for (const Qwen35MoeLayer& l : w.layers) db += I.layer_dense_bytes(l);
     const bool head_is_out = w.mtp.head.data == w.output.data;
     if (o.mtp)
-      db += Impl::layer_dense_bytes(w.mtp.layer) + Impl::dense_bytes(w.mtp.eh_proj) + Impl::vec_bytes(w.mtp.enorm) + Impl::vec_bytes(w.mtp.hnorm) +
-            Impl::vec_bytes(w.mtp.head_norm) + (head_is_out ? 0 : Impl::dense_bytes(w.mtp.head));
+      db += I.layer_dense_bytes(w.mtp.layer) + I.dense_bytes(w.mtp.eh_proj) + Impl::vec_bytes(w.mtp.enorm) + Impl::vec_bytes(w.mtp.hnorm) +
+            Impl::vec_bytes(w.mtp.head_norm) + (head_is_out ? 0 : I.dense_bytes(w.mtp.head));
     I.dense_mem = g::dalloc(db);
     if (!I.dense_mem) return R::fail(Status::fail(Code::over_ceiling, "engine: dense weights (" + std::to_string(db >> 20) + " MiB)"));
     I.dev_bytes += db;

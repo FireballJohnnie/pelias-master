@@ -81,3 +81,30 @@ TEST(gpu_decoder_half_float_is_exact_for_every_half) {
   }
   CHECK(same);
 }
+
+// GP3-14: Q8_0 in R3's repacked layout (g_q8_0r, kern/gpu_stream's upload: per 256 values qs[256] | d[8]) decodes to the
+// same values as the GGUF row, bit for bit (the batched kernels read the copy R3 decodes from)
+TEST(gpu_decoder_q8_0_r3_layout_equals_q8_0) {
+  const std::int64_t k = 1024;
+  std::vector<float> x(static_cast<std::size_t>(k));
+  for (std::int64_t i = 0; i < k; ++i) x[static_cast<std::size_t>(i)] = std::sin(0.37f * static_cast<float>(i)) * (1.0f + static_cast<float>(i % 7));
+  const std::uint64_t rb = q::row_bytes(static_cast<std::uint32_t>(q::Type::q8_0), static_cast<std::uint64_t>(k));
+  std::vector<std::uint8_t> row(rb), rr(static_cast<std::size_t>(k / 256 * 272));
+  CHECK(q::quantize_row(q::Type::q8_0, x.data(), row.data(), k).ok());
+  for (std::int64_t b = 0; b < k / 256; ++b)
+    for (int i = 0; i < 8; ++i) {
+      const std::uint8_t* p = row.data() + 272 * b + 34 * i;
+      std::memcpy(rr.data() + 272 * b + 32 * i, p + 2, 32);
+      std::memcpy(rr.data() + 272 * b + 256 + 2 * i, p, 2);
+    }
+  CHECK(g::block_values(g::g_q8_0r) == 256 && g::block_bytes(g::g_q8_0r) == 272);
+  const g::Tables tb{};
+  int same = 0;
+  for (std::int64_t j = 0; j < k / 32; ++j) {
+    float a[32], b2[32];
+    g::decode32(g::g_q8_0, row.data(), j, tb, a);
+    g::decode32(g::g_q8_0r, rr.data(), j, tb, b2);
+    same += std::memcmp(a, b2, sizeof a) == 0 ? 1 : 0;
+  }
+  CHECK(same == k / 32);
+}

@@ -57,6 +57,12 @@ struct EngineOptions {
   // many as the trunk's average per layer would get if the bank budget were spread over n_layer + 1 layers (DERIVED at
   // open); 0 = none (the MTP experts stay on the CPU path)
   int mtp_bank = -1;
+  // R3 (kern/gpu_stream, the measured decode kernel; author 03:28-03:29): one-token steps run every dense product R3
+  // reads (Q7_ZT, Q4_TG2, Q5_K, Q6_K, Q8_0, Q4_K, IQ4_XS; k 256-4096) on R3, grouped by shared input; batches keep the
+  // batched kernels. One device copy per weight: Q8_0 in R3's repacked layout, read by the batched kernels as g_q8_0r;
+  // Q4_K / Q5_K / Q4_TG2 shared as stored; Q6_K, IQ4_XS and Q7_ZT dense weights (none in the tiered file) keep a second,
+  // GGUF copy for the batched kernels. false: no R3.
+  bool r3 = true;
 };
 
 struct EngineStats {

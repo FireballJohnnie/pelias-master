@@ -27,7 +27,11 @@ enum GType : std::uint32_t {
   g_f32 = 0, g_f16 = 1, g_q4_0 = 2, g_q4_1 = 3, g_q5_0 = 6, g_q5_1 = 7, g_q8_0 = 8, g_q2_k = 10, g_q3_k = 11, g_q4_k = 12,
   g_q5_k = 13, g_q6_k = 14, g_iq2_xxs = 16, g_iq2_xs = 17, g_iq3_xxs = 18, g_iq1_s = 19, g_iq4_nl = 20, g_iq3_s = 21,
   g_iq2_s = 22, g_iq4_xs = 23, g_iq1_m = 29, g_bf16 = 30, g_tq1_0 = 34, g_tq2_0 = 35, g_i2_s = 36, g_mxfp4 = 39, g_nvfp4 = 40,
-  g_q8_z = 200, g_q7_z = 201, g_q7_zt = 202, g_q4_tg = 203, g_q4_tg2 = 204
+  g_q8_z = 200, g_q7_z = 201, g_q7_zt = 202, g_q4_tg = 203, g_q4_tg2 = 204,
+  // GP3-14 (author 2026-10-31 03:29, one copy of each dense weight): Q8_0 in R3's repacked layout (kern/gpu_stream:
+  // per 256 values qs[256] int8 | d[8] fp16, 272 bytes), so the batched kernels read the copy R3 decodes from. Not a file
+  // type: an id of the GPU path only. The same values as g_q8_0 (d x q, the same expression).
+  g_q8_0r = 1008
 };
 
 // The format tables a decoder reads (host or device copies; the GPU's are uploaded once by kern/cuda/gpu_ops.cu):
@@ -54,7 +58,7 @@ PG_HD std::uint32_t block_values(std::uint32_t t) {
     case g_i2_s: return 128;
     case g_q2_k: case g_q3_k: case g_q4_k: case g_q5_k: case g_q6_k: case g_iq2_xxs: case g_iq2_xs: case g_iq3_xxs:
     case g_iq1_s: case g_iq3_s: case g_iq2_s: case g_iq4_xs: case g_iq1_m: case g_tq1_0: case g_tq2_0: case g_q8_z:
-    case g_q7_z: case g_q7_zt: case g_q4_tg: case g_q4_tg2:
+    case g_q7_z: case g_q7_zt: case g_q4_tg: case g_q4_tg2: case g_q8_0r:
       return 256;
     default: return 0;
   }
@@ -88,6 +92,7 @@ PG_HD std::uint32_t block_bytes(std::uint32_t t) {
     case g_tq1_0: return 54;
     case g_tq2_0: return 66;
     case g_q8_z: return 264;
+    case g_q8_0r: return 272;
     case g_q7_z: return 232;
     case g_q7_zt: return 241;
     case g_q4_tg: case g_q4_tg2: return 144;
@@ -225,6 +230,13 @@ PG_HD void decode32(std::uint32_t t, const std::uint8_t* row, std::int64_t j, co
       const std::uint8_t* b = row + 34 * j;
       const float d = half_float(rd16(b));
       for (int i = 0; i < 32; ++i) y[i] = mul(static_cast<float>(static_cast<signed char>(b[2 + i])), d);
+      return;
+    }
+    case g_q8_0r: {  // R3's layout: 32-block j of a row is qs at 272 (j / 8) + 32 (j % 8), its d at 272 (j / 8) + 256 + 2 (j % 8)
+      const std::uint8_t* b = row + 272 * (j / 8);
+      const std::int64_t i8 = j % 8;
+      const float d = half_float(rd16(b + 256 + 2 * i8));
+      for (int i = 0; i < 32; ++i) y[i] = mul(static_cast<float>(static_cast<signed char>(b[32 * i8 + i])), d);
       return;
     }
     case g_q4_k: {
