@@ -932,6 +932,123 @@ int GpuEngine::max_batch() const { return p_ ? p_->o.max_batch : 0; }
 std::uint64_t GpuEngine::bank_bytes() const { return p_ ? p_->bank_bytes_total : 0; }
 Status GpuEngine::reset() { return p_->reset_state(); }
 const EngineTimeline& GpuEngine::timeline() const { return p_->tline; }
+
+Status GpuEngine::bank_selftest(int combos, std::string* report, int* bad) {
+  Impl& I = *p_;
+  const Qwen35MoeSpec& s = I.s;
+  const int64_t e = s.n_embd, ne = s.n_expert, nu = s.n_expert_used;
+  std::uint32_t rng = 12345u;
+  auto rnd = [&]() {
+    rng = rng * 1664525u + 1013904223u;
+    return rng;
+  };
+  std::vector<float> xh(z(2 * e)), yg(z(2 * e)), yc(z(2 * e));
+  for (float& v : xh) v = static_cast<float>(static_cast<int>(rnd() >> 8) % 20001 - 10000) * 1e-4f;
+  struct Worst {
+    double rel;
+    int layer, expert, rows;
+  };
+  std::vector<Worst> all;
+  int checked = 0, nbad = 0, ncombo = 0;
+  double max_rel = 0.0;
+  for (std::uint32_t il = 0; il < s.n_layer; ++il) {
+    Layer& D = I.L[il];
+    if (D.bg.empty()) continue;
+    const Qwen35MoeLayer& l = I.w->layers[il];
+    std::vector<int> hot, cl;
+    for (int x = 0; x < static_cast<int>(ne); ++x) (D.hot[z(x)] ? hot : cl).push_back(x);
+    if (static_cast<int64_t>(cl.size()) < nu) continue;  // fillers must be experts outside the bank
+    const g::MoeStacks sg{D.bg.data(), static_cast<int>(D.bg.size())}, su{D.bu.data(), static_cast<int>(D.bu.size())},
+        sd{D.bd.data(), static_cast<int>(D.bd.size())};
+    // one GPU call and the CPU path on the same picks; returns the worst row's relative L2 gap
+    auto run = [&](int n, const std::vector<std::int32_t>& pk, const std::vector<float>& wt, double* rel) -> Status {
+      if (!g::to_device(I.xn, xh.data(), z(n * e) * sizeof(float)) || !g::act_q8x32(I.xn, e, n, e, false, I.xr, e, I.q, I.scale, I.sum) ||
+          !g::act_digits(I.scale, I.sum, n, e, I.dig) || !g::to_device(I.sel, pk.data(), pk.size() * sizeof(std::int32_t)) ||
+          !g::to_device(I.wsel, wt.data(), wt.size() * sizeof(float)) ||
+          !g::moe_prompt_multi(sg, su, sd, I.q, I.scale, I.dig, n, I.sel, I.wsel, I.moe, g::MoeCombine::kFixed64, 32, I.y) ||
+          !g::to_host(yg.data(), I.y, z(n * e) * sizeof(float)))
+        return gfail("engine: bank self-test (GPU)");
+      I.cold.clear();
+      for (int t = 0; t < n; ++t)
+        for (int64_t j = 0; j < nu; ++j) {
+          const int x = pk[z(t * nu + j)];
+          if (D.hot[z(x)]) I.cold.push_back(ColdPick{t, x, wt[z(t * nu + j)]});
+        }
+      I.cold_experts_io(l, n, xh.data(), yc.data());
+      double worst = 0.0;
+      for (int t = 0; t < n; ++t) {
+        double num = 0.0, den = 0.0;
+        for (int64_t i = 0; i < e; ++i) {
+          const double dd = static_cast<double>(yg[z(t * e + i)]) - yc[z(t * e + i)];
+          num += dd * dd;
+          den += static_cast<double>(yc[z(t * e + i)]) * yc[z(t * e + i)];
+        }
+        worst = std::max(worst, den > 0 ? std::sqrt(num / den) : std::sqrt(num));
+      }
+      *rel = worst;
+      return Status::good();
+    };
+    for (const int x : hot)
+      for (int n = 1; n <= 2; ++n) {
+        std::vector<std::int32_t> pk(z(n * nu));
+        std::vector<float> wt(z(n * nu), 0.0f);
+        for (int t = 0; t < n; ++t) {
+          pk[z(t * nu)] = x;
+          wt[z(t * nu)] = 1.0f;
+          for (int64_t j = 1; j < nu; ++j) pk[z(t * nu + j)] = cl[z(j - 1)];
+        }
+        double rel = 0.0;
+        if (Status st = run(n, pk, wt, &rel); !st) return st;
+        ++checked;
+        max_rel = std::max(max_rel, rel);
+        if (rel > 1e-2) ++nbad;
+        all.push_back(Worst{rel, static_cast<int>(il), x, n});
+      }
+    for (int c = 0; c < combos; ++c) {  // random 8-pick mixes over the whole layer (bank and cold), 1 token
+      std::vector<std::int32_t> pk;
+      std::vector<float> wt;
+      float tot = 0.0f;
+      while (static_cast<int64_t>(pk.size()) < nu) {
+        const int x = static_cast<int>(rnd() % static_cast<std::uint32_t>(ne));
+        if (std::find(pk.begin(), pk.end(), x) != pk.end()) continue;
+        pk.push_back(x);
+        wt.push_back(static_cast<float>(rnd() % 1000 + 1));
+        tot += wt.back();
+      }
+      for (float& v : wt) v /= tot;
+      double rel = 0.0;
+      if (Status st = run(1, pk, wt, &rel); !st) return st;
+      ++ncombo;
+      max_rel = std::max(max_rel, rel);
+      if (rel > 1e-2) ++nbad;
+      all.push_back(Worst{rel, static_cast<int>(il), -1, 1});
+    }
+  }
+  std::sort(all.begin(), all.end(), [](const Worst& a, const Worst& b) { return a.rel > b.rel; });
+  std::string r;
+  char buf[256];
+  std::snprintf(buf, sizeof buf, "bank self-test: %d single-expert checks (1 and 2 tokens) + %d mixes; worst relative L2 gap GPU vs CPU %.3e; %d above 1e-2",
+                checked, ncombo, max_rel, nbad);
+  r += buf;
+  if (!all.empty()) {
+    const double med = all[all.size() / 2].rel;
+    std::snprintf(buf, sizeof buf, "; median %.3e", med);
+    r += buf;
+  }
+  for (std::size_t i = 0; i < all.size() && i < 12; ++i) {
+    const Worst& w8 = all[i];
+    std::string tys;
+    if (w8.expert >= 0)
+      for (const WeightView* v : {&I.w->layers[z(w8.layer)].gate_exps, &I.w->layers[z(w8.layer)].up_exps, &I.w->layers[z(w8.layer)].down_exps})
+        tys += std::string(tys.empty() ? "" : "/") + quant::type_info(exp_type(*v, w8.expert)).name;
+    std::snprintf(buf, sizeof buf, "\n    layer %2d %s %3d, %d token%s: %.3e %s", w8.layer, w8.expert >= 0 ? "expert" : "mix   ", w8.expert, w8.rows,
+                  w8.rows > 1 ? "s" : " ", w8.rel, tys.c_str());
+    r += buf;
+  }
+  if (report) *report = r;
+  if (bad) *bad = nbad;
+  return g::sync() ? Status::good() : gfail("engine: bank self-test sync");
+}
 void GpuEngine::timeline_reset() {
   EngineTimeline& t = p_->tline;
   const int th = t.threads;

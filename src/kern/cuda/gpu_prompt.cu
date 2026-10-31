@@ -1078,8 +1078,16 @@ bool experts(const MoeScratch& m, const std::int8_t* a8, const float* sa32, cons
     nt = m.meta2;
     nv = m.meta2 + 1;
   }
-  return tile_launch<EPI, false>(dim3(static_cast<unsigned>(N / kBN), static_cast<unsigned>(max_tiles)), a8, sa32, adig, W, ut, nt, 0, N, K, E, s) &&
-         vec_launch<EPI>(dim3(static_cast<unsigned>(m.n_expert), static_cast<unsigned>((N + 7) / 8)), a8, sa32, W, uv, nv, N, K, E, s);
+  // v22 (the v21 per-operation timeline: the bank's experts took 0.54 ms per layer at one token): the grids were sized for
+  // every expert (vector: n_expert blocks across; tiles: picks / 64 + n_expert), almost all exiting at once. An expert has
+  // at most `tokens` rows (a token picks an expert once), so with tokens <= kVecMax there are no tile units at all, and
+  // the vector units are at most min(n_expert, picks). Same units, same kernels, same values; fewer empty blocks.
+  const std::int64_t toks = m.n_used > 0 ? picks / m.n_used : picks;
+  const int vec_x = static_cast<int>(std::max<std::int64_t>(1, std::min<std::int64_t>(m.n_expert, picks)));
+  const int tile_y = static_cast<int>(std::min<std::int64_t>(max_tiles, picks / kTile + std::min<std::int64_t>(m.n_expert, picks / (kVecMax + 1) + 1)));
+  if (toks > kVecMax && !tile_launch<EPI, false>(dim3(static_cast<unsigned>(N / kBN), static_cast<unsigned>(tile_y)), a8, sa32, adig, W, ut, nt, 0, N, K, E, s))
+    return false;
+  return vec_launch<EPI>(dim3(static_cast<unsigned>(vec_x), static_cast<unsigned>((N + 7) / 8)), a8, sa32, W, uv, nv, N, K, E, s);
 }
 
 // one expert stack over the GPU work list: the int8 kernels for Q4_K / Q5_K / Q6_K / Q4_TG2, else the exact path (gpu_ops'

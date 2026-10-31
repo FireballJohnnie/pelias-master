@@ -82,6 +82,8 @@ bool add_rows(float* y, std::int64_t ldy, const float* x, std::int64_t ldx, cons
 
 // ---- route: per row, softmax over n_expert logits (sum in double), the top n_used by probability (ties: lower index),
 // renormalized to sum 1 (sum clamped below at 2^-14), times weights_scale when it is neither 0 nor 1; sel / wsel n_used per row
+// tests only (v22): route router_topk through the earlier serial kernel, to check the shared-memory kernel bit for bit
+void router_topk_serial_for_tests(bool on);
 bool router_topk(const float* logits, std::int64_t n_expert, std::int64_t rows, int n_used, float weights_scale, std::int32_t* sel,
                  float* wsel, Stream s = nullptr);
 

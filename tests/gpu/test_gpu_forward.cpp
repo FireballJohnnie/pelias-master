@@ -274,6 +274,13 @@ std::vector<float> engine_case(const Small& sm, int hot, const char* what, bool 
     return {};
   }
   CHECK(f.value->bank_experts() == static_cast<int>(s.n_layer) * hot);
+  if (hot > 0 && hot < static_cast<int>(s.n_expert)) {  // v22: every bank expert against the CPU path
+    std::string rep;
+    int bad = -1;
+    CHECK(f.value->bank_selftest(8, &rep, &bad).ok());
+    CHECK(bad == 0);
+    std::printf("    %s: %s\n", what, rep.substr(0, rep.find('\n')).c_str());
+  }
   CHECK((f.value->summary().find("doorbell") != std::string::npos) == bell);
   // two passes: the second after reset() must give the same logits bit for bit (the state is carried, not leaked)
   std::vector<float> first;

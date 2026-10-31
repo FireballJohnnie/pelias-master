@@ -371,6 +371,86 @@ __global__ void k_router(const float* __restrict__ logits, std::int64_t ne, int 
   }
 }
 
+// v22 (the v21 per-operation timeline: router + top-k 0.325 ms per layer at one token, thread 0 walking global memory
+// for the sum and 8 x 256 x 8 pick checks): the same arithmetic with the row in shared memory and each pick an argmax over
+// the block. The softmax is element for element the reference's (block max, exp of the difference, the sum in double in
+// index order by one thread, one multiply per element); a pick is the highest probability, the lower index on a tie, not
+// picked before (the serial loop's rule); the weights and their sum in pick order as before. Same values bit for bit.
+constexpr int kRouterMaxExperts = 1024;
+__global__ void __launch_bounds__(256) k_router_fast(const float* __restrict__ logits, std::int64_t ne, int nu, float wscale,
+                                                     std::int32_t* __restrict__ sel, float* __restrict__ wsel) {
+  __shared__ float shm[33];
+  __shared__ float p[kRouterMaxExperts];
+  __shared__ unsigned char taken[kRouterMaxExperts];
+  __shared__ float inv_s;
+  __shared__ float bv[8];
+  __shared__ int bi[8];
+  const std::int64_t t = blockIdx.x;
+  const float* l = logits + t * ne;
+  const int tid = static_cast<int>(threadIdx.x), nth = static_cast<int>(blockDim.x);
+  float m = -INFINITY;
+  for (std::int64_t i = tid; i < ne; i += nth) m = fmaxf(m, l[i]);
+  const float mx = block_max_f(m, shm);
+  for (std::int64_t i = tid; i < ne; i += nth) {
+    p[i] = expf(sub(l[i], mx));
+    taken[i] = 0;
+  }
+  __syncthreads();
+  if (tid == 0) {
+    double sum = 0.0;
+    for (std::int64_t i = 0; i < ne; ++i) sum += static_cast<double>(p[i]);
+    inv_s = static_cast<float>(1.0 / sum);
+  }
+  __syncthreads();
+  const float inv = inv_s;
+  for (std::int64_t i = tid; i < ne; i += nth) p[i] = mul(p[i], inv);
+  __syncthreads();
+  float tot = 0.0f;
+  for (int kk = 0; kk < nu; ++kk) {
+    float v = -INFINITY;
+    int ix = 0x7fffffff;
+    for (std::int64_t i = tid; i < ne; i += nth)
+      if (!taken[i] && (ix == 0x7fffffff || p[i] > v)) {  // ascending i per thread: strict > keeps the lower index on a tie
+        v = p[i];
+        ix = static_cast<int>(i);
+      }
+    for (int o = 16; o > 0; o >>= 1) {
+      const float v2 = __shfl_xor_sync(0xffffffffu, v, o);
+      const int i2 = __shfl_xor_sync(0xffffffffu, ix, o);
+      if (i2 != 0x7fffffff && (ix == 0x7fffffff || v2 > v || (v2 == v && i2 < ix))) {
+        v = v2;
+        ix = i2;
+      }
+    }
+    if ((tid & 31) == 0) {
+      bv[tid >> 5] = v;
+      bi[tid >> 5] = ix;
+    }
+    __syncthreads();
+    if (tid == 0) {
+      float bvv = bv[0];
+      int bix = bi[0];
+      for (int w = 1; w < (nth >> 5); ++w)
+        if (bi[w] != 0x7fffffff && (bix == 0x7fffffff || bv[w] > bvv || (bv[w] == bvv && bi[w] < bix))) {
+          bvv = bv[w];
+          bix = bi[w];
+        }
+      sel[t * nu + kk] = bix;
+      wsel[t * nu + kk] = p[bix];
+      tot = add(tot, p[bix]);
+      taken[bix] = 1;
+    }
+    __syncthreads();
+  }
+  if (tid != 0) return;
+  tot = fmaxf(tot, 6.103515625e-5f);
+  for (int kk = 0; kk < nu; ++kk) {
+    float w = quo(wsel[t * nu + kk], tot);
+    if (wscale != 0.0f && wscale != 1.0f) w = mul(w, wscale);
+    wsel[t * nu + kk] = w;
+  }
+}
+
 // ------------------------------------------------------------------------------------------------ attention
 
 // scores[t][h][u] = (q . k_u) * scale for u <= p0 + t; one warp per position
@@ -1078,10 +1158,16 @@ bool add_rows(float* y, std::int64_t ldy, const float* x, std::int64_t ldx, cons
   return launched("add_rows");
 }
 
+bool g_router_serial = false;  // tests only: the serial kernel (the v22 kernel is checked against it bit for bit)
+void router_topk_serial_for_tests(bool on) { g_router_serial = on; }
 bool router_topk(const float* logits, std::int64_t n_expert, std::int64_t rows, int n_used, float weights_scale, std::int32_t* sel, float* wsel,
                  Stream s) {
   if (n_expert <= 0 || n_used <= 0 || n_used > n_expert || !logits || !sel || !wsel) return fail("router_topk: bad shape");
   if (rows <= 0) return true;
+  if (n_expert <= kRouterMaxExperts && !g_router_serial) {  // v22: shared-memory picks, same values
+    k_router_fast<<<static_cast<unsigned>(rows), 256, 0, st(s)>>>(logits, n_expert, n_used, weights_scale, sel, wsel);
+    return launched("router_topk");
+  }
   // the probabilities need a work row per token; kept in a buffer that grows (a model's shape is fixed after load, so this
   // allocates on the first calls only)
   static float* work = nullptr;

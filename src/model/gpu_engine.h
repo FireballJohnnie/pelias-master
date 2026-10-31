@@ -149,6 +149,10 @@ class GpuEngine {
   [[nodiscard]] int bank_experts() const;      // experts held on the GPU (all layers)
   [[nodiscard]] std::uint64_t bank_bytes() const;
   [[nodiscard]] std::string summary() const;   // one line: device bytes, dense, bank, cache, threads
+  // v22 bank self-test: every bank expert of every layer through the GPU's bank kernels (1 token, and 2 tokens picking it)
+  // against the CPU's cold-expert path on the same inputs, then `combos` random 8-pick mixes per layer (1 token). Call
+  // between steps. report: a summary line and the worst cases; bad: results with a relative L2 gap above 1e-2.
+  Status bank_selftest(int combos, std::string* report, int* bad);
   // v19 timeline (empty unless EngineOptions::timeline and the doorbell are on)
   [[nodiscard]] const EngineTimeline& timeline() const;
   void timeline_reset();

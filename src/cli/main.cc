@@ -2132,7 +2132,7 @@ int cmd_engine_check(const Args& a) {
                  "usage: pelias engine-check --model FILE [--routes ROUTES.bin] [--prefill 64] [--decode 32] [--ctx 4096] [--batch 64] [--threads N]\n"
                  "                           [--budget-gb G] [--hot-max N] [--mtp-draft K] [--fast-cpu] [--no-cpu] [--float-ref]\n"
                  "                           [--text FILE [--skip-tokens N]] [--timeline] [--dump-top OUT.tsv] [--dump-split [--split-sizes 2,3,4] [--split-step]]\n"
-                 "                           [--no-doorbell] [--timeline-ops] [--split-ref]\n");
+                 "                           [--no-doorbell] [--timeline-ops] [--split-ref] [--bank-selftest MIXES]\n");
     return 1;
   }
   auto num = [&](const char* k, std::uint64_t d, std::uint64_t lo, std::uint64_t hi, std::uint64_t& out) {
@@ -2218,6 +2218,18 @@ int cmd_engine_check(const Args& a) {
   auto eng = model::GpuEngine::open(s, w.value, eo);
   if (!eng.ok()) return fail_input(eng.status);
   std::printf("pelias engine-check: %s, %u layers; open %.2f s\n  %s\n", s.arch.c_str(), s.n_layer, topen.seconds(), eng.value->summary().c_str());
+  int selftest_bad = 0;
+  if (a.has("bank-selftest")) {  // v22: every bank expert against the CPU path, before any step (MIXES random 8-pick mixes per layer)
+    const Result<std::uint64_t> mr = io::parse_whole(a.get("bank-selftest"), 100000);
+    if (!mr.ok()) {
+      std::fprintf(stderr, "pelias: --bank-selftest takes a number of mixes per layer (0 for none)\n");
+      return 1;
+    }
+    std::string rep;
+    Timer tst;
+    if (Status st = eng.value->bank_selftest(static_cast<int>(mr.value), &rep, &selftest_bad); !st) return fail_input(st);
+    std::printf("  %s (%.1f s)\n", rep.c_str(), tst.seconds());
+  }
   const int n = static_cast<int>(npre + ndec);
   std::vector<std::int32_t> ids(static_cast<std::size_t>(n));
   if (a.has("text")) {  // v19: real text, tokens skip .. skip + n of the file (decode steps are fed the text's next tokens)
@@ -2505,7 +2517,7 @@ int cmd_engine_check(const Args& a) {
       }
     }
   }
-  if (a.has("no-cpu")) return 0;
+  if (a.has("no-cpu")) return selftest_bad > 0 ? 4 : 0;
   model::ForwardOptions o = model::GpuForward::matching_reference_options();
   o.threads = static_cast<int>(thr);
   o.fast_cpu = a.has("fast-cpu");

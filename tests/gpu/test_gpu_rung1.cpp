@@ -513,6 +513,41 @@ TEST(rung1_router_picks_equal_the_reference) {
   std::printf("    64 rows x 256 experts, top 8: picks identical (ties by lower index), weights within %.3e relative\n", worst);
 }
 
+// v22: the shared-memory router kernel against the earlier serial one, bit for bit (picks and weights), on random rows,
+// rows with ties and a row with every expert tied, 256 and 160 experts, 8 and 4 picks, a weight scale
+TEST(rung1_router_fast_equals_serial_bit_for_bit) {
+  if (!gpu_or_skip()) return;
+  bool all = true;
+  int rows_checked = 0;
+  for (const std::int64_t ne : {std::int64_t{256}, std::int64_t{160}})
+    for (const int nu : {8, 4})
+      for (const float wscale : {1.0f, 2.5f}) {
+        const std::int64_t rows = 41;
+        std::vector<float> lg(static_cast<std::size_t>(ne * rows));
+        std::uint32_t r = static_cast<std::uint32_t>(ne * 7 + nu);
+        for (float& v : lg) {
+          r = r * 1664525u + 1013904223u;
+          v = static_cast<float>(static_cast<int>(r >> 9) % 4001 - 2000) * 0.003f;
+        }
+        for (std::int64_t i = 0; i < ne; ++i) lg[static_cast<std::size_t>(3 * ne + i)] = 0.5f;  // all tied
+        for (std::int64_t i = 0; i < ne; i += 3) lg[static_cast<std::size_t>(7 * ne + i)] = 1.25f;  // many ties at the top
+        Dev<float> dl(lg), dw1(static_cast<std::size_t>(rows * nu)), dw2(static_cast<std::size_t>(rows * nu));
+        Dev<std::int32_t> ds1(static_cast<std::size_t>(rows * nu)), ds2(static_cast<std::size_t>(rows * nu));
+        g::router_topk_serial_for_tests(true);
+        CHECK(g::router_topk(dl.p, ne, rows, nu, wscale, ds1.p, dw1.p));
+        g::router_topk_serial_for_tests(false);
+        CHECK(g::router_topk(dl.p, ne, rows, nu, wscale, ds2.p, dw2.p));
+        CHECK(g::sync());
+        const std::vector<std::int32_t> s1 = ds1.get(), s2 = ds2.get();
+        const std::vector<float> w1 = dw1.get(), w2 = dw2.get();
+        all = all && s1 == s2 && std::memcmp(w1.data(), w2.data(), w1.size() * sizeof(float)) == 0;
+        rows_checked += static_cast<int>(rows);
+      }
+  CHECK(all);
+  std::printf("    %d rows (256 / 160 experts, 8 / 4 picks, weight scale 1 / 2.5, ties): shared-memory router = serial router bit for bit%s\n", rows_checked,
+              all ? "" : " (NOT)");
+}
+
 TEST(rung1_attention_against_fp64) {
   if (!gpu_or_skip()) return;
   const std::int64_t nh = 16, nkv = 2, hd = 256, qh = 2 * hd, qs = nh * qh, kv_w = nkv * hd;
