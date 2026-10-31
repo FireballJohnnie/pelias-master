@@ -230,6 +230,21 @@ const char* v12x8_name(int variant);
 cudaError_t gemm_q8x32_q4k_v12x8(const int8_t* a8, const float* sa32, const uint16_t* adig32, const BlockQ4K* w, const void* rec, const uint16_t* wdig8,
                                  float* C, int M, int N, int K, int batch, int variant, int raster, cudaStream_t s);
 cudaError_t v12x8_info(int variant, int* regs, int* local_bytes, int* smem, int* blocks_per_sm);
+// D (2026-10-30): one MoE layer slice on real routing. rmsnorm_q8x32: RMSNorm fused with the per-32 rounding (a8, scale
+// per 32, scale x sum per 32). gather_q8: packed row p = source row src[p] (zeros for src < 0): K int8, F floats, D u16.
+// silu_q8: H (P x 2F: gate | up) -> silu(gate) x up rounded for the down projection (per32 0: per 256 with sums and
+// digits as q8k; 1: per 32 with scale x sum). combine_rows: y[t] = sum_k w[t][k] O[prow[t][k]] in pick order.
+// gemm_list_v12 / gemm_list_v12x8: v12 / v12x8 (64-row tile, variant 2 or 3) over a device work list of int4 units
+// (expert, packed tile row, column tile origin, 0); experts with no rows have no units.
+cudaError_t rmsnorm_q8x32(const uint16_t* X, const uint16_t* gamma, int8_t* a8, float* sa32, float* x32, int M, int K, cudaStream_t s);
+cudaError_t gather_q8(const int* src, int P, int K, int F, int D, const int8_t* a8, const float* fv, const uint16_t* dv, int8_t* oa, float* of, uint16_t* od,
+                      cudaStream_t s);
+cudaError_t silu_q8(const float* H, int P, int F, int per32, int8_t* a8, float* sa, int* s32, float* x32, uint16_t* dig, cudaStream_t s);
+cudaError_t combine_rows(const float* O, const int* prow, const float* wt, int T, int n_used, int N, float* y, cudaStream_t s);
+cudaError_t gemm_list_v12(int nunits, const void* units, const int8_t* a8, const float* sa256, const uint16_t* adig, const BlockQ4K* w, const void* rec,
+                          const uint16_t* wdig, float* C, int P, int N, int K, int variant, cudaStream_t s);
+cudaError_t gemm_list_v12x8(int nunits, const void* units, const int8_t* a8, const float* sa32, const uint16_t* adig32, const BlockQ4K* w, const void* rec,
+                            const uint16_t* wdig8, float* C, int P, int N, int K, int variant, cudaStream_t s);
 // The bf16 GEMM on `batch` problems at once (A: batch x M x K, B: batch x N x K, C: batch x M x N), same tiles as gemm_bf16_tiled.
 cudaError_t gemm_bf16_batched(const uint16_t* A, const uint16_t* B, float* C, int M, int N, int K, int batch, int cfg, int raster, cudaStream_t s);
 // fp32 reference for v7's inputs (activation scale per 256).

@@ -1780,27 +1780,43 @@ struct alignas(16) V12Stage {
   uint16_t Bd[kBN][kDigLd];
 };
 
-template <int S, int BMT>
+template <int S, int BMT, bool kList = false>
 __global__ void __launch_bounds__(256, BMT == 64 ? 2 : 1) k_gemm_q8k_q4k_v12(const int8_t* __restrict__ a8, const float* __restrict__ sa256,
                                                                               const uint16_t* __restrict__ adig, const BlockQ4K* __restrict__ w,
                                                                               const uint4* __restrict__ rec, const uint16_t* __restrict__ wdig,
-                                                                              void* __restrict__ Cout, int M, int N, int K, int raster, int out_bf16) {
+                                                                              void* __restrict__ Cout, int M, int N, int K, int raster, int out_bf16,
+                                                                              const int4* __restrict__ units = nullptr) {
   constexpr int MI = BMT / 32;  // 16-row fragments per warp (warp rows BMT / 2)
   extern __shared__ __align__(16) uint8_t v12_smem[];
   V12Stage<BMT>* stg = reinterpret_cast<V12Stage<BMT>*>(v12_smem);
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
   const int wm = warp >> 2, wn = warp & 3;
   const int bpr = K / kQK;
-  const int splits = static_cast<int>(gridDim.y), split = static_cast<int>(blockIdx.y), z = static_cast<int>(blockIdx.z);
-  a8 += static_cast<size_t>(z) * M * K;
-  sa256 += static_cast<size_t>(z) * M * bpr;
-  adig += static_cast<size_t>(z) * M * bpr * 16;
-  w += static_cast<size_t>(z) * N * bpr;
-  rec += static_cast<size_t>(z) * N * bpr;
-  wdig += static_cast<size_t>(z) * N * bpr * 16;
-  int pm, pn;
-  tile_coords(raster, M / BMT, N / kBN, pm, pn);
-  const int bm = pm * BMT, bn = pn * kBN;
+  const int splits = static_cast<int>(gridDim.y), split = static_cast<int>(blockIdx.y);
+  int z, bm, bn;
+  if constexpr (kList) {  // O14 work list: unit = (expert, first packed row of the 64-row tile, column tile origin, unused);
+    // the activations / results are packed by expert (each expert's rows padded to the tile), so a row index is global
+    const int4 u = units[blockIdx.x];
+    z = u.x;
+    bm = u.y;
+    bn = u.z;
+    w += static_cast<size_t>(z) * N * bpr;
+    rec += static_cast<size_t>(z) * N * bpr;
+    wdig += static_cast<size_t>(z) * N * bpr * 16;
+    z = 0;  // no per-problem offset of A / C: bm is already global
+  } else {
+    z = static_cast<int>(blockIdx.z);
+    a8 += static_cast<size_t>(z) * M * K;
+    sa256 += static_cast<size_t>(z) * M * bpr;
+    adig += static_cast<size_t>(z) * M * bpr * 16;
+    w += static_cast<size_t>(z) * N * bpr;
+    rec += static_cast<size_t>(z) * N * bpr;
+    wdig += static_cast<size_t>(z) * N * bpr * 16;
+    int pm, pn;
+    tile_coords(raster, M / BMT, N / kBN, pm, pn);
+    bm = pm * BMT;
+    bn = pn * kBN;
+  }
   const int kspan = K / splits, kbeg = split * kspan;
   float acc[MI][4][4];
   int ai[MI][4][4];
@@ -2383,28 +2399,40 @@ __global__ void k_prep_q4k_dig8(const BlockQ4K* __restrict__ w, uint16_t* __rest
   }
 }
 
-template <int S, int BMT>
+template <int S, int BMT, bool kList = false>
 __global__ void __launch_bounds__(256, BMT == 64 ? 2 : 1) k_gemm_q8x32_q4k_v12x8(const int8_t* __restrict__ a8, const float* __restrict__ sa32,
                                                                                   const uint16_t* __restrict__ adig, const BlockQ4K* __restrict__ w,
                                                                                   const uint4* __restrict__ rec, const uint16_t* __restrict__ wdig8,
-                                                                                  float* __restrict__ C, int M, int N, int K, int raster) {
+                                                                                  float* __restrict__ C, int M, int N, int K, int raster,
+                                                                                  const int4* __restrict__ units = nullptr) {
   constexpr int MI = BMT / 32;
   extern __shared__ __align__(16) uint8_t v12x8_smem[];
   V12x8Stage<BMT>* stg = reinterpret_cast<V12x8Stage<BMT>*>(v12x8_smem);
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
   const int wm = warp >> 2, wn = warp & 3;
   const int bpr = K / kQK, n32 = K / 32;
-  const int z = static_cast<int>(blockIdx.z);
-  a8 += static_cast<size_t>(z) * M * K;
-  sa32 += static_cast<size_t>(z) * M * n32;
-  adig += static_cast<size_t>(z) * M * bpr * 16;
-  w += static_cast<size_t>(z) * N * bpr;
-  rec += static_cast<size_t>(z) * N * bpr;
-  wdig8 += static_cast<size_t>(z) * N * bpr * 16;
-  C += static_cast<size_t>(z) * M * N;
-  int pm, pn;
-  tile_coords(raster, M / BMT, N / kBN, pm, pn);
-  const int bm = pm * BMT, bn = pn * kBN;
+  int bm, bn;
+  if constexpr (kList) {  // O14 work list (see v12): rows packed by expert, bm global; only the weights move per expert
+    const int4 u = units[blockIdx.x];
+    w += static_cast<size_t>(u.x) * N * bpr;
+    rec += static_cast<size_t>(u.x) * N * bpr;
+    wdig8 += static_cast<size_t>(u.x) * N * bpr * 16;
+    bm = u.y;
+    bn = u.z;
+  } else {
+    const int z = static_cast<int>(blockIdx.z);
+    a8 += static_cast<size_t>(z) * M * K;
+    sa32 += static_cast<size_t>(z) * M * n32;
+    adig += static_cast<size_t>(z) * M * bpr * 16;
+    w += static_cast<size_t>(z) * N * bpr;
+    rec += static_cast<size_t>(z) * N * bpr;
+    wdig8 += static_cast<size_t>(z) * N * bpr * 16;
+    C += static_cast<size_t>(z) * M * N;
+    int pm, pn;
+    tile_coords(raster, M / BMT, N / kBN, pm, pn);
+    bm = pm * BMT;
+    bn = pn * kBN;
+  }
   float acc[MI][4][4];
 #pragma unroll
   for (int i = 0; i < MI; ++i)
@@ -2538,6 +2566,134 @@ __global__ void __launch_bounds__(256, BMT == 64 ? 2 : 1) k_gemm_q8x32_q4k_v12x8
       *reinterpret_cast<float2*>(C + static_cast<size_t>(r0) * N + c0) = make_float2(acc[mi][ni][0], acc[mi][ni][1]);
       *reinterpret_cast<float2*>(C + static_cast<size_t>(r0 + 8) * N + c0) = make_float2(acc[mi][ni][2], acc[mi][ni][3]);
     }
+}
+
+// ---------------------------------------------------------------- D (2026-10-30 21:0x): one MoE layer slice on real routing
+// Pieces: RMSNorm fused with the per-32 rounding (k_rmsnorm32: k_rmsnorm's arithmetic, then the per-32 quantizer of
+// k_quantize_rows_q8 on the same lanes); a row gather into the packed-by-expert layout; silu(gate) x up fused with the
+// rounding for the down projection (per 256: q8k_warp; per 32: the quad quantizer); the combine (each token's 8 rows,
+// weighted, summed in pick order: deterministic, no atomics).
+__global__ void __launch_bounds__(256) k_rmsnorm32(const uint16_t* __restrict__ X, const uint16_t* __restrict__ gamma, int K, float eps,
+                                                   int8_t* __restrict__ a8, float* __restrict__ sa32, float* __restrict__ x32) {
+  __shared__ float red[8];
+  const int row = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  const uint16_t* x = X + static_cast<size_t>(row) * K;
+  float ss = 0.f;
+  for (int c = tid * 8; c < K; c += 2048) {
+    float f[8];
+    bf16x8_to_f32(*reinterpret_cast<const uint4*>(x + c), f);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) ss = fmaf(f[i], f[i], ss);
+  }
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+  if (lane == 0) red[warp] = ss;
+  __syncthreads();
+  float tot = 0.f;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) tot += red[i];
+  const float rinv = rsqrtf(tot / static_cast<float>(K) + eps);
+  for (int c = tid * 8; c < K; c += 2048) {  // a quad of lanes holds one 32-group
+    float f[8], gm[8];
+    bf16x8_to_f32(*reinterpret_cast<const uint4*>(x + c), f);
+    bf16x8_to_f32(*reinterpret_cast<const uint4*>(gamma + c), gm);
+    float amax = 0.f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      f[i] = f[i] * rinv * gm[i];
+      amax = fmaxf(amax, fabsf(f[i]));
+    }
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+    const float scale = amax > 0.f ? amax / 127.f : 1.f;
+    const float inv = 1.f / scale;
+    int sum = 0;
+    uint32_t packed[2] = {0u, 0u};
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int q = max(-127, min(127, __float2int_rn(f[i] * inv)));
+      sum += q;
+      packed[i >> 2] |= (static_cast<uint32_t>(q) & 0xFFu) << ((i & 3) * 8);
+    }
+    sum += __shfl_xor_sync(0xffffffffu, sum, 1);
+    sum += __shfl_xor_sync(0xffffffffu, sum, 2);
+    *reinterpret_cast<uint2*>(a8 + static_cast<size_t>(row) * K + c) = make_uint2(packed[0], packed[1]);
+    if ((lane & 3) == 0) {
+      const size_t gi = (static_cast<size_t>(row) * K + c) / 32;
+      sa32[gi] = scale;
+      x32[gi] = scale * static_cast<float>(sum);
+    }
+  }
+}
+
+// packed row p takes source row src[p] (or zeros when src[p] < 0): K int8, F floats, D u16 per row
+__global__ void k_gather_q8(const int* __restrict__ src, int P, int K, int F, int D, const int8_t* __restrict__ a8, const float* __restrict__ fv,
+                            const uint16_t* __restrict__ dv, int8_t* __restrict__ oa, float* __restrict__ of, uint16_t* __restrict__ od) {
+  const int p = blockIdx.x;
+  if (p >= P) return;
+  const int r = src[p];
+  for (int i = threadIdx.x; i < K / 16; i += blockDim.x) {
+    const uint4 v = r >= 0 ? reinterpret_cast<const uint4*>(a8 + static_cast<size_t>(r) * K)[i] : make_uint4(0u, 0u, 0u, 0u);
+    reinterpret_cast<uint4*>(oa + static_cast<size_t>(p) * K)[i] = v;
+  }
+  for (int i = threadIdx.x; i < F; i += blockDim.x) of[static_cast<size_t>(p) * F + i] = r >= 0 ? fv[static_cast<size_t>(r) * F + i] : 0.f;
+  for (int i = threadIdx.x; i < D; i += blockDim.x) od[static_cast<size_t>(p) * D + i] = r >= 0 ? dv[static_cast<size_t>(r) * D + i] : static_cast<uint16_t>(0);
+}
+
+// H: P rows of 2 * F (gate | up); out: silu(gate) * up rounded to int8 for the down projection. One warp per 256 values.
+__global__ void k_silu_q8(const float* __restrict__ H, int P, int F, int per32, int8_t* __restrict__ a8, float* __restrict__ sa, int* __restrict__ s32,
+                          float* __restrict__ x32, uint16_t* __restrict__ dig) {
+  const size_t groups = static_cast<size_t>(P) * (F / 256);
+  const size_t warps = (static_cast<size_t>(gridDim.x) * blockDim.x) >> 5;
+  const int lane = threadIdx.x & 31;
+  for (size_t gidx = (blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x) >> 5; gidx < groups; gidx += warps) {
+    const size_t p = gidx / (F / 256), c0 = (gidx % (F / 256)) * 256 + lane * 8;
+    const float* hg = H + p * 2 * F + c0;
+    const float* hu = hg + F;
+    float f[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const float gv = hg[i];
+      f[i] = gv / (1.f + __expf(-gv)) * hu[i];
+    }
+    if (!per32) {
+      q8k_warp(f, lane, gidx, a8, sa, s32, x32, dig);
+      continue;
+    }
+    float amax = 0.f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) amax = fmaxf(amax, fabsf(f[i]));
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+    const float scale = amax > 0.f ? amax / 127.f : 1.f;
+    const float inv = 1.f / scale;
+    int sum = 0;
+    uint32_t packed[2] = {0u, 0u};
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int q = max(-127, min(127, __float2int_rn(f[i] * inv)));
+      sum += q;
+      packed[i >> 2] |= (static_cast<uint32_t>(q) & 0xFFu) << ((i & 3) * 8);
+    }
+    sum += __shfl_xor_sync(0xffffffffu, sum, 1);
+    sum += __shfl_xor_sync(0xffffffffu, sum, 2);
+    *reinterpret_cast<uint2*>(a8 + gidx * 256 + lane * 8) = make_uint2(packed[0], packed[1]);
+    if ((lane & 3) == 0) {
+      sa[gidx * 8 + (lane >> 2)] = scale;
+      x32[gidx * 8 + (lane >> 2)] = scale * static_cast<float>(sum);
+    }
+  }
+}
+
+// y[t][c] = sum_k w[t][k] x O[prow[t][k]][c], k in pick order
+__global__ void k_combine(const float* __restrict__ O, const int* __restrict__ prow, const float* __restrict__ wt, int T, int n_used, int N,
+                          float* __restrict__ y) {
+  const size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x;
+  if (i >= static_cast<size_t>(T) * N) return;
+  const int t = static_cast<int>(i / N), c = static_cast<int>(i % N);
+  float acc = 0.f;
+  for (int k = 0; k < n_used; ++k) acc = fmaf(wt[t * n_used + k], O[static_cast<size_t>(prow[t * n_used + k]) * N + c], acc);
+  y[i] = acc;
 }
 
 // Split-K: out[i] = sum over splits of part[s * n + i], as fp32 or bf16; n a multiple of 4.
@@ -3221,6 +3377,66 @@ cudaError_t v12x8_info(int variant, int* regs, int* local_bytes, int* smem, int*
   *local_bytes = static_cast<int>(fa.localSizeBytes);
   *smem = static_cast<int>(fa.sharedSizeBytes) + dyn;
   return cudaOccupancyMaxActiveBlocksPerMultiprocessor(blocks_per_sm, f, 256, dyn);
+}
+cudaError_t rmsnorm_q8x32(const uint16_t* X, const uint16_t* gamma, int8_t* a8, float* sa32, float* x32, int M, int K, cudaStream_t s) {
+  if (K % 256 || K > 2048 * 64) return cudaErrorInvalidValue;
+  k_rmsnorm32<<<M, 256, 0, s>>>(X, gamma, K, 1e-6f, a8, sa32, x32);
+  return cudaGetLastError();
+}
+cudaError_t gather_q8(const int* src, int P, int K, int F, int D, const int8_t* a8, const float* fv, const uint16_t* dv, int8_t* oa, float* of, uint16_t* od,
+                      cudaStream_t s) {
+  if (K % 16 || P < 1) return cudaErrorInvalidValue;
+  k_gather_q8<<<P, 128, 0, s>>>(src, P, K, F, D, a8, fv, dv, oa, of, od);
+  return cudaGetLastError();
+}
+cudaError_t silu_q8(const float* H, int P, int F, int per32, int8_t* a8, float* sa, int* s32, float* x32, uint16_t* dig, cudaStream_t s) {
+  if (F % 256 || P < 1) return cudaErrorInvalidValue;
+  const size_t groups = static_cast<size_t>(P) * (F / 256);
+  k_silu_q8<<<grid_for(groups * 32, 256), 256, 0, s>>>(H, P, F, per32, a8, sa, s32, x32, dig);
+  return cudaGetLastError();
+}
+cudaError_t combine_rows(const float* O, const int* prow, const float* wt, int T, int n_used, int N, float* y, cudaStream_t s) {
+  const size_t n = static_cast<size_t>(T) * N;
+  k_combine<<<static_cast<unsigned>((n + 255) / 256), 256, 0, s>>>(O, prow, wt, T, n_used, N, y);
+  return cudaGetLastError();
+}
+namespace {
+template <int S, int BMT>
+cudaError_t v12l_launch(int nunits, const int4* units, const int8_t* a8, const float* sa256, const uint16_t* adig, const BlockQ4K* w, const uint4* rec,
+                        const uint16_t* wdig, float* C, int P, int N, int K, cudaStream_t s) {
+  static cudaError_t once = cudaFuncSetAttribute(k_gemm_q8k_q4k_v12<S, BMT, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                 static_cast<int>(S * sizeof(V12Stage<BMT>)));
+  if (once != cudaSuccess) return once;
+  k_gemm_q8k_q4k_v12<S, BMT, true><<<nunits, 256, S * sizeof(V12Stage<BMT>), s>>>(a8, sa256, adig, w, rec, wdig, C, P, N, K, 0, 0, units);
+  return cudaGetLastError();
+}
+template <int S, int BMT>
+cudaError_t v12x8l_launch(int nunits, const int4* units, const int8_t* a8, const float* sa32, const uint16_t* adig, const BlockQ4K* w, const uint4* rec,
+                          const uint16_t* wd8, float* C, int P, int N, int K, cudaStream_t s) {
+  static cudaError_t once = cudaFuncSetAttribute(k_gemm_q8x32_q4k_v12x8<S, BMT, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                 static_cast<int>(S * sizeof(V12x8Stage<BMT>)));
+  if (once != cudaSuccess) return once;
+  k_gemm_q8x32_q4k_v12x8<S, BMT, true><<<nunits, 256, S * sizeof(V12x8Stage<BMT>), s>>>(a8, sa32, adig, w, rec, wd8, C, P, N, K, 0, units);
+  return cudaGetLastError();
+}
+}  // namespace
+// work-list GEMMs (64-row tile; variant 2 = 2 stages, 3 = 3 stages, as v12): units on the device, int4 (expert, packed
+// row of the tile, column tile origin, 0); P packed rows (a multiple of 64), C P x N
+cudaError_t gemm_list_v12(int nunits, const void* units, const int8_t* a8, const float* sa256, const uint16_t* adig, const BlockQ4K* w, const void* rec,
+                          const uint16_t* wdig, float* C, int P, int N, int K, int variant, cudaStream_t s) {
+  if (P % 64 || N % kBN || K % kQK || nunits < 1 || (variant != 2 && variant != 3)) return cudaErrorInvalidValue;
+  const int4* u = static_cast<const int4*>(units);
+  const uint4* r = static_cast<const uint4*>(rec);
+  return variant == 2 ? v12l_launch<2, 64>(nunits, u, a8, sa256, adig, w, r, wdig, C, P, N, K, s)
+                      : v12l_launch<3, 64>(nunits, u, a8, sa256, adig, w, r, wdig, C, P, N, K, s);
+}
+cudaError_t gemm_list_v12x8(int nunits, const void* units, const int8_t* a8, const float* sa32, const uint16_t* adig32, const BlockQ4K* w, const void* rec,
+                            const uint16_t* wdig8, float* C, int P, int N, int K, int variant, cudaStream_t s) {
+  if (P % 64 || N % kBN || K % kQK || nunits < 1 || (variant != 2 && variant != 3)) return cudaErrorInvalidValue;
+  const int4* u = static_cast<const int4*>(units);
+  const uint4* r = static_cast<const uint4*>(rec);
+  return variant == 2 ? v12x8l_launch<2, 64>(nunits, u, a8, sa32, adig32, w, r, wdig8, C, P, N, K, s)
+                      : v12x8l_launch<3, 64>(nunits, u, a8, sa32, adig32, w, r, wdig8, C, P, N, K, s);
 }
 cudaError_t kernel_info(int which, int* regs, int* local_bytes, int* static_smem, int* blocks_per_sm) {
   const void* f = nullptr;

@@ -16,6 +16,7 @@
 #include <cublasLt.h>
 
 #include <algorithm>
+#include <iterator>
 #include <functional>
 #include <memory>
 #include <vector>
@@ -1735,6 +1736,327 @@ inline int p_act32(Ctx& c, const Args& a) {
   r.notes = std::string(g_abort.load() ? "ABORTED: " + abort_reason() : "");
   write_result(c, r, "act32");
   std::printf("  ACT32 %s\n", r.headline.c_str());
+  return all_ok ? 0 : 3;
+}
+
+// ================================================================ D: one MoE layer slice on real routing (2026-10-30 21:0x)
+// The author's "merge now" (20:55): A (norm fused with the rounding), B (per-32 activation scales) and C (O14: a work
+// list for unequal expert counts) in one run, each piece timed on its own so the cost of each stays visible.
+// Routing from a PELROUT1 file (pelias kld --route-dump): one chunk's scored tokens, the 8 picks and weights per token, for
+// a few layers. Per layer: RMSNorm + rounding -> gather by expert -> gate|up (2048 -> 2 x 512 per expert) -> silu x up +
+// rounding -> down (512 -> 2048) -> weighted combine, for activation scales per 256 (v12 math) and per 32 (v12x8 math).
+// GEMMs three ways: the work list (only the experts that have rows, each padded to 64), the grouped launch padded to the
+// largest count (every expert, as v12 runs today), and an equal-count ideal with the same total rows. Weights and
+// activations synthetic (the layer's real routing only). Checks: the work-list GEMM equals the padded launch bit for bit on
+// every real row; both formats within 1e-3 of fp32 of their own inputs on 16 rows of the first active expert.
+namespace dslice {
+struct Routes {
+  unsigned n_ctx = 0, chunks = 0, scored = 0, n_layer = 0, n_used = 0;
+  std::vector<int16_t> sel;
+  std::vector<float> w;
+};
+inline Routes read_routes(const std::string& path) {
+  Routes r;
+  std::ifstream f(path, std::ios::binary);
+  if (!f) throw std::runtime_error("cannot read " + path);
+  std::vector<char> b((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+  if (b.size() < 36 || std::memcmp(b.data(), "PELROUT1", 8) != 0) throw std::runtime_error(path + " is not a PELROUT1 routing record");
+  unsigned h[5];
+  std::memcpy(h, b.data() + 8, sizeof h);
+  r.n_ctx = h[0];
+  r.chunks = h[1];
+  r.scored = h[2];
+  r.n_layer = h[3];
+  r.n_used = h[4];
+  if (r.n_used != 8) throw std::runtime_error("routing record: n_used must be 8");
+  const size_t recs = static_cast<size_t>(r.chunks) * r.scored * r.n_layer;
+  if (b.size() < 36 + recs * 72) throw std::runtime_error("routing record shorter than its header says");
+  r.sel.resize(recs * 8);
+  r.w.resize(recs * 8);
+  for (size_t i = 0; i < recs; ++i) {
+    std::memcpy(&r.sel[i * 8], b.data() + 36 + i * 72, 16);
+    std::memcpy(&r.w[i * 8], b.data() + 36 + i * 72 + 16, 32);
+  }
+  return r;
+}
+}  // namespace dslice
+
+inline int p_moe(Ctx& c, const Args& a) {
+  using namespace k2b;
+  Result r;
+  r.probe = "MOE-SLICE";
+  init_cuda(c);
+  const double peak8 = a.num("int8-peak", 259.5);
+  const std::string rpath = a.get("routes", "");
+  if (rpath.empty()) throw std::runtime_error("moe: --routes FILE (a pelias kld --route-dump record) is required");
+  const dslice::Routes R = dslice::read_routes(rpath);
+  const int chunk = static_cast<int>(a.inum("chunk", 0));
+  std::vector<int> layers;
+  {
+    std::stringstream ss(a.get("layers", "0,20,39"));
+    std::string tok;
+    while (std::getline(ss, tok, ',')) layers.push_back(std::stoi(tok));
+  }
+  std::vector<int> nchs;
+  {
+    std::stringstream ss(a.get("nchunks", "1,8"));
+    std::string tok;
+    while (std::getline(ss, tok, ',')) nchs.push_back(std::stoi(tok));
+  }
+  int nmax = 1;
+  for (const int n : nchs) nmax = std::max(nmax, n);
+  if (chunk < 0 || static_cast<unsigned>(chunk + nmax) > R.chunks) throw std::runtime_error("moe: --chunk / --nchunks out of range");
+  const int Tmax = static_cast<int>(R.scored) * nmax, E = 256, H = 2048, F = 512, NU = 8;
+  constexpr int kBMt = 64;
+  Stream s;
+  Sampler sampler(c.nvml);
+  sampler.start(200);
+  JW before = state_now(c);
+  auto tops = [](double macs, double ms) { return 2.0 * macs / (ms * 1e-3) / 1e12; };
+  // weights: experts' gate|up (E x 2F rows of H) and down (E x H rows of F), with v12's records / digits and v12x8's digits
+  JW why;
+  const double wneed = w8_bytes(E * 2 * F, H) + w8_bytes(E * H, F) + static_cast<double>(E) * 2 * F * (H / 256) * 32 + static_cast<double>(E) * H * (F / 256) * 32;
+  if (!fits(a, wneed + 3.0 * (1ull << 30), why)) throw std::runtime_error("moe: would cross the VRAM ceiling");
+  W8 wgu(E * 2 * F, H, 9100u, s), wdn(E * H, F, 9200u, s);
+  DevBuf gu8(static_cast<size_t>(E) * 2 * F * (H / 256) * 32), dn8(static_cast<size_t>(E) * H * (F / 256) * 32);
+  PP_CK(pkc::prep_q4k_dig8(wgu.q.as<pkc::BlockQ4K>(), gu8.as<uint16_t>(), E * 2 * F, H, s));
+  PP_CK(pkc::prep_q4k_dig8(wdn.q.as<pkc::BlockQ4K>(), dn8.as<uint16_t>(), E * H, F, s));
+  DevBuf X(static_cast<size_t>(Tmax) * H * 2), G(static_cast<size_t>(H) * 2), Xn(static_cast<size_t>(Tmax) * H * 2);
+  PP_CK(pkc::fill_bf16(X.as<uint16_t>(), static_cast<size_t>(Tmax) * H, 9300u, s));
+  PP_CK(pkc::fill_bf16(G.as<uint16_t>(), H, 9400u, s));
+  bool all_ok = true;
+  std::vector<JW> rows;
+  for (const int nch : nchs)
+  for (const int L : layers) {
+    if (g_abort.load()) break;
+    if (L < 0 || static_cast<unsigned>(L) >= R.n_layer) continue;
+    const int T = static_cast<int>(R.scored) * nch;  // nch consecutive chunks = one prompt of T tokens
+    // routing of this chunk and layer
+    std::vector<int> cnt(E, 0), sel(static_cast<size_t>(T) * NU);
+    std::vector<float> wt(static_cast<size_t>(T) * NU);
+    for (int t = 0; t < T; ++t) {
+      const size_t rec = (static_cast<size_t>(chunk) * R.scored + t) * R.n_layer + L;
+      for (int k = 0; k < NU; ++k) {
+        const int e = R.sel[rec * 8 + k];
+        if (e < 0 || e >= E) throw std::runtime_error("moe: expert index out of range in the routing record");
+        sel[static_cast<size_t>(t) * NU + k] = e;
+        wt[static_cast<size_t>(t) * NU + k] = R.w[rec * 8 + k];
+        ++cnt[e];
+      }
+    }
+    int active = 0, maxc = 0;
+    std::vector<int> off(E, 0);
+    int P = 0;
+    for (int e = 0; e < E; ++e) {
+      off[e] = P;
+      if (cnt[e]) ++active;
+      maxc = std::max(maxc, cnt[e]);
+      P += (cnt[e] + kBMt - 1) / kBMt * kBMt;
+    }
+    const int Me = (maxc + kBMt - 1) / kBMt * kBMt, Pp = Me * E;
+    const int Mi = ((T * NU + E - 1) / E + kBMt - 1) / kBMt * kBMt;  // equal-count ideal, same total rows
+    std::vector<int> src(P, -1), srcp(Pp, -1), prow(static_cast<size_t>(T) * NU), fill(E, 0);
+    for (int t = 0; t < T; ++t)
+      for (int k = 0; k < NU; ++k) {
+        const int e = sel[static_cast<size_t>(t) * NU + k], i = fill[e]++;
+        src[off[e] + i] = t;
+        srcp[e * Me + i] = t;
+        prow[static_cast<size_t>(t) * NU + k] = off[e] + i;
+      }
+    auto units_for = [&](int N) {
+      std::vector<int> u;
+      for (int e = 0; e < E; ++e)
+        for (int nt = 0; nt < N / 128; ++nt)
+          for (int mt = 0; mt < (cnt[e] + kBMt - 1) / kBMt; ++mt) {
+            u.push_back(e);
+            u.push_back(off[e] + mt * kBMt);
+            u.push_back(nt * 128);
+            u.push_back(0);
+          }
+      return u;
+    };
+    const std::vector<int> u1 = units_for(2 * F), u2 = units_for(H);
+    DevBuf dsrc(static_cast<size_t>(P) * 4), dsrcp(static_cast<size_t>(Pp) * 4), dprow(static_cast<size_t>(T) * NU * 4), dwt(static_cast<size_t>(T) * NU * 4),
+        du1(u1.size() * 4), du2(u2.size() * 4);
+    PP_CK(cudaMemcpyAsync(dsrc.as(), src.data(), src.size() * 4, cudaMemcpyHostToDevice, s));
+    PP_CK(cudaMemcpyAsync(dsrcp.as(), srcp.data(), srcp.size() * 4, cudaMemcpyHostToDevice, s));
+    PP_CK(cudaMemcpyAsync(dprow.as(), prow.data(), prow.size() * 4, cudaMemcpyHostToDevice, s));
+    PP_CK(cudaMemcpyAsync(dwt.as(), wt.data(), wt.size() * 4, cudaMemcpyHostToDevice, s));
+    PP_CK(cudaMemcpyAsync(du1.as(), u1.data(), u1.size() * 4, cudaMemcpyHostToDevice, s));
+    PP_CK(cudaMemcpyAsync(du2.as(), u2.data(), u2.size() * 4, cudaMemcpyHostToDevice, s));
+    const double macs1 = static_cast<double>(T) * NU * 2 * F * H, macs2 = static_cast<double>(T) * NU * H * F;  // useful work only
+    JW row;
+    row.kv("layer", L).kv("chunks", nch).kv("tokens", T).kv("active_experts", active).kv("max_rows_per_expert", maxc).kv("worklist_rows", P).kv("padded_rows", Pp);
+    row.kv("ideal_rows_per_expert", Mi).kv("units_gate_up", static_cast<int>(u1.size() / 4)).kv("units_down", static_cast<int>(u2.size() / 4));
+    std::printf("  layer %2d: %d tokens, %d of %d experts active, rows per expert max %d; work list %d rows, padded %d rows (x%.2f), ideal %d per expert\n", L, T, active,
+                E, maxc, P, Pp, static_cast<double>(Pp) / P, Mi);
+    std::fflush(stdout);
+    const int Pmax = std::max(P, std::max(Pp, Mi * E));
+    std::vector<float> y256;
+    for (const int per32 : {0, 1}) {
+      if (g_abort.load()) break;
+      const int nsa = per32 ? H / 32 : H / 256;
+      // token-side rounded activations
+      DevBuf ta8(static_cast<size_t>(T) * H), tsa(static_cast<size_t>(T) * (H / 32) * 4), ts32(static_cast<size_t>(T) * (H / 32) * 4),
+          tx32(static_cast<size_t>(T) * (H / 32) * 4), tdig(static_cast<size_t>(T) * (H / 256) * 32);
+      auto norm = [&] {
+        if (per32) {
+          PP_CK(pkc::rmsnorm_q8x32(X.as<uint16_t>(), G.as<uint16_t>(), ta8.as<int8_t>(), tsa.as<float>(), tx32.as<float>(), T, H, s));
+          PP_CK(pkc::dig_x32(tx32.as<float>(), tdig.as<uint16_t>(), T, H, s));
+        } else {
+          PP_CK(pkc::rmsnorm_q8k(X.as<uint16_t>(), G.as<uint16_t>(), ta8.as<int8_t>(), tsa.as<float>(), ts32.as<int>(), tx32.as<float>(), tdig.as<uint16_t>(), T, H, s));
+        }
+      };
+      auto norm2 = [&] {  // the two-pass form (norm to bf16, then round), for A's comparison
+        PP_CK(pkc::rmsnorm_bf16(X.as<uint16_t>(), G.as<uint16_t>(), Xn.as<uint16_t>(), T, H, s));
+        if (per32) {
+          PP_CK(pkc::quantize_rows_q8(Xn.as<uint16_t>(), ta8.as<int8_t>(), tsa.as<float>(), ts32.as<int>(), tx32.as<float>(), T, H, s));
+          PP_CK(pkc::dig_x32(tx32.as<float>(), tdig.as<uint16_t>(), T, H, s));
+        } else {
+          PP_CK(pkc::quantize_rows_q8k_dig(Xn.as<uint16_t>(), ta8.as<int8_t>(), tsa.as<float>(), ts32.as<int>(), tx32.as<float>(), tdig.as<uint16_t>(), T, H, s));
+        }
+      };
+      // packed (by expert) activations: work-list layout and padded layout share buffers sized to the larger
+      DevBuf pa8(static_cast<size_t>(Pmax) * H), psa(static_cast<size_t>(Pmax) * nsa * 4), pdig(static_cast<size_t>(Pmax) * (H / 256) * 32),
+          H1(static_cast<size_t>(Pmax) * 2 * F * 4), H1p(static_cast<size_t>(Pp) * 2 * F * 4), qa8(static_cast<size_t>(Pmax) * F),
+          qsa(static_cast<size_t>(Pmax) * (F / 32) * 4), qs32(static_cast<size_t>(Pmax) * (F / 32) * 4), qx32(static_cast<size_t>(Pmax) * (F / 32) * 4),
+          qdig(static_cast<size_t>(Pmax) * (F / 256) * 32), O(static_cast<size_t>(Pmax) * H * 4), Y(static_cast<size_t>(T) * H * 4);
+      auto gather = [&](const DevBuf& sidx, int rowsP) {
+        PP_CK(pkc::gather_q8(sidx.as<int>(), rowsP, H, nsa, (H / 256) * 16, ta8.as<int8_t>(), tsa.as<float>(), tdig.as<uint16_t>(), pa8.as<int8_t>(), psa.as<float>(),
+                             pdig.as<uint16_t>(), s));
+      };
+      const pkc::BlockQ4K* Wg = wgu.q.as<pkc::BlockQ4K>();
+      const pkc::BlockQ4K* Wd = wdn.q.as<pkc::BlockQ4K>();
+      int v1 = 3, v2 = 3;  // 64-row tile, 3 stages (the engine's adopted expert tile), both GEMMs
+      auto gemm1 = [&](float* out) {
+        if (per32)
+          PP_CK(pkc::gemm_list_v12x8(static_cast<int>(u1.size() / 4), du1.as(), pa8.as<int8_t>(), psa.as<float>(), pdig.as<uint16_t>(), Wg, wgu.rec.as(), gu8.as<uint16_t>(),
+                                     out, P, 2 * F, H, v1, s));
+        else
+          PP_CK(pkc::gemm_list_v12(static_cast<int>(u1.size() / 4), du1.as(), pa8.as<int8_t>(), psa.as<float>(), pdig.as<uint16_t>(), Wg, wgu.rec.as(), wgu.dig.as<uint16_t>(),
+                                   out, P, 2 * F, H, v1, s));
+      };
+      auto gemm1_grouped = [&](int Mrows, float* out) {  // every expert, Mrows each (padded or ideal)
+        if (per32)
+          PP_CK(pkc::gemm_q8x32_q4k_v12x8(pa8.as<int8_t>(), psa.as<float>(), pdig.as<uint16_t>(), Wg, wgu.rec.as(), gu8.as<uint16_t>(), out, Mrows, 2 * F, H, E, v1, 0, s));
+        else
+          PP_CK(pkc::gemm_q8k_q4k_v12(pa8.as<int8_t>(), psa.as<float>(), pdig.as<uint16_t>(), Wg, wgu.rec.as(), wgu.dig.as<uint16_t>(), out, Mrows, 2 * F, H, E, 1, 0,
+                                      nullptr, v1, 0, s));
+      };
+      auto act = [&] {
+        PP_CK(pkc::silu_q8(H1.as<float>(), P, F, per32, qa8.as<int8_t>(), qsa.as<float>(), qs32.as<int>(), qx32.as<float>(), qdig.as<uint16_t>(), s));
+        if (per32) PP_CK(pkc::dig_x32(qx32.as<float>(), qdig.as<uint16_t>(), P, F, s));
+      };
+      auto gemm2 = [&] {
+        if (per32)
+          PP_CK(pkc::gemm_list_v12x8(static_cast<int>(u2.size() / 4), du2.as(), qa8.as<int8_t>(), qsa.as<float>(), qdig.as<uint16_t>(), Wd, wdn.rec.as(), dn8.as<uint16_t>(),
+                                     O.as<float>(), P, H, F, v2, s));
+        else
+          PP_CK(pkc::gemm_list_v12(static_cast<int>(u2.size() / 4), du2.as(), qa8.as<int8_t>(), qsa.as<float>(), qdig.as<uint16_t>(), Wd, wdn.rec.as(), wdn.dig.as<uint16_t>(),
+                                   O.as<float>(), P, H, F, v2, s));
+      };
+      auto gemm2_grouped = [&](int Mrows) {
+        if (per32)
+          PP_CK(pkc::gemm_q8x32_q4k_v12x8(qa8.as<int8_t>(), qsa.as<float>(), qdig.as<uint16_t>(), Wd, wdn.rec.as(), dn8.as<uint16_t>(), O.as<float>(), Mrows, H, F, E, v2, 0, s));
+        else
+          PP_CK(pkc::gemm_q8k_q4k_v12(qa8.as<int8_t>(), qsa.as<float>(), qdig.as<uint16_t>(), Wd, wdn.rec.as(), wdn.dig.as<uint16_t>(), O.as(), Mrows, H, F, E, 1, 0, nullptr,
+                                      v2, 0, s));
+      };
+      auto comb = [&] { PP_CK(pkc::combine_rows(O.as<float>(), dprow.as<int>(), dwt.as<float>(), T, NU, H, Y.as<float>(), s)); };
+      // one full pass (work list), then the checks
+      norm();
+      gather(dsrc, P);
+      gemm1(H1.as<float>());
+      act();
+      gemm2();
+      comb();
+      PP_CK(cudaStreamSynchronize(s));
+      std::vector<float> h1(static_cast<size_t>(P) * 2 * F), y(static_cast<size_t>(T) * H);
+      PP_CK(cudaMemcpy(h1.data(), H1.as(), h1.size() * 4, cudaMemcpyDeviceToHost));
+      PP_CK(cudaMemcpy(y.data(), Y.as(), y.size() * 4, cudaMemcpyDeviceToHost));
+      // fp32 check of gate|up: 16 rows of the first active expert, its own inputs
+      int e0 = 0;
+      while (e0 < E && cnt[e0] < 16) ++e0;
+      double eref = 0.0;
+      if (e0 < E) {
+        DevBuf Rf(static_cast<size_t>(16) * 1024 * 4);
+        const size_t bpr = H / 256;
+        if (per32)
+          PP_CK(pkc::ref_q8_q4k_rows(pa8.as<int8_t>() + static_cast<size_t>(off[e0]) * H, psa.as<float>() + static_cast<size_t>(off[e0]) * nsa,
+                                     Wg + static_cast<size_t>(e0) * 2 * F * bpr, Rf.as<float>(), 16, 1024, H, s));
+        else
+          PP_CK(pkc::ref_q8k_q4k_rows(pa8.as<int8_t>() + static_cast<size_t>(off[e0]) * H, psa.as<float>() + static_cast<size_t>(off[e0]) * nsa,
+                                      Wg + static_cast<size_t>(e0) * 2 * F * bpr, Rf.as<float>(), 16, 1024, H, s));
+        eref = err_rows(H1.as<float>() + static_cast<size_t>(off[e0]) * 2 * F, false, 2 * F, Rf, 16, 1024, s);
+      }
+      // the padded grouped launch: same rows, bit for bit
+      gather(dsrcp, Pp);
+      gemm1_grouped(Me, H1p.as<float>());
+      PP_CK(cudaStreamSynchronize(s));
+      std::vector<float> h1p(static_cast<size_t>(Pp) * 2 * F);
+      PP_CK(cudaMemcpy(h1p.data(), H1p.as(), h1p.size() * 4, cudaMemcpyDeviceToHost));
+      bool same = true;
+      for (int e = 0; e < E && same; ++e)
+        for (int i = 0; i < cnt[e] && same; ++i)
+          same = std::memcmp(&h1[static_cast<size_t>(off[e] + i) * 2 * F], &h1p[static_cast<size_t>(e * Me + i) * 2 * F], static_cast<size_t>(2 * F) * 4) == 0;
+      bool finite = true;
+      for (const float v : y) finite = finite && std::isfinite(v);
+      const bool ok = same && finite && eref <= 1e-3;
+      all_ok = all_ok && ok;
+      // timings (warm, each stage on its own)
+      gather(dsrc, P);
+      const double t_norm = time_ms(s, norm, 60.0), t_norm2 = time_ms(s, norm2, 60.0);
+      norm();
+      const double t_gather = time_ms(s, [&] { gather(dsrc, P); }, 60.0);
+      const double t_g1 = time_ms(s, [&] { gemm1(H1.as<float>()); }, 60.0);
+      const double t_act = time_ms(s, act, 60.0);
+      const double t_g2 = time_ms(s, gemm2, 60.0);
+      const double t_comb = time_ms(s, comb, 60.0);
+      gather(dsrcp, Pp);
+      const double t_g1p = time_ms(s, [&] { gemm1_grouped(Me, H1p.as<float>()); }, 60.0);
+      const double t_g2p = time_ms(s, [&] { gemm2_grouped(Me); }, 60.0);
+      const double t_g1i = time_ms(s, [&] { gemm1_grouped(Mi, H1p.as<float>()); }, 60.0);
+      const double t_g2i = time_ms(s, [&] { gemm2_grouped(Mi); }, 60.0);
+      gather(dsrc, P);
+      const double t_all = time_ms(s, [&] { norm(); gather(dsrc, P); gemm1(H1.as<float>()); act(); gemm2(); comb(); }, 100.0);
+      const double sum_st = t_norm + t_gather + t_g1 + t_act + t_g2 + t_comb;
+      const char* fmtn = per32 ? "per-32" : "per-256";
+      JW j;
+      j.kv("format", fmtn).kv("ms_norm_fused", t_norm).kv("ms_norm_two_pass", t_norm2).kv("ms_gather", t_gather).kv("ms_gate_up_worklist", t_g1).kv("ms_silu_round", t_act);
+      j.kv("ms_down_worklist", t_g2).kv("ms_combine", t_comb).kv("ms_stages_sum", sum_st).kv("ms_whole_slice", t_all);
+      j.kv("ms_gate_up_padded", t_g1p).kv("ms_down_padded", t_g2p).kv("ms_gate_up_ideal", t_g1i).kv("ms_down_ideal", t_g2i);
+      j.kv("eps8_gate_up_worklist", tops(macs1, t_g1) / peak8).kv("eps8_down_worklist", tops(macs2, t_g2) / peak8);
+      j.kv("worklist_bit_equal_padded", same).kv("max_rel_err_vs_fp32_first_expert", eref).kv("output_finite", finite).kv("correct", ok);
+      row.kv_obj(per32 ? "per32" : "per256", j);
+      std::printf("    %-7s norm fused %.4f (two-pass %.4f) | gather %.4f | gate|up list %.4f (padded %.4f, ideal %.4f; %.3f of peak) | silu+round %.4f | down list %.4f "
+                  "(padded %.4f, ideal %.4f; %.3f of peak) | combine %.4f | whole slice %.4f ms; list = padded bit for bit: %s; vs fp32 %.2e%s\n",
+                  fmtn, t_norm, t_norm2, t_gather, t_g1, t_g1p, t_g1i, tops(macs1, t_g1) / peak8, t_act, t_g2, t_g2p, t_g2i, tops(macs2, t_g2) / peak8, t_comb, t_all,
+                  same ? "yes" : "NO", eref, ok ? "" : "  FAIL");
+      std::fflush(stdout);
+      if (!per32) {
+        y256 = y;
+      } else if (y256.size() == y.size()) {
+        double num = 0.0, den = 0.0;
+        for (size_t i = 0; i < y.size(); ++i) {
+          const double d = static_cast<double>(y[i]) - y256[i];
+          num += d * d;
+          den += static_cast<double>(y256[i]) * y256[i];
+        }
+        row.kv("y_rel_l2_per32_vs_per256", den > 0 ? std::sqrt(num / den) : 0.0);
+        std::printf("    layer output, per-32 vs per-256: relative L2 %.3e (the difference the activation format makes)\n", den > 0 ? std::sqrt(num / den) : 0.0);
+      }
+    }
+    rows.push_back(row);
+  }
+  const std::vector<Sample> all = sampler.stop();
+  r.inputs.kv("routes", rpath).kv("first_chunk", chunk).kv("tokens_per_chunk", static_cast<int>(R.scored)).kv("experts", E).kv("hidden", H).kv("expert_ffn", F).kv("int8_peak_tops", peak8);
+  r.inputs.kv("weights_activations", "synthetic (fill_q4k / fill_bf16); routing real");
+  r.values.arr_obj("layers", rows).kv("all_correct", all_ok).kv_obj("state_before", before).kv_obj("state_after", state_now(c)).kv_obj("nvml_whole_run", summarize(all));
+  r.pass = all_ok ? -1 : 0;
+  r.headline = std::string(all_ok ? "all checks passed" : "a check FAILED") + "; per-stage times per layer and format in the JSON";
+  r.notes = std::string(g_abort.load() ? "ABORTED: " + abort_reason() : "");
+  write_result(c, r, "moe_slice");
+  std::printf("  MOE-SLICE %s\n", r.headline.c_str());
   return all_ok ? 0 : 3;
 }
 
