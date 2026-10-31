@@ -2469,6 +2469,12 @@ inline int p_moe3(Ctx& c, const Args& a) {
     std::stringstream s3(a.get("cuts", "8,16,24,32"));
     while (std::getline(s3, tok, ',')) cuts.push_back(std::stoi(tok));
   }
+  std::vector<int> orders;  // 0: unit in blockIdx.x (S3); 1: column tile in blockIdx.x (S3b)
+  {
+    std::string tok;
+    std::stringstream s4(a.get("orders", "0"));
+    while (std::getline(s4, tok, ',')) orders.push_back(std::stoi(tok));
+  }
   int nmax = 1;
   for (const int n : nchs) nmax = std::max(nmax, n);
   if (chunk < 0 || static_cast<unsigned>(chunk + nmax) > R.chunks) throw std::runtime_error("moe3: --chunk / --nchunks out of range");
@@ -2631,19 +2637,21 @@ inline int p_moe3(Ctx& c, const Args& a) {
       const int max_tiles = NP / 64 + E;
       DevBuf dut(static_cast<size_t>(max_tiles) * 16), duv(static_cast<size_t>(E) * 16);
       std::vector<JW> cj;
+      for (const int ord : orders)
       for (const int cut : cuts) {
         if (g_abort.load()) break;
+        const bool colx = ord == 1;
         auto build = [&] {
           PP_CK(pkc::route_list_gpu(dsel.as<int16_t>(), dwt.as<float>(), T, NU, cut, dcnt.as<int>(), doff.as<int>(), dcur.as<int>(), dut.as(), duv.as(), dmeta.as<int>(),
                                     dsrc.as<int>(), drt.as<int>(), drw.as<float>(), dprow.as<int>(), s));
         };
         auto gemm1 = [&] {
-          PP_CK(pkc::s3_tiles(0, max_tiles, dmeta.as<int>(), dut.as(), A1(), s));
+          PP_CK(pkc::s3_tiles(0, max_tiles, dmeta.as<int>(), dut.as(), A1(), s, colx));
           PP_CK(pkc::s3_vec(0, cut, E, dmeta.as<int>() + 1, duv.as(), A1(), s));
         };
         auto gemm2 = [&](int epi) {
           const pkc::MoeArgs A = A2(drt.as<int>(), drw.as<float>(), sc32);
-          PP_CK(pkc::s3_tiles(epi, max_tiles, dmeta.as<int>(), dut.as(), A, s));
+          PP_CK(pkc::s3_tiles(epi, max_tiles, dmeta.as<int>(), dut.as(), A, s, colx));
           PP_CK(pkc::s3_vec(epi, cut, E, dmeta.as<int>() + 1, duv.as(), A, s));
         };
         auto fold = [&] {
@@ -2731,13 +2739,13 @@ inline int p_moe3(Ctx& c, const Args& a) {
         act(NP);
         const double t_fold = time_ms(s, fold, 60.0), t_sl = time_ms(s, s3_slice, 100.0);
         JW j;
-        j.kv("cut", cut).kv("tile_units", meta[0]).kv("vector_units", meta[1]).kv("ms_gpu_list_build", t_build).kv("ms_gate_up", t_g1).kv("ms_down_int32_fold", t_fold);
+        j.kv("grid_order", colx ? "column tile in x (S3b)" : "unit in x (S3)").kv("cut", cut).kv("tile_units", meta[0]).kv("vector_units", meta[1]).kv("ms_gpu_list_build", t_build).kv("ms_gate_up", t_g1).kv("ms_down_int32_fold", t_fold);
         j.kv("ms_whole_slice", t_sl).kv("over_s0", t_s0 / t_sl).kv("list_counts_match_host", list_ok).kv("rows_permutation_ok", perm_ok).kv("tile_rows_bit_equal_s0", tile_same);
         j.kv("vector_max_rel_vs_s0", vec_err).kv("fold_rel_l2_vs_s0", rl2).kv("fold_repeat_bit_equal", rep).kv("int32_overflows", static_cast<long long>(nov)).kv("ok", ok);
         cj.push_back(j);
-        std::printf("    S3 cut %2d: %4d tile + %3d vector units | GPU list %.4f ms | gate|up %.4f | down + int32 fold %.4f | whole slice %.4f ms (%.2fx of S0) | list = host %s, "
+        std::printf("    %-3s cut %2d: %4d tile + %3d vector units | GPU list %.4f ms | gate|up %.4f | down + int32 fold %.4f | whole slice %.4f ms (%.2fx of S0) | list = host %s, "
                     "tile rows = S0 bit for bit %s, vector %.1e, fold vs S0 %.1e, repeat %s, overflows %u%s\n",
-                    cut, meta[0], meta[1], t_build, t_g1, t_fold, t_sl, t_s0 / t_sl, list_ok ? "yes" : "NO", tile_same ? "yes" : "NO", vec_err, rl2, rep ? "same" : "DIFF",
+                    colx ? "S3b" : "S3", cut, meta[0], meta[1], t_build, t_g1, t_fold, t_sl, t_s0 / t_sl, list_ok ? "yes" : "NO", tile_same ? "yes" : "NO", vec_err, rl2, rep ? "same" : "DIFF",
                     nov, ok ? "" : "  FAIL");
         std::fflush(stdout);
       }

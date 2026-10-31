@@ -2729,7 +2729,7 @@ __device__ __forceinline__ void moe_epi(int row, int col, float v, float* C, int
   }
 }
 
-template <int S, int BMT, int EPI, bool kCompact = false>
+template <int S, int BMT, int EPI, bool kCompact = false, bool kColX = false>
 __global__ void __launch_bounds__(256, 2) k_moe_tile(const int8_t* __restrict__ a8, const float* __restrict__ sa32,
                                                                      const uint16_t* __restrict__ adig, const BlockQ4K* __restrict__ w,
                                                                      const uint4* __restrict__ rec, const uint16_t* __restrict__ wdig8,
@@ -2740,8 +2740,12 @@ __global__ void __launch_bounds__(256, 2) k_moe_tile(const int8_t* __restrict__ 
   // S3 (compact): units (expert, first row, valid rows, 0) built on the GPU; the column tile is blockIdx.y; the grid is an
   // upper bound and blocks past the GPU-written unit count leave at once; rows past the valid count are neither stored nor
   // added (they belong to the next expert in the unpadded layout)
+  // kColX (S3b, 21:38): the column tile in blockIdx.x and the unit in blockIdx.y, so the column tiles of one row tile run
+  // back to back (its activation tile read once from memory, then from L2), as S0's unit order did
+  const int ublk = kColX ? static_cast<int>(blockIdx.y) : static_cast<int>(blockIdx.x);
+  const int cblk = kColX ? static_cast<int>(blockIdx.x) : static_cast<int>(blockIdx.y);
   if constexpr (kCompact) {
-    if (static_cast<int>(blockIdx.x) >= *nunits) return;
+    if (ublk >= *nunits) return;
   }
   constexpr int WMW = BMT >= 32 ? 2 : 1, WNW = 8 / WMW, NI = 128 / (WNW * 8), WR = BMT / WMW, MI = WR / 16;
   static_assert(MI >= 1 && NI >= 1, "tile layout");
@@ -2750,11 +2754,11 @@ __global__ void __launch_bounds__(256, 2) k_moe_tile(const int8_t* __restrict__ 
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
   const int wm = warp / WNW, wn = warp % WNW;
   const int bpr = K / kQK, n32 = K / 32;
-  const int4 u = units[blockIdx.x];
+  const int4 u = units[kCompact ? ublk : static_cast<int>(blockIdx.x)];
   w += static_cast<size_t>(u.x) * N * bpr;
   rec += static_cast<size_t>(u.x) * N * bpr;
   wdig8 += static_cast<size_t>(u.x) * N * bpr * 16;
-  const int bm = u.y, bn = kCompact ? static_cast<int>(blockIdx.y) * kBN : u.z, vrows = kCompact ? u.z : BMT;
+  const int bm = u.y, bn = kCompact ? cblk * kBN : u.z, vrows = kCompact ? u.z : BMT;
   float acc[MI][NI][4];
 #pragma unroll
   for (int i = 0; i < MI; ++i)
@@ -3850,14 +3854,15 @@ cudaError_t route_list_gpu(const int16_t* sel, const float* wt, int T, int n_use
   return cudaGetLastError();
 }
 namespace {
-template <int EPI>
+template <int EPI, bool kColX>
 cudaError_t s3_tiles_launch(int max_units, const int* nunits, const int4* units, const MoeArgs& A, cudaStream_t s) {
-  static cudaError_t once = cudaFuncSetAttribute(k_moe_tile<3, 64, EPI, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  static cudaError_t once = cudaFuncSetAttribute(k_moe_tile<3, 64, EPI, true, kColX>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                                  static_cast<int>(3 * sizeof(V12x8Stage<64>)));
   if (once != cudaSuccess) return once;
   if (max_units < 1) return cudaSuccess;
-  k_moe_tile<3, 64, EPI, true><<<dim3(max_units, A.N / kBN), 256, 3 * sizeof(V12x8Stage<64>), s>>>(
-      A.a8, A.sa32, A.adig, A.w, static_cast<const uint4*>(A.rec), A.wdig8, units, A.N, A.K, A.C, A.rtok, A.rw, A.Yf, A.Yi, A.Yl, A.scale, A.ovf, nunits);
+  const dim3 grid = kColX ? dim3(A.N / kBN, max_units) : dim3(max_units, A.N / kBN);
+  k_moe_tile<3, 64, EPI, true, kColX><<<grid, 256, 3 * sizeof(V12x8Stage<64>), s>>>(A.a8, A.sa32, A.adig, A.w, static_cast<const uint4*>(A.rec), A.wdig8, units,
+                                                                                  A.N, A.K, A.C, A.rtok, A.rw, A.Yf, A.Yi, A.Yl, A.scale, A.ovf, nunits);
   return cudaGetLastError();
 }
 template <int EPI, int MR>
@@ -3875,14 +3880,22 @@ cudaError_t s3_vec_pick(int cut, int max_units, const int* nunits, const int4* u
   return s3_vec_launch<EPI, 32>(max_units, nunits, units, A, s);
 }
 }  // namespace
-cudaError_t s3_tiles(int epi, int max_units, const int* nunits, const void* units, const MoeArgs& A, cudaStream_t s) {
-  if (A.N % kBN || A.K % kQK || epi < 0 || epi > 3) return cudaErrorInvalidValue;
+cudaError_t s3_tiles(int epi, int max_units, const int* nunits, const void* units, const MoeArgs& A, cudaStream_t s, bool col_x) {
+  if (A.N % kBN || A.K % kQK || epi < 0 || epi > 3 || max_units > 65535) return cudaErrorInvalidValue;
   const int4* u = static_cast<const int4*>(units);
+  if (col_x) {
+    switch (epi) {
+      case 0: return s3_tiles_launch<0, true>(max_units, nunits, u, A, s);
+      case 1: return s3_tiles_launch<1, true>(max_units, nunits, u, A, s);
+      case 2: return s3_tiles_launch<2, true>(max_units, nunits, u, A, s);
+      default: return s3_tiles_launch<3, true>(max_units, nunits, u, A, s);
+    }
+  }
   switch (epi) {
-    case 0: return s3_tiles_launch<0>(max_units, nunits, u, A, s);
-    case 1: return s3_tiles_launch<1>(max_units, nunits, u, A, s);
-    case 2: return s3_tiles_launch<2>(max_units, nunits, u, A, s);
-    default: return s3_tiles_launch<3>(max_units, nunits, u, A, s);
+    case 0: return s3_tiles_launch<0, false>(max_units, nunits, u, A, s);
+    case 1: return s3_tiles_launch<1, false>(max_units, nunits, u, A, s);
+    case 2: return s3_tiles_launch<2, false>(max_units, nunits, u, A, s);
+    default: return s3_tiles_launch<3, false>(max_units, nunits, u, A, s);
   }
 }
 cudaError_t s3_vec(int epi, int cut, int max_units, const int* nunits, const void* units, const MoeArgs& A, cudaStream_t s) {

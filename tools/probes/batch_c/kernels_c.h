@@ -281,7 +281,7 @@ cudaError_t moe_tile_info(int bmt, int* regs, int* local_bytes, int* smem, int* 
 // blocks read the device count and leave; tile rows past the valid count are not stored or added.
 cudaError_t route_list_gpu(const int16_t* sel, const float* wt, int T, int n_used, int cut, int* cnt, int* off, int* cursor, void* ut, void* uv, int* meta, int* src,
                            int* rtok, float* rw, int* prow, cudaStream_t s);
-cudaError_t s3_tiles(int epi, int max_units, const int* nunits, const void* units, const MoeArgs& A, cudaStream_t s);
+cudaError_t s3_tiles(int epi, int max_units, const int* nunits, const void* units, const MoeArgs& A, cudaStream_t s, bool col_x = false);  // col_x: S3b grid order
 cudaError_t s3_vec(int epi, int cut, int max_units, const int* nunits, const void* units, const MoeArgs& A, cudaStream_t s);
 // The bf16 GEMM on `batch` problems at once (A: batch x M x K, B: batch x N x K, C: batch x M x N), same tiles as gemm_bf16_tiled.
 cudaError_t gemm_bf16_batched(const uint16_t* A, const uint16_t* B, float* C, int M, int N, int K, int batch, int cfg, int raster, cudaStream_t s);
