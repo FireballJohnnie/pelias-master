@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -298,7 +299,7 @@ TEST(rung1_rms_norm_q8x32_fused_equals_two_kernels) {
                           m1.get() == m2.get();
         CHECK(same);
         CHECK(all_finite(r2.get()));
-        if (!same || !hasw) continue;
+        if (!same || !hasw || std::getenv("PELIAS_GPU_QUICK") != nullptr) continue;  // timing: not under the sanitizers
         // timing (warm, information only): the two kernels against the fused one, int8 outputs only (xr / y not written),
         // at 1 row (decode) and 2,048 rows (a prompt)
         const auto time_us = [&](int reps, const auto& fn) {
