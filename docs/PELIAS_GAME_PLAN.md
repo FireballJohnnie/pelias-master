@@ -39,8 +39,72 @@ Copyright (c) 2026 John Lipka and the Pelias contributors
 - ~~R2-256 / R2-row~~: struck. **Corrected reason:** the +0.000999 in the draft is the cost of one *activation scale* per 256 (the gpu256 format, MEASURED), a different thing from the *weight rotation* block size these two runs would test. They were to run "only if Block C lands close to Unsloth". The tiered file is 26.6 % below Unsloth (0.009404 vs 0.012808, MEASURED), so the condition never came up.
 - ~~v18 first engine run~~: done 2026-10-31 14:50-15:13 (MEASURED, gp/ENGINE). Build clean in 38 s; 27 / 27 GPU tests; decode 12.1-13.0 tok/s; sanitizers 0 errors from all four tools (the only test failure under them is verify/keep at 1.07e-4 over 1e-4, the drift below). Its follow-ups are in the GP3-14 section below.
 
+### Post-v22 order (author 17:39, from the GPU / CPU mismatch; checked against the logs; this order governs, the 15:09 lines below stay as the item detail)
+
+**Framing (MEASURED v19-v21):**
+- The engine's step was the GPU and the CPU taking turns: per token, the CPU waited 28.0 ms for the GPU and the GPU waited 15.0 ms for the CPU.
+- Each side paid per job rather than per byte:
+  - CPU: 5.9 GB/s, threads 36-39 % busy.
+  - GPU: two slow operations. The router + top-k took 13.0 ms (a one-thread serial loop over global memory). The bank experts took 21.6 ms (grids launched for all 256 experts, almost all empty).
+- v22 fixes the GPU pair and runs the bank self-test (results pending at the time of writing).
+
+**Standing rule (author):**
+- Engine gates and speed numbers use real text, never made-up token IDs. v18 → v19: picks on the GPU 40 % → 64 %, and the top-1 gate went from FAIL to PASS on the same engine (MEASURED).
+- Made-up IDs stay fine for the small-model bit-for-bit tests.
+
+**Strikes (confirmed; corrections to the 17:39 draft):**
+- ~~r2b_exps.gguf~~: already gone. It was moved 10-28 and the to-delete folders were empty at 15:1x. D: has 116 GB free (not 57). Corrected reason: R2b (experts rotated) showed no difference from stock (+0.000530, not resolved); the +0.003980 is its gap to dense-only R2 (DERIVED).
+- ~~O13 persistent-tile route~~: closed. v13 ran at 0.84-1.03x of v12, v13b at 1.00x. Corrected:
+  - The bank's 21.6 ms tie-in to empty blocks is v22's hypothesis until v22 measures it.
+  - O13 itself (the down projection at 0.27-0.29 of peak) stays open, behind the steps below.
+- ~~GP1-12~~ and ~~GP1-16~~: confirmed.
+- ~~R2-256 / R2-row~~: struck. Corrected reason: 0.000999 is the cost of one activation scale per 256, not the rotation size. The runs were conditional on Block C landing close to Unsloth, which never happened (tiered is 26.6 % below).
+
+**Step 0 (new): fix the bank slot that v22's self-test names; the split check must then match plain decode.**
+
+**Step 1: the CPU cold-expert gap.**
+- **Target:** cold work is 30 ms per token (v20) at 5.9-7.1 GB/s.
+- **Corrected ceiling:** most cold bytes are Q4_TG2, the floor type for little-used experts. Its CPU decoder measured 17 GB/s; 28-39 GB/s is Q4_K / Q6_K / Q8_0 int8. Getting past 17 needs the Q4_TG2 decoder raised (game plan C6, byte-plane grid). RAM reads at 40-42 GB/s (MEASURED).
+- 218 MB per token at 17 GB/s = 12.8 ms; at 25-35 GB/s = 6.2-8.7 ms (DERIVED).
+- **Action:** one dispatch per layer. Workers wake once at the ring, then run gate/up + silu and down over all cold picks with one atomic barrier between them and no re-dispatch. Plus the thread count and the spin-vs-sleep policy (corrected: these are the engine's own counterparts of the tier build's `-t 7` / `--poll 100`).
+- **Corrected:** Fable's CPU items are for the CPU reference / kld path, not the engine's cold path: AVX2 in the quantizer, the 3.2 GB of zeroes, the 128 KB copy tile, rounding shared inputs once. The persistent pool is already built (GP3-14). The engine's cold path already uses kern::dot_row_q8 (AVX2). Fable's items move to Step 5, where kld speed matters.
+
+**Step 2: the CPU's wait for the GPU (U8 + O15 + int32 fold).**
+- **Corrected:** the doorbell already rings right after the router (v21 stamps: picks to host + ring sit between the router and the bank experts / shared expert).
+- **Corrected:** v19's "dense 22.6 ms" included the router's 13.0 ms (v21). After v22 the pre-ring GPU work is about 12-13 ms per token: products 7.0, core 2.2, norms / small ops / residuals ~3, router under 1 (DERIVED). The non-product share is ~5 ms, not 15.6.
+- **Action:** U8 (one R3 plan per token + CUDA Graph; replay 0.716 µs vs 4.70 µs eager, MEASURED), O15's two untested doorbell orderings, int32 fold.
+
+**Step 3: MTP.**
+- **Target:** drafts 3.1 ms each; verify of 2 / 3 / 4 tokens 117 / 132 / 157 ms; GPU busy 45 → 66 / 79 / 89 ms (MEASURED v20).
+- v22's grid change already applies to verify batches (no tile launch at 8 tokens or fewer).
+- **Actions:**
+  - R3 reading each weight once for batches of 2-4.
+  - Drafts' cold experts read by the GPU from host memory (dual bus; kept from the 16:34 order, step 4). Without it, the verify's CPU work still grows with its tokens.
+  - MTP bank uploads only the swapped experts. Corrected: an expert is 1.8-3.3 MB by tier, not 1.9 (DERIVED); copy and compute together measured 1.97-1.98x of an ideal 1.99x.
+
+**Step 4: second text + context (Q4 / GP1-10, B4, GP2-11, the locked file on a second text, hot-set re-profile, GP1-09, B6 / GP2-06, DeltaNet path).**
+- **Corrected:** 64 % (v19-v22) and 77.5 % are both WikiText:
+  - 64 % is the engine's bank of 7.93 GB on held-out WikiText (tokens 102,400 on).
+  - 0.775 is the tier build's live hit rate with a 7.0 GiB bank.
+  - Chat+code is a separate measurement: WikiText's top 64 cover 35.9 % of its picks.
+- **Corrected:** B4 needs a held-out chat+code text. The chat+code text behind 35.9 % is Unsloth's calibration text, which tier_v1's importance matrix was built on.
+- **Corrected (DeltaNet):** lock the registers kernel + checkpoints for prefill, decode and verify. 2.01 ms per 1,000-token prompt vs C16's 3.12 ms; decode 11.97 µs vs 27.0 µs (MEASURED). C16 stays only if GP1-09 shows it ahead at 4K+.
+- B6 / GP2-06 as ruled 15:09 (KV q8_0 + int8-row checkpoints every 256 tokens), validated on GP1-09.
+
+**Step 5: parked accuracy, after Step 1.**
+- Fable's CPU items, then `PELIAS_PROF=1 kld --chunks 2` and the 8/12/16-thread kld.
+- Tie band B = 0.1 vs the top 10 % / 20 % of block-scaled error energy, against +0.001009 KL.
+- Planes in the engine, top 4 picks (0.008800, 92 % of the every-pick gain, 0 VRAM).
+- **Corrected (name):** B9 / GP2-12 is the Pelias-made *scoring* base (bf16 reference logits). The master file (rotated Q7_ZT dense at 7.53 bpw and −236.4 MB + tiered experts + v2 dense and head planes) is a separate item. "5.7-6.9 % faster" is the Q7_ZT fold route vs Q8_Z.
+
+**Step 6: native Windows (GP4-04 + BAR1 + NVML) for the GP4-01 / GP4-02 benchmarks.**
+- Nsight gave an empty trace under WSL (v20).
+- **Corrected (P2):** v18 sat in P2 for 98 % of samples at 11,251 vs 11,501 MHz, about 2.2 % of bandwidth (MEASURED / DERIVED). Windows also showed P2 at idle (15:11). Whether Windows holds P0 is UNMEASURED, so the gain is at most ~2 %.
+- BAR1 flag 0.8-1.4 µs vs 2.40 µs; uploads 12.5-12.7 → 22.5-22.7 GB/s (MEASURED).
+- The engine needs its Windows build first; block_wingpu_v2c built the earlier kernels at 30c78ab.
+
 ### Execution lines (the author's grouping, 15:09)
-**Run order:** unchanged from the game plan: A, then C (CPU), then D, then F; B and E follow. A change of order is the author's call.
+**Run order:** superseded by the post-v22 order above (author 17:39).
 
 **v18 friction → line (MEASURED 14:52-14:59):**
 - Host waits of 24-26 ms per token → Line A.
