@@ -30,6 +30,8 @@ bool to_device(void* dst, const void* src, std::size_t bytes, Stream s = nullptr
 bool to_host(void* dst, const void* src, std::size_t bytes, Stream s = nullptr);
 bool dzero(void* p, std::size_t bytes, Stream s = nullptr);
 bool sync(Stream s = nullptr);
+// free and total device memory now (cudaMemGetInfo); false when no device answers
+bool mem_info(std::size_t* free_bytes, std::size_t* total_bytes);
 
 // ---- products straight from GGUF storage (gemm_gguf)
 // y[t * ldy + r] = sum_i W[r][i] * x[t * ldx + i] for r < n_out, t < n_tok; W in one of the types of gpu_decode.h

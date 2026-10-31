@@ -118,7 +118,7 @@ endif()
 # GP3-12 rungs 2-3 / GP3-14: the trunk on the GPU (host orchestration over kern/gpu_ops and kern/gpu_prompt; with the
 # stubs when PELIAS_CUDA is off, so every caller builds and gets "no GPU backend")
 pelias_add_module(pelias_engine
-  SOURCES src/model/gpu_forward.cpp
+  SOURCES src/model/gpu_forward.cpp src/model/gpu_engine.cpp
   DEPENDS pelias_model pelias_kern_gpu pelias_quant)
 pelias_add_module(pelias_verify
   SOURCES src/verify/kl.cpp

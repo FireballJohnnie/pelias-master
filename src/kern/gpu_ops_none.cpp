@@ -21,6 +21,7 @@ bool to_device(void*, const void*, std::size_t, Stream) { return false; }
 bool to_host(void*, const void*, std::size_t, Stream) { return false; }
 bool dzero(void*, std::size_t, Stream) { return false; }
 bool sync(Stream) { return false; }
+bool mem_info(std::size_t*, std::size_t*) { return false; }
 bool matmul(std::uint32_t, const void*, std::uint64_t, std::int64_t, std::int64_t, const float*, std::int64_t, std::int64_t, float*, std::int64_t,
             Stream) {
   return false;

@@ -821,6 +821,13 @@ bool to_host(void* dst, const void* src, std::size_t bytes, Stream s) {
 }
 bool dzero(void* p, std::size_t bytes, Stream s) { return ck(cudaMemsetAsync(p, 0, bytes, st(s)), "cudaMemset"); }
 bool sync(Stream s) { return ck(cudaStreamSynchronize(st(s)), "synchronize"); }
+bool mem_info(std::size_t* free_bytes, std::size_t* total_bytes) {
+  std::size_t f = 0, t = 0;
+  if (!ck(cudaMemGetInfo(&f, &t), "cudaMemGetInfo")) return false;
+  if (free_bytes) *free_bytes = f;
+  if (total_bytes) *total_bytes = t;
+  return true;
+}
 
 // the format tables of gpu_decode.h on the device, uploaded once (34,432 bytes: the Q4_TG grids, the IQ grids, the signs)
 bool device_tables(Tables* out) {

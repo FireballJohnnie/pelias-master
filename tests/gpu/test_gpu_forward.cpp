@@ -25,6 +25,7 @@
 #include "kern/gpu_ops.h"
 #include "model/arch_qwen35moe.h"
 #include "model/gpu_forward.h"
+#include "model/gpu_engine.h"
 #include "model/spec.h"
 #include "os/file_map.h"
 #include "pelias_test.h"
@@ -238,4 +239,109 @@ TEST(rung3_whole_trunk_on_the_gpu_against_the_reference) {
   if (!sm.ok) return;
   const int n = std::getenv("PELIAS_GPU_QUICK") ? 24 : 96;
   compare(sm, {0, 1, 2, 3}, n, "four layers (all expert types)");
+}
+
+namespace {
+
+// GP3-14 stages 1-2: the engine over a sequence fed in pieces (prefill chunks, then one token at a time) against the
+// reference's fresh pass with the same roundings. hot: experts 0 .. hot-1 of every layer in the GPU bank, the rest on
+// the CPU (0: every expert on the CPU; 8: every expert on the GPU).
+void engine_case(const Small& sm, int hot, const char* what) {
+  const m::Qwen35MoeSpec& s = sm.spec;
+  const int n = std::getenv("PELIAS_GPU_QUICK") ? 20 : 48, nv = static_cast<int>(s.n_vocab);
+  std::vector<std::int32_t> tok(static_cast<std::size_t>(n));
+  for (int t = 0; t < n; ++t) tok[static_cast<std::size_t>(t)] = static_cast<std::int32_t>((t * 53 + 7) % 1000);
+  std::vector<float> ref(static_cast<std::size_t>(n) * static_cast<std::size_t>(nv)), eng(ref.size());
+  m::ForwardOptions o = m::GpuForward::matching_reference_options();
+  o.threads = 4;
+  CHECK(m::forward_reference(s, sm.w, tok.data(), n, 0, n, ref.data(), o).ok());
+  m::EngineOptions eo;
+  eo.max_ctx = 128;
+  eo.max_batch = 16;
+  eo.cpu_threads = 4;
+  if (hot > 0) {
+    eo.hot_order.assign(s.n_layer, {});
+    for (auto& v : eo.hot_order)
+      for (int e = 0; e < static_cast<int>(s.n_expert); ++e) v.push_back(e);
+    eo.max_hot_per_layer = hot;
+  }
+  auto f = m::GpuEngine::open(s, sm.w, eo);
+  CHECK(f.ok());
+  if (!f.ok()) {
+    std::printf("    %s: open failed: %s\n", what, f.status.text().c_str());
+    return;
+  }
+  CHECK(f.value->bank_experts() == static_cast<int>(s.n_layer) * hot);
+  // two passes: the second after reset() must give the same logits bit for bit (the state is carried, not leaked)
+  std::vector<float> first;
+  std::uint64_t hp = 0, cp = 0;
+  for (int pass = 0; pass < 2; ++pass) {
+    CHECK(f.value->reset().ok());
+    int t = 0;
+    const int chunk[2] = {16, 13};  // prefill pieces, then single tokens
+    for (int c = 0; c < 2 && t < n; ++c) {
+      const int k = std::min(chunk[c], n - t);
+      m::EngineStats es;
+      const pelias::Status ps = f.value->step(tok.data() + t, k, eng.data() + static_cast<std::size_t>(t) * static_cast<std::size_t>(nv), false, &es);
+      CHECK(ps.ok());
+      if (!ps.ok()) {
+        std::printf("    %s: step failed: %s\n", what, ps.text().c_str());
+        return;
+      }
+      hp += es.hot_picks;
+      cp += es.cold_picks;
+      t += k;
+    }
+    for (; t < n; ++t) {
+      m::EngineStats es;
+      CHECK(f.value->step(tok.data() + t, 1, eng.data() + static_cast<std::size_t>(t) * static_cast<std::size_t>(nv), true, &es).ok());
+      hp += es.hot_picks;
+      cp += es.cold_picks;
+    }
+    CHECK(f.value->pos() == n);
+    if (pass == 0) first = eng;
+    else CHECK(std::memcmp(first.data(), eng.data(), eng.size() * sizeof(float)) == 0);
+  }
+  double num = 0.0, den = 0.0, kl_sum = 0.0, kl_max = 0.0;
+  int top_same = 0;
+  bool finite = true;
+  for (int t = 0; t < n; ++t) {
+    const float* r = ref.data() + static_cast<std::size_t>(t) * static_cast<std::size_t>(nv);
+    const float* gq = eng.data() + static_cast<std::size_t>(t) * static_cast<std::size_t>(nv);
+    int ar = 0, ag = 0;
+    for (int i = 0; i < nv; ++i) {
+      finite = finite && std::isfinite(gq[i]);
+      const double d = static_cast<double>(gq[i]) - r[i];
+      num += d * d;
+      den += static_cast<double>(r[i]) * r[i];
+      if (r[i] > r[ar]) ar = i;
+      if (gq[i] > gq[ag]) ag = i;
+    }
+    top_same += ar == ag ? 1 : 0;
+    const double k = kl(r, gq, nv);
+    kl_sum += k;
+    kl_max = std::max(kl_max, k);
+  }
+  const double kl_mean = kl_sum / n, top = static_cast<double>(top_same) / n;
+  CHECK(finite);
+  CHECK(kl_mean <= 1e-4);
+  CHECK(top >= 0.95);
+  if (hot == 0) CHECK(hp == 0);
+  if (hot == static_cast<int>(s.n_expert)) CHECK(cp == 0);
+  if (hot > 0 && hot < static_cast<int>(s.n_expert)) CHECK(hp > 0 && cp > 0);
+  std::printf("    %-34s %3d tokens: logits rel L2 %.3e; KL mean %.3e max %.3e; top-1 equal %d / %d; picks GPU %llu CPU %llu; reset repeat bit for bit\n", what, n,
+              den > 0 ? std::sqrt(num / den) : 0.0, kl_mean, kl_max, top_same, n, static_cast<unsigned long long>(hp / 2), static_cast<unsigned long long>(cp / 2));
+}
+
+}  // namespace
+
+TEST(rung4_engine_decode_against_the_reference) {
+  if (!g::available()) return;
+  Small sm;
+  small_model(sm);
+  CHECK(sm.ok);
+  if (!sm.ok) return;
+  engine_case(sm, 0, "engine, every expert on the CPU");
+  engine_case(sm, 4, "engine, half the experts in the bank");
+  engine_case(sm, 8, "engine, every expert in the bank");
 }
