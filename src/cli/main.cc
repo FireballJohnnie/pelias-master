@@ -131,7 +131,7 @@ void usage() {
       "pelias <command> [options]\n"
       "  version                         build version and backends\n"
       "  device [--index N]              what the GPU reports (CUDA and NVML), and the VRAM ceiling\n"
-      "  gpu-check --model FILE [--tokens 64] [--layers N] [--repeat 3] [--threads N] [--fast-cpu] [--no-cpu]\n"
+      "  gpu-check --model FILE [--tokens 64] [--layers N] [--repeat 3] [--threads N] [--fast-cpu] [--no-cpu] [--floor] [--float-ref]\n"
       "                                  GP3-12: the trunk on the GPU (prefill, fresh sequence) against the CPU reference with the\n"
       "                                  same per-32 int8 rounding: KL, top-1, logits error; GPU time per call and tokens/s\n"
       "  mtp-logits --model FILE --ids 1,2,3 --out OUT.bin [--threads N] [--fast-cpu]\n"
@@ -1887,7 +1887,7 @@ int cmd_logits(const Args& a) {
 int cmd_gpu_check(const Args& a) {
   const std::string path = a.get("model");
   if (path.empty()) {
-    std::fprintf(stderr, "usage: pelias gpu-check --model FILE [--tokens 64] [--layers N] [--repeat 3] [--threads N] [--fast-cpu] [--no-cpu]\n");
+    std::fprintf(stderr, "usage: pelias gpu-check --model FILE [--tokens 64] [--layers N] [--repeat 3] [--threads N] [--fast-cpu] [--no-cpu] [--floor] [--float-ref]\n");
     return 1;
   }
   auto num = [&](const char* k, std::uint64_t def, std::uint64_t lo, std::uint64_t hi, std::uint64_t& v) {
@@ -1945,42 +1945,81 @@ int cmd_gpu_check(const Args& a) {
   Timer tcpu;
   if (Status rs = model::forward_reference(s, w.value, ids.data(), n, 0, n, lg_ref.data(), o); !rs) return fail_input(rs);
   const double cpu_s = tcpu.seconds();
-  double num2 = 0.0, den = 0.0, worst = 0.0, kl_sum = 0.0, kl_max = 0.0;
-  int top = 0;
-  for (int t = 0; t < n; ++t) {
-    const float* r = lg_ref.data() + static_cast<std::size_t>(t) * nv;
-    const float* gq = lg_gpu.data() + static_cast<std::size_t>(t) * nv;
-    std::size_t ar = 0, ag = 0;
-    double mr = r[0], mg = gq[0];
-    for (std::size_t i = 0; i < nv; ++i) {
-      const double d = static_cast<double>(gq[i]) - r[i];
-      num2 += d * d;
-      den += static_cast<double>(r[i]) * r[i];
-      worst = std::max(worst, std::fabs(d));
-      if (r[i] > r[ar]) ar = i;
-      if (gq[i] > gq[ag]) ag = i;
-      mr = std::max(mr, static_cast<double>(r[i]));
-      mg = std::max(mg, static_cast<double>(gq[i]));
+  struct Cmp {
+    double rel, worst, kl_mean, kl_max;
+    int top;
+  };
+  // b against a (a the reference side): logits rel L2, largest |diff|, KL(a || b) per token, top-1 agreement
+  auto compare = [&](const std::vector<float>& ra, const std::vector<float>& rb) {
+    double num2 = 0.0, den = 0.0, worst = 0.0, kl_sum = 0.0, kl_max = 0.0;
+    int top = 0;
+    for (int t = 0; t < n; ++t) {
+      const float* r = ra.data() + static_cast<std::size_t>(t) * nv;
+      const float* gq = rb.data() + static_cast<std::size_t>(t) * nv;
+      std::size_t ar = 0, ag = 0;
+      double mr = r[0], mg = gq[0];
+      for (std::size_t i = 0; i < nv; ++i) {
+        const double d = static_cast<double>(gq[i]) - r[i];
+        num2 += d * d;
+        den += static_cast<double>(r[i]) * r[i];
+        worst = std::max(worst, std::fabs(d));
+        if (r[i] > r[ar]) ar = i;
+        if (gq[i] > gq[ag]) ag = i;
+        mr = std::max(mr, static_cast<double>(r[i]));
+        mg = std::max(mg, static_cast<double>(gq[i]));
+      }
+      top += ar == ag ? 1 : 0;
+      double sr = 0.0, sg = 0.0;
+      for (std::size_t i = 0; i < nv; ++i) {
+        sr += std::exp(r[i] - mr);
+        sg += std::exp(gq[i] - mg);
+      }
+      const double lr = mr + std::log(sr), lgg = mg + std::log(sg);
+      double k = 0.0;
+      for (std::size_t i = 0; i < nv; ++i) {
+        const double pa = r[i] - lr, pb = gq[i] - lgg;
+        k += std::exp(pa) * (pa - pb);
+      }
+      kl_sum += k;
+      kl_max = std::max(kl_max, k);
     }
-    top += ar == ag ? 1 : 0;
-    double sr = 0.0, sg = 0.0;
-    for (std::size_t i = 0; i < nv; ++i) {
-      sr += std::exp(r[i] - mr);
-      sg += std::exp(gq[i] - mg);
-    }
-    const double lr = mr + std::log(sr), lgg = mg + std::log(sg);
-    double k = 0.0;
-    for (std::size_t i = 0; i < nv; ++i) {
-      const double pa = r[i] - lr, pb = gq[i] - lgg;
-      k += std::exp(pa) * (pa - pb);
-    }
-    kl_sum += k;
-    kl_max = std::max(kl_max, k);
-  }
+    return Cmp{den > 0 ? std::sqrt(num2 / den) : 0.0, worst, kl_sum / n, kl_max, top};
+  };
+  auto show = [&](const char* label, const Cmp& c) {
+    std::printf("  %s: logits rel L2 %.3e, largest |diff| %.3e; KL mean %.3e max %.3e; top-1 equal %d / %d\n", label, c.rel, c.worst, c.kl_mean, c.kl_max,
+                c.top, n);
+  };
+  const Cmp main_cmp = compare(lg_ref, lg_gpu);
   std::printf("  CPU reference (same rounding%s): %.2f s = %.2f tokens/s\n", o.fast_cpu ? ", fast CPU kernels" : "", cpu_s, n / cpu_s);
-  std::printf("  GPU vs reference: logits rel L2 %.3e, largest |diff| %.3e; KL mean %.3e max %.3e; top-1 equal %d / %d; GPU %.1fx the reference's speed\n",
-              den > 0 ? std::sqrt(num2 / den) : 0.0, worst, kl_sum / n, kl_max, top, n, cpu_s / best);
-  return kl_sum / n <= 1e-4 && top * 100 >= n * 95 ? 0 : 3;
+  show("GPU vs reference", main_cmp);
+  std::printf("  GPU %.1fx the reference's speed\n", cpu_s / best);
+  // --floor: the same rounding through the other CPU kernels (fast <-> plain). The two differ only in fp32 summation order, as the GPU
+  // does, so their gap is the floor any second implementation of this rounding meets: int8 rounding flips near boundaries, carried
+  // through the layers.
+  if (a.has("floor")) {
+    model::ForwardOptions o2 = o;
+    o2.fast_cpu = !o.fast_cpu;
+    std::vector<float> lg_alt(lg_gpu.size());
+    Timer t2;
+    if (Status rs = model::forward_reference(s, w.value, ids.data(), n, 0, n, lg_alt.data(), o2); !rs) return fail_input(rs);
+    std::printf("  floor: CPU reference again through the %s kernels: %.2f s\n", o2.fast_cpu ? "fast" : "plain", t2.seconds());
+    show("reference vs the other CPU kernels (floor)", compare(lg_ref, lg_alt));
+    show("GPU vs the other CPU kernels", compare(lg_alt, lg_gpu));
+  }
+  // --float-ref: the model without activation rounding (the default options: fp32 activations into every product). How far each
+  // rounded path sits from it says whether the GPU is as close to the model as the CPU reference is.
+  if (a.has("float-ref")) {
+    model::ForwardOptions o3;
+    o3.threads = o.threads;
+    o3.fast_cpu = o.fast_cpu;
+    std::vector<float> lg_f(lg_gpu.size());
+    Timer t3;
+    if (Status rs = model::forward_reference(s, w.value, ids.data(), n, 0, n, lg_f.data(), o3); !rs) return fail_input(rs);
+    std::printf("  float reference (no activation rounding%s): %.2f s\n", o3.fast_cpu ? ", fast CPU kernels" : "", t3.seconds());
+    show("rounded CPU reference vs float", compare(lg_f, lg_ref));
+    show("GPU vs float", compare(lg_f, lg_gpu));
+  }
+  return main_cmp.kl_mean <= 1e-4 && main_cmp.top * 100 >= n * 95 ? 0 : 3;
 }
 
 int cmd_mtp_logits(const Args& a) {
