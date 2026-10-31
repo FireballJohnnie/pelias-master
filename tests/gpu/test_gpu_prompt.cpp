@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <vector>
 
 #include "../unit/gpu_test_rows.h"
@@ -214,7 +215,57 @@ TEST(rung1_prompt_gemm_against_fp64) {
   std::printf("    other types, widths and row counts refused\n");
 }
 
-static void moe_case(q::Type ty, const char* nm) {
+// one expert projection as stacks: expert e has type types[e % types.size()]; one stack per type (with an expert map
+// when there is more than one), as a usage-tiered file stores its experts
+struct Proj {
+  std::int64_t n_out, k;
+  std::vector<std::unique_ptr<QW>> w;
+  std::vector<std::unique_ptr<Dev<std::uint8_t>>> d;
+  std::vector<std::unique_ptr<Dev<int>>> em;
+  std::vector<g::PromptWeights> pw;
+  std::vector<int> st, ix;
+  Proj(const std::vector<q::Type>& types, int E, std::int64_t no, std::int64_t kk, std::uint32_t seed) : n_out(no), k(kk) {
+    const int nt = static_cast<int>(types.size());
+    st.assign(static_cast<std::size_t>(E), 0);
+    ix.assign(static_cast<std::size_t>(E), 0);
+    pw.resize(static_cast<std::size_t>(nt));
+    for (int t = 0; t < nt; ++t) {
+      std::vector<int> map(static_cast<std::size_t>(E), -1);
+      int cnt = 0;
+      for (int e = 0; e < E; ++e)
+        if (e % nt == t) {
+          st[static_cast<std::size_t>(e)] = t;
+          ix[static_cast<std::size_t>(e)] = cnt;
+          map[static_cast<std::size_t>(e)] = cnt++;
+        }
+      w.push_back(std::make_unique<QW>(types[static_cast<std::size_t>(t)], cnt * n_out, k, seed + 1000u * static_cast<std::uint32_t>(t)));
+      d.push_back(std::make_unique<Dev<std::uint8_t>>(w.back()->bytes));
+      g::PromptWeights& P = pw[static_cast<std::size_t>(t)];
+      CHECK(g::prompt_prepare(static_cast<std::uint32_t>(types[static_cast<std::size_t>(t)]), d.back()->p, cnt * n_out, k, &P));
+      if (nt > 1) {
+        em.push_back(std::make_unique<Dev<int>>(map));
+        P.emap = em.back()->p;
+        P.n_mat = cnt;
+      }
+    }
+  }
+  ~Proj() {
+    for (g::PromptWeights& P : pw) g::prompt_release(&P);
+  }
+  Proj(const Proj&) = delete;
+  Proj& operator=(const Proj&) = delete;
+  const float* row(int e, std::int64_t c) const {
+    return w[static_cast<std::size_t>(st[static_cast<std::size_t>(e)])]->deq.data() + (ix[static_cast<std::size_t>(e)] * n_out + c) * k;
+  }
+  g::MoeStacks stacks() const { return g::MoeStacks{pw.data(), static_cast<int>(pw.size())}; }
+};
+double dot_ptr(const float* w, std::int64_t k, const double* x) {
+  double s = 0.0;
+  for (std::int64_t i = 0; i < k; ++i) s += static_cast<double>(w[i]) * x[i];
+  return s;
+}
+
+static void moe_case(const std::vector<q::Type>& types, const char* nm) {
   // a small expert layer with the model's structure: 32 experts, hidden 512, ffn 256, 8 picks per token
   const int E = 32, NU = 8;
   const std::int64_t H = 512, F = 256;
@@ -247,19 +298,15 @@ static void moe_case(q::Type ty, const char* nm) {
     else if (cnt[static_cast<std::size_t>(e)]) ++n_vec;
     else ++n_none;
   }
-  const QW wg(ty, E * F, H, 5100u), wu(ty, E * F, H, 5200u), wd(ty, E * H, F, 5300u);
-  Dev<std::uint8_t> dg(wg.bytes), du(wu.bytes), dd(wd.bytes);
-  g::PromptWeights pg, pu, pd;
-  CHECK(g::prompt_prepare(static_cast<std::uint32_t>(ty), dg.p, E * F, H, &pg));
-  CHECK(g::prompt_prepare(static_cast<std::uint32_t>(ty), du.p, E * F, H, &pu));
-  CHECK(g::prompt_prepare(static_cast<std::uint32_t>(ty), dd.p, E * H, F, &pd));
+  const Proj wg(types, E, F, H, 5100u), wu(types, E, F, H, 5200u), wd(types, E, H, F, 5300u);
+
   const Act a(T, H, 5400u);
   Dev<std::int32_t> dsel(sel);
   Dev<float> dw(wsel), y(static_cast<std::size_t>(T * H));
   g::MoeScratch m;
   CHECK(g::moe_scratch_alloc(T, NU, E, H, F, &m, true));
   // the float combine first (no scale needed): the device's row map, gate / up rows and rounded silu x up come from it
-  CHECK(g::moe_prompt(pg, pu, pd, a.qv.p, a.sc.p, a.dig.p, T, dsel.p, dw.p, m, g::MoeCombine::kFloat, 0, y.p));
+  CHECK(g::moe_prompt_multi(wg.stacks(), wu.stacks(), wd.stacks(), a.qv.p, a.sc.p, a.dig.p, T, dsel.p, dw.p, m, g::MoeCombine::kFloat, 0, y.p));
   CHECK(g::sync());
   const std::size_t np = static_cast<std::size_t>(T * NU);
   const std::vector<int> prow = pull(m.prow, np), meta = pull(m.meta, std::size_t{4});
@@ -286,7 +333,7 @@ static void moe_case(q::Type ty, const char* nm) {
       const int e = sel[i];
       const std::size_t p = static_cast<std::size_t>(prow[i]);
       for (std::int64_t c = 0; c < F; ++c) {
-        const double rg = dot_row(wg.deq, e * F + c, H, a.eff.data() + t * H), ru = dot_row(wu.deq, e * F + c, H, a.eff.data() + t * H);
+        const double rg = dot_ptr(wg.row(e, c), H, a.eff.data() + t * H), ru = dot_ptr(wu.row(e, c), H, a.eff.data() + t * H);
         const double vg = hg[p * static_cast<std::size_t>(F) + static_cast<std::size_t>(c)], vu = hu[p * static_cast<std::size_t>(F) + static_cast<std::size_t>(c)];
         ng += (vg - rg) * (vg - rg) + (vu - ru) * (vu - ru);
         dgd += rg * rg + ru * ru;
@@ -296,7 +343,7 @@ static void moe_case(q::Type ty, const char* nm) {
         x2[static_cast<std::size_t>(j)] = static_cast<double>(q2[p * static_cast<std::size_t>(F) + static_cast<std::size_t>(j)]) *
                                           static_cast<double>(sc2[p * static_cast<std::size_t>(F / 32) + static_cast<std::size_t>(j / 32)]);
       for (std::int64_t c = 0; c < H; ++c) {
-        const double o = dot_row(wd.deq, e * H + c, F, x2.data()) * static_cast<double>(wsel[i]);
+        const double o = dot_ptr(wd.row(e, c), F, x2.data()) * static_cast<double>(wsel[i]);
         maxc = std::max(maxc, std::fabs(o));
         yref[static_cast<std::size_t>(t * H + c)] += o;
       }
@@ -316,12 +363,12 @@ static void moe_case(q::Type ty, const char* nm) {
   CHECK(e_f <= kTol);
   // the int32 combine: scale 2^k with 8 addends below 2^31, from the largest single contribution
   const int k32 = maxc > 0 ? static_cast<int>(std::floor(std::log2(268435455.0 / maxc))) : 20;
-  CHECK(g::moe_prompt(pg, pu, pd, a.qv.p, a.sc.p, a.dig.p, T, dsel.p, dw.p, m, g::MoeCombine::kFixed32, k32, y.p));
+  CHECK(g::moe_prompt_multi(wg.stacks(), wu.stacks(), wd.stacks(), a.qv.p, a.sc.p, a.dig.p, T, dsel.p, dw.p, m, g::MoeCombine::kFixed32, k32, y.p));
   CHECK(g::sync());
   const std::vector<float> y32 = y.get();
   unsigned ovf = 0;
   CHECK(g::to_host(&ovf, m.ovf, sizeof ovf));
-  CHECK(g::moe_prompt(pg, pu, pd, a.qv.p, a.sc.p, a.dig.p, T, dsel.p, dw.p, m, g::MoeCombine::kFixed32, k32, y.p));
+  CHECK(g::moe_prompt_multi(wg.stacks(), wu.stacks(), wd.stacks(), a.qv.p, a.sc.p, a.dig.p, T, dsel.p, dw.p, m, g::MoeCombine::kFixed32, k32, y.p));
   CHECK(g::sync());
   const std::vector<float> y32b = y.get();
   const bool same = std::memcmp(y32.data(), y32b.data(), y32.size() * sizeof(float)) == 0;
@@ -330,7 +377,7 @@ static void moe_case(q::Type ty, const char* nm) {
   CHECK(ovf == 0);
   CHECK(e_32 <= kTol);
   const int k64 = maxc > 0 ? std::min(60, static_cast<int>(std::floor(std::log2(5.7e17 / maxc)))) : 40;
-  CHECK(g::moe_prompt(pg, pu, pd, a.qv.p, a.sc.p, a.dig.p, T, dsel.p, dw.p, m, g::MoeCombine::kFixed64, k64, y.p));
+  CHECK(g::moe_prompt_multi(wg.stacks(), wu.stacks(), wd.stacks(), a.qv.p, a.sc.p, a.dig.p, T, dsel.p, dw.p, m, g::MoeCombine::kFixed64, k64, y.p));
   CHECK(g::sync());
   const double e_64 = rel_y(y.get());
   CHECK(e_64 <= kTol);
@@ -339,9 +386,6 @@ static void moe_case(q::Type ty, const char* nm) {
   std::printf("    %s gate / up vs fp64 %.3e; y vs fp64: float combine %.3e, int32 (2^%d) %.3e repeat %s overflows %u, int64 (2^%d) %.3e (tolerance 1e-6)\n", nm, e_gu, e_f,
               k32, e_32, same ? "bit for bit" : "DIFFERENT", ovf, k64, e_64);
   g::moe_scratch_free(&m);
-  g::prompt_release(&pg);
-  g::prompt_release(&pu);
-  g::prompt_release(&pd);
 }
 
 TEST(rung1_moe_prompt_against_fp64) {
@@ -349,12 +393,13 @@ TEST(rung1_moe_prompt_against_fp64) {
     CHECK(g::available());
     return;
   }
-  moe_case(q::Type::q4_k, "Q4_K  ");
-  moe_case(q::Type::q5_k, "Q5_K  ");
-  moe_case(q::Type::q6_k, "Q6_K  ");
-  moe_case(q::Type::q4_tg2, "Q4_TG2");
-  moe_case(q::Type::q8_0, "Q8_0  ");    // exact path (gpu_ops' moe_matmul) over the same GPU work list and fold
-  moe_case(q::Type::iq4_xs, "IQ4_XS");
+  moe_case({q::Type::q4_k}, "Q4_K  ");
+  moe_case({q::Type::q5_k}, "Q5_K  ");
+  moe_case({q::Type::q6_k}, "Q6_K  ");
+  moe_case({q::Type::q4_tg2}, "Q4_TG2");
+  moe_case({q::Type::q8_0}, "Q8_0  ");  // exact path (gpu_ops' moe_matmul) over the same GPU work list and fold
+  moe_case({q::Type::iq4_xs}, "IQ4_XS");
+  moe_case({q::Type::q4_tg2, q::Type::q5_k, q::Type::q6_k}, "tiered mix (Q4_TG2 / Q5_K / Q6_K stacks)");  // a usage-tiered weight
 }
 
 TEST(rung1_moe_prompt_refuses_bad_shapes) {

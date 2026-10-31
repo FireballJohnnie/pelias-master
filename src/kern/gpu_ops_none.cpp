@@ -105,5 +105,9 @@ bool moe_prompt(const PromptWeights&, const PromptWeights&, const PromptWeights&
                 const std::int32_t*, const float*, MoeScratch&, MoeCombine, int, float*, Stream) {
   return false;
 }
+bool moe_prompt_multi(MoeStacks, MoeStacks, MoeStacks, const std::int8_t*, const float*, const float*, std::int64_t, const std::int32_t*, const float*,
+                      MoeScratch&, MoeCombine, int, float*, Stream) {
+  return false;
+}
 
 }  // namespace pelias::kern::gpu

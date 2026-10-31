@@ -41,6 +41,11 @@ struct PromptWeights {
   const void* w = nullptr;
   void* rec = nullptr;
   void* dig = nullptr;
+  // MoE stacks of a usage-tiered weight (experts of several types, each type its own tensor): emap (device, n_expert
+  // ints, not owned) gives each expert's matrix index in this stack, -1 when the expert is in another stack; n_mat = the
+  // stack's matrices (rows = n_mat x n_out). Unset (null / 0): every expert, matrix e = expert e. int8 types only.
+  const int* emap = nullptr;
+  int n_mat = 0;
 };
 // Q4_K, Q5_K, Q6_K or Q4_TG2 with k a multiple of 256
 bool prompt_type_ok(std::uint32_t type, std::int64_t k);
@@ -83,6 +88,9 @@ struct MoeScratch {
   bool exact = false;
   float *xf = nullptr, *x2f = nullptr, *yd = nullptr;
   int* iota = nullptr;
+  // one stack's own copy of the work list (PromptWeights::emap): its tile and vector units and their counts
+  void *units_t2 = nullptr, *units_v2 = nullptr;
+  int* meta2 = nullptr;
 };
 // exact: also allocate the exact paths' buffers (stacks of types without an int8 prompt step, run by gpu_ops' moe_matmul
 // over the same GPU work list, folded into y by the same int32 / int64 / float reductions)
@@ -92,6 +100,12 @@ void moe_scratch_free(MoeScratch* m);
 // How the expert outputs are combined into the token rows
 enum class MoeCombine : int { kFixed32 = 2, kFixed64 = 3, kFloat = 1 };
 
+// One expert projection as one or more stacks (a usage-tiered weight: one stack per type, each with its emap); a plain
+// weight is one stack with no emap.
+struct MoeStacks {
+  const PromptWeights* w = nullptr;
+  int n = 0;
+};
 // One MoE slice for `tokens` rows: q / scale / dig are the tokens' per-32 activations (hidden wide, readable to tokens
 // rounded up to 64); sel / wsel the router's picks (tokens x n_used, int32 expert ids and weights, as router_topk);
 // gate / up / down Q4_K expert stacks (n_expert x ffn rows of hidden; n_expert x hidden rows of ffn). y (tokens x
@@ -100,5 +114,9 @@ enum class MoeCombine : int { kFixed32 = 2, kFixed64 = 3, kFloat = 1 };
 bool moe_prompt(const PromptWeights& gate, const PromptWeights& up, const PromptWeights& down, const std::int8_t* q, const float* scale, const float* dig,
                 std::int64_t tokens, const std::int32_t* sel, const float* wsel, MoeScratch& m, MoeCombine combine, int scale_log2, float* y,
                 Stream s = nullptr);
+// The same with each projection as stacks (gate / up / down may each have 1-4 stacks; every stack covers its own
+// experts; together they cover every routed expert).
+bool moe_prompt_multi(MoeStacks gate, MoeStacks up, MoeStacks down, const std::int8_t* q, const float* scale, const float* dig, std::int64_t tokens,
+                      const std::int32_t* sel, const float* wsel, MoeScratch& m, MoeCombine combine, int scale_log2, float* y, Stream s = nullptr);
 
 }  // namespace pelias::kern::gpu

@@ -1043,15 +1043,43 @@ bool vec_launch(dim3 grid, const std::int8_t* a8, const float* sa32, const Promp
   k_vec<EPI><<<grid, 256, 0, pst(s)>>>(a8, sa32, static_cast<const std::uint8_t*>(W.w), units, nunits, N, K, E);
   return pck(cudaGetLastError(), "prompt vector");
 }
-// expert GEMM over the device lists (tiles + vectors) with epilogue EPI
+// one stack's copy of the work list: the units of its experts (emap[e] >= 0), expert index rewritten to its matrix index,
+// in list order (one thread: at most a few hundred units)
+__global__ void k_units_remap(const int4* __restrict__ ut, const int4* __restrict__ uv, const int* __restrict__ meta, const int* __restrict__ emap,
+                              int4* __restrict__ ut2, int4* __restrict__ uv2, int* __restrict__ meta2) {
+  int nt = 0, nv = 0;
+  for (int i = 0; i < meta[0]; ++i) {
+    const int4 u = ut[i];
+    const int x = emap[u.x];
+    if (x >= 0) ut2[nt++] = make_int4(x, u.y, u.z, u.w);
+  }
+  for (int i = 0; i < meta[1]; ++i) {
+    const int4 u = uv[i];
+    const int x = emap[u.x];
+    if (x >= 0) uv2[nv++] = make_int4(x, u.y, u.z, u.w);
+  }
+  meta2[0] = nt;
+  meta2[1] = nv;
+}
+// expert GEMM over the device lists (tiles + vectors) with epilogue EPI; a stack with an emap runs over its own copy
 template <int EPI>
 bool experts(const MoeScratch& m, const std::int8_t* a8, const float* sa32, const float* adig, const PromptWeights& W, int N, int K, const Epi& E,
              std::int64_t picks, Stream s) {
   const int max_tiles = static_cast<int>(picks / kTile) + m.n_expert;
   const int4* ut = static_cast<const int4*>(m.units_t);
   const int4* uv = static_cast<const int4*>(m.units_v);
-  return tile_launch<EPI, false>(dim3(static_cast<unsigned>(N / kBN), static_cast<unsigned>(max_tiles)), a8, sa32, adig, W, ut, m.meta, 0, N, K, E, s) &&
-         vec_launch<EPI>(dim3(static_cast<unsigned>(m.n_expert), static_cast<unsigned>((N + 7) / 8)), a8, sa32, W, uv, m.meta + 1, N, K, E, s);
+  const int* nt = m.meta;
+  const int* nv = m.meta + 1;
+  if (W.emap) {
+    k_units_remap<<<1, 1, 0, pst(s)>>>(ut, uv, m.meta, W.emap, static_cast<int4*>(m.units_t2), static_cast<int4*>(m.units_v2), m.meta2);
+    if (!pck(cudaGetLastError(), "moe_prompt: stack units")) return false;
+    ut = static_cast<const int4*>(m.units_t2);
+    uv = static_cast<const int4*>(m.units_v2);
+    nt = m.meta2;
+    nv = m.meta2 + 1;
+  }
+  return tile_launch<EPI, false>(dim3(static_cast<unsigned>(N / kBN), static_cast<unsigned>(max_tiles)), a8, sa32, adig, W, ut, nt, 0, N, K, E, s) &&
+         vec_launch<EPI>(dim3(static_cast<unsigned>(m.n_expert), static_cast<unsigned>((N + 7) / 8)), a8, sa32, W, uv, nv, N, K, E, s);
 }
 
 // one expert stack over the GPU work list: the int8 kernels for Q4_K / Q5_K / Q6_K / Q4_TG2, else the exact path (gpu_ops'
@@ -1066,6 +1094,7 @@ bool run_stack(const MoeScratch& m, const PromptWeights& W, const std::int8_t* a
                int N, int K, const Epi& E, std::int64_t picks, Stream s) {
   if (int8_type(W.type)) return experts<EPI>(m, a8, sa32, adig, W, N, K, E, picks, s);
   if (!m.exact) return pfail("moe_prompt: a stack without an int8 step needs moe_scratch_alloc(..., exact = true)");
+  if (W.emap) return pfail("moe_prompt: stacks with an expert map must have an int8 type");
   const std::uint64_t rb = static_cast<std::uint64_t>(K / static_cast<int>(block_values(W.type))) * block_bytes(W.type);
   float* out = EPI == 0 ? E.C : m.yd;
   if (!moe_matmul(W.type, W.w, rb * static_cast<std::uint64_t>(N), rb, N, K, m.n_expert, m.off, srcmap, m.iota, xf, K, out, N, static_cast<int>(picks), s))
@@ -1214,7 +1243,8 @@ bool moe_scratch_alloc(std::int64_t max_tokens, int n_used, int n_expert, std::i
                                al(pr * F * 4), al(pr * F * 4),  // hg, hu
                                al(pr * F), al(pr * (F / 32) * 4), al(pr * (F / 32) * 4), al(pr * (F / 32) * 4),  // q2, sc2, sum2, dig2
                                al(T * H * 8), al(16),  // yfix (int64 capable), ovf
-                               al(xe * T * H * 4), al(xe * pr * F * 4), al(xe * pr * H * 4), al(xe * pr * 4)};  // exact: xf, x2f, yd, iota
+                               al(xe * T * H * 4), al(xe * pr * F * 4), al(xe * pr * H * 4), al(xe * pr * 4),  // exact: xf, x2f, yd, iota
+                               al((np / kTile + 256) * 16), al(256 * 16), al(16)};  // a stack's units (emap): tile, vector, counts
   std::size_t total = 0;
   for (const std::size_t z : sizes) total += z;
   auto* base = static_cast<std::uint8_t*>(dalloc(total));
@@ -1255,6 +1285,9 @@ bool moe_scratch_alloc(std::int64_t max_tokens, int n_used, int n_expert, std::i
   out->x2f = static_cast<float*>(take());
   out->yd = static_cast<float*>(take());
   out->iota = static_cast<int*>(take());
+  out->units_t2 = take();
+  out->units_v2 = take();
+  out->meta2 = static_cast<int*>(take());
   out->exact = exact;
   if (exact) {
     k_iota<<<grid_of(pr, 256, 4096), 256>>>(out->iota, static_cast<int>(pr));
@@ -1282,12 +1315,26 @@ void moe_scratch_free(MoeScratch* m) {
   *m = MoeScratch{};
 }
 
-bool moe_prompt(const PromptWeights& gate, const PromptWeights& up, const PromptWeights& down, const std::int8_t* q, const float* scale, const float* dig,
-                std::int64_t tokens, const std::int32_t* sel, const float* wsel, MoeScratch& m, MoeCombine combine, int scale_log2, float* y, Stream s) {
+bool moe_prompt_multi(MoeStacks gate, MoeStacks up, MoeStacks down, const std::int8_t* q, const float* scale, const float* dig, std::int64_t tokens,
+                      const std::int32_t* sel, const float* wsel, MoeScratch& m, MoeCombine combine, int scale_log2, float* y, Stream s) {
   if (!m.mem || tokens < 0 || tokens > m.max_tokens || !q || !scale || !dig || !sel || !wsel || !y) return pfail("moe_prompt: bad arguments");
   const std::int64_t H = m.hidden, F = m.ffn, E = m.n_expert;
-  if (gate.rows != E * F || up.rows != E * F || down.rows != E * H || gate.k != H || up.k != H || down.k != F)
-    return pfail("moe_prompt: the expert stacks do not match the scratch shape");
+  if (gate.n < 1 || up.n < 1 || down.n < 1 || gate.n > 4 || up.n > 4 || down.n > 4 || !gate.w || !up.w || !down.w)
+    return pfail("moe_prompt: 1-4 stacks per projection");
+  auto shape_ok = [&](const MoeStacks& st, std::int64_t n_out, std::int64_t k) {
+    for (int i = 0; i < st.n; ++i) {
+      const PromptWeights& W = st.w[i];
+      const std::int64_t nm = W.n_mat > 0 ? W.n_mat : E;
+      if (W.rows != nm * n_out || W.k != k || (st.n > 1 && !W.emap)) return false;
+    }
+    return true;
+  };
+  if (!shape_ok(gate, F, H) || !shape_ok(up, F, H) || !shape_ok(down, H, F)) return pfail("moe_prompt: the expert stacks do not match the scratch shape");
+  auto any_exact = [](const MoeStacks& st) {
+    for (int i = 0; i < st.n; ++i)
+      if (!int8_type(st.w[i].type)) return true;
+    return false;
+  };
   if (tokens == 0) return true;
   const int np = static_cast<int>(tokens * m.n_used);
   cudaStream_t cs = pst(s);
@@ -1302,16 +1349,18 @@ bool moe_prompt(const PromptWeights& gate, const PromptWeights& up, const Prompt
   Epi eg, eu;
   eg.C = m.hg;
   eu.C = m.hu;
-  if ((!int8_type(gate.type) || !int8_type(up.type)) && m.exact) {  // the exact path reads the token rows as floats (q x scale)
+  if ((any_exact(gate) || any_exact(up)) && m.exact) {  // the exact path reads the token rows as floats (q x scale)
     k_deq_rows<<<grid_of(static_cast<std::size_t>(tokens) * static_cast<std::size_t>(H), 256, 4096), 256, 0, cs>>>(q, scale, static_cast<std::size_t>(tokens * H), m.xf);
     if (!pck(cudaGetLastError(), "moe_prompt: float rows")) return false;
   }
-  if (!run_stack<0>(m, gate, m.pq, m.psc, m.pdig, m.xf, m.src, static_cast<int>(F), static_cast<int>(H), eg, np, s)) return false;
-  if (!run_stack<0>(m, up, m.pq, m.psc, m.pdig, m.xf, m.src, static_cast<int>(F), static_cast<int>(H), eu, np, s)) return false;
+  for (int i = 0; i < gate.n; ++i)
+    if (!run_stack<0>(m, gate.w[i], m.pq, m.psc, m.pdig, m.xf, m.src, static_cast<int>(F), static_cast<int>(H), eg, np, s)) return false;
+  for (int i = 0; i < up.n; ++i)
+    if (!run_stack<0>(m, up.w[i], m.pq, m.psc, m.pdig, m.xf, m.src, static_cast<int>(F), static_cast<int>(H), eu, np, s)) return false;
   k_silu_q8x32<<<grid_of(static_cast<std::size_t>(np) * static_cast<std::size_t>(F / 32), 128, 0x7fffffff), 128, 0, cs>>>(m.hg, m.hu, np, F, m.q2, m.sc2, m.sum2);
   const std::size_t n32 = static_cast<std::size_t>(np) * static_cast<std::size_t>(F / 32);
   k_act_digits<<<grid_of(n32, 256, 4096), 256, 0, cs>>>(m.sc2, m.sum2, n32, m.dig2);
-  if (!int8_type(down.type) && m.exact)
+  if (any_exact(down) && m.exact)
     k_deq_rows<<<grid_of(static_cast<std::size_t>(np) * static_cast<std::size_t>(F), 256, 4096), 256, 0, cs>>>(m.q2, m.sc2, static_cast<std::size_t>(np) * static_cast<std::size_t>(F), m.x2f);
   if (!pck(cudaGetLastError(), "moe_prompt: silu and rounding")) return false;
   // (5) down folded into the combine
@@ -1324,20 +1373,29 @@ bool moe_prompt(const PromptWeights& gate, const PromptWeights& up, const Prompt
   if (combine == MoeCombine::kFloat) {
     if (!pck(cudaMemsetAsync(y, 0, ny * sizeof(float), cs), "moe_prompt: clear y")) return false;
     ed.Yf = y;
-    return run_stack<1>(m, down, m.q2, m.sc2, m.dig2, m.x2f, m.iota, static_cast<int>(H), static_cast<int>(F), ed, np, s);
+    for (int i = 0; i < down.n; ++i)
+      if (!run_stack<1>(m, down.w[i], m.q2, m.sc2, m.dig2, m.x2f, m.iota, static_cast<int>(H), static_cast<int>(F), ed, np, s)) return false;
+    return true;
   }
   const bool w64 = combine == MoeCombine::kFixed64;
   if (!pck(cudaMemsetAsync(m.yfix, 0, ny * (w64 ? 8 : 4), cs), "moe_prompt: clear accumulators")) return false;
   if (w64) {
     ed.Yl = static_cast<unsigned long long*>(m.yfix);
-    if (!run_stack<3>(m, down, m.q2, m.sc2, m.dig2, m.x2f, m.iota, static_cast<int>(H), static_cast<int>(F), ed, np, s)) return false;
+    for (int i = 0; i < down.n; ++i)
+      if (!run_stack<3>(m, down.w[i], m.q2, m.sc2, m.dig2, m.x2f, m.iota, static_cast<int>(H), static_cast<int>(F), ed, np, s)) return false;
   } else {
     ed.Yi = static_cast<int*>(m.yfix);
-    if (!run_stack<2>(m, down, m.q2, m.sc2, m.dig2, m.x2f, m.iota, static_cast<int>(H), static_cast<int>(F), ed, np, s)) return false;
+    for (int i = 0; i < down.n; ++i)
+      if (!run_stack<2>(m, down.w[i], m.q2, m.sc2, m.dig2, m.x2f, m.iota, static_cast<int>(H), static_cast<int>(F), ed, np, s)) return false;
   }
   k_fix<<<grid_of(ny, 256, 4096), 256, 0, cs>>>(w64 ? nullptr : static_cast<const int*>(m.yfix), w64 ? static_cast<const unsigned long long*>(m.yfix) : nullptr, ny,
                                                 std::ldexp(1.0f, -scale_log2), y);
   return pck(cudaGetLastError(), "moe_prompt: conversion");
+}
+
+bool moe_prompt(const PromptWeights& gate, const PromptWeights& up, const PromptWeights& down, const std::int8_t* q, const float* scale, const float* dig,
+                std::int64_t tokens, const std::int32_t* sel, const float* wsel, MoeScratch& m, MoeCombine combine, int scale_log2, float* y, Stream s) {
+  return moe_prompt_multi(MoeStacks{&gate, 1}, MoeStacks{&up, 1}, MoeStacks{&down, 1}, q, scale, dig, tokens, sel, wsel, m, combine, scale_log2, y, s);
 }
 
 }  // namespace pelias::kern::gpu
