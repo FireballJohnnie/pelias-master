@@ -921,6 +921,12 @@ bool bell_wait(const unsigned* flag, unsigned value, Stream s, unsigned long lon
   k_bell_wait<<<1, 1, 0, st(s)>>>(flag, value, ts);
   return launched("doorbell wait");
 }
+__global__ void k_stamp(volatile unsigned long long* p) { *p = gtimer(); }
+bool stamp(unsigned long long* p, Stream s) {
+  if (!p) return fail("stamp: no address");
+  k_stamp<<<1, 1, 0, st(s)>>>(p);
+  return launched("stamp");
+}
 bool to_host_async(void* dst, const void* src, std::size_t bytes, Stream s) {
   return ck(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, st(s)), "copy to the host (async)");
 }

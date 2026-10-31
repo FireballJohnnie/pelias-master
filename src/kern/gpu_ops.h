@@ -142,6 +142,9 @@ void host_free(void* p);
 bool bell_ring(unsigned* flag, unsigned value, Stream s = nullptr, unsigned long long* ts = nullptr);
 bool bell_wait(const unsigned* flag, unsigned value, Stream s = nullptr, unsigned long long* ts = nullptr);
 bool to_host_async(void* dst, const void* src, std::size_t bytes, Stream s = nullptr);
+// v21 (per-operation timeline): a one-thread kernel writes the GPU's globaltimer (ns) to *p (a device address, e.g. of
+// mapped memory) when the stream reaches it
+bool stamp(unsigned long long* p, Stream s = nullptr);
 // device to device copy (stream ordered)
 bool dcopy(void* dst, const void* src, std::size_t bytes, Stream s = nullptr);
 // per value head: o = rms_norm(o) * w * silu(z), in place on core (n rows of nv * ds), z alike

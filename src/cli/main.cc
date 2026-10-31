@@ -2132,7 +2132,7 @@ int cmd_engine_check(const Args& a) {
                  "usage: pelias engine-check --model FILE [--routes ROUTES.bin] [--prefill 64] [--decode 32] [--ctx 4096] [--batch 64] [--threads N]\n"
                  "                           [--budget-gb G] [--hot-max N] [--mtp-draft K] [--fast-cpu] [--no-cpu] [--float-ref]\n"
                  "                           [--text FILE [--skip-tokens N]] [--timeline] [--dump-top OUT.tsv] [--dump-split [--split-sizes 2,3,4] [--split-step]]\n"
-                 "                           [--no-doorbell]\n");
+                 "                           [--no-doorbell] [--timeline-ops] [--split-ref]\n");
     return 1;
   }
   auto num = [&](const char* k, std::uint64_t d, std::uint64_t lo, std::uint64_t hi, std::uint64_t& out) {
@@ -2187,6 +2187,7 @@ int cmd_engine_check(const Args& a) {
   eo.max_verify = static_cast<int>(ndraft) + 1;
   eo.timeline = a.has("timeline");
   eo.doorbell = !a.has("no-doorbell");
+  eo.timeline_ops = a.has("timeline-ops");
   // v20: the split check's batch sizes (default 1 + drafts)
   std::vector<int> split_sizes;
   if (a.has("split-sizes")) {
@@ -2275,6 +2276,26 @@ int cmd_engine_check(const Args& a) {
     std::printf("  decode %llu tokens: %.3f s = %.1f tokens/s (median step %.2f ms = %.1f tokens/s, slowest %.2f ms); picks on the GPU %.1f %%; CPU cold work %.2f ms, host waits %.2f ms per token\n",
                 static_cast<unsigned long long>(ndec), tot_dec.seconds, static_cast<double>(ndec) / tot_dec.seconds, med * 1e3, 1.0 / med, sorted.back() * 1e3,
                 share(tot_dec), tot_dec.cold_seconds * 1e3 / static_cast<double>(ndec), tot_dec.wait_seconds * 1e3 / static_cast<double>(ndec));
+  }
+  if (a.has("timeline-ops") && ndec > 0) {  // v21: per operation, one-token steps
+    const model::EngineTimeline& T = eng.value->timeline();
+    if (T.ops_steps == 0) {
+      std::printf("  per-operation timeline: no steps recorded\n");
+    } else {
+      int nl[2] = {0, 0};
+      for (std::uint32_t il = 0; il < s.n_layer; ++il) ++nl[w.value.layers[il].recurrent ? 0 : 1];
+      std::printf("  per-operation timeline, %d one-token steps (stamps add a launch each; GPU clock), ms per token over %d DeltaNet + %d attention layers:\n",
+                  T.ops_steps, nl[0], nl[1]);
+      double tot[2] = {0.0, 0.0};
+      for (int k = 1; k < model::EngineTimeline::kOps; ++k) {
+        const double dn = 1e3 * T.ops[0][k] / T.ops_steps, at = 1e3 * T.ops[1][k] / T.ops_steps;
+        tot[0] += dn;
+        tot[1] += at;
+        std::printf("    %-46s DeltaNet %7.3f (%.3f per layer)   attention %7.3f (%.3f per layer)\n", model::kOpNames[k], dn, nl[0] ? dn / nl[0] : 0.0, at,
+                    nl[1] ? at / nl[1] : 0.0);
+      }
+      std::printf("    %-46s DeltaNet %7.3f   attention %7.3f   all %.3f ms per token\n", "sum", tot[0], tot[1], tot[0] + tot[1]);
+    }
   }
   if (a.has("timeline") && ndec > 0) {
     const model::EngineTimeline& T = eng.value->timeline();
@@ -2372,6 +2393,8 @@ int cmd_engine_check(const Args& a) {
     // row for the same position: KL by the row's place in its batch, top-1, margins; the one-token margin where plain and
     // drafted first differ
     if (split && ndec > 1) {
+      std::vector<float> bat_rows;  // v21: the first verify replay's rows, for --split-ref
+      bool bat_have = false;
       for (const int kb : split_sizes)
         for (int mode = 0; mode < (a.has("split-step") ? 2 : 1); ++mode) {
           const bool use_verify = mode == 0;
@@ -2408,6 +2431,10 @@ int cmd_engine_check(const Args& a) {
               }
               kl_r[static_cast<std::size_t>(r)] += kl;
               ++n_r[static_cast<std::size_t>(r)];
+              if (use_verify && !bat_have) {
+                if (bat_rows.empty()) bat_rows.assign(static_cast<std::size_t>(ndec) * nv, 0.0f);
+                std::copy(bb, bb + nv, bat_rows.begin() + static_cast<std::ptrdiff_t>(pidx * nv));
+              }
               const Top2 to = top2(ob, nv), tb = top2(bb, nv);
               ++cnt;
               if (to.i1 == tb.i1) ++eq;
@@ -2428,12 +2455,54 @@ int cmd_engine_check(const Args& a) {
           }
           std::printf("  split check, %s batches of %d vs one token at a time: KL mean %.3e max %.3e (position %zu); KL by place in the batch %s; top-1 equal %d / %d%s%s\n",
                       use_verify ? "verify" : "step", kb, cnt ? kl_s / cnt : 0.0, kl_m, worst_at, byr.c_str(), eq, cnt, diffs.empty() ? "" : "; differ at ", diffs.c_str());
+          if (use_verify) bat_have = true;
           if (use_verify && kb == static_cast<int>(ndraft) + 1 && same < plain.size()) {
             const Top2 ts = top2(one_rows.data() + same * nv, nv);
             std::printf("  split check: first MTP difference at token %zu: one-token top-2 %zu / %zu, margin %.4f; the verify batch's top-1 there %s\n", same, ts.i1,
                         ts.i2, ts.margin, split_eq < 0 ? "(token 0: from the prefill, same path)" : split_eq ? "agrees with one-token" : "differs from one-token");
           }
         }
+      // v21 --split-ref: the CPU reference (the engine's rounding) over the prompt and the plain tokens; which of the
+      // one-token and batched rows is off where they disagree
+      if (a.has("split-ref") && bat_have) {
+        model::ForwardOptions orf = model::GpuForward::matching_reference_options();
+        orf.threads = static_cast<int>(thr);
+        orf.fast_cpu = a.has("fast-cpu");
+        std::vector<std::int32_t> seq(prompt);
+        seq.insert(seq.end(), plain.begin(), plain.end() - 1);
+        std::vector<float> rr(static_cast<std::size_t>(ndec) * nv);
+        Timer trf;
+        if (Status rs = model::forward_reference(s, w.value, seq.data(), static_cast<int>(seq.size()), static_cast<int>(npre) - 1,
+                                                 static_cast<int>(npre) - 1 + static_cast<int>(ndec), rr.data(), orf);
+            !rs)
+          return fail_input(rs);
+        double ko = 0.0, kb2 = 0.0, kmx = -1.0;
+        int to = 0, tb = 0, cntr = 0;
+        std::size_t at = 0;
+        for (std::size_t i = 1; i < static_cast<std::size_t>(ndec); ++i) {
+          const float* rf = rr.data() + i * nv;
+          const float* ob = one_rows.data() + i * nv;
+          const float* bb = bat_rows.data() + i * nv;
+          const double k1 = kl_rows(rf, ob, nv), k2 = kl_rows(rf, bb, nv), kob = kl_rows(ob, bb, nv);
+          ko += k1;
+          kb2 += k2;
+          const Top2 tr = top2(rf, nv);
+          to += top2(ob, nv).i1 == tr.i1 ? 1 : 0;
+          tb += top2(bb, nv).i1 == tr.i1 ? 1 : 0;
+          ++cntr;
+          if (kob > kmx) {
+            kmx = kob;
+            at = i;
+          }
+        }
+        const float* rf = rr.data() + at * nv;
+        const Top2 tr = top2(rf, nv), t1 = top2(one_rows.data() + at * nv, nv), t2 = top2(bat_rows.data() + at * nv, nv);
+        std::printf("  split ref (CPU reference, %.1f s): over %d positions KL ref->one-token %.3e, ref->batched %.3e; top-1 equal to the reference: one-token %d, batched %d of %d\n",
+                    trf.seconds(), cntr, cntr ? ko / cntr : 0.0, cntr ? kb2 / cntr : 0.0, to, tb, cntr);
+        std::printf("  split ref at position %zu (largest one-token vs batched gap, KL %.3e): reference top-2 %zu / %zu margin %.4f; one-token %zu / %zu (KL from ref %.3e); batched %zu / %zu (KL from ref %.3e) -> %s is off\n",
+                    at, kmx, tr.i1, tr.i2, tr.margin, t1.i1, t1.i2, kl_rows(rf, one_rows.data() + at * nv, nv), t2.i1, t2.i2, kl_rows(rf, bat_rows.data() + at * nv, nv),
+                    kl_rows(rf, one_rows.data() + at * nv, nv) > kl_rows(rf, bat_rows.data() + at * nv, nv) ? "the one-token path" : "the batched path");
+      }
     }
   }
   if (a.has("no-cpu")) return 0;

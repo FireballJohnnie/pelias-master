@@ -66,6 +66,9 @@ struct EngineOptions {
   // v19 (author 15:27): per-layer timeline of the doorbell steps: GPU timestamps (globaltimer) at the ring and around the
   // wait, CPU times of the wait and of each cold-path stage, worker wake-up and busy time. Off by default (timing costs).
   bool timeline = false;
+  // v21: the per-operation timeline (implies timeline): a GPU stamp between the operations of each layer of a doorbell
+  // step (one extra one-thread launch per stamp, so it slows the step a little; a diagnostic pass only)
+  bool timeline_ops = false;
 };
 
 struct EngineStats {
@@ -92,7 +95,17 @@ struct EngineTimeline {
   // v20: per step size (index n for n = 1 .. 8, 9 for larger batches): steps, wall time, GPU busy (dense + bank + shared,
   // summed over layers), GPU idle waiting for the CPU, CPU cold work, CPU waiting for the ring
   double by_n_steps[10] = {}, by_n_wall[10] = {}, by_n_gpu_busy[10] = {}, by_n_gpu_idle[10] = {}, by_n_cpu_cold[10] = {}, by_n_cpu_wait[10] = {};
+  // v21 per-operation timeline (EngineOptions::timeline_ops), one-token steps only: GPU seconds per segment, summed over
+  // steps, [0] DeltaNet layers, [1] attention layers; segment k = from stamp k - 1 to stamp k (kOpNames)
+  static constexpr int kOps = 16;
+  double ops[2][kOps] = {};
+  int ops_steps = 0;
 };
+// the per-operation segments (v21), in layer order
+inline const char* const kOpNames[EngineTimeline::kOps] = {
+    "-", "attn/ssm norm", "input products (R3)", "small ops (gates, conv, l2 / q-k norm, rope)", "core (recurrence / attention)",
+    "gated norm", "output product", "residual + post norm", "router + top-k", "picks to host + ring", "expert input rounding",
+    "bank experts", "shared expert + add", "wait for the CPU", "cold sum add", "residual"};
 
 // v20: where an MTP greedy run spends its time (engine_generate_greedy_mtp): drafting (the MTP block, one token per
 // draft), the trunk's verify by batch size (index 1 .. 8), keep(), the MTP block's catch-up on the kept tokens,

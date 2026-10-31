@@ -289,6 +289,10 @@ struct GpuEngine::Impl {
   EngineTimeline tline;
   void* ts_hv = nullptr;  // pinned mapped: per layer [ring, wait enter, wait release, spare] GPU ns
   unsigned long long *ts_h = nullptr, *ts_d = nullptr;
+  // v21 per-operation stamps: pinned mapped, per layer kOps GPU ns; cur_ops = this layer's row while it is enqueued
+  void* ops_hv = nullptr;
+  unsigned long long *ops_h = nullptr, *ops_d = nullptr, *cur_ops = nullptr;
+  bool opstamp(int k) { return !cur_ops || g::stamp(cur_ops + k); }
 
   // ---- weights
   static std::size_t view_bytes(const WeightView& v) {
@@ -535,6 +539,7 @@ struct GpuEngine::Impl {
     } else if (!(st = prod(D.wq, xn, n, qg)) || !(st = prod(D.wk, xn, n, kn)) || !(st = prod(D.wv, xn, n, vn))) {
       return st;
     }
+    if (!opstamp(2)) return gfail("engine: stamp");
     if (D.q_norm && !g::rms_norm(qg, D.q_norm, qg, hd, nh, qh, q_w, n, s.rms_eps)) return gfail("engine: q norm");
     if (D.k_norm && !g::rms_norm(kn, D.k_norm, kn, hd, nkv, hd, kv_w, n, s.rms_eps)) return gfail("engine: k norm");
     const int sec[4] = {s.rope_sections[0], s.rope_sections[1], s.rope_sections[2], s.rope_sections[3]};
@@ -542,8 +547,11 @@ struct GpuEngine::Impl {
         !g::rope(kn, nkv, hd, kv_w, n, p0, static_cast<int>(s.n_rot), s.rope_freq_base, sec, s.rope_neox, rope_ff))
       return gfail("engine: rope");
     const float scl = s.attn_scale != 0.0f ? s.attn_scale : 1.0f / std::sqrt(static_cast<float>(hd));
+    if (!opstamp(3)) return gfail("engine: stamp");
     if (!g::attention(qg, q_w, qh, D.K, D.V, kv_w, nh, nkv, hd, n, p0, scl, s.attn_gate, att, ascr)) return gfail("engine: attention");
-    return prod(D.wo, att, n, y);
+    if (!opstamp(4) || !opstamp(5)) return gfail("engine: stamp");
+    if (Status ps = prod(D.wo, att, n, y); !ps) return ps;
+    return opstamp(6) ? Status::good() : gfail("engine: stamp");
   }
 
   Status deltanet_block(Layer& D, int64_t n) {
@@ -555,19 +563,24 @@ struct GpuEngine::Impl {
       return st;
     }
     if (!(st = prod(D.wbeta, xn, n, beta)) || !(st = prod(D.walpha, xn, n, alpha))) return st;
+    if (!opstamp(2)) return gfail("engine: stamp");
     if (!g::deltanet_gates(beta, alpha, D.ssm_dt, D.ssm_a, n, nv)) return gfail("engine: deltanet gates");
     const bool ck = ckpt_mode && n > 1;
     if (ck && !g::dcopy(D.mixed_save, mixed, z(n * ch) * sizeof(float))) return gfail("engine: verify inputs");
     if (!g::deltanet_conv(mixed, D.tail[D.cur], D.conv1d, n, ch, taps, conv, D.tail[1 - D.cur])) return gfail("engine: deltanet conv");
     D.cur = 1 - D.cur;
     if (!g::l2_norm(conv, ds, 2 * nk, ds, ch, n, s.rms_eps)) return gfail("engine: deltanet l2 norm");
+    if (!opstamp(3)) return gfail("engine: stamp");
     const bool pow2 = ds >= 32 && ds <= 1024 && (ds & (ds - 1)) == 0;
     const bool ok = ck ? g::deltanet_recurrent_reg_ckpt(conv, ch, beta, alpha, D.state, n, nk, nv, ds, core, D.ckpt)
                        : pow2 ? g::deltanet_recurrent_reg(conv, ch, beta, alpha, D.state, n, nk, nv, ds, core)
                               : g::deltanet_recurrent(conv, ch, beta, alpha, D.state, n, nk, nv, ds, core);
     if (!ok) return gfail("engine: deltanet recurrence");
+    if (!opstamp(4)) return gfail("engine: stamp");
     if (!g::gated_norm(core, zg, D.ssm_norm, n, nv, ds, s.rms_eps)) return gfail("engine: gated norm");
-    return prod(D.ssm_out, core, n, y);
+    if (!opstamp(5)) return gfail("engine: stamp");
+    if (Status ps = prod(D.ssm_out, core, n, y); !ps) return ps;
+    return opstamp(6) ? Status::good() : gfail("engine: stamp");
   }
 
   // the cold picks on the CPU: ycold_h (n x e) = sum over cold picks of weight x down(round32(silu(gate x) * up x))
@@ -833,17 +846,21 @@ struct GpuEngine::Impl {
     Status st;
     if (!(st = prod(D.gate_inp, xn, n, logits_r))) return st;
     if (!g::router_topk(logits_r, ne, n, static_cast<int>(nu), s.expert_weights_scale, sel, wsel)) return gfail("engine: router");
+    if (!opstamp(8)) return gfail("engine: stamp");
     if (!g::to_host_async(sel_m, sel, z(n * nu) * sizeof(std::int32_t)) || !g::to_host_async(wsel_m, wsel, z(n * nu) * sizeof(float)) ||
         !g::to_host_async(xn_m, xn, z(n * e) * sizeof(float)) || !g::bell_ring(fa_d, g, nullptr, tsd))
       return gfail("engine: doorbell (picks)");
+    if (!opstamp(9)) return gfail("engine: stamp");
     if (!D.bg.empty()) {
       if (!g::act_q8x32(xn, e, n, e, false, xr, e, q, scale, sum) || !g::act_digits(scale, sum, n, e, dig)) return gfail("engine: expert input rounding");
+      if (!opstamp(10)) return gfail("engine: stamp");
       const g::MoeStacks sg{D.bg.data(), static_cast<int>(D.bg.size())}, su{D.bu.data(), static_cast<int>(D.bu.size())},
           sd{D.bd.data(), static_cast<int>(D.bd.size())};
       if (!g::moe_prompt_multi(sg, su, sd, q, scale, dig, n, sel, wsel, moe, g::MoeCombine::kFixed64, 32, y)) return gfail("engine: bank experts");
-    } else if (!g::dzero(y, z(n * e) * sizeof(float))) {
+    } else if (!opstamp(10) || !g::dzero(y, z(n * e) * sizeof(float))) {
       return gfail("engine: clear y");
     }
+    if (!opstamp(11)) return gfail("engine: stamp");
     if (n == 1 && D.gate_sh.r3 && D.up_sh.r3 && D.gate_sh.k == D.up_sh.k) {
       if (!(st = prod_r3({{&D.gate_sh, gs}, {&D.up_sh, us}}, xn))) return st;
     } else if (!(st = prod(D.gate_sh, xn, n, gs)) || !(st = prod(D.up_sh, xn, n, us))) {
@@ -855,7 +872,11 @@ struct GpuEngine::Impl {
         !g::deltanet_gates(gsh, galpha, zero2, zero2, n, 1))
       return gfail("engine: shared gate");
     if (!g::add_rows(y, e, sh, e, gsh, e, n)) return gfail("engine: shared add");
-    if (!g::bell_wait(fb_d, g, nullptr, tsd ? tsd + 1 : nullptr) || !g::add_rows(y, e, yc_md, e, nullptr, e, n)) return gfail("engine: doorbell (cold sum)");
+    if (!opstamp(12)) return gfail("engine: stamp");
+    if (!g::bell_wait(fb_d, g, nullptr, tsd ? tsd + 1 : nullptr)) return gfail("engine: doorbell (cold sum)");
+    if (!opstamp(13)) return gfail("engine: stamp");
+    if (!g::add_rows(y, e, yc_md, e, nullptr, e, n)) return gfail("engine: doorbell (cold sum)");
+    if (!opstamp(14)) return gfail("engine: stamp");
     return Status::good();
   }
 
@@ -887,6 +908,7 @@ GpuEngine::~GpuEngine() {
   }
   g::host_free(p_->bell_h);
   g::host_free(p_->ts_hv);
+  g::host_free(p_->ops_hv);
   g::moe_scratch_free(&p_->moe);
   for (Layer& D : p_->L) g::dfree(D.bank_mem);
   g::dfree(p_->M.bank_mem);
@@ -1166,7 +1188,15 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
       I.yc_m = reinterpret_cast<float*>(hb + 512 + 2 * sel_b + xn_b);
       I.yc_md = reinterpret_cast<float*>(db2 + 512 + 2 * sel_b + xn_b);
       I.bell = true;
-      if (o.timeline) {
+      if (o.timeline_ops) {
+        void* odev = nullptr;
+        I.ops_hv = g::host_alloc_mapped(z(s.n_layer) * z(EngineTimeline::kOps) * sizeof(unsigned long long), &odev);
+        if (I.ops_hv) {
+          I.ops_h = static_cast<unsigned long long*>(I.ops_hv);
+          I.ops_d = static_cast<unsigned long long*>(odev);
+        }
+      }
+      if (o.timeline || o.timeline_ops) {
         void* tdev = nullptr;
         I.ts_hv = g::host_alloc_mapped(z(s.n_layer) * 4 * sizeof(unsigned long long), &tdev);
         if (I.ts_hv) {
@@ -1261,13 +1291,20 @@ Status GpuEngine::Impl::run(const std::int32_t* tokens, int n, float* logits, bo
   for (std::uint32_t il = 0; il < s.n_layer; ++il) {
     const Qwen35MoeLayer& l = wt.layers[il];
     Layer& D = I.L[il];
+    I.cur_ops = (I.ops_d && I.bell && n == 1) ? I.ops_d + z(EngineTimeline::kOps) * il : nullptr;
+    if (!I.opstamp(0)) return gfail("engine: stamp");
     if (!g::rms_norm(I.x, D.attn_norm, I.xn, e, 1, e, e, n, s.rms_eps)) return gfail("engine: attn norm");
+    if (!I.opstamp(1)) return gfail("engine: stamp");
     if (!(st = l.recurrent ? I.deltanet_block(D, n) : I.attention_block(D, n, I.pos))) return st;
     if (!g::add_rows(I.x, e, I.y, e, nullptr, e, n)) return gfail("engine: residual");
     if (!g::rms_norm(I.x, D.post_norm, I.xn, e, 1, e, e, n, s.rms_eps)) return gfail("engine: post norm");
+    if (!I.opstamp(7)) return gfail("engine: stamp");
     if (!(st = I.bell ? I.moe_block_bell(D, n, g0 + il, I.ts_d ? I.ts_d + 4 * il : nullptr) : I.moe_block(l, D, n, es))) return st;
     if (!g::add_rows(I.x, e, I.y, e, nullptr, e, n)) return gfail("engine: residual");
+    if (!I.opstamp(15)) return gfail("engine: stamp");
   }
+  const bool ops_this = I.cur_ops != nullptr;
+  I.cur_ops = nullptr;
   const int64_t nvoc = s.n_vocab;
   const int r_begin = last_only ? n - 1 : 0;
   for (int r0 = hidden_out ? 0 : r_begin; r0 < n; r0 += Impl::kOutRows) {
@@ -1317,6 +1354,14 @@ Status GpuEngine::Impl::run(const std::int32_t* tokens, int n, float* logits, bo
       I.tline.by_n_gpu_idle[b] += idle;
       I.tline.by_n_cpu_cold[b] += I.bst.cold_seconds;
       I.tline.by_n_cpu_wait[b] += I.bst.wait_seconds;
+      if (ops_this && I.ops_h) {  // v21: the per-operation segments of this one-token step
+        for (std::uint32_t il = 0; il < s.n_layer; ++il) {
+          const unsigned long long* orow = I.ops_h + z(EngineTimeline::kOps) * il;
+          const int ty = wt.layers[il].recurrent ? 0 : 1;
+          for (int k = 1; k < EngineTimeline::kOps; ++k) I.tline.ops[ty][k] += d(orow[k - 1], orow[k]);
+        }
+        ++I.tline.ops_steps;
+      }
     }
   }
   I.pos += n;

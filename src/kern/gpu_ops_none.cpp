@@ -27,6 +27,7 @@ void* host_alloc_mapped(std::size_t, void**) { return nullptr; }
 void host_free(void*) {}
 bool bell_ring(unsigned*, unsigned, Stream, unsigned long long*) { return false; }
 bool bell_wait(const unsigned*, unsigned, Stream, unsigned long long*) { return false; }
+bool stamp(unsigned long long*, Stream) { return false; }
 bool to_host_async(void*, const void*, std::size_t, Stream) { return false; }
 bool matmul(std::uint32_t, const void*, std::uint64_t, std::int64_t, std::int64_t, const float*, std::int64_t, std::int64_t, float*, std::int64_t,
             Stream) {
