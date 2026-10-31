@@ -27,6 +27,98 @@ Copyright (c) 2026 John Lipka and the Pelias contributors
 
 ---
 
+## Open items, whole build (sweep 2026-10-31 14:3x; author 14:29 and 14:33)
+
+~~Struck~~ = done or superseded by where the build stands now. "(confirm)" = no clear ruling found in the logs. Every leftover in Appendix E maps to an item below. The Theories section's tests are all GP3-10, GP3-14 or GP4-02.
+
+**Part 1 questions**
+- ~~Q1 rankings under Pelias scoring~~: Blocks A–C, urm and tier
+- ~~Q2 llama.cpp rounding path~~: GP1-02/03
+- ~~Q3 T8+imatrix / T9 vs Unsloth~~: Block L, then urm/tier beat Unsloth
+- **Q4 long context (4096) and a second kind of text: OPEN.** GP1-09 and GP1-10 never ran.
+- ~~Q5 bf16 floor and flips~~: floor 0.002801; flips don't drive the drift
+- Q6 re-quantize the same bytes → trainer phase (GP1-08)
+
+**GP1 tests**
+- ~~GP1-00 to 03, 05, 06, 07~~
+- ~~GP1-04 bench set~~: replaced by t8r/t9r/Unsloth/urm
+- ~~GP1-13 own importance matrix~~: Block L, plus the urm merge
+- ~~GP1-15 machine run~~: a unit test replaced it
+- ~~GP1-12 per-layer ffn_down sweep~~: covered by the tiered base's 40-layer slopes (confirm)
+- ~~GP1-16 CPU speed of the shared format~~: covered by the GP3-10 CPU benches (confirm)
+- ~~GP1-11 KV q8~~ at 512 tokens (+0.000350). The long-context part stays open and goes with GP1-09.
+- Open: GP1-09 (4096 base), GP1-10 (domain base), GP1-14 (spec checks recorded as DONE in the docs)
+
+**Appendix B rulings**
+- ~~B1~~ (locked tiered path), ~~B3~~ (v2 calibration text), ~~B5~~ (per-32 format and the floor gate), ~~B7~~ (tier types), ~~B10~~ (embedding on the host), ~~B11~~ (budget-derived), ~~B13~~, ~~B14~~
+- B6 KV default: measured; ruling (confirm)
+- Open:
+  - B2: PEL bytes for AWQ/GPTQ (Q4_TG2 is already a precedent)
+  - B4: domain text
+  - B8: parameter conflicts
+  - B9: Pelias-made base. The floor 0.002801 is about 23 % of urm's drift (DERIVED), so it may matter more now.
+  - B12: LoRA scaling
+
+**GP2 docs**
+- ~~GP2-01 paired gates~~, ~~GP2-05 rounding policy~~ (the correction itself is parked below), ~~GP2-09 recipes locked~~
+- Open:
+  - GP2-02 / 02b: status corrections and stale records
+  - GP2-06: KV default
+  - GP2-07: parameter conflicts
+  - GP2-08: data port
+  - GP2-11: 4096 and domain base IDs
+  - GP2-12: Pelias-made base
+  - GP2-13: namespace
+  - GP2-14: version string
+  - GP2-03: trainer phase
+
+**GP3 build**
+- ~~GP3-01, 02, 07, 08, 09, 10, 11~~
+- ~~GP3-06~~: not needed, flips don't carry the tail
+- ~~Router fp32 check~~: the router is F32 and never rounded, so it isn't the source
+- **GP3-14 engine (next):**
+  - v18 first run
+  - U8 (R3 per token + CUDA Graph)
+  - O15, O13 (down projection at 0.27–0.29 of peak)
+  - int32 fold
+  - MTP bank uploads only the swapped experts
+  - DeltaNet prefill decision
+  - planes in the engine
+  - NVML and ceiling reads
+  - hot set re-profile
+  - gates E4–E9, G3, K3
+  - BAR1
+- **CPU (Fable):** persistent pool, AVX2, drop the 3.2 GB zeroes, drop the 128 KB buffer, round shared inputs once. Measure first with `PELIAS_PROF=1 kld --chunks 2`.
+- **Then:** GP3-14c infinite context loop, small-card layout, GP3-03 AWQ, GP3-04 GPTQ, GP3-05 data pipeline, GP3-12 backward/LoRA, GP3-12b, GP3-13 repair training, GP3-13b idle-work scheduler, GP3-15/15b server and web, GP3-16 steps 13–17
+
+**Parked accuracy:**
+- v2 dense and head planes
+- split-token grade
+- real text and long prompts on the GPU
+- tie band B = 0.1 vs top-block error energy, after the CPU fixes
+- 8/12/16-thread kld
+- R2-256 / R2-row (low priority)
+- the locked file on a second text
+
+**Build/platform:** the WSL + MSVC build, Windows-native vs WSL, native Linux (GP4-04)
+
+**GP4 release:**
+- GP4-01 benchmark
+- GP4-02 sweeps (bank size, Lane D, `-t 7` / `--poll`, huge pages, live hit rate)
+- GP4-03 acceptance; restore the persona criterion
+- GP4-04 hardware
+- GP4-05 gates; trademark check
+- GP4-05b future tests
+- GP4-06 freeze
+
+**Housekeeping:**
+- Removal of `r2b_exps.gguf` is the author's call.
+- Turn display-sleep off for overnight runs.
+- Use `stdbuf -oL` in run scripts.
+- The case fans don't ramp under all-core load.
+
+---
+
 ## QUEUED, MUST NOT BE LOST (author 2026-10-30 22:19)
 
 **PDF update:** how the speedup works rev4 -> rev5; Section 21 calibrated gains rev4 -> rev5; 7-bit and 1-bit decoder plain language rev3 -> rev4; pathways whole project v6b -> v7. Skip pathways v5 (the older one, overlapping v6b). Sources and generators in the backup folder (2026-10-28). Content: the 10-30 evening work (fused norm, per-32 prompt format, the GPU work list, the locked MoE slice, gpu_prompt in src, the fp32 min term, the Q4_TG2 probe results). Slot: after the Q4_TG2 probe code ships, before the GP3-12 rungs.
