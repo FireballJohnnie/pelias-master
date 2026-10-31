@@ -27,95 +27,130 @@ Copyright (c) 2026 John Lipka and the Pelias contributors
 
 ---
 
-## Open items, whole build (sweep 2026-10-31 14:3x; author 14:29 and 14:33)
+## Open items, whole build (sweep 2026-10-31 14:3x; merged with the author's consolidation 15:09)
 
-~~Struck~~ = done or superseded by where the build stands now. "(confirm)" = no clear ruling found in the logs. Every leftover in Appendix E maps to an item below. The Theories section's tests are all GP3-10, GP3-14 or GP4-02.
+~~Struck~~ = done or superseded by where the build stands now. "(confirm)" = no clear ruling found in the logs. "Corrected:" = a number or name in the author's 15:09 draft checked against the logs and fixed. Every leftover in Appendix E maps to an item below. The Theories section's tests are all GP3-10, GP3-14 or GP4-02.
 
-**Part 1 questions**
-- ~~Q1 rankings under Pelias scoring~~: Blocks A–C, urm and tier
-- ~~Q2 llama.cpp rounding path~~: GP1-02/03
-- ~~Q3 T8+imatrix / T9 vs Unsloth~~: Block L, then urm/tier beat Unsloth
-- **Q4 long context (4096) and a second kind of text: OPEN.** GP1-09 and GP1-10 never ran.
-- ~~Q5 bf16 floor and flips~~: floor 0.002801; flips don't drive the drift
-- Q6 re-quantize the same bytes → trainer phase (GP1-08)
+### Struck since the 14:3x sweep (author 15:09, checked against the logs)
+- ~~`r2b_exps.gguf`~~: already gone. It was moved to a to-delete folder on 10-28 at the author's request (BUILD_LOG), and the three to-delete folders are empty now (checked 15:1x). D: has 116 GB free (MEASURED 14:49). Corrected: rotating the routed experts was no different from stock (R2b fp32 0.039544, +0.000530 vs stock, t 1.14, not resolved, MEASURED); it sits +0.003980 above dense-only rotation R2 (0.035564; DERIVED from the two MEASURED runs). The 57 GB free figure is older; nothing needs deleting.
+- ~~O13 persistent-tile route~~: closed 10-30 20:08-20:12. v13 ran at 0.84-1.03x of v12 and v13b at v12's speed ("fill/drain not the cost", MEASURED). The locked S3b MoE slice stays: GPU-built work list 0.040-0.130 ms vs host build 0.20-0.45 ms; whole slice 1.30-1.39x at 255 tokens, 1.11-1.15x at 2,040 tokens (MEASURED). **Corrected:** O13 itself stays open. The down projection still runs at 0.27-0.29 of peak; only this route to it is closed.
+- ~~GP1-12 per-layer ffn_down sweep~~: confirmed. The 40-layer slope rerun found Q4_K relative error nearly flat over layers, with down 10-35 % above gate/up only in layers 32-39 (MEASURED). That is built into the tiered quantizer.
+- ~~GP1-16 CPU speed of the shared format~~: confirmed. AVX2 decoders at 16 threads, float / int8 GB/s: Q8_0 35 / 39, Q6_K 38 / 36, Q5_K 31 / 27, Q4_K 22 / 28, IQ4_XS 24 / 29, against 8.5 for the reference path (MEASURED). Q4_TG2 17 / 17 and IQ2_XXS 10 / 11 are below the 27 GB/s gate (DERIVED gate); they move into Line C.
+- ~~R2-256 / R2-row~~: struck. **Corrected reason:** the +0.000999 in the draft is the cost of one *activation scale* per 256 (the gpu256 format, MEASURED), a different thing from the *weight rotation* block size these two runs would test. They were to run "only if Block C lands close to Unsloth". The tiered file is 26.6 % below Unsloth (0.009404 vs 0.012808, MEASURED), so the condition never came up.
+- ~~v18 first engine run~~: done 2026-10-31 from 14:50 (MEASURED, gp/ENGINE; sanitizers finishing). Build clean in 38 s; 27 / 27 GPU tests; decode 12.1-13.0 tok/s. Its follow-ups are in the GP3-14 section below.
 
-**GP1 tests**
-- ~~GP1-00 to 03, 05, 06, 07~~
-- ~~GP1-04 bench set~~: replaced by t8r/t9r/Unsloth/urm
-- ~~GP1-13 own importance matrix~~: Block L, plus the urm merge
-- ~~GP1-15 machine run~~: a unit test replaced it
-- ~~GP1-12 per-layer ffn_down sweep~~: covered by the tiered base's 40-layer slopes (confirm)
-- ~~GP1-16 CPU speed of the shared format~~: covered by the GP3-10 CPU benches (confirm)
-- ~~GP1-11 KV q8~~ at 512 tokens (+0.000350). The long-context part stays open and goes with GP1-09.
-- Open: GP1-09 (4096 base), GP1-10 (domain base), GP1-14 (spec checks recorded as DONE in the docs)
+### Execution lines (the author's grouping, 15:09)
+**Run order:** unchanged from the game plan: A, then C (CPU), then D, then F; B and E follow. A change of order is the author's call.
 
-**Appendix B rulings**
-- ~~B1~~ (locked tiered path), ~~B3~~ (v2 calibration text), ~~B5~~ (per-32 format and the floor gate), ~~B7~~ (tier types), ~~B10~~ (embedding on the host), ~~B11~~ (budget-derived), ~~B13~~, ~~B14~~
-- B6 KV default: measured; ruling (confirm)
-- Open:
-  - B2: PEL bytes for AWQ/GPTQ (Q4_TG2 is already a precedent)
-  - B4: domain text
-  - B8: parameter conflicts
-  - B9: Pelias-made base. The floor 0.002801 is about 23 % of urm's drift (DERIVED), so it may matter more now.
-  - B12: LoRA scaling
+**v18 friction → line (MEASURED 14:52-14:59):**
+- Host waits of 24-26 ms per token → Line A.
+- CPU cold work of 50-57 ms per token, within a 77 ms median step → Line C.
+- Only 39-42 % of picks on the GPU (the bank holds 2,748-2,926 of 10,240 experts) → Line B.
 
-**GP2 docs**
-- ~~GP2-01 paired gates~~, ~~GP2-05 rounding policy~~ (the correction itself is parked below), ~~GP2-09 recipes locked~~
-- Open:
-  - GP2-02 / 02b: status corrections and stale records
-  - GP2-06: KV default
-  - GP2-07: parameter conflicts
-  - GP2-08: data port
-  - GP2-11: 4096 and domain base IDs
-  - GP2-12: Pelias-made base
-  - GP2-13: namespace
-  - GP2-14: version string
-  - GP2-03: trainer phase
+**Line A: U8 (one R3 plan per token + CUDA Graph) + doorbell counter inside R3 + int32 fold + O15**
+- Gap to close: R3's real token measures 5.685 ms against 4.75 ms of pure streaming (about 478 GB/s). The read ceiling is 494 GB/s, about 89.5 % of the card's 552 GB/s as run (MEASURED).
+- Graph replay costs 0.716 µs against 4.70 µs per eager kernel (MEASURED, P-H9).
+- The deterministic int32 folded combine runs at 1.08x, against 1.13x for the f32 fold, at 2,040 tokens (MEASURED).
+- Doorbell: the release store is 2.0 µs and the round trip 2.40 µs (MEASURED).
+- Plan: one R3 launch per token. The cold-expert completion flag becomes a host-mapped counter inside R3's counter array, so the combine waits inline. The launch is wrapped in a CUDA Graph. The int32 fold and O15's two untested ordering forms are fixed in the same pass.
+- **Corrected:**
+  - "5.685 ms vs 6.06 ms grid sync" mixes two measurements. Fix 6 measured counter barriers at 6.16 ms against 6.06 for the grid sync (5.91 with one-task prefetch). The 5.685 came later, with the Q4_TG2 grid in shared memory and per-expert counters.
+  - The 0.52 µs is the grid sync itself.
+  - "19.2 ms vs 24.0 ms": 19.2 ms is graph replay of path (a) on both WSL and Windows. 24 is the µs drain/ramp per stage boundary, not a ms figure.
+- Test: real-token time against 5.685 ms; v18's host waits against 24-26 ms per token.
 
-**GP3 build**
-- ~~GP3-01, 02, 07, 08, 09, 10, 11~~
-- ~~GP3-06~~: not needed, flips don't carry the tail
-- ~~Router fp32 check~~: the router is F32 and never rounded, so it isn't the source
-- **GP3-14 engine (next):**
-  - v18 first run
-  - U8 (R3 per token + CUDA Graph)
-  - O15, O13 (down projection at 0.27–0.29 of peak)
-  - int32 fold
-  - MTP bank uploads only the swapped experts
-  - DeltaNet prefill decision
-  - planes in the engine
-  - NVML and ceiling reads
-  - hot set re-profile
-  - gates E4–E9, G3, K3
-  - BAR1
-- **CPU (Fable):** persistent pool, AVX2, drop the 3.2 GB zeroes, drop the 128 KB buffer, round shared inputs once. Measure first with `PELIAS_PROF=1 kld --chunks 2`.
-- **Then:** GP3-14c infinite context loop, small-card layout, GP3-03 AWQ, GP3-04 GPTQ, GP3-05 data pipeline, GP3-12 backward/LoRA, GP3-12b, GP3-13 repair training, GP3-13b idle-work scheduler, GP3-15/15b server and web, GP3-16 steps 13–17
+**Line B: second text (Q4, GP1-10, B4, GP2-11, the locked file on a second text) + hot-set re-profile + MTP bank delta swaps**
+- WikiText's top 64 experts per layer cover 35.9 % of chat+code picks, against 72.2 % of its own. The rank correlation averages 0.41 per layer, lowest 0.22 (MEASURED).
+- Token-time formula t = D/(e·B) + h·X/(e·B) + (1−h)·X/C + o, with X = 0.532 GB and C = 42.5 GB/s (DERIVED).
+- The live hit rate was 0.775-0.779 with a 7.0 GiB bank on WikiText (MEASURED, tier build). DDR4 saturates at 47.8 GB/s at 2 threads (MEASURED), about 93 % of 51.2 (DERIVED).
+- **Corrected:**
+  - h = 0.36 on chat+code is not measured. The 35.9 % is a top-64 coverage, not a hit rate, and the live h on chat+code is UNMEASURED; this line measures it (engine pick share on the second text).
+  - At h = 0.36 the extra cold read would be (0.775 − 0.36) × 0.532 GB ≈ 221 MB per token (DERIVED), not 212.
+- **Headache found:** the chat+code text behind the 35.9 % is Unsloth's calibration text (842,201 tokens), and tier_v1 uses Unsloth's importance matrix, which was calibrated on it. The GP1-10 rule says never evaluate on a calibration text. B4 must therefore pick a held-out chat+code text.
+- Plan:
+  1. bf16 base on that text: about 57 min at 100 × 512 (MEASURED for WikiText).
+  2. tier_v1 scored on it. Projected about 0.0110 base and 0.0092 with 2 GB planes (DERIVED).
+  3. The same run's routing trace re-profiles the hot set.
+  4. MTP bank promotions upload only the swapped experts, over the copy engines. Copy and compute together reached 1.97-1.98x of an ideal 1.99x (MEASURED).
+- **Corrected:** one expert is 3 × 2048 × 512 weights, about 1.8 MB at Q4_TG2 and 3.3 MB at Q8_0 (DERIVED), so a swap moves 1.8-3.3 MB by tier, not a flat 1.9.
 
-**Parked accuracy:**
-- v2 dense and head planes
-- split-token grade
-- real text and long prompts on the GPU
-- tie band B = 0.1 vs top-block error energy, after the CPU fixes
-- 8/12/16-thread kld
-- R2-256 / R2-row (low priority)
-- the locked file on a second text
+**Line C: Fable's CPU fixes → 8/12/16-thread kld + tie band vs top-block error energy + planes in the engine**
+- Profile of one 512-token CPU chunk: 15.98 s = experts 8.00, DeltaNet 4.50, attention 1.16, head 0.74, shared 0.64, router 0.32 (MEASURED).
+- v17b: Tctl 91.0-91.6 °C, 102-104 W, 14.1-14.35 s per chunk (MEASURED).
+- Fable's five fixes: persistent pool, AVX2 in the quantizer, drop the 3.2 GB of zeroes, drop the 128 KB copy tile, round shared inputs once. Estimated gain 7-12 s per chunk (ESTIMATE, not measured).
+1. Land the five fixes. Raise the Q4_TG2 (17 GB/s) and IQ2_XXS (10-11 GB/s) CPU decoders toward the 27 GB/s gate (game plan C6: byte-plane grid). Verify with `PELIAS_PROF=1 kld --chunks 2`, then the 8/12/16-thread kld sweep.
+2. Tie band B = 0.1 (touches about every 32-wide weight block, DERIVED) side by side with the top 10 % and 20 % of 32-blocks by scaled error energy.
+   - Measured against the rounding cost +0.001009 KL (t 8.27, 10.7 % of 0.009404), whose worst 1 % persists 7x at t+1 (7.09 % vs 1 %; KL 9x), MEASURED.
+   - **Corrected:** this needs new kld runs, one per variant, about 24 min each before the fixes. Tonight's dumps hold per-token KL, not the activations a new rule needs.
+3. Planes in the engine on the same CPU pool, read for the top 4 picks.
+   - 0.008800 KL (−6.4 % vs tiered, t −2.88, MEASURED), keeping 92 % of the every-pick 2 GB gain (0.008747, DERIVED) at half the plane reads, 0 VRAM.
+   - **Corrected:** −31.7 % vs Unsloth's 0.012808 is the every-pick figure (0.008747). Top 4 is −31.3 % (MEASURED).
+   - These numbers are from the CPU reference; the engine must match them.
 
-**Build/platform:** the WSL + MSVC build, Windows-native vs WSL, native Linux (GP4-04)
+**Line D: DeltaNet path + KV default (B6, GP2-06) + GP1-09 (4096 base) + GP3-14c (infinite context)**
+- Registers kernel: decode 11.9-11.97 µs per token, 2.01-2.18 ms per 1,000-token prompt, 2.33x plain recurrent, lowest energy (MEASURED, v5, v7 and v18).
+- The checkpoint variant equals it bit for bit, with free rollback for rejected drafts (MEASURED v18).
+- C16 chunked rows: within 3.1e-7 of fp64 (MEASURED).
+- **Corrected (the prefill choice):** the registers kernel also wins the prompt. 2.01 ms (v18) / 2.18 ms (v5) per 1,000 tokens against C16's 3.12-3.13 ms, and its decode (11.97 µs) beats C16's 27.0 µs (MEASURED). Lock registers + checkpoint for prefill, decode and verify. C16 is kept only if chunking wins at 4K+ prompts (UNMEASURED; GP1-09 measures it).
+- **B6 / GP2-06 (author 15:09):** KV q8_0 + int8-row DeltaNet checkpoints every 256 tokens.
+  - Costs: KV q8 +0.000350, t 2.00, growing with context: +0.00066 at positions 384-510. State int8row +0.000356, t 2.07, one restore. Rejected: KV int4r +0.004156; state int4r +0.032824 (MEASURED).
+  - A 4K repeat skips about 1.8 s (DERIVED).
+  - Because the KV cost grows with context, the 4096 base (GP1-09) re-measures both.
+- C1 1-bit page gate: keeps 72.6 % of attention mass at 1/8 of keys, vs Quest 62.0 % (MEASURED).
+- GP3-14c: 1M tokens ≈ 10.9 GB of q8 KV; a 64-page pull takes under 2 ms from RAM (DERIVED).
 
-**GP4 release:**
-- GP4-01 benchmark
-- GP4-02 sweeps (bank size, Lane D, `-t 7` / `--poll`, huge pages, live hit rate)
-- GP4-03 acceptance; restore the persona criterion
-- GP4-04 hardware
-- GP4-05 gates; trademark check
-- GP4-05b future tests
-- GP4-06 freeze
+**Line E: combined file + Pelias-made base (B9, GP2-12) + v2 dense and head planes**
+- **Corrected (name):** B9 / GP2-12's "Pelias-made base" is the *scoring reference*: Pelias's own bf16 logits, to replace llama.cpp's bf16 base for rankings. It is not a model file.
+  - The floor 0.002801 is the gap between the two references: ~23 % of urm_TG2's 0.012056 and ~32 % of 0.008747 (DERIVED).
+  - The new file is its own item. Both are done in this line, and the file is scored against both bases.
+- Combined file, from BF16:
+  - Dense: rotated Q7_ZT (7.53 bpw), with blk.40 eh_proj rotated (−49.5 % error, MEASURED).
+  - Experts: usage-tiered on the Q4_TG2 floor.
+  - **Corrected:** urm_TG2 0.012056 at −236.4 MB; tier_v1 0.009404 (−26.6 % vs 0.012808) (MEASURED). The Q7_ZT speed figure is the fold route: 5.7-6.9 % faster than Q8_Z (probe v2, MEASURED), not "large matrices" in general.
+  - The ~236 MB saved pays for the v2 dense and head planes at the same total size. Head routes: a 3rd head plane 0.067 GB or frequent-token rows 0.13 GB, against 1.0 GB for the exact head re-score. That re-score gained 0.005818 → 0.005741 (−1.3 %, t −16.8) on the Unsloth file with 2 planes (MEASURED; routes DERIVED).
+- **Corrected:** Q6 / GP1-08 (re-quantize the same bytes) stays in the trainer phase. It decides the trainer's Mode Q; building this file from BF16 does not answer it.
 
-**Housekeeping:**
-- Removal of `r2b_exps.gguf` is the author's call.
-- Turn display-sleep off for overnight runs.
-- Use `stdbuf -oL` in run scripts.
-- The case fans don't ramp under all-core load.
+**Line F: Windows-native vs WSL (GP4-04) + BAR1 + NVML and ceiling reads**
+- WSL2 has no BAR1 mapping. A VRAM flag answers in 0.8-1.4 µs on Windows vs 2.40 µs for the system-RAM flag (MEASURED, graphics probe). Uploads 12.5-12.7 → 22.5-22.7 GB/s, 1.8x (MEASURED).
+- Windows GPU build, gp/block_wingpu_v2c, 30c78ab: clean, 16 / 16, digits identical to WSL, host 86 / 0, memcheck 0 (MEASURED).
+- **Corrected:** the "logits within 2.6e-6, top-1 14/14" in the draft belong to other runs. 2.6e-6 is the Windows CPU (MSVC) check at 14:28; 14 / 14 is the BitNet top-1 against transformers.
+- **Corrected (P2):** v18's sampler shows the card in P2 for 1,647 of 1,684 samples, memory 11,251 MHz vs 11,501 MHz in P0 (MEASURED). That is about 2.2 % less bandwidth (552 → ~540 GB/s, DERIVED), not a large throttle; the 494 GB/s ceiling was measured on both WSL and Windows. Windows also showed P2 at idle (15:11). Whether a Windows run holds P0 is UNMEASURED; the run logs pstate and memory clock.
+
+### Still open outside the lines
+- **GP3-14 engine, v18 follow-ups:**
+  - The batched verify path drifts from the one-token R3 path: verify/keep KL 6.3e-05 vs 1.0e-05; under memcheck 1.07e-04 over the 1e-4 test limit. MTP plain vs drafted split after token 16 (draft 1, 2) and after token 1 (draft 3) (MEASURED).
+  - Float gate top-1 555 vs 566, 11 short of the "within 3" gate, while engine KL 6.69e-3 is below the CPU's 7.06e-3 (MEASURED). Check the 11 flipped positions against their logits (the prompt is made-up IDs).
+  - The 3 skipped unit tests (confirm they are the usual CPU-only skips).
+  - O13 (down projection at 0.27-0.29 of peak); gates E4-E9, G3, K3.
+- **GP1-14:** spec checks recorded as DONE in the docs.
+- **Appendix B:**
+  - Struck: ~~B1~~ (locked tiered path), ~~B3~~ (v2 calibration text), ~~B5~~ (per-32 format and the floor gate), ~~B7~~ (tier types), ~~B10~~ (embedding on the host), ~~B11~~ (budget-derived), ~~B13~~, ~~B14~~.
+  - ~~B6~~ ruled by the author at 15:09 (Line D).
+  - Open: B2 (PEL bytes for AWQ/GPTQ; Q4_TG2 is already a precedent), B4 (held-out chat+code text, Line B), B8 (parameter conflicts), B9 (Line E), B12 (LoRA scaling).
+- **GP2 docs:**
+  - Struck: ~~GP2-01~~, ~~GP2-05~~ (the correction itself is Line C), ~~GP2-09~~, ~~GP2-06~~ (Line D).
+  - Open: GP2-02 / 02b (status corrections, stale records), GP2-07 (parameter conflicts), GP2-08 (data port), GP2-11 (Line B), GP2-12 (Line E), GP2-13 (namespace), GP2-14 (version string). GP2-03 is in the trainer phase.
+- **GP3:**
+  - Struck: ~~GP3-01, 02, 07, 08, 09, 10, 11~~; ~~GP3-06~~ (flips don't carry the tail); ~~router fp32 check~~ (the router is F32 and never rounded).
+  - Then: small-card layout, GP3-03 AWQ, GP3-04 GPTQ, GP3-05 data pipeline, GP3-12 backward/LoRA, GP3-12b, GP3-13 repair training, GP3-13b idle-work scheduler, GP3-15/15b server and web, GP3-16 steps 13-17.
+- **Trainer phase:** Q6 / GP1-08, GP2-03, B12.
+- **Parked accuracy:**
+  - Split-token grade.
+  - Real text and long prompts on the GPU (the second text in Line B and 4096 in Line D cover part of this).
+- **Build/platform:** native Linux (GP4-04).
+- **GP4 release:**
+  - GP4-01 benchmark
+  - GP4-02 sweeps (bank size, Lane D, `-t 7` / `--poll`, huge pages, live hit rate)
+  - GP4-03 acceptance; restore the persona criterion
+  - GP4-04 hardware
+  - GP4-05 gates; trademark check
+  - GP4-05b future tests
+  - GP4-06 freeze
+- **Housekeeping:**
+  - Display-sleep set to never (author 14:44).
+  - A WSL window stays open during runs: WSL powers itself off when idle (14:35 and 14:41 today).
+  - Use `stdbuf -oL` in run scripts.
+  - The case fans don't ramp under all-core load.
 
 ---
 
