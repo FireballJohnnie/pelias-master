@@ -35,6 +35,11 @@ bool host_register(void*, std::size_t, void**, std::string* why) {
 }
 void host_unregister(void*) {}
 bool read_rate(const void*, std::size_t, int, double*) { return false; }
+bool read_chunks_rate(const void*, const std::uint64_t*, int, std::size_t, double*) { return false; }
+bool moe_reader(const ExpertPtr*, const std::int32_t*, const float*, int, const float*, std::int64_t, std::int64_t, std::int64_t, float*, float*, float*,
+                Stream) {
+  return false;
+}
 bool to_host_async(void*, const void*, std::size_t, Stream) { return false; }
 bool matmul(std::uint32_t, const void*, std::uint64_t, std::int64_t, std::int64_t, const float*, std::int64_t, std::int64_t, float*, std::int64_t,
             Stream) {
@@ -61,7 +66,7 @@ bool rope(float*, std::int64_t, std::int64_t, std::int64_t, std::int64_t, std::i
 }
 bool silu_mul(const float*, const float*, float*, std::int64_t, Stream) { return false; }
 bool add_rows(float*, std::int64_t, const float*, std::int64_t, const float*, std::int64_t, std::int64_t, Stream) { return false; }
-bool router_topk(const float*, std::int64_t, std::int64_t, int, float, std::int32_t*, float*, Stream) { return false; }
+bool router_topk(const float*, std::int64_t, std::int64_t, int, float, std::int32_t*, float*, Stream, float) { return false; }
 bool attention(const float*, std::int64_t, std::int64_t, const float*, const float*, std::int64_t, std::int64_t, std::int64_t, std::int64_t,
                std::int64_t, std::int64_t, float, bool, float*, float*, Stream) {
   return false;

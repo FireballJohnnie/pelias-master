@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include "../unit/gpu_test_rows.h"
@@ -546,6 +547,167 @@ TEST(rung1_router_fast_equals_serial_bit_for_bit) {
   CHECK(all);
   std::printf("    %d rows (256 / 160 experts, 8 / 4 picks, weight scale 1 / 2.5, ties): shared-memory router = serial router bit for bit%s\n", rows_checked,
               all ? "" : " (NOT)");
+}
+
+// v24 tie rule: with a band, the picks are the host's order by floor((logit - max) / band), descending, lower index first
+// within a band; the weights are the picked probabilities renormalized (positive, summing to the weight scale)
+TEST(rung1_router_tie_band_picks_equal_host) {
+  if (!gpu_or_skip()) return;
+  bool all = true;
+  int rows_checked = 0;
+  double worst_sum = 0.0;
+  for (const std::int64_t ne : {std::int64_t{256}, std::int64_t{160}})
+    for (const int nu : {8, 4})
+      for (const float band : {0.01f, 0.05f}) {
+        const std::int64_t rows = 41;
+        std::vector<float> lg(static_cast<std::size_t>(ne * rows));
+        std::uint32_t r = static_cast<std::uint32_t>(ne * 11 + nu);
+        for (float& v : lg) {
+          r = r * 1664525u + 1013904223u;
+          v = static_cast<float>(static_cast<int>(r >> 9) % 4001 - 2000) * 0.003f;
+        }
+        for (std::int64_t i = 0; i < ne; ++i) lg[static_cast<std::size_t>(3 * ne + i)] = 0.5f;
+        for (std::int64_t i = 0; i < ne; i += 3) lg[static_cast<std::size_t>(7 * ne + i)] = 1.25f - 1e-5f * static_cast<float>(i % 5);  // near-ties
+        Dev<float> dl(lg), dw(static_cast<std::size_t>(rows * nu));
+        Dev<std::int32_t> ds(static_cast<std::size_t>(rows * nu));
+        CHECK(g::router_topk(dl.p, ne, rows, nu, 1.0f, ds.p, dw.p, nullptr, band));
+        CHECK(g::sync());
+        const std::vector<std::int32_t> sg = ds.get();
+        const std::vector<float> wg = dw.get();
+        for (std::int64_t t = 0; t < rows; ++t) {
+          const float* l = lg.data() + t * ne;
+          float mx = l[0];
+          for (std::int64_t i = 1; i < ne; ++i) mx = std::max(mx, l[i]);
+          std::vector<float> key(static_cast<std::size_t>(ne));
+          for (std::int64_t i = 0; i < ne; ++i) key[static_cast<std::size_t>(i)] = std::floor((l[i] - mx) / band);
+          std::vector<std::int32_t> ord(static_cast<std::size_t>(ne));
+          for (std::int64_t i = 0; i < ne; ++i) ord[static_cast<std::size_t>(i)] = static_cast<std::int32_t>(i);
+          std::partial_sort(ord.begin(), ord.begin() + nu, ord.end(), [&](std::int32_t a, std::int32_t b) {
+            return key[static_cast<std::size_t>(a)] > key[static_cast<std::size_t>(b)] || (key[static_cast<std::size_t>(a)] == key[static_cast<std::size_t>(b)] && a < b);
+          });
+          double ws = 0.0;
+          for (int j = 0; j < nu; ++j) {
+            all = all && sg[static_cast<std::size_t>(t * nu + j)] == ord[static_cast<std::size_t>(j)] && wg[static_cast<std::size_t>(t * nu + j)] > 0.0f;
+            ws += wg[static_cast<std::size_t>(t * nu + j)];
+          }
+          worst_sum = std::max(worst_sum, std::fabs(ws - 1.0));
+        }
+        rows_checked += static_cast<int>(rows);
+      }
+  CHECK(all);
+  CHECK(worst_sum < 1e-5);
+  std::printf("    %d rows (256 / 160 experts, 8 / 4 picks, bands 0.01 / 0.05, ties and near-ties): band picks = host%s; weights sum to 1 within %.2e\n",
+              rows_checked, all ? "" : " (NOT)", worst_sum);
+}
+
+// v24 picked-expert reader: 6 experts of mixed types, 3 in device memory and 3 in registered host memory (as the file
+// mapping), 1-4 tokens of 3 picks, against fp64 products with the per-32 rounding of silu x up; and repeatable bit for bit
+TEST(rung1_moe_reader_against_fp64) {
+  if (!gpu_or_skip()) return;
+  const std::int64_t H = 512, F = 256, ne = 6;  // k a multiple of 256 (the K-quant blocks)
+  const int nu = 3;
+  const q::Type types[3] = {q::Type::q8_0, q::Type::q6_k, q::Type::q4_tg2};
+  std::vector<Mat> M;  // expert e, projection pj at 3 * e + pj
+  for (std::int64_t e = 0; e < ne; ++e)
+    for (int pj = 0; pj < 3; ++pj) {
+      const q::Type t = types[(e + pj) % 3];
+      M.push_back(pj < 2 ? make_mat(t, F, H, static_cast<std::uint32_t>(100 + 10 * e + pj)) : make_mat(t, H, F, static_cast<std::uint32_t>(100 + 10 * e + pj)));
+    }
+  // host memory for experts 3..5, page aligned and registered; device memory for 0..2
+  std::size_t host_b = 0;
+  for (std::int64_t e = 3; e < ne; ++e)
+    for (int pj = 0; pj < 3; ++pj) host_b += (M[static_cast<std::size_t>(3 * e + pj)].bytes.size() + 4095) & ~std::size_t{4095};
+  void* hm = std::aligned_alloc(4096, host_b);
+  CHECK(hm != nullptr);
+  if (!hm) return;
+  void* hdev = nullptr;
+  std::string why;
+  const bool reg = g::host_register(hm, host_b, &hdev, &why);
+  if (!reg) std::printf("    host_register refused (%s): the host experts are copied to the device instead\n", why.c_str());
+  std::vector<g::ExpertPtr> tab(static_cast<std::size_t>(ne));
+  std::vector<void*> dmem;
+  std::size_t hoff = 0;
+  for (std::int64_t e = 0; e < ne; ++e)
+    for (int pj = 0; pj < 3; ++pj) {
+      const Mat& m = M[static_cast<std::size_t>(3 * e + pj)];
+      g::ExpertPtr& X = tab[static_cast<std::size_t>(e)];
+      X.type[pj] = static_cast<std::uint32_t>(types[(e + pj) % 3]);
+      X.rb[pj] = m.rb;
+      if (e >= 3 && reg) {
+        std::memcpy(static_cast<std::uint8_t*>(hm) + hoff, m.bytes.data(), m.bytes.size());
+        X.w[pj] = static_cast<const std::uint8_t*>(hdev) + hoff;
+        hoff += (m.bytes.size() + 4095) & ~std::size_t{4095};
+      } else {
+        void* d = g::dalloc(m.bytes.size());
+        CHECK(d && g::to_device(d, m.bytes.data(), m.bytes.size()));
+        dmem.push_back(d);
+        X.w[pj] = static_cast<const std::uint8_t*>(d);
+      }
+    }
+  Dev<g::ExpertPtr> dtab(tab);
+  bool ok_all = true, same = true;
+  double worst = 0.0;
+  for (const std::int64_t T : {std::int64_t{1}, std::int64_t{2}, std::int64_t{4}}) {
+    const std::vector<float> x = wave(T * H, static_cast<std::uint32_t>(7 + T), 1.0f);
+    std::vector<std::int32_t> sel(static_cast<std::size_t>(T * nu));
+    std::vector<float> wsel(static_cast<std::size_t>(T * nu));
+    for (std::int64_t t = 0; t < T; ++t)
+      for (int j = 0; j < nu; ++j) {
+        sel[static_cast<std::size_t>(t * nu + j)] = static_cast<std::int32_t>((t + 2 * j + (j == 2 ? 1 : 0)) % ne);
+        wsel[static_cast<std::size_t>(t * nu + j)] = 0.2f + 0.15f * static_cast<float>(j);
+      }
+    Dev<float> dx(x), dw(wsel), dgu(static_cast<std::size_t>(T * nu * 2 * F)), dh(static_cast<std::size_t>(T * nu * F)), dy(static_cast<std::size_t>(T * H)),
+        dy2(static_cast<std::size_t>(T * H));
+    Dev<std::int32_t> ds(sel);
+    CHECK(g::moe_reader(dtab.p, ds.p, dw.p, nu, dx.p, T, H, F, dgu.p, dh.p, dy.p));
+    CHECK(g::moe_reader(dtab.p, ds.p, dw.p, nu, dx.p, T, H, F, dgu.p, dh.p, dy2.p));
+    CHECK(g::sync());
+    const std::vector<float> y = dy.get(), y2 = dy2.get();
+    same = same && std::memcmp(y.data(), y2.data(), y.size() * sizeof(float)) == 0;
+    std::vector<double> ref(static_cast<std::size_t>(T * H), 0.0);
+    for (std::int64_t t = 0; t < T; ++t)
+      for (int j = 0; j < nu; ++j) {
+        const std::int64_t e = sel[static_cast<std::size_t>(t * nu + j)];
+        const Mat &mg = M[static_cast<std::size_t>(3 * e)], &mu = M[static_cast<std::size_t>(3 * e + 1)], &md = M[static_cast<std::size_t>(3 * e + 2)];
+        std::vector<float> h(static_cast<std::size_t>(F));
+        for (std::int64_t b = 0; b < F / 32; ++b) {
+          float v[32], a = 0.0f;
+          for (int i = 0; i < 32; ++i) {
+            const std::int64_t r = 32 * b + i;
+            double gg = 0.0, uu = 0.0;
+            for (std::int64_t k = 0; k < H; ++k) {
+              gg += static_cast<double>(mg.deq[static_cast<std::size_t>(r * H + k)]) * x[static_cast<std::size_t>(t * H + k)];
+              uu += static_cast<double>(mu.deq[static_cast<std::size_t>(r * H + k)]) * x[static_cast<std::size_t>(t * H + k)];
+            }
+            const float gf = static_cast<float>(gg);
+            v[i] = (gf / (1.0f + std::exp(-gf))) * static_cast<float>(uu);
+            a = std::max(a, std::fabs(v[i]));
+          }
+          const float sc = a > 0.0f ? a / 127.0f : 1.0f, inv = 1.0f / sc;
+          for (int i = 0; i < 32; ++i) h[static_cast<std::size_t>(32 * b + i)] = sc * std::min(127.0f, std::max(-127.0f, std::rint(v[i] * inv)));
+        }
+        for (std::int64_t r = 0; r < H; ++r) {
+          double acc = 0.0;
+          for (std::int64_t k = 0; k < F; ++k) acc += static_cast<double>(md.deq[static_cast<std::size_t>(r * F + k)]) * h[static_cast<std::size_t>(k)];
+          ref[static_cast<std::size_t>(t * H + r)] += wsel[static_cast<std::size_t>(t * nu + j)] * acc;
+        }
+      }
+    double num = 0.0, den = 0.0;
+    for (std::size_t i = 0; i < ref.size(); ++i) {
+      num += (y[i] - ref[i]) * (y[i] - ref[i]);
+      den += ref[i] * ref[i];
+    }
+    const double rel = std::sqrt(num / std::max(den, 1e-300));
+    worst = std::max(worst, rel);
+    ok_all = ok_all && rel <= 2e-3 && std::isfinite(rel);
+  }
+  CHECK(ok_all);
+  CHECK(same);
+  std::printf("    1 / 2 / 4 tokens x 3 picks, q8_0 / q6_k / q4_tg2, %s: worst rel L2 %.3e against fp64 (the per-32 rounding may flip a step); repeat %s\n",
+              reg ? "3 experts from registered host memory" : "all on the device", worst, same ? "bit for bit" : "DIFFERS");
+  for (void* d : dmem) g::dfree(d);
+  if (reg) g::host_unregister(hm);
+  std::free(hm);
 }
 
 TEST(rung1_attention_against_fp64) {

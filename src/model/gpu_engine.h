@@ -69,6 +69,14 @@ struct EngineOptions {
   // v21: the per-operation timeline (implies timeline): a GPU stamp between the operations of each layer of a doorbell
   // step (one extra one-thread launch per stamp, so it slows the step a little; a diagnostic pass only)
   bool timeline_ops = false;
+  // v24 tie rule (author 18:19): every router call orders experts by floor((logit - max) / router_tie, lower index first
+  // within a band (router_topk's tie_band; the CPU reference's ForwardOptions::router_tie_band). 0: by probability.
+  float router_tie = 0.0f;
+  // v24 picked-expert reader: steps of 1-4 tokens (decode, the MTP verify) run every routed expert on the GPU, reading the
+  // router's picks on the device; bank experts from VRAM, the rest from the model file's mapping registered for the GPU
+  // (host_register). No doorbell, no CPU cold path in those steps. Larger steps keep the bank + doorbell path. Falls back to
+  // off (said in summary()) if the mapping cannot be registered or an expert weight cannot be read by the kernel.
+  bool cold_on_gpu = false;
 };
 
 struct EngineStats {

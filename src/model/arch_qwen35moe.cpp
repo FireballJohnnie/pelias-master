@@ -1037,13 +1037,25 @@ void moe(const Ctx& c, const Qwen35MoeLayer& l, const float* xn, float* out, flo
   std::vector<int32_t> sel(z(n * nu));
   std::vector<float> wsel(z(n * nu));
   std::vector<int32_t> order(z(ne));
+  std::vector<float> tie_key(c.opt.router_tie_band > 0.0f ? z(ne) : 0);
   for (int64_t t = 0; t < n; ++t) {
     float* p = probs.data() + t * ne;
+    const float band = c.opt.router_tie_band;
+    if (band > 0.0f) {  // v24 tie rule: the band keys from the logits, before the softmax
+      float mx = p[0];
+      for (int64_t i = 1; i < ne; ++i) mx = std::max(mx, p[i]);
+      for (int64_t i = 0; i < ne; ++i) tie_key[z(i)] = std::floor((p[i] - mx) / band);
+    }
     softmax(p, ne);
     for (int64_t i = 0; i < ne; ++i) order[z(i)] = static_cast<int32_t>(i);
     // one more than picked, so the first unpicked expert is known (the picks themselves are the same)
     const int64_t nsort = std::min<int64_t>(nu + 1, ne);
-    std::partial_sort(order.begin(), order.begin() + nsort, order.end(), [p](int32_t a, int32_t b) { return p[a] > p[b] || (p[a] == p[b] && a < b); });
+    if (band > 0.0f) {
+      const float* kk = tie_key.data();
+      std::partial_sort(order.begin(), order.begin() + nsort, order.end(), [kk](int32_t a, int32_t b) { return kk[a] > kk[b] || (kk[a] == kk[b] && a < b); });
+    } else {
+      std::partial_sort(order.begin(), order.begin() + nsort, order.end(), [p](int32_t a, int32_t b) { return p[a] > p[b] || (p[a] == p[b] && a < b); });
+    }
     if (c.opt.route) {
       RouteRecord& rr = c.opt.route[z(t * static_cast<int64_t>(s.n_layer) + c.il)];
       rr.p_last = p[order[z(nu - 1)]];

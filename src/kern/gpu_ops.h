@@ -85,8 +85,10 @@ bool add_rows(float* y, std::int64_t ldy, const float* x, std::int64_t ldx, cons
 // renormalized to sum 1 (sum clamped below at 2^-14), times weights_scale when it is neither 0 nor 1; sel / wsel n_used per row
 // tests only (v22): route router_topk through the earlier serial kernel, to check the shared-memory kernel bit for bit
 void router_topk_serial_for_tests(bool on);
+// tie_band (v24, the author's tie rule): > 0 orders the experts by floor((logit - max logit) / tie_band), lower index first
+// within a band (see k_router_fast); 0 = by probability, as before.
 bool router_topk(const float* logits, std::int64_t n_expert, std::int64_t rows, int n_used, float weights_scale, std::int32_t* sel,
-                 float* wsel, Stream s = nullptr);
+                 float* wsel, Stream s = nullptr, float tie_band = 0.0f);
 
 // ---- attention (full attention layers): causal, grouped heads, optional per-head output gate sigmoid(q-row second half).
 // q: n_tok rows of q_stride floats, head h at h * q_head (q_head = head_dim, or 2 * head_dim with the gate after the query);
@@ -153,6 +155,20 @@ bool stamp(unsigned long long* p, Stream s = nullptr);
 bool host_register(void* p, std::size_t bytes, void** dev, std::string* why);
 void host_unregister(void* p);
 bool read_rate(const void* dev, std::size_t bytes, int blocks, double* seconds);
+// v24: n blocks each read one chunk of `chunk` bytes at dev_base + offsets[b] (a routed expert's size, scattered)
+bool read_chunks_rate(const void* dev_base, const std::uint64_t* offsets, int n, std::size_t chunk, double* seconds);
+// v24 expert reader (1-4 tokens): per routed expert its three matrices (gate, up, down), each a device address (the VRAM
+// bank, or the model file's mapping registered with host_register), its GGUF type and row bytes
+struct ExpertPtr {
+  const std::uint8_t* w[3] = {nullptr, nullptr, nullptr};
+  std::uint32_t type[3] = {0, 0, 0};
+  std::uint64_t rb[3] = {0, 0, 0};
+};
+// tab: n_expert entries (device); sel / wsel: tokens x n_used picks and weights (device, as router_topk); xr: tokens x H
+// rounded inputs; gu: scratch tokens x n_used x 2F; h: scratch tokens x n_used x F; y: tokens x H, overwritten with the
+// weighted sum of the picked experts (pick order)
+bool moe_reader(const ExpertPtr* tab, const std::int32_t* sel, const float* wsel, int n_used, const float* xr, std::int64_t tokens, std::int64_t H,
+                std::int64_t F, float* gu, float* h, float* y, Stream s = nullptr);
 // device to device copy (stream ordered)
 bool dcopy(void* dst, const void* src, std::size_t bytes, Stream s = nullptr);
 // per value head: o = rms_norm(o) * w * silu(z), in place on core (n rows of nv * ds), z alike

@@ -379,9 +379,10 @@ __global__ void k_router(const float* __restrict__ logits, std::int64_t ne, int 
 // picked before (the serial loop's rule); the weights and their sum in pick order as before. Same values bit for bit.
 constexpr int kRouterMaxExperts = 1024;
 __global__ void __launch_bounds__(256) k_router_fast(const float* __restrict__ logits, std::int64_t ne, int nu, float wscale,
-                                                     std::int32_t* __restrict__ sel, float* __restrict__ wsel) {
+                                                     std::int32_t* __restrict__ sel, float* __restrict__ wsel, float band) {
   __shared__ float shm[33];
   __shared__ float p[kRouterMaxExperts];
+  __shared__ float key[kRouterMaxExperts];  // v24 tie rule: floor((logit - max) / band); unused when band == 0
   __shared__ unsigned char taken[kRouterMaxExperts];
   __shared__ float inv_s;
   __shared__ float bv[8];
@@ -393,7 +394,9 @@ __global__ void __launch_bounds__(256) k_router_fast(const float* __restrict__ l
   for (std::int64_t i = tid; i < ne; i += nth) m = fmaxf(m, l[i]);
   const float mx = block_max_f(m, shm);
   for (std::int64_t i = tid; i < ne; i += nth) {
-    p[i] = expf(sub(l[i], mx));
+    const float dl = sub(l[i], mx);
+    p[i] = expf(dl);
+    key[i] = band > 0.0f ? floorf(quo(dl, band)) : 0.0f;
     taken[i] = 0;
   }
   __syncthreads();
@@ -410,11 +413,16 @@ __global__ void __launch_bounds__(256) k_router_fast(const float* __restrict__ l
   for (int kk = 0; kk < nu; ++kk) {
     float v = -INFINITY;
     int ix = 0x7fffffff;
-    for (std::int64_t i = tid; i < ne; i += nth)
-      if (!taken[i] && (ix == 0x7fffffff || p[i] > v)) {  // ascending i per thread: strict > keeps the lower index on a tie
-        v = p[i];
+    // v24 tie rule (author 18:19): with band > 0 the order is by key = floor((logit - max) / band), so logits within the
+    // same band of width `band` tie and the lower index wins; every path (one token, a batch, the CPU reference with the
+    // same band) then picks the same experts unless their logits straddle a band edge. band == 0: by probability.
+    for (std::int64_t i = tid; i < ne; i += nth) {
+      const float c = band > 0.0f ? key[i] : p[i];
+      if (!taken[i] && (ix == 0x7fffffff || c > v)) {  // ascending i per thread: strict > keeps the lower index on a tie
+        v = c;
         ix = static_cast<int>(i);
       }
+    }
     for (int o = 16; o > 0; o >>= 1) {
       const float v2 = __shfl_xor_sync(0xffffffffu, v, o);
       const int i2 = __shfl_xor_sync(0xffffffffu, ix, o);
@@ -1038,6 +1046,118 @@ __global__ void k_read_sum(const uint4* __restrict__ p, std::size_t n, unsigned*
   }
   if (acc == 0x9e3779b9u) atomicAdd(out, 1u);  // keeps the reads
 }
+// v24 scattered reads: block b reads chunk b (`chunk` bytes at off[b] from base), as one routed expert per block
+__global__ void k_read_chunks(const std::uint8_t* __restrict__ base, const std::uint64_t* __restrict__ off, std::size_t chunk, unsigned* out) {
+  const uint4* p = reinterpret_cast<const uint4*>(base + off[blockIdx.x]);
+  unsigned acc = 0;
+  for (std::size_t i = threadIdx.x; i < chunk / 16; i += blockDim.x) {
+    const uint4 v = p[i];
+    acc ^= v.x ^ v.y ^ v.z ^ v.w;
+  }
+  if (acc == 0x9e3779b9u) atomicAdd(out, 1u);
+}
+bool read_chunks_rate(const void* dev_base, const std::uint64_t* offsets, int n, std::size_t chunk, double* seconds) {
+  std::uint64_t* doff = static_cast<std::uint64_t*>(dalloc(static_cast<std::size_t>(n) * 8));
+  unsigned* o = static_cast<unsigned*>(dalloc(sizeof(unsigned)));
+  if (!doff || !o) return false;
+  bool ok = to_device(doff, offsets, static_cast<std::size_t>(n) * 8) && sync();
+  const auto t0 = std::chrono::steady_clock::now();
+  k_read_chunks<<<static_cast<unsigned>(n), 256>>>(static_cast<const std::uint8_t*>(dev_base), doff, chunk, o);
+  ok = ok && launched("read chunks") && sync();
+  *seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  dfree(doff);
+  dfree(o);
+  return ok;
+}
+
+// ------------------------------------------------------------------------------------------------ v24 expert reader
+bool device_tables(Tables* out);  // defined below
+// For 1-4 tokens (decode, the MTP verify): the router's picks read straight from device memory, each picked expert's rows
+// read from wherever its table entry points (the VRAM bank, or the model file's mapping registered for the GPU), one warp
+// per output row, lanes over 32-value blocks (decode32, as k_matmul), on the rounded inputs. Three launches per layer:
+// gate and up; silu x up rounded per 32 (the CPU cold path's rule); down summed over a token's picks in pick order (a
+// deterministic sum) into y, overwritten.
+__global__ void __launch_bounds__(128) k_rd_gate_up(const ExpertPtr* __restrict__ tab, const std::int32_t* __restrict__ sel, int nu,
+                                                    const float* __restrict__ xr, std::int64_t H, std::int64_t F, float* __restrict__ gu,
+                                                    const Tables tb) {
+  const std::int64_t pi = blockIdx.y;  // pick index t * nu + j
+  const std::int64_t r = static_cast<std::int64_t>(blockIdx.x) * 4 + (threadIdx.x >> 5);
+  const int lane = static_cast<int>(threadIdx.x & 31);
+  if (r >= 2 * F) return;
+  const int e = sel[pi];
+  const int pj = r < F ? 0 : 1;
+  const std::int64_t rr = r < F ? r : r - F;
+  const ExpertPtr& X = tab[e];
+  const std::uint8_t* row = X.w[pj] + static_cast<std::uint64_t>(rr) * X.rb[pj];
+  const float* x = xr + (pi / nu) * H;
+  float acc = 0.0f;
+  for (std::int64_t j = lane; j < H / 32; j += 32) {
+    float wv[32];
+    decode32(X.type[pj], row, j, tb, wv);
+    float s = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 32; ++i) s += wv[i] * x[32 * j + i];
+    acc += s;
+  }
+  acc = warp_sum(acc);
+  if (lane == 0) gu[(pi * 2 + pj) * F + rr] = acc;
+}
+__global__ void k_rd_silu_round(const float* __restrict__ gu, std::int64_t picks, std::int64_t F, float* __restrict__ h) {
+  const std::int64_t id = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x, nb = F / 32;
+  if (id >= picks * nb) return;
+  const std::int64_t pi = id / nb, b = id % nb;
+  const float* g = gu + pi * 2 * F + 32 * b;
+  const float* u = gu + (pi * 2 + 1) * F + 32 * b;
+  float v[32];
+  float a = 0.0f;
+  for (int i = 0; i < 32; ++i) {
+    v[i] = mul(silu_d(g[i]), u[i]);
+    a = fmaxf(a, fabsf(v[i]));
+  }
+  const float sc = a > 0.0f ? quo(a, 127.0f) : 1.0f;
+  const float inv = quo(1.0f, sc);
+  for (int i = 0; i < 32; ++i) h[pi * F + 32 * b + i] = mul(sc, fminf(127.0f, fmaxf(-127.0f, rintf(mul(v[i], inv)))));
+}
+__global__ void __launch_bounds__(128) k_rd_down(const ExpertPtr* __restrict__ tab, const std::int32_t* __restrict__ sel,
+                                                 const float* __restrict__ wsel, int nu, const float* __restrict__ h, std::int64_t H,
+                                                 std::int64_t F, float* __restrict__ y, const Tables tb) {
+  const std::int64_t t = blockIdx.y;
+  const std::int64_t r = static_cast<std::int64_t>(blockIdx.x) * 4 + (threadIdx.x >> 5);
+  const int lane = static_cast<int>(threadIdx.x & 31);
+  if (r >= H) return;
+  float tot = 0.0f;
+  for (int j = 0; j < nu; ++j) {
+    const std::int64_t pi = t * nu + j;
+    const ExpertPtr& X = tab[sel[pi]];
+    const std::uint8_t* row = X.w[2] + static_cast<std::uint64_t>(r) * X.rb[2];
+    const float* hv = h + pi * F;
+    float acc = 0.0f;
+    for (std::int64_t q = lane; q < F / 32; q += 32) {
+      float wv[32];
+      decode32(X.type[2], row, q, tb, wv);
+      float s = 0.0f;
+#pragma unroll
+      for (int i = 0; i < 32; ++i) s += wv[i] * hv[32 * q + i];
+      acc += s;
+    }
+    acc = warp_sum(acc);
+    tot = add(tot, mul(wsel[pi], acc));
+  }
+  if (lane == 0) y[t * H + r] = tot;
+}
+bool moe_reader(const ExpertPtr* tab, const std::int32_t* sel, const float* wsel, int n_used, const float* xr, std::int64_t tokens, std::int64_t H,
+                std::int64_t F, float* gu, float* h, float* y, Stream s) {
+  if (!tab || !sel || !wsel || !xr || !gu || !h || !y || n_used <= 0 || H % 32 != 0 || F % 32 != 0) return fail("moe_reader: bad shape or pointer");
+  if (tokens <= 0) return true;
+  Tables tb;
+  if (!device_tables(&tb)) return false;
+  const std::int64_t picks = tokens * n_used;
+  k_rd_gate_up<<<dim3(static_cast<unsigned>((2 * F + 3) / 4), static_cast<unsigned>(picks)), 128, 0, st(s)>>>(tab, sel, n_used, xr, H, F, gu, tb);
+  k_rd_silu_round<<<blocks_for(picks * (F / 32), 128), 128, 0, st(s)>>>(gu, picks, F, h);
+  k_rd_down<<<dim3(static_cast<unsigned>((H + 3) / 4), static_cast<unsigned>(tokens)), 128, 0, st(s)>>>(tab, sel, wsel, n_used, h, H, F, y, tb);
+  return launched("moe_reader");
+}
+
 bool read_rate(const void* dev, std::size_t bytes, int blocks, double* seconds) {
   unsigned* o = static_cast<unsigned*>(dalloc(sizeof(unsigned)));
   if (!o) return false;
@@ -1208,13 +1328,15 @@ bool add_rows(float* y, std::int64_t ldy, const float* x, std::int64_t ldx, cons
 bool g_router_serial = false;  // tests only: the serial kernel (the v22 kernel is checked against it bit for bit)
 void router_topk_serial_for_tests(bool on) { g_router_serial = on; }
 bool router_topk(const float* logits, std::int64_t n_expert, std::int64_t rows, int n_used, float weights_scale, std::int32_t* sel, float* wsel,
-                 Stream s) {
+                 Stream s, float tie_band) {
   if (n_expert <= 0 || n_used <= 0 || n_used > n_expert || !logits || !sel || !wsel) return fail("router_topk: bad shape");
   if (rows <= 0) return true;
-  if (n_expert <= kRouterMaxExperts && !g_router_serial) {  // v22: shared-memory picks, same values
-    k_router_fast<<<static_cast<unsigned>(rows), 256, 0, st(s)>>>(logits, n_expert, n_used, weights_scale, sel, wsel);
+  if (tie_band < 0.0f) return fail("router_topk: a negative tie band");
+  if (n_expert <= kRouterMaxExperts && (!g_router_serial || tie_band > 0.0f)) {  // v22: shared-memory picks, same values
+    k_router_fast<<<static_cast<unsigned>(rows), 256, 0, st(s)>>>(logits, n_expert, n_used, weights_scale, sel, wsel, tie_band);
     return launched("router_topk");
   }
+  if (tie_band > 0.0f) return fail("router_topk: the tie band needs at most 1024 experts");
   // the probabilities need a work row per token; kept in a buffer that grows (a model's shape is fixed after load, so this
   // allocates on the first calls only)
   static float* work = nullptr;

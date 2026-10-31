@@ -246,7 +246,7 @@ namespace {
 // GP3-14 stages 1-2: the engine over a sequence fed in pieces (prefill chunks, then one token at a time) against the
 // reference's fresh pass with the same roundings. hot: experts 0 .. hot-1 of every layer in the GPU bank, the rest on
 // the CPU (0: every expert on the CPU; 8: every expert on the GPU).
-std::vector<float> engine_case(const Small& sm, int hot, const char* what, bool bell = true, bool timeline = false) {
+std::vector<float> engine_case(const Small& sm, int hot, const char* what, bool bell = true, bool timeline = false, bool reader = false, float band = 0.0f) {
   const m::Qwen35MoeSpec& s = sm.spec;
   const int n = std::getenv("PELIAS_GPU_QUICK") ? 20 : 48, nv = static_cast<int>(s.n_vocab);
   std::vector<std::int32_t> tok(static_cast<std::size_t>(n));
@@ -254,6 +254,7 @@ std::vector<float> engine_case(const Small& sm, int hot, const char* what, bool 
   std::vector<float> ref(static_cast<std::size_t>(n) * static_cast<std::size_t>(nv)), eng(ref.size());
   m::ForwardOptions o = m::GpuForward::matching_reference_options();
   o.threads = 4;
+  o.router_tie_band = band;  // v24: the reference orders by the same band
   CHECK(m::forward_reference(s, sm.w, tok.data(), n, 0, n, ref.data(), o).ok());
   m::EngineOptions eo;
   eo.max_ctx = 128;
@@ -261,6 +262,8 @@ std::vector<float> engine_case(const Small& sm, int hot, const char* what, bool 
   eo.cpu_threads = 4;
   eo.doorbell = bell;
   eo.timeline = timeline;
+  eo.cold_on_gpu = reader;
+  eo.router_tie = band;
   if (hot > 0) {
     eo.hot_order.assign(s.n_layer, {});
     for (auto& v : eo.hot_order)
@@ -282,6 +285,11 @@ std::vector<float> engine_case(const Small& sm, int hot, const char* what, bool 
     std::printf("    %s: %s\n", what, rep.substr(0, rep.find('\n')).c_str());
   }
   CHECK((f.value->summary().find("doorbell") != std::string::npos) == bell);
+  if (reader) {  // v24: the reader must be on (the small model's file mapping registered)
+    const std::string sm_sum = f.value->summary();
+    CHECK(sm_sum.find("expert reader on") != std::string::npos);
+    std::printf("    %s: %s\n", what, sm_sum.substr(sm_sum.find("expert reader")).c_str());
+  }
   // two passes: the second after reset() must give the same logits bit for bit (the state is carried, not leaked)
   std::vector<float> first;
   std::uint64_t hp = 0, cp = 0;
@@ -380,6 +388,11 @@ TEST(rung4_engine_decode_against_the_reference) {
   CHECK(!a.empty() && a.size() == c.size() && std::memcmp(a.data(), c.data(), a.size() * sizeof(float)) == 0);
   CHECK(!a.empty() && a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0);
   std::printf("    doorbell vs device syncs: logits bit for bit %s\n", !a.empty() && a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0 ? "equal" : "DIFFERENT");
+  // v24: the picked-expert reader (decode steps: every routed expert on the GPU, bank and file mapping), and the tie band
+  engine_case(sm, 4, "engine, reader, half in the bank", true, false, true);
+  engine_case(sm, 0, "engine, reader, no bank", true, false, true);
+  engine_case(sm, 4, "engine, tie band 0.01", true, false, false, 0.01f);
+  engine_case(sm, 4, "engine, reader + tie band 0.01", true, false, true, 0.01f);
 }
 
 // GP3-14 stage 3: verify batches and keep() (the MTP rollback) on the small model: after a 16-token prefill, batches of 4

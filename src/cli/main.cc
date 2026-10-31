@@ -2177,6 +2177,29 @@ int cmd_pin_probe(const Args& a) {
     std::printf("  (1) register the read-only file mapping: %s (%.3f s)%s%s\n", ok ? "OK" : "REFUSED", tr.seconds(), ok ? "" : ": ", why.c_str());
     if (ok) {
       rate(dev, "(1) GPU reads the file mapping");
+      // v24: scattered expert-sized reads in the registered region (one block per chunk, offsets from a fixed LCG,
+      // 4 KiB aligned), as the reader's routed experts would be read
+      for (const std::size_t kb : {std::size_t{256}, std::size_t{1024}, std::size_t{2048}}) {
+        const std::size_t chunk = kb << 10;
+        if (chunk * 2 > bytes) continue;
+        for (const int nchunks : {80, 320}) {
+          std::vector<std::uint64_t> offs(static_cast<std::size_t>(nchunks));
+          std::uint64_t st = 0x9e3779b97f4a7c15ull ^ (kb * 131 + static_cast<std::uint64_t>(nchunks));
+          for (auto& of : offs) {
+            st = st * 6364136223846793005ull + 1442695040888963407ull;
+            of = ((st >> 17) % ((bytes - chunk) / 4096)) * 4096;
+          }
+          for (int rep = 0; rep < 2; ++rep) {
+            double sec = 0.0;
+            if (!kern::gpu::read_chunks_rate(dev, offs.data(), nchunks, chunk, &sec)) {
+              std::printf("  (1s) scattered read failed: %s\n", kern::gpu::last_error());
+              break;
+            }
+            std::printf("  (1s) scattered: %d chunks of %zu KiB in %.4f s = %.2f GB/s\n", nchunks, kb, sec,
+                        static_cast<double>(chunk) * nchunks / sec / 1e9);
+          }
+        }
+      }
       kern::gpu::host_unregister(region);
     }
   }
@@ -2207,7 +2230,8 @@ int cmd_engine_check(const Args& a) {
                  "usage: pelias engine-check --model FILE [--routes ROUTES.bin] [--prefill 64] [--decode 32] [--ctx 4096] [--batch 64] [--threads N]\n"
                  "                           [--budget-gb G] [--hot-max N] [--mtp-draft K] [--fast-cpu] [--no-cpu] [--float-ref]\n"
                  "                           [--text FILE [--skip-tokens N]] [--timeline] [--dump-top OUT.tsv] [--dump-split [--split-sizes 2,3,4] [--split-step]]\n"
-                 "                           [--no-doorbell] [--timeline-ops] [--split-ref] [--bank-selftest MIXES] [--probe-pos P]\n");
+                 "                           [--no-doorbell] [--timeline-ops] [--split-ref] [--bank-selftest MIXES] [--probe-pos P]\n"
+                 "                           [--router-tie BAND] [--cold-on-gpu]\n");
     return 1;
   }
   auto num = [&](const char* k, std::uint64_t d, std::uint64_t lo, std::uint64_t hi, std::uint64_t& out) {
@@ -2263,6 +2287,20 @@ int cmd_engine_check(const Args& a) {
   eo.timeline = a.has("timeline");
   eo.doorbell = !a.has("no-doorbell");
   eo.timeline_ops = a.has("timeline-ops");
+  // v24: the tie rule's band (the engine and the rounded CPU reference; the float reference keeps the plain order) and the
+  // picked-expert reader
+  float tie_band = 0.0f;
+  if (a.has("router-tie")) {
+    const std::string tv = a.get("router-tie");
+    char* endp = nullptr;
+    tie_band = std::strtof(tv.c_str(), &endp);
+    if (tv.empty() || !endp || *endp != '\0' || !(tie_band >= 0.0f && tie_band <= 1.0f)) {
+      std::fprintf(stderr, "pelias: --router-tie takes a band from 0 to 1\n");
+      return 1;
+    }
+  }
+  eo.router_tie = tie_band;
+  eo.cold_on_gpu = a.has("cold-on-gpu");
   // v20: the split check's batch sizes (default 1 + drafts)
   std::vector<int> split_sizes;
   if (a.has("split-sizes")) {
@@ -2572,6 +2610,7 @@ int cmd_engine_check(const Args& a) {
         model::ForwardOptions orf = model::GpuForward::matching_reference_options();
         orf.threads = static_cast<int>(thr);
         orf.fast_cpu = a.has("fast-cpu");
+        orf.router_tie_band = tie_band;
         std::vector<std::int32_t> seq(prompt);
         seq.insert(seq.end(), plain.begin(), plain.end() - 1);
         std::vector<float> rr(static_cast<std::size_t>(ndec) * nv);
@@ -2657,10 +2696,11 @@ int cmd_engine_check(const Args& a) {
   model::ForwardOptions o = model::GpuForward::matching_reference_options();
   o.threads = static_cast<int>(thr);
   o.fast_cpu = a.has("fast-cpu");
+  o.router_tie_band = tie_band;
   std::vector<float> ref(lg.size());
   Timer tcpu;
   if (Status rs = model::forward_reference(s, w.value, ids.data(), n, 0, n, ref.data(), o); !rs) return fail_input(rs);
-  std::printf("  CPU reference (same rounding%s): %.2f s\n", o.fast_cpu ? ", fast CPU kernels" : "", tcpu.seconds());
+  std::printf("  CPU reference (same rounding%s%s): %.2f s\n", o.fast_cpu ? ", fast CPU kernels" : "", tie_band > 0.0f ? ", the same tie band" : "", tcpu.seconds());
   auto show = [&](const char* label, const Cmp& c) {
     std::printf("  %s: logits rel L2 %.3e, largest |diff| %.3e; KL mean %.3e max %.3e; top-1 equal %d / %d\n", label, c.rel, c.worst, c.kl_mean, c.kl_max, c.top, n);
   };

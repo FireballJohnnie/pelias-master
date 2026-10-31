@@ -20,6 +20,7 @@
 #include "kern/cpu_dot.h"
 #include "kern/gpu_ops.h"
 #include "kern/gpu_decode.h"
+#include "kern/gpu_decode.h"
 #include "kern/gpu_prompt.h"
 #include "kern/gpu_stream.h"
 #include "quant/block_types.h"
@@ -190,6 +191,7 @@ struct Layer {
   std::size_t bank_cap = 0;     // > 0: bank_mem is a fixed arena of this many bytes (rebuilt in place by promotion)
   int bank_slots = 0;           // experts the fixed arena may hold
   std::vector<std::uint64_t> picks;  // picks per expert (the MTP block counts them for promotion)
+  std::vector<const std::uint8_t*> bank_at[3];  // v24: per projection (gate, up, down), each hot expert's matrix in the bank
 };
 
 // one routed expert's rows of one projection
@@ -239,6 +241,13 @@ struct GpuEngine::Impl {
   float* yc = nullptr;  // the cold sum, copied up
   std::int32_t* sel = nullptr;
   float* lg = nullptr;
+  // v24 picked-expert reader
+  static constexpr int kReaderMax = 4;   // steps of up to this many tokens use it
+  bool reader = false;
+  std::string reader_note = "off";
+  void* reg_base = nullptr;              // the registered span of the model file's mapping (host)
+  g::ExpertPtr* rtab = nullptr;          // n_layer x n_expert entries (device)
+  float *rgu = nullptr, *rh = nullptr;   // scratch: kReaderMax x nu x 2F, kReaderMax x nu x F
   static constexpr int kOutRows = 64;
   // host side of the cold path (sized once)
   std::unique_ptr<Pool> pool;
@@ -443,7 +452,8 @@ struct GpuEngine::Impl {
       bank_bytes_total += need_b;
     }
     Arena A{static_cast<std::uint8_t*>(D.bank_mem), D.bank_cap > 0 ? D.bank_cap : need_b, 0};
-    auto stacks = [&](const WeightView& v, std::vector<g::PromptWeights>& dst) -> Status {
+    for (auto& ba : D.bank_at) ba.assign(z(ne), nullptr);
+    auto stacks = [&](const WeightView& v, std::vector<g::PromptWeights>& dst, int proj) -> Status {
       std::map<std::uint32_t, std::vector<int>> by;
       for (int e = 0; e < ne; ++e)
         if (D.hot[z(e)]) by[exp_type(v, e)].push_back(e);
@@ -456,6 +466,7 @@ struct GpuEngine::Impl {
         for (std::size_t i = 0; i < ex.size(); ++i) {
           const ExpRows r = exp_rows(v, ex[i]);
           if (!g::to_device(d + i * mat, r.base, mat)) return gfail("engine: bank upload " + v.name);
+          D.bank_at[proj][z(ex[i])] = d + i * mat;
         }
         const int64_t rows = static_cast<int64_t>(ex.size()) * n_out;
         g::PromptWeights pw;
@@ -472,7 +483,7 @@ struct GpuEngine::Impl {
       return Status::good();
     };
     Status st;
-    if (!(st = stacks(l.gate_exps, D.bg)) || !(st = stacks(l.up_exps, D.bu)) || !(st = stacks(l.down_exps, D.bd))) return st;
+    if (!(st = stacks(l.gate_exps, D.bg, 0)) || !(st = stacks(l.up_exps, D.bu, 1)) || !(st = stacks(l.down_exps, D.bd, 2))) return st;
     if (D.bg.size() > 4 || D.bu.size() > 4 || D.bd.size() > 4) return Status::fail(Code::unsupported, "engine: more than 4 expert types in a layer's bank");
     return Status::good();
   }
@@ -711,7 +722,7 @@ struct GpuEngine::Impl {
     const int64_t e = s.n_embd, ne = s.n_expert, nu = s.n_expert_used, ffs = s.n_ff_shexp;
     Status st;
     if (!(st = prod(D.gate_inp, xn, n, logits_r))) return st;
-    if (!g::router_topk(logits_r, ne, n, static_cast<int>(nu), s.expert_weights_scale, sel, wsel)) return gfail("engine: router");
+    if (!g::router_topk(logits_r, ne, n, static_cast<int>(nu), s.expert_weights_scale, sel, wsel, nullptr, o.router_tie)) return gfail("engine: router");
     // the picks and the normed rows to the host (waits for the router)
     Clock::time_point tw = Clock::now();
     if (!g::to_host(sel_h.data(), sel, z(n * nu) * sizeof(std::int32_t)) || !g::to_host(wsel_h.data(), wsel, z(n * nu) * sizeof(float)))
@@ -853,7 +864,7 @@ struct GpuEngine::Impl {
     const int64_t e = s.n_embd, ne = s.n_expert, nu = s.n_expert_used, ffs = s.n_ff_shexp;
     Status st;
     if (!(st = prod(D.gate_inp, xn, n, logits_r))) return st;
-    if (!g::router_topk(logits_r, ne, n, static_cast<int>(nu), s.expert_weights_scale, sel, wsel)) return gfail("engine: router");
+    if (!g::router_topk(logits_r, ne, n, static_cast<int>(nu), s.expert_weights_scale, sel, wsel, nullptr, o.router_tie)) return gfail("engine: router");
     if (!opstamp(8)) return gfail("engine: stamp");
     if (!g::to_host_async(sel_m, sel, z(n * nu) * sizeof(std::int32_t)) || !g::to_host_async(wsel_m, wsel, z(n * nu) * sizeof(float)) ||
         !g::to_host_async(xn_m, xn, z(n * e) * sizeof(float)) || !g::bell_ring(fa_d, g, nullptr, tsd))
@@ -888,6 +899,99 @@ struct GpuEngine::Impl {
     return Status::good();
   }
 
+  // v24: the MoE block of a 1-4 token step with the picked-expert reader: router, rounding, every routed expert on the GPU
+  // (bank experts from VRAM, the rest from the registered file mapping), then the shared expert; nothing waits on the CPU
+  Status moe_block_reader(Layer& D, int64_t n, std::uint32_t il) {
+    const int64_t e = s.n_embd, ne = s.n_expert, nu = s.n_expert_used, ffs = s.n_ff_shexp;
+    Status st;
+    if (!(st = prod(D.gate_inp, xn, n, logits_r))) return st;
+    if (!g::router_topk(logits_r, ne, n, static_cast<int>(nu), s.expert_weights_scale, sel, wsel, nullptr, o.router_tie)) return gfail("engine: router");
+    if (!opstamp(8) || !opstamp(9)) return gfail("engine: stamp");
+    if (!g::act_q8x32(xn, e, n, e, false, xr, e, q, scale, sum)) return gfail("engine: expert input rounding");
+    if (!opstamp(10)) return gfail("engine: stamp");
+    if (!g::moe_reader(rtab + static_cast<int64_t>(il) * ne, sel, wsel, static_cast<int>(nu), xr, n, e, s.n_ff_exp, rgu, rh, y))
+      return gfail("engine: expert reader");
+    if (!opstamp(11)) return gfail("engine: stamp");
+    if (n == 1 && D.gate_sh.r3 && D.up_sh.r3 && D.gate_sh.k == D.up_sh.k) {
+      if (!(st = prod_r3({{&D.gate_sh, gs}, {&D.up_sh, us}}, xn))) return st;
+    } else if (!(st = prod(D.gate_sh, xn, n, gs)) || !(st = prod(D.up_sh, xn, n, us))) {
+      return st;
+    }
+    if (!g::silu_mul(gs, us, gs, n * ffs)) return gfail("engine: shared silu");
+    if (!(st = prod(D.down_sh, gs, n, sh))) return st;
+    if (!g::matmul(static_cast<std::uint32_t>(quant::Type::f32), D.gate_inp_sh, static_cast<std::uint64_t>(e) * sizeof(float), 1, e, xn, n, e, gsh, 1) ||
+        !g::deltanet_gates(gsh, galpha, zero2, zero2, n, 1))
+      return gfail("engine: shared gate");
+    if (!g::add_rows(y, e, sh, e, gsh, e, n)) return gfail("engine: shared add");
+    if (!opstamp(12) || !opstamp(13) || !opstamp(14)) return gfail("engine: stamp");
+    return Status::good();
+  }
+  // v24: register the span of the model file holding the trunk's routed experts, and build the reader's tables
+  void setup_reader() {
+    const int64_t ne = s.n_expert;
+    if (s.n_embd % 32 != 0 || s.n_ff_exp % 32 != 0) {
+      reader_note = "off (shapes not a multiple of 32)";
+      return;
+    }
+    std::uintptr_t lo = UINTPTR_MAX, hi = 0;
+    for (std::uint32_t il = 0; il < s.n_layer; ++il)
+      for (const WeightView* v : {&w->layers[il].gate_exps, &w->layers[il].up_exps, &w->layers[il].down_exps}) {
+        if (v->rot32) {
+          reader_note = "off (a rotated expert weight)";
+          return;
+        }
+        for (int64_t ex = 0; ex < ne; ++ex) {
+          const ExpRows r = exp_rows(*v, static_cast<int>(ex));
+          if (!g::type_supported(static_cast<std::uint32_t>(r.t))) {
+            reader_note = "off (an expert type the reader cannot decode)";
+            return;
+          }
+          const auto a = reinterpret_cast<std::uintptr_t>(r.base);
+          lo = std::min(lo, a);
+          hi = std::max(hi, a + static_cast<std::uintptr_t>(r.rb * v->ne[1]));
+        }
+      }
+    if (hi <= lo) return;
+    const std::uintptr_t pg = 4096, b0 = lo & ~(pg - 1), b1 = (hi + pg - 1) & ~(pg - 1);
+    void* dev = nullptr;
+    std::string why;
+    const Clock::time_point tr = Clock::now();
+    if (!g::host_register(reinterpret_cast<void*>(b0), static_cast<std::size_t>(b1 - b0), &dev, &why)) {
+      reader_note = "off (registering " + std::to_string((b1 - b0) >> 20) + " MiB of the file mapping failed: " + why + ")";
+      return;
+    }
+    reg_base = reinterpret_cast<void*>(b0);
+    const double reg_s = since(tr);
+    std::vector<g::ExpertPtr> tab(z(static_cast<int64_t>(s.n_layer) * ne));
+    for (std::uint32_t il = 0; il < s.n_layer; ++il) {
+      const Qwen35MoeLayer& l = w->layers[il];
+      const WeightView* vv[3] = {&l.gate_exps, &l.up_exps, &l.down_exps};
+      for (int64_t ex = 0; ex < ne; ++ex) {
+        g::ExpertPtr& X = tab[z(static_cast<int64_t>(il) * ne + ex)];
+        for (int pj = 0; pj < 3; ++pj) {
+          const ExpRows r = exp_rows(*vv[pj], static_cast<int>(ex));
+          const std::uint8_t* bank = L[il].hot[z(ex)] && !L[il].bank_at[pj].empty() ? L[il].bank_at[pj][z(ex)] : nullptr;
+          X.w[pj] = bank ? bank : static_cast<const std::uint8_t*>(dev) + (reinterpret_cast<std::uintptr_t>(r.base) - b0);
+          X.type[pj] = static_cast<std::uint32_t>(r.t);
+          X.rb[pj] = r.rb;
+        }
+      }
+    }
+    const int64_t mp = kReaderMax * static_cast<int64_t>(s.n_expert_used), ff = s.n_ff_exp;
+    rtab = static_cast<g::ExpertPtr*>(g::dalloc(tab.size() * sizeof(g::ExpertPtr)));
+    rgu = static_cast<float*>(g::dalloc(z(mp * 2 * ff) * sizeof(float)));
+    rh = static_cast<float*>(g::dalloc(z(mp * ff) * sizeof(float)));
+    if (!rtab || !rgu || !rh || !g::to_device(rtab, tab.data(), tab.size() * sizeof(g::ExpertPtr))) {
+      reader_note = "off (device memory for the reader's tables)";
+      return;
+    }
+    dev_bytes += tab.size() * sizeof(g::ExpertPtr) + z(mp * 3 * ff) * sizeof(float);
+    reader = true;
+    char b[160];
+    std::snprintf(b, sizeof b, "on (steps of 1-%d tokens; %.2f GB of the file registered in %.2f s)", kReaderMax, static_cast<double>(b1 - b0) / 1e9, reg_s);
+    reader_note = b;
+  }
+
   Status reset_state() {
     pos = 0;
     mtp_pos = 0;
@@ -914,6 +1018,10 @@ GpuEngine::~GpuEngine() {
     p_->bcv.notify_all();
     p_->bell_th.join();
   }
+  if (p_->reg_base) g::host_unregister(p_->reg_base);
+  g::dfree(p_->rtab);
+  g::dfree(p_->rgu);
+  g::dfree(p_->rh);
   g::host_free(p_->bell_h);
   g::host_free(p_->ts_hv);
   g::host_free(p_->ops_hv);
@@ -1091,11 +1199,11 @@ void GpuEngine::timeline_reset() {
 
 std::string GpuEngine::summary() const {
   const Impl& I = *p_;
-  char b[512];
-  std::snprintf(b, sizeof b, "engine: %.2f GB on the device (dense + output %.2f GB, bank %.2f GB = %d experts of %u, cache + state %.2f GB); %d CPU threads; ctx %d, batch %d; hand-off %s",
+  char b[768];
+  std::snprintf(b, sizeof b, "engine: %.2f GB on the device (dense + output %.2f GB, bank %.2f GB = %d experts of %u, cache + state %.2f GB); %d CPU threads; ctx %d, batch %d; hand-off %s; router tie band %g; expert reader %s",
                 static_cast<double>(I.dev_bytes) / 1e9, static_cast<double>(I.dense_bytes_total) / 1e9, static_cast<double>(I.bank_bytes_total) / 1e9, I.bank_count,
                 I.s.n_layer * I.s.n_expert, static_cast<double>(I.cache_bytes) / 1e9, I.pool ? I.pool->threads() : 0, I.o.max_ctx, I.o.max_batch,
-                I.bell ? "doorbell" : "device sync per layer");
+                I.bell ? "doorbell" : "device sync per layer", static_cast<double>(I.o.router_tie), I.reader_note.c_str());
   return b;
 }
 
@@ -1300,6 +1408,7 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
       if (!st) return R::fail(st);
     }
   }
+  if (o.cold_on_gpu) I.setup_reader();  // v24
   // the host side of the cold path
   const int threads = o.cpu_threads > 0 ? o.cpu_threads : static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
   I.pool = std::make_unique<Pool>(threads);
@@ -1412,7 +1521,9 @@ Status GpuEngine::Impl::run(const std::int32_t* tokens, int n, float* logits, bo
   const int64_t e = s.n_embd;
   if (Status es0 = I.embed(wt.tok_embd, tokens, n, I.x, e); !es0) return es0;
   const unsigned g0 = I.gen + 1;
-  if (I.bell) {  // the CPU side starts waiting for this step's rings
+  const bool rd = I.reader && n <= Impl::kReaderMax;  // v24: the reader's steps use no doorbell
+  const bool bl = I.bell && !rd;
+  if (bl) {  // the CPU side starts waiting for this step's rings
     {
       std::lock_guard<std::mutex> lk(I.bmu);
       I.bn = n;
@@ -1434,12 +1545,12 @@ Status GpuEngine::Impl::run(const std::int32_t* tokens, int n, float* logits, bo
       std::unique_lock<std::mutex> lk(I.bmu);
       I.bcv.wait(lk, [&] { return !I.bbusy; });
     }
-  } guard{I, I.bell};
+  } guard{I, bl};
   Status st;
   for (std::uint32_t il = 0; il < s.n_layer; ++il) {
     const Qwen35MoeLayer& l = wt.layers[il];
     Layer& D = I.L[il];
-    I.cur_ops = (I.ops_d && I.bell && n == 1) ? I.ops_d + z(EngineTimeline::kOps) * il : nullptr;
+    I.cur_ops = (I.ops_d && (bl || rd) && n == 1) ? I.ops_d + z(EngineTimeline::kOps) * il : nullptr;
     if (!I.opstamp(0)) return gfail("engine: stamp");
     if (!g::rms_norm(I.x, D.attn_norm, I.xn, e, 1, e, e, n, s.rms_eps)) return gfail("engine: attn norm");
     if (!I.opstamp(1)) return gfail("engine: stamp");
@@ -1447,7 +1558,7 @@ Status GpuEngine::Impl::run(const std::int32_t* tokens, int n, float* logits, bo
     if (!g::add_rows(I.x, e, I.y, e, nullptr, e, n)) return gfail("engine: residual");
     if (!g::rms_norm(I.x, D.post_norm, I.xn, e, 1, e, e, n, s.rms_eps)) return gfail("engine: post norm");
     if (!I.opstamp(7)) return gfail("engine: stamp");
-    if (!(st = I.bell ? I.moe_block_bell(D, n, g0 + il, I.ts_d ? I.ts_d + 4 * il : nullptr) : I.moe_block(l, D, n, es))) return st;
+    if (!(st = rd ? I.moe_block_reader(D, n, il) : bl ? I.moe_block_bell(D, n, g0 + il, I.ts_d ? I.ts_d + 4 * il : nullptr) : I.moe_block(l, D, n, es))) return st;
     if (!g::add_rows(I.x, e, I.y, e, nullptr, e, n)) return gfail("engine: residual");
     if (!I.opstamp(15)) return gfail("engine: stamp");
     if (I.probe_pos >= I.pos && I.probe_pos < I.pos + n && I.probe_xd) {  // v23: this row's residual and picks after the layer
@@ -1487,7 +1598,22 @@ Status GpuEngine::Impl::run(const std::int32_t* tokens, int n, float* logits, bo
       return gfail("engine: logits");
   }
   if (!g::sync()) return gfail("engine: sync");
-  if (I.bell) {
+  if (rd && I.tl_on) {  // v24: the reader's steps: wall time per step size, and the per-operation segments
+    const int b = n > 8 ? 9 : n;
+    I.tline.by_n_steps[b] += 1.0;
+    I.tline.by_n_wall[b] += since(t0);
+    ++I.tline.steps;
+    if (ops_this && I.ops_h) {
+      auto d = [](unsigned long long a, unsigned long long b2) { return static_cast<double>(static_cast<std::int64_t>(b2 - a)) * 1e-9; };
+      for (std::uint32_t il = 0; il < s.n_layer; ++il) {
+        const unsigned long long* orow = I.ops_h + z(EngineTimeline::kOps) * il;
+        const int ty = wt.layers[il].recurrent ? 0 : 1;
+        for (int k = 1; k < EngineTimeline::kOps; ++k) I.tline.ops[ty][k] += d(orow[k - 1], orow[k]);
+      }
+      ++I.tline.ops_steps;
+    }
+  }
+  if (bl) {
     guard.armed = false;
     std::unique_lock<std::mutex> lk(I.bmu);
     I.bcv.wait(lk, [&] { return !I.bbusy; });

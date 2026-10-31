@@ -179,6 +179,10 @@ struct ForwardOptions {
   // (n_layer x n_embd floats) into probe_x
   std::int64_t probe_pos = -1;
   float* probe_x = nullptr;
+  // v24 tie rule (author 18:19): > 0: the router orders experts by floor((logit - max logit) / band), descending, lower
+  // index first within a band (the GPU's router_topk with the same band picks the same experts unless a logit straddles a
+  // band edge); the weights stay the probabilities. 0: by probability.
+  float router_tie_band = 0.0f;
   // Optional coin-flip counts (activation rounding near halfway; game plan, author 2026-10-31): n_tokens x 3 counters
   // (position-major), added to (not cleared): per token, over every gpu256x8-rounded trunk and expert input row, the
   // values within 1e-4, 1e-3 and 1e-2 of a step from halfway. The output layer is not counted.
