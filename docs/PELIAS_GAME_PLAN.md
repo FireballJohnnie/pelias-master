@@ -27,6 +27,10 @@ Copyright (c) 2026 John Lipka and the Pelias contributors
 
 ---
 
+## QUEUED, MUST NOT BE LOST (author 2026-10-30 22:19)
+
+**PDF update:** how the speedup works rev4 -> rev5; Section 21 calibrated gains rev4 -> rev5; 7-bit and 1-bit decoder plain language rev3 -> rev4; pathways whole project v6b -> v7. Skip pathways v5 (the older one, overlapping v6b). Sources and generators in the backup folder (2026-10-28). Content: the 10-30 evening work (fused norm, per-32 prompt format, the GPU work list, the locked MoE slice, gpu_prompt in src, the fp32 min term, the Q4_TG2 probe results). Slot: after the Q4_TG2 probe code ships, before the GP3-12 rungs.
+
 ## PRIORITY (author 2026-10-29 18:44): near-tie accuracy first; every other step waits until it is solved
 
 **Problem.** The GP3-07 gate (v8, Pelias's own format, no wormhole) split from llama.cpp on 11 of 20 prompts: 8 at near-ties, 3 at end-of-text setup (MEASURED); 4 of the 11 splits are in the first 5 output tokens. The KL drift sits in few tokens: the top 1 % hold 23-52 % of it (MEASURED). Better or worse is decided by KL against the original model (scoreboard); agreement is the gate.
