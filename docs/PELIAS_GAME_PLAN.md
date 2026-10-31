@@ -105,6 +105,19 @@ correction W (x - round(x)) on the tied values (careful+1). The +0.001009 and th
 projections writing the recurrent state and residual stream (DeltaNet main projections, attention Q/K/V/O, experts), which
 then move the unrounded router input on the next layer and token. Order (author): after the CPU speed items, with the
 scale-weighted error energy (r - round(r)) x scale per projection; PC idle until then.
+**Author 02:49 (DECISIONS_LOG):** (a) kld runs parked until after the GP3-14 build; NO further long CPU kld (80-100 chunks)
+until Fable's CPU fixes are wired in (persistent thread pool, AVX2 dequant, the 3.2 GB of zeroed buffers dropped, shared
+inputs rounded once): no reason to hold the CPU at 90 C for 20+ minutes when those fixes cut the run to a fraction.
+(b) Engine cost of the scalar tie band: 20 % of single values scattered over x hit about every 32-wide block of W (about 6.4
+of 32 per block), so W (x - round(x)) on the CPU decodes and multiplies nearly whole matrices: it would sink the speed.
+(c) The 20 % / 49 % table holds within one scale only; block scales vary 10x-1000x across a row, so a half-step tie in a
+quiet block (scale 0.001) carries 1000x less error than one in an outlier block (scale 1.0).
+(d) Rank 32-wide activation sub-blocks by their real scaled error energy, sum((x - dequant(x))^2) per 32-block, and correct the
+top 10-20 %: more of the true error energy, and the correction stays on contiguous 32-wide blocks (W columns 32 at a time)
+that the GPU or AVX2 handle cleanly. Test order: CPU fixes first, then scalar tie band B = 0.1 side by side with the top
+block-energy correction (10 % and 20 %), both paired against the v17b dumps, to see which wins back more of +0.001009.
+
+
 
 **First measurement (UNMEASURED; offline, existing tools):** per token, the count of coin-flip roundings (|frac - 0.5| < eps)
 against that token's KL and the next token's KL on WikiText; and the activation-rounding cost itself on WikiText (kld with
