@@ -97,7 +97,7 @@ void prompt_release(PromptWeights* w) {
 const char* prompt_last_error() { return "built without the CUDA backend (configure with -DPELIAS_CUDA=ON)"; }
 bool act_digits(const float*, const int*, std::int64_t, std::int64_t, float*, Stream) { return false; }
 bool prompt_gemm(const PromptWeights&, std::int64_t, const std::int8_t*, const float*, const float*, std::int64_t, float*, Stream) { return false; }
-bool moe_scratch_alloc(std::int64_t, int, int, std::int64_t, std::int64_t, MoeScratch*) { return false; }
+bool moe_scratch_alloc(std::int64_t, int, int, std::int64_t, std::int64_t, MoeScratch*, bool) { return false; }
 void moe_scratch_free(MoeScratch* m) {
   if (m) *m = MoeScratch{};
 }

@@ -44,6 +44,9 @@ struct PromptWeights {
 };
 // Q4_K, Q5_K, Q6_K or Q4_TG2 with k a multiple of 256
 bool prompt_type_ok(std::uint32_t type, std::int64_t k);
+// Types without an int8 step but with a GPU decoder (kern/gpu_decode.h) are accepted with no side tables: moe_prompt runs
+// such a stack on the exact path (gpu_ops' moe_matmul, fp32), prompt_gemm refuses it (use gpu_ops' matmul on the rounded
+// floats).
 bool prompt_prepare(std::uint32_t type, const void* w_dev, std::int64_t rows, std::int64_t k, PromptWeights* out, Stream s = nullptr);
 void prompt_release(PromptWeights* w);
 const char* prompt_last_error();
@@ -75,8 +78,15 @@ struct MoeScratch {
   float* dig2 = nullptr;
   void* yfix = nullptr;  // int32 or int64 accumulators (tokens x hidden)
   unsigned* ovf = nullptr;
+  // exact paths (allocated when moe_scratch_alloc's `exact` is set): token rows as floats (q x scale), the rounded silu x up
+  // rows as floats, the down rows before the fold, the identity row map
+  bool exact = false;
+  float *xf = nullptr, *x2f = nullptr, *yd = nullptr;
+  int* iota = nullptr;
 };
-bool moe_scratch_alloc(std::int64_t max_tokens, int n_used, int n_expert, std::int64_t hidden, std::int64_t ffn, MoeScratch* out);
+// exact: also allocate the exact paths' buffers (stacks of types without an int8 prompt step, run by gpu_ops' moe_matmul
+// over the same GPU work list, folded into y by the same int32 / int64 / float reductions)
+bool moe_scratch_alloc(std::int64_t max_tokens, int n_used, int n_expert, std::int64_t hidden, std::int64_t ffn, MoeScratch* out, bool exact = false);
 void moe_scratch_free(MoeScratch* m);
 
 // How the expert outputs are combined into the token rows

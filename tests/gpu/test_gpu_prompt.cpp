@@ -202,10 +202,13 @@ TEST(rung1_prompt_gemm_against_fp64) {
   dense_case(q::Type::q5_k, "Q5_K  ");
   dense_case(q::Type::q6_k, "Q6_K  ");
   dense_case(q::Type::q4_tg2, "Q4_TG2");
-  // refusals: not Q4_K / Q4_TG2, k not a multiple of 256, rows not a multiple of 128
+  // refusals: no decoder at all, an exact-path type in prompt_gemm, k not a multiple of 256, rows not a multiple of 128
   g::PromptWeights bad;
   Dev<std::uint8_t> junk(4096);
-  CHECK(!g::prompt_prepare(static_cast<std::uint32_t>(q::Type::iq4_xs), junk.p, 128, 256, &bad));
+  CHECK(!g::prompt_prepare(9999u, junk.p, 128, 256, &bad));  // no int8 step and no GPU decoder
+  CHECK(g::prompt_prepare(static_cast<std::uint32_t>(q::Type::iq4_xs), junk.p, 128, 256, &bad));  // exact path: accepted ...
+  CHECK(!g::prompt_gemm(bad, 128, reinterpret_cast<const std::int8_t*>(junk.p), nullptr, nullptr, 0, nullptr));  // ... but not for prompt_gemm
+  g::prompt_release(&bad);
   CHECK(!g::prompt_prepare(static_cast<std::uint32_t>(q::Type::q4_k), junk.p, 128, 320, &bad));
   CHECK(!g::prompt_prepare(static_cast<std::uint32_t>(q::Type::q4_k), junk.p, 100, 256, &bad));
   std::printf("    other types, widths and row counts refused\n");
@@ -254,7 +257,7 @@ static void moe_case(q::Type ty, const char* nm) {
   Dev<std::int32_t> dsel(sel);
   Dev<float> dw(wsel), y(static_cast<std::size_t>(T * H));
   g::MoeScratch m;
-  CHECK(g::moe_scratch_alloc(T, NU, E, H, F, &m));
+  CHECK(g::moe_scratch_alloc(T, NU, E, H, F, &m, true));
   // the float combine first (no scale needed): the device's row map, gate / up rows and rounded silu x up come from it
   CHECK(g::moe_prompt(pg, pu, pd, a.qv.p, a.sc.p, a.dig.p, T, dsel.p, dw.p, m, g::MoeCombine::kFloat, 0, y.p));
   CHECK(g::sync());
@@ -350,6 +353,8 @@ TEST(rung1_moe_prompt_against_fp64) {
   moe_case(q::Type::q5_k, "Q5_K  ");
   moe_case(q::Type::q6_k, "Q6_K  ");
   moe_case(q::Type::q4_tg2, "Q4_TG2");
+  moe_case(q::Type::q8_0, "Q8_0  ");    // exact path (gpu_ops' moe_matmul) over the same GPU work list and fold
+  moe_case(q::Type::iq4_xs, "IQ4_XS");
 }
 
 TEST(rung1_moe_prompt_refuses_bad_shapes) {

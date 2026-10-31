@@ -923,6 +923,7 @@ __global__ void k_route_build(const int* __restrict__ cnt, int n_expert, int* __
     meta[1] = v_in;
     meta[2] = a_in;
     meta[3] = r_in;
+    off[n_expert] = r_in;  // the end of the last expert (gpu_ops' moe_matmul reads off[e + 1])
   }
 }
 __global__ void k_route_place(const std::int32_t* __restrict__ sel, const float* __restrict__ wt, int n, int n_used, int* __restrict__ cursor,
@@ -971,6 +972,21 @@ __global__ void k_silu_q8x32(const float* __restrict__ hg, const float* __restri
 __global__ void k_fix(const int* __restrict__ yi, const unsigned long long* __restrict__ yl, std::size_t n, float inv, float* __restrict__ y) {
   for (std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x; i < n; i += static_cast<std::size_t>(gridDim.x) * blockDim.x)
     y[i] = yi ? static_cast<float>(yi[i]) * inv : static_cast<float>(static_cast<double>(static_cast<long long>(yl[i])) * static_cast<double>(inv));
+}
+
+// exact paths: rows of q x scale as floats; the identity row map; the down rows folded into y by the combine epilogue
+__global__ void k_deq_rows(const std::int8_t* __restrict__ q, const float* __restrict__ sc, std::size_t n, float* __restrict__ x) {
+  for (std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x; i < n; i += static_cast<std::size_t>(gridDim.x) * blockDim.x)
+    x[i] = static_cast<float>(q[i]) * sc[i / 32];
+}
+__global__ void k_iota(int* __restrict__ v, int n) {
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) v[i] = i;
+}
+template <int EPI>
+__global__ void k_fold(const float* __restrict__ yd, const int* __restrict__ nrows, int N, Epi E) {
+  const std::size_t n = static_cast<std::size_t>(*nrows) * static_cast<std::size_t>(N);
+  for (std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x; i < n; i += static_cast<std::size_t>(gridDim.x) * blockDim.x)
+    epi_store<EPI>(static_cast<int>(i / static_cast<std::size_t>(N)), static_cast<int>(i % static_cast<std::size_t>(N)), yd[i], N, E);
 }
 
 unsigned grid_of(std::size_t n, int per, unsigned cap = 65535) {
@@ -1038,6 +1054,29 @@ bool experts(const MoeScratch& m, const std::int8_t* a8, const float* sa32, cons
          vec_launch<EPI>(dim3(static_cast<unsigned>(m.n_expert), static_cast<unsigned>((N + 7) / 8)), a8, sa32, W, uv, m.meta + 1, N, K, E, s);
 }
 
+// one expert stack over the GPU work list: the int8 kernels for Q4_K / Q5_K / Q6_K / Q4_TG2, else the exact path (gpu_ops'
+// moe_matmul on float rows, same work list: slots off[e] .. off[e + 1], rows read through `srcmap`, written in packed
+// order; EPI 0 writes E.C directly, the folded epilogues go through m.yd and k_fold)
+bool int8_type(std::uint32_t t) {
+  return t == static_cast<std::uint32_t>(quant::Type::q4_k) || t == static_cast<std::uint32_t>(quant::Type::q5_k) ||
+         t == static_cast<std::uint32_t>(quant::Type::q6_k) || t == static_cast<std::uint32_t>(quant::Type::q4_tg2);
+}
+template <int EPI>
+bool run_stack(const MoeScratch& m, const PromptWeights& W, const std::int8_t* a8, const float* sa32, const float* adig, const float* xf, const int* srcmap,
+               int N, int K, const Epi& E, std::int64_t picks, Stream s) {
+  if (int8_type(W.type)) return experts<EPI>(m, a8, sa32, adig, W, N, K, E, picks, s);
+  if (!m.exact) return pfail("moe_prompt: a stack without an int8 step needs moe_scratch_alloc(..., exact = true)");
+  const std::uint64_t rb = static_cast<std::uint64_t>(K / static_cast<int>(block_values(W.type))) * block_bytes(W.type);
+  float* out = EPI == 0 ? E.C : m.yd;
+  if (!moe_matmul(W.type, W.w, rb * static_cast<std::uint64_t>(N), rb, N, K, m.n_expert, m.off, srcmap, m.iota, xf, K, out, N, static_cast<int>(picks), s))
+    return pfail(std::string("moe_prompt: exact path: ") + last_error());
+  if constexpr (EPI != 0) {
+    k_fold<EPI><<<grid_of(static_cast<std::size_t>(picks) * static_cast<std::size_t>(N), 256, 4096), 256, 0, pst(s)>>>(m.yd, m.meta + 3, N, E);
+    return pck(cudaGetLastError(), "moe_prompt: exact fold");
+  }
+  return true;
+}
+
 std::size_t al(std::size_t x) { return (x + 255) / 256 * 256; }
 
 }  // namespace
@@ -1052,8 +1091,16 @@ bool prompt_type_ok(std::uint32_t type, std::int64_t k) {
 
 bool prompt_prepare(std::uint32_t type, const void* w_dev, std::int64_t rows, std::int64_t k, PromptWeights* out, Stream s) {
   if (!out || !w_dev || rows <= 0 || rows % kBN != 0) return pfail("prompt_prepare: bad arguments (rows a multiple of 128)");
-  if (!prompt_type_ok(type, k)) return pfail("prompt_prepare: the int8 prompt path reads Q4_K, Q5_K, Q6_K and Q4_TG2 with k a multiple of 256");
   *out = PromptWeights{};
+  if (!prompt_type_ok(type, k)) {  // no int8 step: the exact path (moe_prompt) if the GPU decodes the type
+    if (!type_supported(type) || k <= 0 || k % 32 != 0 || k % static_cast<std::int64_t>(block_values(type)) != 0)
+      return pfail("prompt_prepare: type " + std::to_string(type) + " has neither an int8 prompt step nor a GPU decoder for rows of " + std::to_string(k));
+    out->type = type;
+    out->rows = rows;
+    out->k = k;
+    out->w = w_dev;
+    return true;
+  }
   const std::size_t nb = static_cast<std::size_t>(rows) * static_cast<std::size_t>(k / kQK);
   if (type == static_cast<std::uint32_t>(quant::Type::q6_k)) {  // rec: 16 int8 scales + fp32 d per 256; no min term
     if ((reinterpret_cast<std::uintptr_t>(w_dev) & 15u) != 0) return pfail("prompt_prepare: Q6_K data must start 16-byte aligned");
@@ -1143,6 +1190,7 @@ bool act_digits(const float* scale, const int* sum, std::int64_t rows, std::int6
 
 bool prompt_gemm(const PromptWeights& w, std::int64_t n_out, const std::int8_t* q, const float* scale, const float* dig, std::int64_t rows, float* y,
                  Stream s) {
+  if (!prompt_type_ok(w.type, w.k)) return pfail("prompt_gemm: no int8 step for this type (use gpu_ops' matmul on the rounded floats)");
   if (!w.w || !w.rec || !q || !scale || !dig || !y || n_out <= 0 || n_out % kBN != 0 || n_out > w.rows || rows < 0 || rows > 64 * 65535)
     return pfail("prompt_gemm: bad arguments (n_out a multiple of 128, within the weight)");
   if (rows == 0) return true;
@@ -1152,19 +1200,21 @@ bool prompt_gemm(const PromptWeights& w, std::int64_t n_out, const std::int8_t* 
   return tile_launch<0, true>(grid, q, scale, dig, w, nullptr, nullptr, static_cast<int>(rows), static_cast<int>(n_out), static_cast<int>(w.k), E, s);
 }
 
-bool moe_scratch_alloc(std::int64_t max_tokens, int n_used, int n_expert, std::int64_t hidden, std::int64_t ffn, MoeScratch* out) {
+bool moe_scratch_alloc(std::int64_t max_tokens, int n_used, int n_expert, std::int64_t hidden, std::int64_t ffn, MoeScratch* out, bool exact) {
   if (!out || max_tokens <= 0 || n_used <= 0 || n_expert <= 0 || n_expert > 256 || hidden % kQK != 0 || ffn % kQK != 0 || hidden % kBN != 0 || ffn % kBN != 0)
     return pfail("moe_scratch_alloc: bad shape (n_expert <= 256; hidden and ffn multiples of 256)");
   *out = MoeScratch{};
   const std::size_t np = static_cast<std::size_t>(max_tokens) * static_cast<std::size_t>(n_used), pr = np + kTile, H = static_cast<std::size_t>(hidden),
                     F = static_cast<std::size_t>(ffn), T = static_cast<std::size_t>(max_tokens);
-  const std::size_t sizes[] = {al(256 * 4), al(256 * 4), al(256 * 4), al(16),  // cnt, off, cursor, meta
+  const std::size_t xe = exact ? 1 : 0;
+  const std::size_t sizes[] = {al(256 * 4), al(257 * 4), al(256 * 4), al(16),  // cnt, off (n_expert + 1), cursor, meta
                                al((np / kTile + 256) * 16), al(256 * 16),     // units
                                al(np * 4), al(pr * 4), al(np * 4), al(pr * 4),  // src, rtok, prow, rw
                                al(pr * H), al(pr * (H / 32) * 4), al(pr * (H / 32) * 4),  // pq, psc, pdig
                                al(pr * F * 4), al(pr * F * 4),  // hg, hu
                                al(pr * F), al(pr * (F / 32) * 4), al(pr * (F / 32) * 4), al(pr * (F / 32) * 4),  // q2, sc2, sum2, dig2
-                               al(T * H * 8), al(16)};  // yfix (int64 capable), ovf
+                               al(T * H * 8), al(16),  // yfix (int64 capable), ovf
+                               al(xe * T * H * 4), al(xe * pr * F * 4), al(xe * pr * H * 4), al(xe * pr * 4)};  // exact: xf, x2f, yd, iota
   std::size_t total = 0;
   for (const std::size_t z : sizes) total += z;
   auto* base = static_cast<std::uint8_t*>(dalloc(total));
@@ -1201,6 +1251,22 @@ bool moe_scratch_alloc(std::int64_t max_tokens, int n_used, int n_expert, std::i
   out->dig2 = static_cast<float*>(take());
   out->yfix = take();
   out->ovf = static_cast<unsigned*>(take());
+  out->xf = static_cast<float*>(take());
+  out->x2f = static_cast<float*>(take());
+  out->yd = static_cast<float*>(take());
+  out->iota = static_cast<int*>(take());
+  out->exact = exact;
+  if (exact) {
+    k_iota<<<grid_of(pr, 256, 4096), 256>>>(out->iota, static_cast<int>(pr));
+    if (!pck(cudaGetLastError(), "moe_scratch_alloc: row map") || !pck(cudaDeviceSynchronize(), "moe_scratch_alloc: row map")) {
+      dfree(base);
+      *out = MoeScratch{};
+      return false;
+    }
+  } else {
+    out->xf = out->x2f = out->yd = nullptr;
+    out->iota = nullptr;
+  }
   out->mem = base;
   out->max_tokens = max_tokens;
   out->hidden = hidden;
@@ -1236,11 +1302,17 @@ bool moe_prompt(const PromptWeights& gate, const PromptWeights& up, const Prompt
   Epi eg, eu;
   eg.C = m.hg;
   eu.C = m.hu;
-  if (!experts<0>(m, m.pq, m.psc, m.pdig, gate, static_cast<int>(F), static_cast<int>(H), eg, np, s)) return false;
-  if (!experts<0>(m, m.pq, m.psc, m.pdig, up, static_cast<int>(F), static_cast<int>(H), eu, np, s)) return false;
+  if ((!int8_type(gate.type) || !int8_type(up.type)) && m.exact) {  // the exact path reads the token rows as floats (q x scale)
+    k_deq_rows<<<grid_of(static_cast<std::size_t>(tokens) * static_cast<std::size_t>(H), 256, 4096), 256, 0, cs>>>(q, scale, static_cast<std::size_t>(tokens * H), m.xf);
+    if (!pck(cudaGetLastError(), "moe_prompt: float rows")) return false;
+  }
+  if (!run_stack<0>(m, gate, m.pq, m.psc, m.pdig, m.xf, m.src, static_cast<int>(F), static_cast<int>(H), eg, np, s)) return false;
+  if (!run_stack<0>(m, up, m.pq, m.psc, m.pdig, m.xf, m.src, static_cast<int>(F), static_cast<int>(H), eu, np, s)) return false;
   k_silu_q8x32<<<grid_of(static_cast<std::size_t>(np) * static_cast<std::size_t>(F / 32), 128, 0x7fffffff), 128, 0, cs>>>(m.hg, m.hu, np, F, m.q2, m.sc2, m.sum2);
   const std::size_t n32 = static_cast<std::size_t>(np) * static_cast<std::size_t>(F / 32);
   k_act_digits<<<grid_of(n32, 256, 4096), 256, 0, cs>>>(m.sc2, m.sum2, n32, m.dig2);
+  if (!int8_type(down.type) && m.exact)
+    k_deq_rows<<<grid_of(static_cast<std::size_t>(np) * static_cast<std::size_t>(F), 256, 4096), 256, 0, cs>>>(m.q2, m.sc2, static_cast<std::size_t>(np) * static_cast<std::size_t>(F), m.x2f);
   if (!pck(cudaGetLastError(), "moe_prompt: silu and rounding")) return false;
   // (5) down folded into the combine
   const std::size_t ny = static_cast<std::size_t>(tokens) * static_cast<std::size_t>(H);
@@ -1252,16 +1324,16 @@ bool moe_prompt(const PromptWeights& gate, const PromptWeights& up, const Prompt
   if (combine == MoeCombine::kFloat) {
     if (!pck(cudaMemsetAsync(y, 0, ny * sizeof(float), cs), "moe_prompt: clear y")) return false;
     ed.Yf = y;
-    return experts<1>(m, m.q2, m.sc2, m.dig2, down, static_cast<int>(H), static_cast<int>(F), ed, np, s);
+    return run_stack<1>(m, down, m.q2, m.sc2, m.dig2, m.x2f, m.iota, static_cast<int>(H), static_cast<int>(F), ed, np, s);
   }
   const bool w64 = combine == MoeCombine::kFixed64;
   if (!pck(cudaMemsetAsync(m.yfix, 0, ny * (w64 ? 8 : 4), cs), "moe_prompt: clear accumulators")) return false;
   if (w64) {
     ed.Yl = static_cast<unsigned long long*>(m.yfix);
-    if (!experts<3>(m, m.q2, m.sc2, m.dig2, down, static_cast<int>(H), static_cast<int>(F), ed, np, s)) return false;
+    if (!run_stack<3>(m, down, m.q2, m.sc2, m.dig2, m.x2f, m.iota, static_cast<int>(H), static_cast<int>(F), ed, np, s)) return false;
   } else {
     ed.Yi = static_cast<int*>(m.yfix);
-    if (!experts<2>(m, m.q2, m.sc2, m.dig2, down, static_cast<int>(H), static_cast<int>(F), ed, np, s)) return false;
+    if (!run_stack<2>(m, down, m.q2, m.sc2, m.dig2, m.x2f, m.iota, static_cast<int>(H), static_cast<int>(F), ed, np, s)) return false;
   }
   k_fix<<<grid_of(ny, 256, 4096), 256, 0, cs>>>(w64 ? nullptr : static_cast<const int*>(m.yfix), w64 ? static_cast<const unsigned long long*>(m.yfix) : nullptr, ny,
                                                 std::ldexp(1.0f, -scale_log2), y);
