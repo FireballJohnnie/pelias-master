@@ -645,7 +645,10 @@ TEST(rung1_moe_reader_against_fp64) {
       }
     }
   Dev<g::ExpertPtr> dtab(tab);
-  bool ok_all = true, same = true;
+  std::uint64_t row_max = 0;
+  for (const g::ExpertPtr& X : tab)
+    for (int pj = 0; pj < 3; ++pj) row_max = std::max<std::uint64_t>(row_max, X.rb[pj]);
+  bool ok_all = true, same = true, v25_eq = true, alone_eq = true;
   double worst = 0.0;
   for (const std::int64_t T : {std::int64_t{1}, std::int64_t{2}, std::int64_t{4}}) {
     const std::vector<float> x = wave(T * H, static_cast<std::uint32_t>(7 + T), 1.0f);
@@ -657,13 +660,30 @@ TEST(rung1_moe_reader_against_fp64) {
         wsel[static_cast<std::size_t>(t * nu + j)] = 0.2f + 0.15f * static_cast<float>(j);
       }
     Dev<float> dx(x), dw(wsel), dgu(static_cast<std::size_t>(T * nu * 2 * F)), dh(static_cast<std::size_t>(T * nu * F)), dy(static_cast<std::size_t>(T * H)),
-        dy2(static_cast<std::size_t>(T * H));
+        dy2(static_cast<std::size_t>(T * H)), dy1(static_cast<std::size_t>(T * H)), dyd(static_cast<std::size_t>(T * nu * H));
     Dev<std::int32_t> ds(sel);
-    CHECK(g::moe_reader(dtab.p, ds.p, dw.p, nu, dx.p, T, H, F, dgu.p, dh.p, dy.p));
-    CHECK(g::moe_reader(dtab.p, ds.p, dw.p, nu, dx.p, T, H, F, dgu.p, dh.p, dy2.p));
+    Dev<int> dgrp(static_cast<std::size_t>(1 + 6 * T * nu));
+    Dev<unsigned long long> dts(6);
+    // v25 grouped reader (the engine's), twice (repeatable), with stamps the second time; the v24 reader for comparison
+    CHECK(g::moe_reader(dtab.p, ds.p, dw.p, nu, dx.p, T, H, F, row_max, dgu.p, dh.p, dyd.p, dgrp.p, dy.p));
+    CHECK(g::moe_reader(dtab.p, ds.p, dw.p, nu, dx.p, T, H, F, row_max, dgu.p, dh.p, dyd.p, dgrp.p, dy2.p, dts.p));
+    CHECK(g::moe_reader_v24(dtab.p, ds.p, dw.p, nu, dx.p, T, H, F, dgu.p, dh.p, dy1.p));
     CHECK(g::sync());
-    const std::vector<float> y = dy.get(), y2 = dy2.get();
+    const std::vector<float> y = dy.get(), y2 = dy2.get(), y1 = dy1.get();
     same = same && std::memcmp(y.data(), y2.data(), y.size() * sizeof(float)) == 0;
+    v25_eq = v25_eq && std::memcmp(y.data(), y1.data(), y.size() * sizeof(float)) == 0;
+    const std::vector<unsigned long long> tsv = dts.get();
+    for (int k = 1; k < 6; ++k) CHECK(tsv[static_cast<std::size_t>(k)] >= tsv[static_cast<std::size_t>(k - 1)]);
+    // batch invariance: each token alone gives its row of the batch bit for bit
+    for (std::int64_t t = 0; t < T; ++t) {
+      Dev<float> dxa(std::vector<float>(x.begin() + t * H, x.begin() + (t + 1) * H)),
+          dwa(std::vector<float>(wsel.begin() + t * nu, wsel.begin() + (t + 1) * nu)), dya(static_cast<std::size_t>(H));
+      Dev<std::int32_t> dsa(std::vector<std::int32_t>(sel.begin() + t * nu, sel.begin() + (t + 1) * nu));
+      CHECK(g::moe_reader(dtab.p, dsa.p, dwa.p, nu, dxa.p, 1, H, F, row_max, dgu.p, dh.p, dyd.p, dgrp.p, dya.p));
+      CHECK(g::sync());
+      const std::vector<float> ya = dya.get();
+      alone_eq = alone_eq && std::memcmp(ya.data(), y.data() + t * H, static_cast<std::size_t>(H) * sizeof(float)) == 0;
+    }
     std::vector<double> ref(static_cast<std::size_t>(T * H), 0.0);
     for (std::int64_t t = 0; t < T; ++t)
       for (int j = 0; j < nu; ++j) {
@@ -703,8 +723,12 @@ TEST(rung1_moe_reader_against_fp64) {
   }
   CHECK(ok_all);
   CHECK(same);
-  std::printf("    1 / 2 / 4 tokens x 3 picks, q8_0 / q6_k / q4_tg2, %s: worst rel L2 %.3e against fp64 (the per-32 rounding may flip a step); repeat %s\n",
-              reg ? "3 experts from registered host memory" : "all on the device", worst, same ? "bit for bit" : "DIFFERS");
+  CHECK(v25_eq);
+  CHECK(alone_eq);
+  std::printf("    1 / 2 / 4 tokens x 3 picks, q8_0 / q6_k / q4_tg2, %s: worst rel L2 %.3e against fp64 (the per-32 rounding may flip a step); repeat %s; "
+              "grouped = v24 %s; each token alone = its batch row %s\n",
+              reg ? "3 experts from registered host memory" : "all on the device", worst, same ? "bit for bit" : "DIFFERS", v25_eq ? "bit for bit" : "DIFFERS",
+              alone_eq ? "bit for bit" : "DIFFERS");
   for (void* d : dmem) g::dfree(d);
   if (reg) g::host_unregister(hm);
   std::free(hm);

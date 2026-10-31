@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <map>
 #include <random>
@@ -2232,7 +2233,7 @@ int cmd_engine_check(const Args& a) {
                  "                           [--budget-gb G] [--hot-max N] [--mtp-draft K] [--fast-cpu] [--no-cpu] [--float-ref]\n"
                  "                           [--text FILE [--skip-tokens N]] [--timeline] [--dump-top OUT.tsv] [--dump-split [--split-sizes 2,3,4] [--split-step]]\n"
                  "                           [--no-doorbell] [--timeline-ops] [--split-ref] [--bank-selftest MIXES] [--probe-pos P]\n"
-                 "                           [--router-tie BAND] [--cold-on-gpu]\n");
+                 "                           [--router-tie BAND] [--cold-on-gpu] [--trace OUT.tsv]\n");
     return 1;
   }
   auto num = [&](const char* k, std::uint64_t d, std::uint64_t lo, std::uint64_t hi, std::uint64_t& out) {
@@ -2302,6 +2303,15 @@ int cmd_engine_check(const Args& a) {
   }
   eo.router_tie = tie_band;
   eo.cold_on_gpu = a.has("cold-on-gpu");
+  // v25 trace: a new file (nothing is overwritten); the reader's steps, per layer
+  const std::string trace_path = a.get("trace");
+  if (!trace_path.empty()) {
+    if (std::ifstream(trace_path).good()) {
+      std::fprintf(stderr, "pelias: %s exists (nothing is overwritten)\n", trace_path.c_str());
+      return 1;
+    }
+    eo.trace = true;
+  }
   // v20: the split check's batch sizes (default 1 + drafts)
   std::vector<int> split_sizes;
   if (a.has("split-sizes")) {
@@ -2332,6 +2342,24 @@ int cmd_engine_check(const Args& a) {
   auto eng = model::GpuEngine::open(s, w.value, eo);
   if (!eng.ok()) return fail_input(eng.status);
   std::printf("pelias engine-check: %s, %u layers; open %.2f s\n  %s\n", s.arch.c_str(), s.n_layer, topen.seconds(), eng.value->summary().c_str());
+  // v25 trace: each phase's lines under a "# phase" line; whatever is left is written when engine-check returns
+  auto tflush = [&](const std::string& phase) {
+    if (trace_path.empty()) return;
+    const std::string txt = eng.value->trace_take();
+    if (txt.empty()) return;
+    std::ofstream tf(trace_path, std::ios::app);
+    tf << "# phase: " << phase << "\n" << txt;
+  };
+  struct TraceAtExit {
+    std::function<void(const std::string&)> f;
+    ~TraceAtExit() { f("remaining steps (gate decode / MTP)"); }
+  } trace_at_exit{tflush};
+  if (!trace_path.empty()) {
+    std::ofstream tf(trace_path);
+    tf << "# pelias engine-check trace (v25). S: step seq, tokens, wall ms, unix ms. L: step seq, layer, experts read (GPU count), experts read (host count), "
+          "picks from the bank, picks from the file, bytes from VRAM, bytes from the file, reader us: grouping, gate/up, silu, down, combine; picks (tokens split by ;)\n"
+       << "# " << eng.value->summary() << "\n";
+  }
   int selftest_bad = 0;
   if (a.has("bank-selftest")) {  // v22: every bank expert against the CPU path, before any step (MIXES random 8-pick mixes per layer)
     const Result<std::uint64_t> mr = io::parse_whole(a.get("bank-selftest"), 100000);
@@ -2403,6 +2431,7 @@ int cmd_engine_check(const Args& a) {
                 static_cast<unsigned long long>(ndec), tot_dec.seconds, static_cast<double>(ndec) / tot_dec.seconds, med * 1e3, 1.0 / med, sorted.back() * 1e3,
                 share(tot_dec), tot_dec.cold_seconds * 1e3 / static_cast<double>(ndec), tot_dec.wait_seconds * 1e3 / static_cast<double>(ndec));
   }
+  tflush("decode (the speed numbers above)");
   if (a.has("timeline-ops") && ndec > 0) {  // v21: per operation, one-token steps
     const model::EngineTimeline& T = eng.value->timeline();
     if (T.ops_steps == 0) {
@@ -2436,6 +2465,9 @@ int cmd_engine_check(const Args& a) {
       };
       const double cold = sum(T.cpu_cold);
       const double picks = static_cast<double>(T.hot_picks + T.cold_picks);
+      if (sum(T.gpu_dense) + sum(T.gpu_hot) + cold <= 0.0) {  // v25: reader steps only (no doorbell): the columns below do not apply
+        std::printf("  timeline: %d decode steps, every one with the expert reader (no doorbell, no CPU cold work); see the per-operation lines and the trace\n", T.steps);
+      } else {
       std::printf("  timeline, %d decode steps, ms per token (GPU clock): dense %.2f, bank + shared experts %.2f, idle waiting for the CPU %.2f\n", T.steps,
                   sum(T.gpu_dense) * k, sum(T.gpu_hot) * k, sum(T.gpu_idle) * k);
       std::printf("  timeline, ms per token (CPU clock): waiting for the ring %.2f, cold experts %.2f = input rounding %.2f + gate/up %.2f + silu %.2f + down %.2f + combine %.2f\n",
@@ -2447,6 +2479,7 @@ int cmd_engine_check(const Args& a) {
       for (std::size_t il = 0; il < T.gpu_dense.size(); ++il)
         std::printf("    layer %2zu: GPU dense %.3f, bank + shared %.3f, idle %.3f | CPU wait %.3f, cold %.3f ms\n", il, T.gpu_dense[il] * k, T.gpu_hot[il] * k, T.gpu_idle[il] * k,
                     T.cpu_wait[il] * k, T.cpu_cold[il] * k);
+      }
     }
   }
   // --mtp-draft K: greedy decoding of --decode tokens from the made-up prompt, plain and with MTP drafting (K per step):
@@ -2478,6 +2511,7 @@ int cmd_engine_check(const Args& a) {
     }
     std::vector<float> pxa, pxb, pwa, pwb;
     std::vector<std::int32_t> psa, psb;
+    std::vector<float> boa, loa, moa, bob, lob, mob;  // v25: per-operation rows at the probe (one-token / batched)
     Timer tdp;
     for (std::uint64_t i = 0; i < ndec; ++i) {
       std::int32_t best = 0;
@@ -2490,6 +2524,8 @@ int cmd_engine_check(const Args& a) {
     }
     const double plain_s = tdp.seconds();
     if (probe_p >= 0 && !eng.value->probe_get(&pxa, &psa, &pwa)) std::printf("  probe: nothing captured in the plain run\n");
+    if (probe_p >= 0) eng.value->probe_get_ops(&boa, &loa, &moa);
+    tflush("split check: plain, one token at a time");
     model::MtpStats ms;
     model::EngineStats emt;
     model::EngineMtpTiming tmg;
@@ -2598,6 +2634,8 @@ int cmd_engine_check(const Args& a) {
           std::printf("  split check, %s batches of %d vs one token at a time: KL mean %.3e max %.3e (position %zu); KL by place in the batch %s; top-1 equal %d / %d%s%s\n",
                       use_verify ? "verify" : "step", kb, cnt ? kl_s / cnt : 0.0, kl_m, worst_at, byr.c_str(), eq, cnt, diffs.empty() ? "" : "; differ at ", diffs.c_str());
           if (use_verify && !bat_have && probe_p >= 0 && !eng.value->probe_get(&pxb, &psb, &pwb)) std::printf("  probe: nothing captured in the verify replay\n");
+          if (use_verify && !bat_have && probe_p >= 0) eng.value->probe_get_ops(&bob, &lob, &mob);
+          tflush(std::string("split check: ") + (use_verify ? "verify" : "step") + " replay, batches of " + std::to_string(kb));
           if (use_verify) bat_have = true;
           if (use_verify && kb == static_cast<int>(ndraft) + 1 && same < plain.size()) {
             const Top2 ts = top2(one_rows.data() + same * nv, nv);
@@ -2688,6 +2726,39 @@ int cmd_engine_check(const Args& a) {
             }
             std::printf("    layer %2zu: one-token %.3e  batched %.3e | max |x| %.1f | margin %.2e | picks one-token %s | batched %s\n", il, rel(pxa), rel(pxb), amax,
                         static_cast<double>(rc.p_last - rc.p_next), pa.c_str(), pb.c_str());
+          }
+          // v25: one-token vs batched per operation at the probe row: "=" bit for bit, else the relative L2 gap. The first
+          // operation that is not bit for bit is where the two paths part (every later one sees different inputs).
+          if (!boa.empty() && boa.size() == bob.size() && loa.size() == lob.size() && moa.size() == mob.size()) {
+            const std::size_t ne2 = s.n_expert;
+            auto cmp_op = [](const std::vector<float>& va, const std::vector<float>& vb2, std::size_t off, std::size_t len, bool* eqp) {
+              double nn2 = 0.0, dd2 = 0.0;
+              *eqp = std::memcmp(va.data() + off, vb2.data() + off, len * sizeof(float)) == 0;
+              for (std::size_t i = 0; i < len; ++i) {
+                const double d = static_cast<double>(va[off + i]) - vb2[off + i];
+                nn2 += d * d;
+                dd2 += static_cast<double>(va[off + i]) * va[off + i];
+              }
+              return dd2 > 0 ? std::sqrt(nn2 / dd2) : 0.0;
+            };
+            std::printf("  per operation at the probe row, one-token vs batched (= bit for bit, else relative L2):\n");
+            std::string first;
+            for (std::size_t il = 0; il < s.n_layer; ++il) {
+              bool sb = false, sl = false, sm = false;
+              const double gb = cmp_op(boa, bob, il * e2, e2, &sb), gl = cmp_op(loa, lob, il * ne2, ne2, &sl), gm = cmp_op(moa, mob, il * e2, e2, &sm);
+              char fb[32], fl[32], fm[32];
+              std::snprintf(fb, sizeof fb, sb ? "=" : "%.2e", gb);
+              std::snprintf(fl, sizeof fl, sl ? "=" : "%.2e", gl);
+              std::snprintf(fm, sizeof fm, sm ? "=" : "%.2e", gm);
+              const char* blk = w.value.layers[il].recurrent ? "DeltaNet" : "attention";
+              std::printf("    layer %2zu: %-9s block %-9s | router logits %-9s | MoE (reader / bank + shared) %s\n", il, blk, fb, fl, fm);
+              if (first.empty()) {
+                if (!sb) first = "layer " + std::to_string(il) + ", the " + blk + " block";
+                else if (!sl) first = "layer " + std::to_string(il) + ", the router logits (input: the post norm of an equal residual)";
+                else if (!sm) first = "layer " + std::to_string(il) + ", the MoE block (the reader, the shared expert or their sum)";
+              }
+            }
+            std::printf("  per operation: first difference %s\n", first.empty() ? "none (one-token and batched equal bit for bit at every layer)" : first.c_str());
           }
         }
       }

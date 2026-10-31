@@ -248,6 +248,17 @@ struct GpuEngine::Impl {
   void* reg_base = nullptr;              // the registered span of the model file's mapping (host)
   g::ExpertPtr* rtab = nullptr;          // n_layer x n_expert entries (device)
   float *rgu = nullptr, *rh = nullptr;   // scratch: kReaderMax x nu x 2F, kReaderMax x nu x F
+  float* ryd = nullptr;                  // v25 scratch: kReaderMax x nu x H (each pick's down row)
+  int* rgrp = nullptr;                   // v25 scratch: the picks grouped by expert
+  std::uint64_t rrow_max = 0;            // the longest expert row (bytes)
+  std::vector<g::ExpertPtr> rtab_h;      // host copy of the table (the trace's byte counts)
+  // v25 trace: pinned mapped, per layer 6 reader stamps, the picks (kReaderMax x nu) and the group count
+  void* trc_hv = nullptr;
+  unsigned long long *trc_ts_h = nullptr, *trc_ts_d = nullptr;
+  std::int32_t *trc_sel_h = nullptr, *trc_sel_d = nullptr;
+  int *trc_u_h = nullptr, *trc_u_d = nullptr;
+  std::string trace_text;
+  std::uint64_t trace_seq = 0;
   static constexpr int kOutRows = 64;
   // host side of the cold path (sized once)
   std::unique_ptr<Pool> pool;
@@ -304,6 +315,8 @@ struct GpuEngine::Impl {
   float* probe_xd = nullptr;
   std::int32_t* probe_seld = nullptr;
   float* probe_wd = nullptr;
+  float *probe_bd = nullptr, *probe_ld = nullptr, *probe_md = nullptr;  // v25 per-operation rows
+  std::vector<float> probe_bh, probe_lh, probe_mh;
   std::vector<float> probe_xh, probe_wh;
   std::vector<std::int32_t> probe_selh;
   // v21 per-operation stamps: pinned mapped, per layer kOps GPU ns; cur_ops = this layer's row while it is enqueued
@@ -909,8 +922,12 @@ struct GpuEngine::Impl {
     if (!opstamp(8) || !opstamp(9)) return gfail("engine: stamp");
     if (!g::act_q8x32(xn, e, n, e, false, xr, e, q, scale, sum)) return gfail("engine: expert input rounding");
     if (!opstamp(10)) return gfail("engine: stamp");
-    if (!g::moe_reader(rtab + static_cast<int64_t>(il) * ne, sel, wsel, static_cast<int>(nu), xr, n, e, s.n_ff_exp, rgu, rh, y))
+    if (!g::moe_reader(rtab + static_cast<int64_t>(il) * ne, sel, wsel, static_cast<int>(nu), xr, n, e, s.n_ff_exp, rrow_max, rgu, rh, ryd, rgrp, y,
+                       trc_ts_d ? trc_ts_d + 6 * static_cast<int64_t>(il) : nullptr))
       return gfail("engine: expert reader");
+    if (trc_sel_d && (!g::dcopy(trc_sel_d + static_cast<int64_t>(il) * kReaderMax * nu, sel, z(n * nu) * sizeof(std::int32_t)) ||
+                      !g::dcopy(trc_u_d + il, rgrp, sizeof(int))))
+      return gfail("engine: trace copy");
     if (!opstamp(11)) return gfail("engine: stamp");
     if (n == 1 && D.gate_sh.r3 && D.up_sh.r3 && D.gate_sh.k == D.up_sh.k) {
       if (!(st = prod_r3({{&D.gate_sh, gs}, {&D.up_sh, us}}, xn))) return st;
@@ -925,6 +942,40 @@ struct GpuEngine::Impl {
     if (!g::add_rows(y, e, sh, e, gsh, e, n)) return gfail("engine: shared add");
     if (!opstamp(12) || !opstamp(13) || !opstamp(14)) return gfail("engine: stamp");
     return Status::good();
+  }
+  // v25 trace of one reader step (after the step's sync): S line, then one L line per layer
+  void trace_step(int n, double wall_s) {
+    const int64_t nu = s.n_expert_used, ne = s.n_expert, mp = kReaderMax * nu;
+    const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    char b[256];
+    std::snprintf(b, sizeof b, "S\t%llu\t%d\t%.3f\t%lld\n", static_cast<unsigned long long>(trace_seq++), n, wall_s * 1e3, static_cast<long long>(now_ms));
+    trace_text += b;
+    for (std::uint32_t il = 0; il < s.n_layer; ++il) {
+      const std::int32_t* sp = trc_sel_h + static_cast<int64_t>(il) * mp;
+      std::vector<int> seen;
+      std::uint64_t bv = 0, bh = 0;
+      int n_hot = 0, n_cold = 0;
+      std::string picks;
+      for (int64_t pi = 0; pi < n * nu; ++pi) {
+        const int ex = sp[pi];
+        picks += (pi > 0 ? (pi % nu == 0 ? ";" : ",") : "") + std::to_string(ex);
+        if (ex < 0 || ex >= ne) continue;
+        if (L[il].hot[z(ex)]) ++n_hot;
+        else ++n_cold;
+        if (std::find(seen.begin(), seen.end(), ex) != seen.end()) continue;
+        seen.push_back(ex);
+        const g::ExpertPtr& X = rtab_h[z(static_cast<int64_t>(il) * ne + ex)];
+        const std::uint64_t bytes = X.rb[0] * s.n_ff_exp + X.rb[1] * s.n_ff_exp + X.rb[2] * s.n_embd;
+        (L[il].hot[z(ex)] ? bv : bh) += bytes;
+      }
+      const unsigned long long* qs = trc_ts_h + 6 * il;
+      auto dus = [&](int a, int c) { return static_cast<double>(static_cast<std::int64_t>(qs[c] - qs[a])) * 1e-3; };
+      std::snprintf(b, sizeof b, "L\t%llu\t%u\t%d\t%d\t%d\t%d\t%llu\t%llu\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t", static_cast<unsigned long long>(trace_seq - 1), il,
+                    trc_u_h[il], static_cast<int>(seen.size()), n_hot, n_cold, static_cast<unsigned long long>(bv), static_cast<unsigned long long>(bh), dus(0, 1), dus(1, 2),
+                    dus(2, 3), dus(3, 4), dus(4, 5));
+      trace_text += b;
+      trace_text += picks + "\n";
+    }
   }
   // v24: register the span of the model file holding the trunk's routed experts, and build the reader's tables
   void setup_reader() {
@@ -978,14 +1029,38 @@ struct GpuEngine::Impl {
       }
     }
     const int64_t mp = kReaderMax * static_cast<int64_t>(s.n_expert_used), ff = s.n_ff_exp;
+    for (const g::ExpertPtr& X : tab)
+      for (int pj = 0; pj < 3; ++pj) rrow_max = std::max<std::uint64_t>(rrow_max, X.rb[pj]);
+    if (4 * ((rrow_max + 32 + 15) & ~std::uint64_t{15}) > 48 * 1024) {
+      reader_note = "off (expert rows too long for the reader's shared staging)";
+      return;
+    }
     rtab = static_cast<g::ExpertPtr*>(g::dalloc(tab.size() * sizeof(g::ExpertPtr)));
     rgu = static_cast<float*>(g::dalloc(z(mp * 2 * ff) * sizeof(float)));
     rh = static_cast<float*>(g::dalloc(z(mp * ff) * sizeof(float)));
-    if (!rtab || !rgu || !rh || !g::to_device(rtab, tab.data(), tab.size() * sizeof(g::ExpertPtr))) {
+    ryd = static_cast<float*>(g::dalloc(z(mp * s.n_embd) * sizeof(float)));
+    rgrp = static_cast<int*>(g::dalloc(z(1 + 6 * mp) * sizeof(int)));
+    if (!rtab || !rgu || !rh || !ryd || !rgrp || !g::to_device(rtab, tab.data(), tab.size() * sizeof(g::ExpertPtr))) {
       reader_note = "off (device memory for the reader's tables)";
       return;
     }
-    dev_bytes += tab.size() * sizeof(g::ExpertPtr) + z(mp * 3 * ff) * sizeof(float);
+    dev_bytes += tab.size() * sizeof(g::ExpertPtr) + z(mp * 3 * ff + mp * s.n_embd) * sizeof(float) + z(1 + 6 * mp) * sizeof(int);
+    rtab_h = tab;
+    if (o.trace) {
+      const std::size_t nl = s.n_layer, b_ts = nl * 6 * sizeof(unsigned long long), b_sel = nl * z(mp) * sizeof(std::int32_t), b_u = nl * sizeof(int);
+      void* dv = nullptr;
+      trc_hv = g::host_alloc_mapped(b_ts + b_sel + b_u + 64, &dv);
+      if (trc_hv) {
+        auto* hb = static_cast<std::uint8_t*>(trc_hv);
+        auto* db = static_cast<std::uint8_t*>(dv);
+        trc_ts_h = reinterpret_cast<unsigned long long*>(hb);
+        trc_ts_d = reinterpret_cast<unsigned long long*>(db);
+        trc_sel_h = reinterpret_cast<std::int32_t*>(hb + b_ts);
+        trc_sel_d = reinterpret_cast<std::int32_t*>(db + b_ts);
+        trc_u_h = reinterpret_cast<int*>(hb + b_ts + b_sel);
+        trc_u_d = reinterpret_cast<int*>(db + b_ts + b_sel);
+      }
+    }
     reader = true;
     char b[160];
     std::snprintf(b, sizeof b, "on (steps of 1-%d tokens; %.2f GB of the file registered in %.2f s)", kReaderMax, static_cast<double>(b1 - b0) / 1e9, reg_s);
@@ -1022,6 +1097,12 @@ GpuEngine::~GpuEngine() {
   g::dfree(p_->rtab);
   g::dfree(p_->rgu);
   g::dfree(p_->rh);
+  g::dfree(p_->ryd);
+  g::dfree(p_->rgrp);
+  g::host_free(p_->trc_hv);
+  g::dfree(p_->probe_bd);
+  g::dfree(p_->probe_ld);
+  g::dfree(p_->probe_md);
   g::host_free(p_->bell_h);
   g::host_free(p_->ts_hv);
   g::host_free(p_->ops_hv);
@@ -1060,7 +1141,10 @@ void GpuEngine::probe_set(std::int64_t pos) {
     I.probe_xd = static_cast<float*>(g::dalloc(nl * I.s.n_embd * sizeof(float)));
     I.probe_seld = static_cast<std::int32_t*>(g::dalloc(nl * nuq * sizeof(std::int32_t)));
     I.probe_wd = static_cast<float*>(g::dalloc(nl * nuq * sizeof(float)));
-    if (!I.probe_xd || !I.probe_seld || !I.probe_wd) I.probe_pos = -1;
+    I.probe_bd = static_cast<float*>(g::dalloc(nl * I.s.n_embd * sizeof(float)));
+    I.probe_ld = static_cast<float*>(g::dalloc(nl * I.s.n_expert * sizeof(float)));
+    I.probe_md = static_cast<float*>(g::dalloc(nl * I.s.n_embd * sizeof(float)));
+    if (!I.probe_xd || !I.probe_seld || !I.probe_wd || !I.probe_bd || !I.probe_ld || !I.probe_md) I.probe_pos = -1;
   }
 }
 bool GpuEngine::probe_get(std::vector<float>* x_layers, std::vector<std::int32_t>* picks, std::vector<float>* pick_w) {
@@ -1070,6 +1154,19 @@ bool GpuEngine::probe_get(std::vector<float>* x_layers, std::vector<std::int32_t
   if (picks) *picks = I.probe_selh;
   if (pick_w) *pick_w = I.probe_wh;
   return true;
+}
+bool GpuEngine::probe_get_ops(std::vector<float>* block_out, std::vector<float>* router_logits, std::vector<float>* moe_out) {
+  Impl& I = *p_;
+  if (I.probe_bh.empty()) return false;
+  if (block_out) *block_out = I.probe_bh;
+  if (router_logits) *router_logits = I.probe_lh;
+  if (moe_out) *moe_out = I.probe_mh;
+  return true;
+}
+std::string GpuEngine::trace_take() {
+  std::string out;
+  out.swap(p_->trace_text);
+  return out;
 }
 
 Status GpuEngine::bank_selftest(int combos, std::string* report, int* bad) {
@@ -1555,10 +1652,18 @@ Status GpuEngine::Impl::run(const std::int32_t* tokens, int n, float* logits, bo
     if (!g::rms_norm(I.x, D.attn_norm, I.xn, e, 1, e, e, n, s.rms_eps)) return gfail("engine: attn norm");
     if (!I.opstamp(1)) return gfail("engine: stamp");
     if (!(st = l.recurrent ? I.deltanet_block(D, n) : I.attention_block(D, n, I.pos))) return st;
+    const bool probe_row = I.probe_pos >= I.pos && I.probe_pos < I.pos + n && I.probe_bd;
+    if (probe_row && !g::dcopy(I.probe_bd + static_cast<int64_t>(il) * e, I.y + (I.probe_pos - I.pos) * e, z(e) * sizeof(float))) return gfail("engine: probe copy");
     if (!g::add_rows(I.x, e, I.y, e, nullptr, e, n)) return gfail("engine: residual");
     if (!g::rms_norm(I.x, D.post_norm, I.xn, e, 1, e, e, n, s.rms_eps)) return gfail("engine: post norm");
     if (!I.opstamp(7)) return gfail("engine: stamp");
     if (!(st = rd ? I.moe_block_reader(D, n, il) : bl ? I.moe_block_bell(D, n, g0 + il, I.ts_d ? I.ts_d + 4 * il : nullptr) : I.moe_block(l, D, n, es))) return st;
+    if (probe_row) {
+      const int64_t pr = I.probe_pos - I.pos, ne2 = s.n_expert;
+      if (!g::dcopy(I.probe_md + static_cast<int64_t>(il) * e, I.y + pr * e, z(e) * sizeof(float)) ||
+          !g::dcopy(I.probe_ld + static_cast<int64_t>(il) * ne2, I.logits_r + pr * ne2, z(ne2) * sizeof(float)))
+        return gfail("engine: probe copy");
+    }
     if (!g::add_rows(I.x, e, I.y, e, nullptr, e, n)) return gfail("engine: residual");
     if (!I.opstamp(15)) return gfail("engine: stamp");
     if (I.probe_pos >= I.pos && I.probe_pos < I.pos + n && I.probe_xd) {  // v23: this row's residual and picks after the layer
@@ -1577,6 +1682,13 @@ Status GpuEngine::Impl::run(const std::int32_t* tokens, int n, float* logits, bo
     if (!g::to_host(I.probe_xh.data(), I.probe_xd, I.probe_xh.size() * sizeof(float)) ||
         !g::to_host(I.probe_selh.data(), I.probe_seld, I.probe_selh.size() * sizeof(std::int32_t)) ||
         !g::to_host(I.probe_wh.data(), I.probe_wd, I.probe_wh.size() * sizeof(float)))
+      return gfail("engine: probe read");
+    I.probe_bh.resize(nl * z(e));
+    I.probe_lh.resize(nl * z(s.n_expert));
+    I.probe_mh.resize(nl * z(e));
+    if (!g::to_host(I.probe_bh.data(), I.probe_bd, I.probe_bh.size() * sizeof(float)) ||
+        !g::to_host(I.probe_lh.data(), I.probe_ld, I.probe_lh.size() * sizeof(float)) ||
+        !g::to_host(I.probe_mh.data(), I.probe_md, I.probe_mh.size() * sizeof(float)))
       return gfail("engine: probe read");
     I.probe_have = true;
     I.probe_pos = -1;
@@ -1598,6 +1710,10 @@ Status GpuEngine::Impl::run(const std::int32_t* tokens, int n, float* logits, bo
       return gfail("engine: logits");
   }
   if (!g::sync()) return gfail("engine: sync");
+  if (rd) {  // v25: every pick of a reader step runs on the GPU
+    es.hot_picks += static_cast<std::uint64_t>(n) * s.n_expert_used;
+    if (I.trc_ts_h) I.trace_step(n, since(t0));
+  }
   if (rd && I.tl_on) {  // v24: the reader's steps: wall time per step size, and the per-operation segments
     const int b = n > 8 ? 9 : n;
     I.tline.by_n_steps[b] += 1.0;

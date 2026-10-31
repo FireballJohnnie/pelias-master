@@ -36,8 +36,12 @@ bool host_register(void*, std::size_t, void**, std::string* why) {
 void host_unregister(void*) {}
 bool read_rate(const void*, std::size_t, int, double*) { return false; }
 bool read_chunks_rate(const void*, const std::uint64_t*, int, std::size_t, double*) { return false; }
-bool moe_reader(const ExpertPtr*, const std::int32_t*, const float*, int, const float*, std::int64_t, std::int64_t, std::int64_t, float*, float*, float*,
-                Stream) {
+bool moe_reader_v24(const ExpertPtr*, const std::int32_t*, const float*, int, const float*, std::int64_t, std::int64_t, std::int64_t, float*, float*, float*,
+                    Stream) {
+  return false;
+}
+bool moe_reader(const ExpertPtr*, const std::int32_t*, const float*, int, const float*, std::int64_t, std::int64_t, std::int64_t, std::uint64_t, float*, float*,
+                float*, int*, float*, unsigned long long*, Stream) {
   return false;
 }
 bool to_host_async(void*, const void*, std::size_t, Stream) { return false; }

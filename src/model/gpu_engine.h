@@ -77,6 +77,10 @@ struct EngineOptions {
   // (host_register). No doorbell, no CPU cold path in those steps. Larger steps keep the bank + doorbell path. Falls back to
   // off (said in summary()) if the mapping cannot be registered or an expert weight cannot be read by the kernel.
   bool cold_on_gpu = false;
+  // v25 trace (author 19:15): for every reader step, per layer the picks, the experts read (once per expert) and their
+  // bytes from VRAM / the file, and the reader's four launch times (GPU stamps), and per step the wall time; read with
+  // trace_take(). Off by default (stamps cost launches).
+  bool trace = false;
 };
 
 struct EngineStats {
@@ -113,7 +117,7 @@ struct EngineTimeline {
 inline const char* const kOpNames[EngineTimeline::kOps] = {
     "-", "attn/ssm norm", "input products (R3)", "small ops (gates, conv, l2 / q-k norm, rope)", "core (recurrence / attention)",
     "gated norm", "output product", "residual + post norm", "router + top-k", "picks to host + ring", "expert input rounding",
-    "bank experts", "shared expert + add", "wait for the CPU", "cold sum add", "residual"};
+    "routed experts (bank / reader)", "shared expert + add", "wait for the CPU", "cold sum add", "residual"};
 
 // v20: where an MTP greedy run spends its time (engine_generate_greedy_mtp): drafting (the MTP block, one token per
 // draft), the trunk's verify by batch size (index 1 .. 8), keep(), the MTP block's catch-up on the kept tokens,
@@ -165,6 +169,11 @@ class GpuEngine {
   // residual stream after every layer and every layer's router picks. probe_get: the capture (false if none yet).
   void probe_set(std::int64_t pos);
   bool probe_get(std::vector<float>* x_layers, std::vector<std::int32_t>* picks, std::vector<float>* pick_w);
+  // v25: the same capture's per-operation rows, per layer: the attention / DeltaNet block's output (before the residual
+  // add, n_embd), the router logits (n_expert) and the MoE block's output (n_embd)
+  bool probe_get_ops(std::vector<float>* block_out, std::vector<float>* router_logits, std::vector<float>* moe_out);
+  // v25 trace text gathered since the last call (EngineOptions::trace), tab-separated lines
+  std::string trace_take();
   // v19 timeline (empty unless EngineOptions::timeline and the doorbell are on)
   [[nodiscard]] const EngineTimeline& timeline() const;
   void timeline_reset();

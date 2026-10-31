@@ -263,6 +263,7 @@ std::vector<float> engine_case(const Small& sm, int hot, const char* what, bool 
   eo.doorbell = bell;
   eo.timeline = timeline;
   eo.cold_on_gpu = reader;
+  eo.trace = reader;  // v25: the trace only reads stamps and picks
   eo.router_tie = band;
   if (hot > 0) {
     eo.hot_order.assign(s.n_layer, {});
@@ -317,6 +318,18 @@ std::vector<float> engine_case(const Small& sm, int hot, const char* what, bool 
       cp += es.cold_picks;
     }
     CHECK(f.value->pos() == n);
+    if (reader) {  // v25: one S line per reader step, one L line per layer
+      const std::string tr = f.value->trace_take();
+      std::size_t s_lines = 0, l_lines = 0;
+      for (std::size_t i = 0; i < tr.size();) {
+        const std::size_t j = tr.find('\n', i);
+        if (tr.compare(i, 2, "S\t") == 0) ++s_lines;
+        if (tr.compare(i, 2, "L\t") == 0) ++l_lines;
+        i = j == std::string::npos ? tr.size() : j + 1;
+      }
+      CHECK(s_lines == static_cast<std::size_t>(std::max(0, n - 29)) && l_lines == s_lines * s.n_layer);
+      if (pass == 0) std::printf("    %s: trace %zu steps, %zu layer lines\n", what, s_lines, l_lines);
+    }
     if (pass == 0) first = eng;
     else CHECK(std::memcmp(first.data(), eng.data(), eng.size() * sizeof(float)) == 0);
   }

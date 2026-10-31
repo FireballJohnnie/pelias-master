@@ -167,8 +167,15 @@ struct ExpertPtr {
 // tab: n_expert entries (device); sel / wsel: tokens x n_used picks and weights (device, as router_topk); xr: tokens x H
 // rounded inputs; gu: scratch tokens x n_used x 2F; h: scratch tokens x n_used x F; y: tokens x H, overwritten with the
 // weighted sum of the picked experts (pick order)
+bool moe_reader_v24(const ExpertPtr* tab, const std::int32_t* sel, const float* wsel, int n_used, const float* xr, std::int64_t tokens, std::int64_t H,
+                    std::int64_t F, float* gu, float* h, float* y, Stream s = nullptr);
+// v25 grouped reader (the engine's): the picks grouped by expert, each expert's rows read once (16-byte staged) for every
+// token that picked it; bit for bit equal to moe_reader_v24. tokens 1-4. row_max: the longest row (bytes) in tab. yd:
+// scratch tokens x n_used x H; grp: scratch 1 + 6 x tokens x n_used ints (device). ts (optional, device): 6 GPU stamps
+// (start, after grouping, after gate/up, after silu, after down, after combine).
 bool moe_reader(const ExpertPtr* tab, const std::int32_t* sel, const float* wsel, int n_used, const float* xr, std::int64_t tokens, std::int64_t H,
-                std::int64_t F, float* gu, float* h, float* y, Stream s = nullptr);
+                std::int64_t F, std::uint64_t row_max, float* gu, float* h, float* yd, int* grp, float* y, unsigned long long* ts = nullptr,
+                Stream s = nullptr);
 // device to device copy (stream ordered)
 bool dcopy(void* dst, const void* src, std::size_t bytes, Stream s = nullptr);
 // per value head: o = rms_norm(o) * w * silu(z), in place on core (n rows of nv * ds), z alike
