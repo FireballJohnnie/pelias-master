@@ -1465,4 +1465,130 @@ inline int p_q10(Ctx& c, const Args& a) {
   return 0;
 }
 
+// ================================================================ O13: persistent v13 against v12 (2026-10-30)
+// Expert down (512->2048) and, as the K = 2048 control, expert gate/up (2048->512): dense at M = 2048 and 4096, and
+// grouped (--experts 256 x --expert-m 64, one launch). Every v12 variant (splits 1) and every v13 variant (persistent,
+// at the resident block count and, for the 64-row tile, also capped at 1 block per SM), best of both tile orders. Each v13
+// result must equal the same v12 variant's bit for bit (max |diff| 0) and stay within 1e-3 of fp32 on the first rows.
+inline int p_o13(Ctx& c, const Args& a) {
+  using namespace k2b;
+  Result r;
+  r.probe = "O13";
+  init_cuda(c);
+  const double peak8 = a.num("int8-peak", 259.5);
+  Stream s;
+  Sampler sampler(c.nvml);
+  sampler.start(200);
+  JW before = state_now(c);
+  const int ref_rows = 16;
+  const int E = static_cast<int>(a.inum("experts", 256));
+  const int Me = static_cast<int>(a.inum("expert-m", 64));
+  auto tops = [](double M, double N, double K, double ms) { return 2.0 * M * N * K / (ms * 1e-3) / 1e12; };
+  bool all_ok = true;
+  std::vector<JW> rows;
+  double best_gain_down = 0.0;
+  struct Case {
+    int si, M, batch;
+  };
+  std::vector<Case> cases;
+  for (const int si : {4, 3})
+    for (const int M : {2048, 4096}) cases.push_back({si, M, 1});
+  for (const int si : {4, 3}) cases.push_back({si, Me, E});
+  for (const Case& cs : cases) {
+    if (g_abort.load()) break;
+    const Shape& sh = kShapes[cs.si];
+    const int M = cs.M, B = cs.batch, rowsA = M * B, wrows = sh.N * B, rc = std::min(sh.N, 1024);
+    JW row, why;
+    row.kv("shape", sh.name).kv("M", M).kv("problems", B).kv("K", sh.K).kv("N", sh.N);
+    const double need = static_cast<double>(rowsA) * sh.K * 2 + a8_bytes(rowsA, sh.K) + w8_bytes(wrows, sh.K) + static_cast<double>(rowsA) * sh.N * 4 * 2 +
+                        ref_rows * rc * 4.0;
+    if (!fits(a, need, why)) {
+      row.kv("status", "skipped: would cross the VRAM ceiling").kv_obj("cap", why);
+      rows.push_back(row);
+      continue;
+    }
+    DevBuf A(static_cast<size_t>(rowsA) * sh.K * 2), C12(static_cast<size_t>(rowsA) * sh.N * 4), C13(static_cast<size_t>(rowsA) * sh.N * 4),
+        Cref(static_cast<size_t>(ref_rows) * rc * 4);
+    PP_CK(pkc::fill_bf16(A.as<uint16_t>(), static_cast<size_t>(rowsA) * sh.K, 7000u + sh.K + M, s));
+    W8 w(wrows, sh.K, 8000u + sh.N, s);
+    A8 x(rowsA, sh.K);
+    x.quantize(A, rowsA, sh.K, s);
+    PP_CK(pkc::ref_q8k_q4k_rows(x.a8.as<int8_t>(), x.sa.as<float>(), w.q.as<pkc::BlockQ4K>(), Cref.as<float>(), ref_rows, rc, sh.K, s));
+    std::vector<JW> kj;
+    double t12 = 1e30, t13 = 1e30;
+    std::string n12, n13;
+    for (int v = 0; v < pkc::kV12Variants; ++v) {
+      if (M % pkc::v12_tile_m(v)) continue;
+      // v12, splits 1, best tile order
+      double tv12 = 1e30;
+      int rg12 = 0;
+      for (int rg = 0; rg < 2; ++rg) {
+        auto run = [&] { PP_CK(pkc::gemm_q8k_q4k_v12(x.a8.as<int8_t>(), x.sa.as<float>(), x.dig.as<uint16_t>(), w.q.as<pkc::BlockQ4K>(), w.rec.as(), w.dig.as<uint16_t>(),
+                                                     C12.as(), M, sh.N, sh.K, B, 1, 0, nullptr, v, rg, s)); };
+        const double t = time_ms(s, run, 80.0);
+        if (t < tv12) { tv12 = t; rg12 = rg; }
+      }
+      PP_CK(pkc::gemm_q8k_q4k_v12(x.a8.as<int8_t>(), x.sa.as<float>(), x.dig.as<uint16_t>(), w.q.as<pkc::BlockQ4K>(), w.rec.as(), w.dig.as<uint16_t>(), C12.as(), M,
+                                  sh.N, sh.K, B, 1, 0, nullptr, v, rg12, s));
+      JW j12;
+      j12.kv("kernel", pkc::v12_name(v)).kv("raster", rg12).kv("blocks", (M / pkc::v12_tile_m(v)) * (sh.N / 128) * B).kv("ms", tv12).kv("tops", tops(rowsA, sh.N, sh.K, tv12));
+      j12.kv("eps8", tops(rowsA, sh.N, sh.K, tv12) / peak8);
+      kj.push_back(j12);
+      if (tv12 < t12) { t12 = tv12; n12 = pkc::v12_name(v); }
+      // v13 at the resident count, and capped at 1 block per SM for the 64-row tile (2 resident)
+      for (const int cap : {0, 1}) {
+        if (cap == 1 && pkc::v12_tile_m(v) != 64) continue;
+        double tv13 = 1e30;
+        int rg13 = 0, grid = 0;
+        for (int rg = 0; rg < 2; ++rg) {
+          auto run = [&] { PP_CK(pkc::gemm_q8k_q4k_v13(x.a8.as<int8_t>(), x.sa.as<float>(), x.dig.as<uint16_t>(), w.q.as<pkc::BlockQ4K>(), w.rec.as(),
+                                                       w.dig.as<uint16_t>(), C13.as(), M, sh.N, sh.K, B, 0, v, rg, cap, &grid, s)); };
+          const double t = time_ms(s, run, 80.0);
+          if (t < tv13) { tv13 = t; rg13 = rg; }
+        }
+        PP_CK(cudaMemsetAsync(C13.as(), 0xFF, static_cast<size_t>(rowsA) * sh.N * 4, s));  // NaN fill: a tile not written shows up
+        // the same variant and tile order as v12's best, for the bit-for-bit check
+        PP_CK(pkc::gemm_q8k_q4k_v13(x.a8.as<int8_t>(), x.sa.as<float>(), x.dig.as<uint16_t>(), w.q.as<pkc::BlockQ4K>(), w.rec.as(), w.dig.as<uint16_t>(), C13.as(), M,
+                                    sh.N, sh.K, B, 0, v, rg12, cap, &grid, s));
+        double absd = 0;
+        (void)rel_max_err(C13.as<float>(), C12.as<float>(), static_cast<size_t>(rowsA) * sh.N, s, &absd);
+        const Cos cc = cosine(C13.as<float>(), C12.as<float>(), static_cast<size_t>(rowsA) * sh.N, s);
+        const bool same = absd == 0.0 && std::isfinite(cc.cosine) && cc.cosine > 0.999999;
+        const double eref = err_rows(C13.as(), false, sh.N, Cref, ref_rows, rc, s);
+        const bool ok = same && eref <= 1e-3;
+        all_ok = all_ok && ok;
+        JW j13;
+        j13.kv("kernel", pkc::v13_name(v)).kv("blocks_per_sm_cap", cap).kv("grid", grid).kv("raster", rg13).kv("ms", tv13).kv("tops", tops(rowsA, sh.N, sh.K, tv13));
+        j13.kv("eps8", tops(rowsA, sh.N, sh.K, tv13) / peak8).kv("over_v12_same_variant", tv12 / tv13).kv("max_abs_diff_vs_v12", absd).kv("bit_equal_v12", same);
+        j13.kv("max_rel_err_vs_fp32_first_rows", eref).kv("correct", ok);
+        kj.push_back(j13);
+        if (ok && tv13 < t13) { t13 = tv13; n13 = std::string(pkc::v13_name(v)) + (cap ? " (1 block per SM)" : ""); }
+        std::printf("    %-34s M=%4d x%3d  %-30s cap %d grid %4d: %.4f ms %6.1f TOPS (%.3f of peak) vs v12 %.4f ms -> %.3fx; |diff| %g; vs fp32 %.2e%s\n",
+                    sh.name, M, B, pkc::v13_name(v), cap, grid, tv13, tops(rowsA, sh.N, sh.K, tv13), tops(rowsA, sh.N, sh.K, tv13) / peak8, tv12, tv12 / tv13, absd, eref,
+                    ok ? "" : "  FAIL");
+        std::fflush(stdout);
+      }
+    }
+    const double gain = t12 / t13;
+    if (cs.si == 4) best_gain_down = std::max(best_gain_down, gain);
+    row.kv("status", "ok").arr_obj("kernels", kj).kv("v12_best", n12).kv("v12_best_ms", t12).kv("v12_best_eps8", tops(rowsA, sh.N, sh.K, t12) / peak8);
+    row.kv("v13_best", n13).kv("v13_best_ms", t13).kv("v13_best_eps8", tops(rowsA, sh.N, sh.K, t13) / peak8).kv("v13_over_v12_best", gain);
+    rows.push_back(row);
+    std::printf("  %-34s M=%4d x%3d: v12 best %s %.3f of peak; v13 best %s %.3f of peak; %.3fx\n", sh.name, M, B, n12.c_str(), tops(rowsA, sh.N, sh.K, t12) / peak8,
+                n13.c_str(), tops(rowsA, sh.N, sh.K, t13) / peak8, gain);
+    std::fflush(stdout);
+  }
+  const std::vector<Sample> all = sampler.stop();
+  r.inputs.kv("int8_peak_tops", peak8).kv("experts", E).kv("expert_m", Me).kv("weights_activations", "synthetic (fill_q4k / fill_bf16), as P-K2b");
+  r.values.arr_obj("cases", rows).kv("all_v13_bit_equal_v12_and_correct", all_ok).kv("best_gain_expert_down", best_gain_down);
+  r.values.kv_obj("state_before", before).kv_obj("state_after", state_now(c)).kv_obj("nvml_whole_run", summarize(all));
+  r.thresholds.kv("o13_goal_eps8_above", 0.29).kv("adopt_if_faster_and_bit_equal", true);
+  r.pass = all_ok ? -1 : 0;
+  r.headline = std::string(all_ok ? "v13 bit-equal to v12 everywhere" : "v13 MISMATCH") + "; best expert-down gain " + fmt("%.3f", best_gain_down) + "x";
+  r.notes = std::string(g_abort.load() ? "ABORTED: " + abort_reason() : "");
+  write_result(c, r, "o13_persistent");
+  std::printf("  O13 %s\n", r.headline.c_str());
+  return all_ok ? 0 : 3;
+}
+
 }  // namespace pp

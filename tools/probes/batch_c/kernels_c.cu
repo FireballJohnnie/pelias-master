@@ -1947,6 +1947,206 @@ __global__ void __launch_bounds__(256, BMT == 64 ? 2 : 1) k_gemm_q8k_q4k_v12(con
     }
 }
 
+// ---------------------------------------------------------------- O13 v13: v12 made persistent (2026-10-30)
+// Expert down (K = 512) has only 8 K steps per tile, so each tile's pipeline fill (S - 1 steps of loads before the first
+// mma) and drain (the last mma, then the stores) weigh heavily (O13: 0.27 to 0.29 of the int8 peak; split-K, 2 stages and
+// bf16 output did not help, masterwork 17.5). v13 keeps v12's arithmetic bit for bit (same per-tile k order, same
+// epilogue) but launches at most `blocks` blocks (the card's resident count); each block walks the tiles
+// t = blockIdx.x, blockIdx.x + gridDim.x, ... over all problems (z-major) and its cp.async pipeline runs over the flat
+// sequence of (tile, k step): the first S - 1 steps of the next tile are already loading while the current tile's last
+// steps compute and its results are stored. No split-K (whole K per tile).
+__device__ __forceinline__ void tile_coords_id(int raster, int pid, int npm, int npn, int& pm, int& pn) {
+  if (raster == 0) {
+    pm = pid / npn;
+    pn = pid % npn;
+  } else {
+    constexpr int G = 8;
+    const int width = G * npn, group = pid / width, first = group * G;
+    const int gs = min(npm - first, G);
+    pm = first + (pid % width) % gs;
+    pn = (pid % width) / gs;
+  }
+}
+
+template <int S, int BMT>
+__global__ void __launch_bounds__(256, BMT == 64 ? 2 : 1) k_gemm_q8k_q4k_v13(const int8_t* __restrict__ a8, const float* __restrict__ sa256,
+                                                                              const uint16_t* __restrict__ adig, const BlockQ4K* __restrict__ w,
+                                                                              const uint4* __restrict__ rec, const uint16_t* __restrict__ wdig,
+                                                                              void* __restrict__ Cout, int M, int N, int K, int batch, int raster,
+                                                                              int out_bf16) {
+  constexpr int MI = BMT / 32;
+  extern __shared__ __align__(16) uint8_t v13_smem[];
+  V12Stage<BMT>* stg = reinterpret_cast<V12Stage<BMT>*>(v13_smem);
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
+  const int wm = warp >> 2, wn = warp & 3;
+  const int bpr = K / kQK;
+  const int npm = M / BMT, npn = N / kBN, tpz = npm * npn, total = tpz * batch;
+  const int G = static_cast<int>(gridDim.x), b0 = static_cast<int>(blockIdx.x);
+  const int ntile = b0 < total ? (total - b0 + G - 1) / G : 0;
+  const int kt_n = K / 64, nsteps = ntile * kt_n;
+  const int lm_row = (lane & 7) + 8 * ((lane >> 3) & 1), lm_col = 16 * (lane >> 4);
+  // tile i of this block -> problem z and tile origin (bm, bn)
+  auto where = [&](int i, int& z, int& bm, int& bn) {
+    const int tile = b0 + i * G;
+    z = tile / tpz;
+    int pm, pn;
+    tile_coords_id(raster, tile % tpz, npm, npn, pm, pn);
+    bm = pm * BMT;
+    bn = pn * kBN;
+  };
+  auto load = [&](int stage, int step) {
+    const int i = step / kt_n, k0 = (step % kt_n) * 64;
+    int z, bm, bn;
+    where(i, z, bm, bn);
+    const int8_t* A = a8 + static_cast<size_t>(z) * M * K;
+    const float* SA = sa256 + static_cast<size_t>(z) * M * bpr;
+    const uint16_t* AD = adig + static_cast<size_t>(z) * M * bpr * 16;
+    const BlockQ4K* W = w + static_cast<size_t>(z) * N * bpr;
+    const uint4* RC = rec + static_cast<size_t>(z) * N * bpr;
+    const uint16_t* WD = wdig + static_cast<size_t>(z) * N * bpr * 16;
+    V12Stage<BMT>& T = stg[stage];
+#pragma unroll
+    for (int ii = 0; ii < BMT / 64; ++ii) {
+      const int idx = tid + ii * 256, r = idx >> 2, c = (idx & 3) * 16;
+      cp_async16(&T.As[r][c], A + static_cast<size_t>(bm + r) * K + k0 + c);
+    }
+    const int sb = k0 / kQK;
+    {
+      const int r = tid >> 1, h = tid & 1;
+      const uint8_t* blk = reinterpret_cast<const uint8_t*>(W + static_cast<size_t>(bn + r) * bpr + sb);
+      cp_async16(&T.Qs[r][h * 16], blk + 16 + ((k0 % kQK) / 64) * 32 + h * 16);
+    }
+    if (tid < 128) {
+      cp_async16(&T.Wr[tid], RC + static_cast<size_t>(bn + tid) * bpr + sb);
+    } else if (tid < 128 + BMT) {
+      const int r2 = tid - 128;
+      const unsigned s4 = static_cast<unsigned>(__cvta_generic_to_shared(&T.Sr[r2]));
+      asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(s4), "l"(SA + static_cast<size_t>(bm + r2) * bpr + sb));
+    }
+    if (((k0 + 64) % kQK) == 0) {
+      const int r = tid >> 1, h = tid & 1;
+      if (r < BMT) cp_async16(&T.Ad[r][h * 8], AD + (static_cast<size_t>(bm + r) * bpr + sb) * 16 + h * 8);
+      cp_async16(&T.Bd[r][h * 8], WD + (static_cast<size_t>(bn + r) * bpr + sb) * 16 + h * 8);
+    }
+  };
+  float acc[MI][4][4];
+  int ai[MI][4][4];
+#pragma unroll
+  for (int i = 0; i < MI; ++i)
+#pragma unroll
+    for (int j = 0; j < 4; ++j)
+#pragma unroll
+      for (int k = 0; k < 4; ++k) {
+        acc[i][j][k] = 0.f;
+        ai[i][j][k] = 0;
+      }
+#pragma unroll
+  for (int st = 0; st < S - 1; ++st) {
+    if (st < nsteps) load(st, st);
+    cp_async_commit();
+  }
+  for (int step = 0; step < nsteps; ++step) {
+    cp_async_wait<S - 2>();
+    __syncthreads();
+    {
+      const int nk = step + S - 1;
+      if (nk < nsteps) load(nk % S, nk);  // crosses into the next tile near the end of this one
+      cp_async_commit();
+    }
+    const V12Stage<BMT>& T = stg[step % S];
+    const int kt = step % kt_n, k0 = kt * 64;
+    const int j0 = (k0 % kQK) / 32;
+    uint32_t bw[4][2];
+#pragma unroll
+    for (int ni = 0; ni < 4; ++ni) {
+      const int c = wn * 32 + ni * 8 + g;
+      bw[ni][0] = ld32(&T.Qs[c][4 * t]);
+      bw[ni][1] = ld32(&T.Qs[c][16 + 4 * t]);
+    }
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      uint32_t b[4][2];
+      int is0[4], is1[4];
+#pragma unroll
+      for (int ni = 0; ni < 4; ++ni) {
+        b[ni][0] = h ? ((bw[ni][0] >> 4) & 0x0F0F0F0Fu) : (bw[ni][0] & 0x0F0F0F0Fu);
+        b[ni][1] = h ? ((bw[ni][1] >> 4) & 0x0F0F0F0Fu) : (bw[ni][1] & 0x0F0F0F0Fu);
+        const int col0 = wn * 32 + ni * 8 + 2 * t;
+        is0[ni] = reinterpret_cast<const uint8_t*>(&T.Wr[col0])[4 + j0 + h];
+        is1[ni] = reinterpret_cast<const uint8_t*>(&T.Wr[col0 + 1])[4 + j0 + h];
+      }
+#pragma unroll
+      for (int mi = 0; mi < MI; ++mi) {
+        uint32_t a[4];
+        ldsm_x4(a, &T.As[wm * (BMT / 2) + mi * 16 + lm_row][h * 32 + lm_col]);
+#pragma unroll
+        for (int ni = 0; ni < 4; ++ni) {
+          int c4[4] = {0, 0, 0, 0};
+          mma_s8(c4, a, b[ni]);
+          ai[mi][ni][0] += is0[ni] * c4[0];
+          ai[mi][ni][1] += is1[ni] * c4[1];
+          ai[mi][ni][2] += is0[ni] * c4[2];
+          ai[mi][ni][3] += is1[ni] * c4[3];
+        }
+      }
+    }
+    if (((k0 + 64) % kQK) == 0) {
+#pragma unroll
+      for (int mi = 0; mi < MI; ++mi) {
+        const int r0 = wm * (BMT / 2) + mi * 16 + g, r1 = r0 + 8;
+        uint32_t ad[4];
+        ad[0] = ld32(&T.Ad[r0][2 * t]);
+        ad[1] = ld32(&T.Ad[r1][2 * t]);
+        ad[2] = ld32(&T.Ad[r0][2 * t + 8]);
+        ad[3] = ld32(&T.Ad[r1][2 * t + 8]);
+        const float s0 = T.Sr[r0], s1 = T.Sr[r1];
+#pragma unroll
+        for (int ni = 0; ni < 4; ++ni) {
+          const int cb = wn * 32 + ni * 8 + g;
+          uint32_t bd[2];
+          bd[0] = ld32(&T.Bd[cb][2 * t]);
+          bd[1] = ld32(&T.Bd[cb][2 * t + 8]);
+          float mn[4] = {0.f, 0.f, 0.f, 0.f};
+          mma_bf16(mn, ad, bd);
+          const int col0 = wn * 32 + ni * 8 + 2 * t;
+          const uint4 w0 = T.Wr[col0], w1 = T.Wr[col0 + 1];
+          const float d0 = __uint_as_float(w0.x), d1 = __uint_as_float(w1.x);
+          const float m0 = __uint_as_float(w0.w), m1 = __uint_as_float(w1.w);
+          acc[mi][ni][0] = fmaf(s0 * d0, static_cast<float>(ai[mi][ni][0]), fmaf(-s0 * m0, mn[0], acc[mi][ni][0]));
+          acc[mi][ni][1] = fmaf(s0 * d1, static_cast<float>(ai[mi][ni][1]), fmaf(-s0 * m1, mn[1], acc[mi][ni][1]));
+          acc[mi][ni][2] = fmaf(s1 * d0, static_cast<float>(ai[mi][ni][2]), fmaf(-s1 * m0, mn[2], acc[mi][ni][2]));
+          acc[mi][ni][3] = fmaf(s1 * d1, static_cast<float>(ai[mi][ni][3]), fmaf(-s1 * m1, mn[3], acc[mi][ni][3]));
+          ai[mi][ni][0] = ai[mi][ni][1] = ai[mi][ni][2] = ai[mi][ni][3] = 0;
+        }
+      }
+    }
+    if (kt == kt_n - 1) {  // the tile is done: store from registers (the next tile's loads are already in flight), reset
+      int z, bm, bn;
+      where(step / kt_n, z, bm, bn);
+      const size_t zoff = static_cast<size_t>(z) * M * N;
+#pragma unroll
+      for (int mi = 0; mi < MI; ++mi)
+#pragma unroll
+        for (int ni = 0; ni < 4; ++ni) {
+          const int r0 = bm + wm * (BMT / 2) + mi * 16 + g;
+          const int c0 = bn + wn * 32 + ni * 8 + 2 * t;
+          const size_t i0 = zoff + static_cast<size_t>(r0) * N + c0, i1 = i0 + static_cast<size_t>(8) * N;
+          if (out_bf16) {
+            uint16_t* C = static_cast<uint16_t*>(Cout);
+            *reinterpret_cast<uint32_t*>(C + i0) = static_cast<uint32_t>(f2bf(acc[mi][ni][0])) | (static_cast<uint32_t>(f2bf(acc[mi][ni][1])) << 16);
+            *reinterpret_cast<uint32_t*>(C + i1) = static_cast<uint32_t>(f2bf(acc[mi][ni][2])) | (static_cast<uint32_t>(f2bf(acc[mi][ni][3])) << 16);
+          } else {
+            float* C = static_cast<float*>(Cout);
+            *reinterpret_cast<float2*>(C + i0) = make_float2(acc[mi][ni][0], acc[mi][ni][1]);
+            *reinterpret_cast<float2*>(C + i1) = make_float2(acc[mi][ni][2], acc[mi][ni][3]);
+          }
+          acc[mi][ni][0] = acc[mi][ni][1] = acc[mi][ni][2] = acc[mi][ni][3] = 0.f;
+        }
+    }
+  }
+  cp_async_wait<0>();
+}
+
 // Split-K: out[i] = sum over splits of part[s * n + i], as fp32 or bf16; n a multiple of 4.
 __global__ void k_splitk_reduce(const float* __restrict__ part, int splits, size_t n, void* __restrict__ out, int out_bf16) {
   const size_t n4 = n / 4;
@@ -2491,6 +2691,45 @@ cudaError_t gemm_q8k_q4k_v12(const int8_t* a8, const float* sa256, const uint16_
   const size_t n = static_cast<size_t>(batch) * M * N;
   k_splitk_reduce<<<grid_for(n / 4, 256), 256, 0, s>>>(partial, splits, n, C, out_bf16);
   return cudaGetLastError();
+}
+namespace {
+template <int S, int BMT>
+cudaError_t v13_launch(int blocks_per_sm_cap, const int8_t* a8, const float* sa256, const uint16_t* adig, const BlockQ4K* w, const uint4* rec,
+                       const uint16_t* wdig, void* C, int M, int N, int K, int batch, int raster, int out_bf16, int* grid_out, cudaStream_t s) {
+  static cudaError_t once = cudaFuncSetAttribute(k_gemm_q8k_q4k_v13<S, BMT>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                 static_cast<int>(S * sizeof(V12Stage<BMT>)));
+  if (once != cudaSuccess) return once;
+  int dev = 0, sms = 0, per_sm = 0;
+  cudaError_t e = cudaGetDevice(&dev);
+  if (e == cudaSuccess) e = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+  if (e == cudaSuccess) e = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, k_gemm_q8k_q4k_v13<S, BMT>, 256, S * sizeof(V12Stage<BMT>));
+  if (e != cudaSuccess) return e;
+  if (per_sm < 1) return cudaErrorInvalidConfiguration;
+  if (blocks_per_sm_cap > 0) per_sm = std::min(per_sm, blocks_per_sm_cap);
+  const long long total = static_cast<long long>(M / BMT) * (N / kBN) * batch;
+  const int grid = static_cast<int>(std::min<long long>(total, static_cast<long long>(sms) * per_sm));
+  if (grid_out) *grid_out = grid;
+  k_gemm_q8k_q4k_v13<S, BMT><<<grid, 256, S * sizeof(V12Stage<BMT>), s>>>(a8, sa256, adig, w, rec, wdig, C, M, N, K, batch, raster, out_bf16);
+  return cudaGetLastError();
+}
+}  // namespace
+const char* v13_name(int variant) {
+  static const char* n[] = {"v13 128x128 2-stage persistent", "v13 128x128 3-stage persistent", "v13 64x128 2-stage persistent",
+                            "v13 64x128 3-stage persistent"};
+  return (variant >= 0 && variant < kV12Variants) ? n[variant] : "?";
+}
+cudaError_t gemm_q8k_q4k_v13(const int8_t* a8, const float* sa256, const uint16_t* adig, const BlockQ4K* w, const void* rec, const uint16_t* wdig,
+                             void* C, int M, int N, int K, int batch, int out_bf16, int variant, int raster, int blocks_per_sm_cap, int* grid_out,
+                             cudaStream_t s) {
+  const int bm = v12_tile_m(variant);
+  if (M % bm || N % kBN || K % kQK || batch < 1 || variant < 0 || variant >= kV12Variants) return cudaErrorInvalidValue;
+  const uint4* r = static_cast<const uint4*>(rec);
+  switch (variant) {
+    case 0: return v13_launch<2, 128>(blocks_per_sm_cap, a8, sa256, adig, w, r, wdig, C, M, N, K, batch, raster, out_bf16, grid_out, s);
+    case 1: return v13_launch<3, 128>(blocks_per_sm_cap, a8, sa256, adig, w, r, wdig, C, M, N, K, batch, raster, out_bf16, grid_out, s);
+    case 2: return v13_launch<2, 64>(blocks_per_sm_cap, a8, sa256, adig, w, r, wdig, C, M, N, K, batch, raster, out_bf16, grid_out, s);
+    default: return v13_launch<3, 64>(blocks_per_sm_cap, a8, sa256, adig, w, r, wdig, C, M, N, K, batch, raster, out_bf16, grid_out, s);
+  }
 }
 cudaError_t kernel_info(int which, int* regs, int* local_bytes, int* static_smem, int* blocks_per_sm) {
   const void* f = nullptr;

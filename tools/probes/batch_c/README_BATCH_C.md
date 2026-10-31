@@ -55,3 +55,5 @@ export LD_LIBRARY_PATH=/usr/lib/wsl/lib:/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 ```
 
 Run: `pelias_batch_c all --out DIR` (k1, k2, k2b, k3, q10 with a 30 s cooldown), or one probe; `pelias_batch_c k2prof --out DIR` under `ncu --set full --kernel-name regex:k_gemm -o REPORT` for the stall profile.
+
+O13 (2026-10-30): `v13` = v12's arithmetic made persistent (at most the resident block count; each block walks its tiles over all problems with one cp.async pipeline across tile boundaries, so the next tile's first K steps load while the current tile finishes and stores). Command `o13` (not part of `all`): expert down (512->2048) and expert gate/up (2048->512) dense at M = 2048 / 4096 and grouped (256 x M = 64), every v12 variant (splits 1) against every v13 variant (and the 64-row tile capped at 1 block per SM), best of both tile orders; each v13 output must equal the same v12 variant's bit for bit and stay within 1e-3 of fp32. Checked in the sandbox: kernels_c.cu (host and device) and main_c.cpp type-check with clang 18 against stand-in CUDA / cuBLASLt headers, 0 warnings.

@@ -210,6 +210,14 @@ int v12_tile_m(int variant);
 size_t splitk_partial_bytes(int M, int N, int batch, int splits);
 cudaError_t gemm_q8k_q4k_v12(const int8_t* a8, const float* sa256, const uint16_t* adig, const BlockQ4K* w, const void* rec, const uint16_t* wdig,
                              void* C, int M, int N, int K, int batch, int splits, int out_bf16, float* partial, int variant, int raster, cudaStream_t s);
+// v13 (O13, 2026-10-30): v12's arithmetic made persistent: at most (SMs x resident blocks per SM, capped by
+// blocks_per_sm_cap when > 0) blocks, each walking tiles blockIdx.x + i * gridDim.x over all problems with one cp.async
+// pipeline across tile boundaries (the next tile loads while the current one finishes and stores). Same variants as v12,
+// no split-K. grid_out (optional) receives the launched block count. Results equal v12's (splits 1) bit for bit.
+const char* v13_name(int variant);
+cudaError_t gemm_q8k_q4k_v13(const int8_t* a8, const float* sa256, const uint16_t* adig, const BlockQ4K* w, const void* rec, const uint16_t* wdig,
+                             void* C, int M, int N, int K, int batch, int out_bf16, int variant, int raster, int blocks_per_sm_cap, int* grid_out,
+                             cudaStream_t s);
 // The bf16 GEMM on `batch` problems at once (A: batch x M x K, B: batch x N x K, C: batch x M x N), same tiles as gemm_bf16_tiled.
 cudaError_t gemm_bf16_batched(const uint16_t* A, const uint16_t* B, float* C, int M, int N, int K, int batch, int cfg, int raster, cudaStream_t s);
 // fp32 reference for v7's inputs (activation scale per 256).
