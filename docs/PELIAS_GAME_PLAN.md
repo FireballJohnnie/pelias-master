@@ -40,6 +40,24 @@ Copyright (c) 2026 John Lipka and the Pelias contributors
 
 **Note (author 2026-10-31 00:15): the power / temperature watchdog (gp/watchdog_v1.sh) is a test-harness tool, not part of the program.** Its limits (200 W, the CPU's PPT) are this PC's. If the product ever guards power or temperature, it reads each machine's own limits from a probe (NVML power.limit and temperatures; the CPU's PPT / TDP from the platform) and never assumes these numbers; other GPUs and CPUs have other limits.
 
+## Activation coin flips: GPU first, exact CPU late (author 2026-10-31 01:07-01:14; dual-act logic of 2026-10-29 17:44)
+
+**Why (MEASURED, v16, 40 layers, 64 made-up tokens):** GPU and CPU round the same activations to int8 (per 32); values a hair
+from halfway land either way (fp32 sum order), and the layers carry the flips (CPU fast vs plain kernels KL 5.3e-3 = GPU vs
+CPU 5.5e-3). The rounding itself costs KL about 7e-3 against the unrounded model (CPU 6.95e-3, GPU 6.82e-3): a cost of
+8-bit activations, apart from the weights. The weight planes do not touch it.
+
+**The author's rule:** the GPU answers first (rounded, fast, in step t); the CPU answers late with the **more exact** value
+(only the flagged coin-flip values, recomputed in fp32, unrounded). When they disagree, side with the CPU. A late CPU answer
+still counts: it makes t+1 careful ("careful+1": planes read, flagged values kept unrounded, head re-score), as the late CPU
+hit did in the dual act. Spotting the coin flips is nearly free: the rounding kernel already has |frac - 0.5|; ballot + popc
+counts them per token.
+
+**First measurement (UNMEASURED; offline, existing tools):** per token, the count of coin-flip roundings (|frac - 0.5| < eps)
+against that token's KL and the next token's KL on WikiText; and the activation-rounding cost itself on WikiText (kld with
+and without act rounding). It says whether a token's coin flips predict a miss at t+1 (the author assumes it follows the
+11 % vs 1 % pattern measured for misses) and whether the late exact CPU pass is worth wiring.
+
 ## PRIORITY (author 2026-10-29 18:44): near-tie accuracy first; every other step waits until it is solved
 
 **Problem.** The GP3-07 gate (v8, Pelias's own format, no wormhole) split from llama.cpp on 11 of 20 prompts: 8 at near-ties, 3 at end-of-text setup (MEASURED); 4 of the 11 splits are in the first 5 output tokens. The KL drift sits in few tokens: the top 1 % hold 23-52 % of it (MEASURED). Better or worse is decided by KL against the original model (scoreboard); agreement is the gate.
