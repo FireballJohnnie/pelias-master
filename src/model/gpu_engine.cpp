@@ -75,7 +75,13 @@ class Pool {
     std::atomic<std::int64_t> wake_ns{-1};
   };
   // v28b (author 23:14): while hot, idle workers spin (no sleep, no OS wake-up) so a split step's per-layer jobs start at once
-  void set_hot(bool h) { hot_.store(h, std::memory_order_release); }
+  void set_hot(bool h) {
+    hot_.store(h, std::memory_order_release);
+    if (h) {  // v29 fix: workers that went to sleep before the step must be woken to start spinning
+      std::lock_guard<std::mutex> lk(mu_);
+      cv_.notify_all();
+    }
+  }
   // v28b: two phases in one dispatch: items 0 .. n1-1 run fn1, then (each worker waits until every phase-1 item is done)
   // items 0 .. n2-1 run fn2. One generation bump per call: one wake-up per layer instead of one per stage.
   void run2(int64_t n1, const std::function<void(int64_t)>& fn1, int64_t n2, const std::function<void(int64_t)>& fn2) {
@@ -98,7 +104,7 @@ class Pool {
       std::lock_guard<std::mutex> lk(mu_);
       gen_.fetch_add(1, std::memory_order_release);
     }
-    if (!hot_.load(std::memory_order_acquire)) cv_.notify_all();
+    cv_.notify_all();  // v29 fix: always (v29 skipped it when hot; a worker asleep from before the step then never woke: S4 hung)
     work2(true);
     for (int spin = 0; active_.load(std::memory_order_acquire) != 0; ++spin)
       if (spin > kSpin && !hot_.load(std::memory_order_relaxed)) std::this_thread::yield();
