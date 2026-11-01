@@ -2233,7 +2233,7 @@ int cmd_engine_check(const Args& a) {
                  "                           [--budget-gb G] [--hot-max N] [--mtp-draft K] [--fast-cpu] [--no-cpu] [--float-ref]\n"
                  "                           [--text FILE [--skip-tokens N]] [--timeline] [--dump-top OUT.tsv] [--dump-split [--split-sizes 2,3,4] [--split-step]]\n"
                  "                           [--no-doorbell] [--timeline-ops] [--split-ref] [--bank-selftest MIXES] [--probe-pos P]\n"
-                 "                           [--router-tie BAND] [--cold-on-gpu] [--trace OUT.tsv]\n");
+                 "                           [--router-tie BAND] [--cold-on-gpu] [--trace OUT.tsv] [--reader-v25] [--reader-cache K] [--fold-shared]\n");
     return 1;
   }
   auto num = [&](const char* k, std::uint64_t d, std::uint64_t lo, std::uint64_t hi, std::uint64_t& out) {
@@ -2303,6 +2303,17 @@ int cmd_engine_check(const Args& a) {
   }
   eo.router_tie = tie_band;
   eo.cold_on_gpu = a.has("cold-on-gpu");
+  // v26 switches (each measured on its own in the run)
+  eo.reader_v3 = !a.has("reader-v25");
+  eo.fold_shared = a.has("fold-shared");
+  if (a.has("reader-cache")) {
+    const Result<std::uint64_t> rc = io::parse_whole(a.get("reader-cache"), 64);
+    if (!rc.ok()) {
+      std::fprintf(stderr, "pelias: --reader-cache takes slots per layer, 0 .. 64\n");
+      return 1;
+    }
+    eo.reader_cache = static_cast<int>(rc.value);
+  }
   // v25 trace: a new file (nothing is overwritten); the reader's steps, per layer
   const std::string trace_path = a.get("trace");
   if (!trace_path.empty()) {

@@ -163,6 +163,19 @@ struct ExpertPtr {
   const std::uint8_t* w[3] = {nullptr, nullptr, nullptr};
   std::uint32_t type[3] = {0, 0, 0};
   std::uint64_t rb[3] = {0, 0, 0};
+  std::uint32_t vram = 0;  // v26: 1 if w points at VRAM (the bank, the shared expert): never cached
+};
+// v26 reader cache (per layer K slots of slot_bytes in VRAM; a slot holds one file expert's gate, up and down rows back to
+// back, as stored): tag (expert, -1 empty) and last-use stamp per slot, and the layer's call counter. The grouping kernel
+// looks each file expert up; a miss is read from the file and its rows are written into the least recently used slot as the
+// reader stages them (no extra bus traffic), so later steps read it from VRAM.
+struct ReaderCache {
+  int* tag = nullptr;            // K
+  unsigned* use = nullptr;       // K
+  unsigned* stamp = nullptr;     // 1
+  std::uint8_t* base = nullptr;  // K x slot_bytes
+  std::uint64_t slot_bytes = 0;
+  int K = 0;
 };
 // tab: n_expert entries (device); sel / wsel: tokens x n_used picks and weights (device, as router_topk); xr: tokens x H
 // rounded inputs; gu: scratch tokens x n_used x 2F; h: scratch tokens x n_used x F; y: tokens x H, overwritten with the
@@ -176,6 +189,16 @@ bool moe_reader_v24(const ExpertPtr* tab, const std::int32_t* sel, const float* 
 bool moe_reader(const ExpertPtr* tab, const std::int32_t* sel, const float* wsel, int n_used, const float* xr, std::int64_t tokens, std::int64_t H,
                 std::int64_t F, std::uint64_t row_max, float* gu, float* h, float* yd, int* grp, float* y, unsigned long long* ts = nullptr,
                 Stream s = nullptr);
+// v26 reader v3: the v25 grouped reader with (1) the Q4_TG2 grid replicated per lane in shared memory (R3's grid path:
+// the same floats as decode32, conflict-free), (2) two rows staged per warp before decoding (more bytes in flight), (3) the
+// down projection by half-warps when its rows have at most 16 blocks of 32 (F = 512: v25 left half of each warp idle);
+// each pick's arithmetic is v25's, so it equals moe_reader bit for bit without a shared expert. Optional: the cache (c,
+// K > 0) and the shared expert as an extra pick for every token (shx: its three matrices in VRAM, gsh: tokens gates, added
+// after the routed picks). Scratch: gu tokens x P x 2F, h tokens x P x F, yd tokens x P x H with P = n_used + 1;
+// grp 1 + 6 x tokens x P ints; gsrc / gfill tokens x P ExpertPtr (device).
+bool moe_reader3(const ExpertPtr* tab, const ExpertPtr* shx, const std::int32_t* sel, const float* wsel, const float* gsh, int n_used, const float* xr,
+                 std::int64_t tokens, std::int64_t H, std::int64_t F, std::uint64_t row_max, const ReaderCache* cache, float* gu, float* h, float* yd,
+                 int* grp, ExpertPtr* gsrc, ExpertPtr* gfill, float* y, unsigned long long* ts = nullptr, Stream s = nullptr);
 // device to device copy (stream ordered)
 bool dcopy(void* dst, const void* src, std::size_t bytes, Stream s = nullptr);
 // per value head: o = rms_norm(o) * w * silu(z), in place on core (n rows of nv * ds), z alike

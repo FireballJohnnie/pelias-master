@@ -252,6 +252,14 @@ struct GpuEngine::Impl {
   int* rgrp = nullptr;                   // v25 scratch: the picks grouped by expert
   std::uint64_t rrow_max = 0;            // the longest expert row (bytes)
   std::vector<g::ExpertPtr> rtab_h;      // host copy of the table (the trace's byte counts)
+  // v26 reader v3: the shared expert per layer (device), the groups' sources / fills, the cache
+  g::ExpertPtr *rshx = nullptr, *rgsrc = nullptr, *rgfill = nullptr;
+  bool fold_ok = false;
+  std::uint64_t cache_reserved = 0, cslot = 0;
+  void* cache_mem = nullptr;
+  void* cache_meta = nullptr;
+  std::vector<g::ReaderCache> rcache;
+  g::ExpertPtr *trc_src_h = nullptr, *trc_src_d = nullptr, *trc_fill_h = nullptr, *trc_fill_d = nullptr;
   // v25 trace: pinned mapped, per layer 6 reader stamps, the picks (kReaderMax x nu) and the group count
   void* trc_hv = nullptr;
   unsigned long long *trc_ts_h = nullptr, *trc_ts_d = nullptr;
@@ -922,24 +930,40 @@ struct GpuEngine::Impl {
     if (!opstamp(8) || !opstamp(9)) return gfail("engine: stamp");
     if (!g::act_q8x32(xn, e, n, e, false, xr, e, q, scale, sum)) return gfail("engine: expert input rounding");
     if (!opstamp(10)) return gfail("engine: stamp");
-    if (!g::moe_reader(rtab + static_cast<int64_t>(il) * ne, sel, wsel, static_cast<int>(nu), xr, n, e, s.n_ff_exp, rrow_max, rgu, rh, ryd, rgrp, y,
-                       trc_ts_d ? trc_ts_d + 6 * static_cast<int64_t>(il) : nullptr))
-      return gfail("engine: expert reader");
+    const bool fold = fold_ok;
+    if (fold && (!g::matmul(static_cast<std::uint32_t>(quant::Type::f32), D.gate_inp_sh, static_cast<std::uint64_t>(e) * sizeof(float), 1, e, xn, n, e, gsh, 1) ||
+                 !g::deltanet_gates(gsh, galpha, zero2, zero2, n, 1)))
+      return gfail("engine: shared gate");
+    unsigned long long* tsl = trc_ts_d ? trc_ts_d + 6 * static_cast<int64_t>(il) : nullptr;
+    const bool rd_ok =
+        o.reader_v3
+            ? g::moe_reader3(rtab + static_cast<int64_t>(il) * ne, fold ? rshx + il : nullptr, sel, wsel, gsh, static_cast<int>(nu), xr, n, e, s.n_ff_exp,
+                             rrow_max, rcache.empty() ? nullptr : &rcache[il], rgu, rh, ryd, rgrp, rgsrc, rgfill, y, tsl)
+            : g::moe_reader(rtab + static_cast<int64_t>(il) * ne, sel, wsel, static_cast<int>(nu), xr, n, e, s.n_ff_exp, rrow_max, rgu, rh, ryd, rgrp, y, tsl);
+    if (!rd_ok) return gfail("engine: expert reader");
+    if (trc_src_d && o.reader_v3) {
+      const int64_t P = kReaderMax * (nu + 1);
+      if (!g::dcopy(trc_src_d + static_cast<int64_t>(il) * P, rgsrc, z(n * (nu + 1)) * sizeof(g::ExpertPtr)) ||
+          !g::dcopy(trc_fill_d + static_cast<int64_t>(il) * P, rgfill, z(n * (nu + 1)) * sizeof(g::ExpertPtr)))
+        return gfail("engine: trace copy");
+    }
     if (trc_sel_d && (!g::dcopy(trc_sel_d + static_cast<int64_t>(il) * kReaderMax * nu, sel, z(n * nu) * sizeof(std::int32_t)) ||
                       !g::dcopy(trc_u_d + il, rgrp, sizeof(int))))
       return gfail("engine: trace copy");
     if (!opstamp(11)) return gfail("engine: stamp");
-    if (n == 1 && D.gate_sh.r3 && D.up_sh.r3 && D.gate_sh.k == D.up_sh.k) {
-      if (!(st = prod_r3({{&D.gate_sh, gs}, {&D.up_sh, us}}, xn))) return st;
-    } else if (!(st = prod(D.gate_sh, xn, n, gs)) || !(st = prod(D.up_sh, xn, n, us))) {
-      return st;
+    if (!fold) {
+      if (n == 1 && D.gate_sh.r3 && D.up_sh.r3 && D.gate_sh.k == D.up_sh.k) {
+        if (!(st = prod_r3({{&D.gate_sh, gs}, {&D.up_sh, us}}, xn))) return st;
+      } else if (!(st = prod(D.gate_sh, xn, n, gs)) || !(st = prod(D.up_sh, xn, n, us))) {
+        return st;
+      }
+      if (!g::silu_mul(gs, us, gs, n * ffs)) return gfail("engine: shared silu");
+      if (!(st = prod(D.down_sh, gs, n, sh))) return st;
+      if (!g::matmul(static_cast<std::uint32_t>(quant::Type::f32), D.gate_inp_sh, static_cast<std::uint64_t>(e) * sizeof(float), 1, e, xn, n, e, gsh, 1) ||
+          !g::deltanet_gates(gsh, galpha, zero2, zero2, n, 1))
+        return gfail("engine: shared gate");
+      if (!g::add_rows(y, e, sh, e, gsh, e, n)) return gfail("engine: shared add");
     }
-    if (!g::silu_mul(gs, us, gs, n * ffs)) return gfail("engine: shared silu");
-    if (!(st = prod(D.down_sh, gs, n, sh))) return st;
-    if (!g::matmul(static_cast<std::uint32_t>(quant::Type::f32), D.gate_inp_sh, static_cast<std::uint64_t>(e) * sizeof(float), 1, e, xn, n, e, gsh, 1) ||
-        !g::deltanet_gates(gsh, galpha, zero2, zero2, n, 1))
-      return gfail("engine: shared gate");
-    if (!g::add_rows(y, e, sh, e, gsh, e, n)) return gfail("engine: shared add");
     if (!opstamp(12) || !opstamp(13) || !opstamp(14)) return gfail("engine: stamp");
     return Status::good();
   }
@@ -974,7 +998,29 @@ struct GpuEngine::Impl {
                     trc_u_h[il], static_cast<int>(seen.size()), n_hot, n_cold, static_cast<unsigned long long>(bv), static_cast<unsigned long long>(bh), dus(0, 1), dus(1, 2),
                     dus(2, 3), dus(3, 4), dus(4, 5));
       trace_text += b;
-      trace_text += picks + "\n";
+      trace_text += picks;
+      if (trc_src_h && o.reader_v3) {  // v26: groups served from VRAM by the cache, and misses written into a slot
+        const int64_t P = kReaderMax * (nu + 1);
+        const int U = trc_u_h[il];
+        int hits = 0, fills = 0;
+        std::uint64_t vram_b = 0, file_b = 0;
+        for (int u = 0; u < U && u < P; ++u) {
+          const g::ExpertPtr& X = trc_src_h[static_cast<int64_t>(il) * P + u];
+          const std::uint64_t bytes = X.rb[0] * s.n_ff_exp + X.rb[1] * s.n_ff_exp + X.rb[2] * s.n_embd;
+          (X.vram ? vram_b : file_b) += bytes;
+          if (trc_fill_h[static_cast<int64_t>(il) * P + u].w[0]) ++fills;
+        }
+        for (int u = 0; u < U && u < P; ++u) {
+          const g::ExpertPtr& X = trc_src_h[static_cast<int64_t>(il) * P + u];
+          bool bank = false;
+          for (int64_t ex = 0; ex < ne; ++ex)
+            if (rtab_h[z(static_cast<int64_t>(il) * ne + ex)].w[0] == X.w[0] && rtab_h[z(static_cast<int64_t>(il) * ne + ex)].vram) bank = true;
+          if (X.vram && !bank && u < static_cast<int>(seen.size())) ++hits;
+        }
+        std::snprintf(b, sizeof b, "\t%d\t%d\t%llu\t%llu", hits, fills, static_cast<unsigned long long>(vram_b), static_cast<unsigned long long>(file_b));
+        trace_text += b;
+      }
+      trace_text += "\n";
     }
   }
   // v24: register the span of the model file holding the trunk's routed experts, and build the reader's tables
@@ -1025,31 +1071,98 @@ struct GpuEngine::Impl {
           X.w[pj] = bank ? bank : static_cast<const std::uint8_t*>(dev) + (reinterpret_cast<std::uintptr_t>(r.base) - b0);
           X.type[pj] = static_cast<std::uint32_t>(r.t);
           X.rb[pj] = r.rb;
+          if (bank) X.vram = 1;
         }
       }
+    }
+    // v26: the shared expert as a pick (its three matrices as the batched kernels read them, in VRAM)
+    std::vector<g::ExpertPtr> shx_h;
+    if (o.fold_shared && o.reader_v3 && s.n_ff_shexp == s.n_ff_exp) {
+      bool ok = true;
+      for (std::uint32_t il = 0; il < s.n_layer && ok; ++il) {
+        const Layer& D = L[il];
+        g::ExpertPtr X;
+        const DevW* dw[3] = {&D.gate_sh, &D.up_sh, &D.down_sh};
+        for (int pj = 0; pj < 3; ++pj) {
+          const DevW& W = *dw[pj];
+          if (!W.d || !W.v || W.v->rot32 || !g::type_supported(W.dtype) || W.k != (pj < 2 ? s.n_embd : s.n_ff_shexp)) ok = false;
+          X.w[pj] = static_cast<const std::uint8_t*>(W.d);
+          X.type[pj] = W.dtype;
+          X.rb[pj] = W.drb;
+        }
+        X.vram = 1;
+        shx_h.push_back(X);
+      }
+      if (ok) fold_ok = true;
+      else shx_h.clear();
     }
     const int64_t mp = kReaderMax * static_cast<int64_t>(s.n_expert_used), ff = s.n_ff_exp;
     for (const g::ExpertPtr& X : tab)
       for (int pj = 0; pj < 3; ++pj) rrow_max = std::max<std::uint64_t>(rrow_max, X.rb[pj]);
-    if (4 * ((rrow_max + 32 + 15) & ~std::uint64_t{15}) > 48 * 1024) {
+    for (const g::ExpertPtr& X : shx_h)
+      for (int pj = 0; pj < 3; ++pj) rrow_max = std::max<std::uint64_t>(rrow_max, X.rb[pj]);
+    if (8192 + 8 * ((rrow_max + 32 + 15) & ~std::uint64_t{15}) > 48 * 1024) {
       reader_note = "off (expert rows too long for the reader's shared staging)";
+      fold_ok = false;
       return;
     }
+    const int64_t P = kReaderMax * (static_cast<int64_t>(s.n_expert_used) + 1);  // v26: room for the shared expert's picks
+    (void)mp;
     rtab = static_cast<g::ExpertPtr*>(g::dalloc(tab.size() * sizeof(g::ExpertPtr)));
-    rgu = static_cast<float*>(g::dalloc(z(mp * 2 * ff) * sizeof(float)));
-    rh = static_cast<float*>(g::dalloc(z(mp * ff) * sizeof(float)));
-    ryd = static_cast<float*>(g::dalloc(z(mp * s.n_embd) * sizeof(float)));
-    rgrp = static_cast<int*>(g::dalloc(z(1 + 6 * mp) * sizeof(int)));
-    if (!rtab || !rgu || !rh || !ryd || !rgrp || !g::to_device(rtab, tab.data(), tab.size() * sizeof(g::ExpertPtr))) {
+    rgu = static_cast<float*>(g::dalloc(z(P * 2 * ff) * sizeof(float)));
+    rh = static_cast<float*>(g::dalloc(z(P * ff) * sizeof(float)));
+    ryd = static_cast<float*>(g::dalloc(z(P * s.n_embd) * sizeof(float)));
+    rgrp = static_cast<int*>(g::dalloc(z(1 + 6 * P) * sizeof(int)));
+    rgsrc = static_cast<g::ExpertPtr*>(g::dalloc(z(P) * sizeof(g::ExpertPtr)));
+    rgfill = static_cast<g::ExpertPtr*>(g::dalloc(z(P) * sizeof(g::ExpertPtr)));
+    if (!shx_h.empty()) {
+      rshx = static_cast<g::ExpertPtr*>(g::dalloc(shx_h.size() * sizeof(g::ExpertPtr)));
+      if (!rshx || !g::to_device(rshx, shx_h.data(), shx_h.size() * sizeof(g::ExpertPtr))) fold_ok = false;
+    }
+    if (!rtab || !rgu || !rh || !ryd || !rgrp || !rgsrc || !rgfill || !g::to_device(rtab, tab.data(), tab.size() * sizeof(g::ExpertPtr))) {
       reader_note = "off (device memory for the reader's tables)";
+      fold_ok = false;
       return;
     }
-    dev_bytes += tab.size() * sizeof(g::ExpertPtr) + z(mp * 3 * ff + mp * s.n_embd) * sizeof(float) + z(1 + 6 * mp) * sizeof(int);
+    dev_bytes += tab.size() * sizeof(g::ExpertPtr) + z(P * 3 * ff + P * s.n_embd) * sizeof(float) + z(1 + 6 * P) * sizeof(int) + z(2 * P) * sizeof(g::ExpertPtr);
+    // v26 cache: the bytes reserved before the bank was filled
+    std::string cache_note;
+    if (cache_reserved > 0 && o.reader_v3) {
+      const int K = o.reader_cache;
+      const std::size_t meta_b = static_cast<std::size_t>(s.n_layer) * (static_cast<std::size_t>(K) * 8 + 16);
+      cache_mem = g::dalloc(cache_reserved);
+      cache_meta = g::dalloc(meta_b);
+      if (cache_mem && cache_meta) {
+        std::vector<std::uint8_t> init(meta_b, 0);
+        auto* ip = reinterpret_cast<int*>(init.data());
+        for (std::size_t i = 0; i < static_cast<std::size_t>(s.n_layer) * static_cast<std::size_t>(K); ++i) ip[i] = -1;  // tags: empty
+        if (g::to_device(cache_meta, init.data(), meta_b)) {
+          auto* mb = static_cast<std::uint8_t*>(cache_meta);
+          const std::size_t nl = s.n_layer;
+          for (std::size_t il = 0; il < nl; ++il) {
+            g::ReaderCache c;
+            c.K = K;
+            c.tag = reinterpret_cast<int*>(mb) + il * static_cast<std::size_t>(K);
+            c.use = reinterpret_cast<unsigned*>(mb + nl * static_cast<std::size_t>(K) * 4) + il * static_cast<std::size_t>(K);
+            c.stamp = reinterpret_cast<unsigned*>(mb + nl * static_cast<std::size_t>(K) * 8) + il;
+            c.base = static_cast<std::uint8_t*>(cache_mem) + il * static_cast<std::size_t>(K) * cslot;
+            c.slot_bytes = cslot;
+            rcache.push_back(c);
+          }
+          dev_bytes += cache_reserved + meta_b;
+          char cb[128];
+          std::snprintf(cb, sizeof cb, "; cache %d slots per layer, %.2f GB", K, static_cast<double>(cache_reserved) / 1e9);
+          cache_note = cb;
+        }
+      }
+      if (rcache.empty()) cache_note = "; cache off (device memory)";
+    }
     rtab_h = tab;
     if (o.trace) {
       const std::size_t nl = s.n_layer, b_ts = nl * 6 * sizeof(unsigned long long), b_sel = nl * z(mp) * sizeof(std::int32_t), b_u = nl * sizeof(int);
+      const std::size_t b_src = nl * z(P) * sizeof(g::ExpertPtr);
       void* dv = nullptr;
-      trc_hv = g::host_alloc_mapped(b_ts + b_sel + b_u + 64, &dv);
+      trc_hv = g::host_alloc_mapped(b_ts + b_sel + b_u + 64 + 2 * b_src, &dv);
       if (trc_hv) {
         auto* hb = static_cast<std::uint8_t*>(trc_hv);
         auto* db = static_cast<std::uint8_t*>(dv);
@@ -1059,12 +1172,20 @@ struct GpuEngine::Impl {
         trc_sel_d = reinterpret_cast<std::int32_t*>(db + b_ts);
         trc_u_h = reinterpret_cast<int*>(hb + b_ts + b_sel);
         trc_u_d = reinterpret_cast<int*>(db + b_ts + b_sel);
+        const std::size_t o2 = (b_ts + b_sel + b_u + 63) & ~std::size_t{63};
+        trc_src_h = reinterpret_cast<g::ExpertPtr*>(hb + o2);
+        trc_src_d = reinterpret_cast<g::ExpertPtr*>(db + o2);
+        trc_fill_h = reinterpret_cast<g::ExpertPtr*>(hb + o2 + b_src);
+        trc_fill_d = reinterpret_cast<g::ExpertPtr*>(db + o2 + b_src);
       }
     }
     reader = true;
     char b[160];
-    std::snprintf(b, sizeof b, "on (steps of 1-%d tokens; %.2f GB of the file registered in %.2f s)", kReaderMax, static_cast<double>(b1 - b0) / 1e9, reg_s);
-    reader_note = b;
+    char b2[320];
+    std::snprintf(b2, sizeof b2, "on (%s, steps of 1-%d tokens; %.2f GB of the file registered in %.2f s%s%s)", o.reader_v3 ? "v3" : "v25", kReaderMax,
+                  static_cast<double>(b1 - b0) / 1e9, reg_s, fold_ok ? "; shared expert folded in" : "", cache_note.c_str());
+    reader_note = b2;
+    (void)b;
   }
 
   Status reset_state() {
@@ -1099,6 +1220,11 @@ GpuEngine::~GpuEngine() {
   g::dfree(p_->rh);
   g::dfree(p_->ryd);
   g::dfree(p_->rgrp);
+  g::dfree(p_->rgsrc);
+  g::dfree(p_->rgfill);
+  g::dfree(p_->rshx);
+  g::dfree(p_->cache_mem);
+  g::dfree(p_->cache_meta);
   g::host_free(p_->trc_hv);
   g::dfree(p_->probe_bd);
   g::dfree(p_->probe_ld);
@@ -1481,6 +1607,22 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
     }
   }
   if (o.mtp) I.M.picks.assign(z(ne), 0);
+  if (o.cold_on_gpu && o.reader_v3 && o.reader_cache > 0) {  // v26: the reader cache's bytes before the bank takes its share
+    std::uint64_t mx = 0;
+    for (std::uint32_t il = 0; il < s.n_layer; ++il)
+      for (int ex = 0; ex < static_cast<int>(ne); ++ex) {
+        std::uint64_t b = 0;
+        for (const WeightView* v : {&w.layers[il].gate_exps, &w.layers[il].up_exps, &w.layers[il].down_exps}) b += exp_rows(*v, ex).rb * v->ne[1];
+        mx = std::max(mx, b);
+      }
+    const std::uint64_t slot_b = (mx + 255) & ~std::uint64_t{255};
+    const std::uint64_t need = slot_b * static_cast<std::uint64_t>(o.reader_cache) * s.n_layer;
+    if (need < left) {
+      left -= need;
+      I.cache_reserved = need;
+      I.cslot = slot_b;
+    }
+  }
   if (!o.hot_order.empty()) {
     // stack overhead per layer (alignment, maps, table rounding): ESTIMATE, kept out of the budget
     const std::uint64_t per_layer_slack = 3 * 4 * (2048 + 256 * 4) + 64 * 1024;

@@ -44,6 +44,10 @@ bool moe_reader(const ExpertPtr*, const std::int32_t*, const float*, int, const 
                 float*, int*, float*, unsigned long long*, Stream) {
   return false;
 }
+bool moe_reader3(const ExpertPtr*, const ExpertPtr*, const std::int32_t*, const float*, const float*, int, const float*, std::int64_t, std::int64_t, std::int64_t,
+                 std::uint64_t, const ReaderCache*, float*, float*, float*, int*, ExpertPtr*, ExpertPtr*, float*, unsigned long long*, Stream) {
+  return false;
+}
 bool to_host_async(void*, const void*, std::size_t, Stream) { return false; }
 bool matmul(std::uint32_t, const void*, std::uint64_t, std::int64_t, std::int64_t, const float*, std::int64_t, std::int64_t, float*, std::int64_t,
             Stream) {

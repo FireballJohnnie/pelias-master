@@ -734,6 +734,141 @@ TEST(rung1_moe_reader_against_fp64) {
   std::free(hm);
 }
 
+// v26 reader v3: equal to the v24 / v25 reader bit for bit (Q4_TG2 from the per-lane grid, two rows per warp, half-warp
+// down rows at F = 256 and a full warp at F = 1024), with the cache (a first call fills the slots, a second reads them:
+// both bit for bit, and the second serves every file expert from VRAM), and with the shared expert folded in (against fp64)
+TEST(rung1_moe_reader3_equals_v25_cache_and_shared) {
+  if (!gpu_or_skip()) return;
+  const q::Type types[3] = {q::Type::q8_0, q::Type::q6_k, q::Type::q4_tg2};
+  bool eq_all = true, cache_eq = true, cache_hits_ok = true, shared_ok = true;
+  double worst_sh = 0.0;
+  for (const std::int64_t F : {std::int64_t{256}, std::int64_t{1024}}) {
+    const std::int64_t H = 512, ne = 6;
+    const int nu = 3;
+    std::vector<Mat> M;
+    for (std::int64_t e = 0; e < ne + 1; ++e)  // expert 6: the shared expert
+      for (int pj = 0; pj < 3; ++pj) {
+        const q::Type ty = types[(e + pj) % 3];
+        M.push_back(pj < 2 ? make_mat(ty, F, H, static_cast<std::uint32_t>(300 + 10 * e + pj + F)) : make_mat(ty, H, F, static_cast<std::uint32_t>(300 + 10 * e + pj + F)));
+      }
+    std::vector<g::ExpertPtr> tab(static_cast<std::size_t>(ne));
+    g::ExpertPtr shx;
+    std::vector<void*> dmem;
+    std::uint64_t row_max = 0, ebytes_max = 0;
+    for (std::int64_t e = 0; e < ne + 1; ++e) {
+      g::ExpertPtr& X = e < ne ? tab[static_cast<std::size_t>(e)] : shx;
+      std::uint64_t eb = 0;
+      for (int pj = 0; pj < 3; ++pj) {
+        const Mat& m = M[static_cast<std::size_t>(3 * e + pj)];
+        void* d = g::dalloc(m.bytes.size());
+        CHECK(d && g::to_device(d, m.bytes.data(), m.bytes.size()));
+        dmem.push_back(d);
+        X.w[pj] = static_cast<const std::uint8_t*>(d);
+        X.type[pj] = static_cast<std::uint32_t>(types[(e + pj) % 3]);
+        X.rb[pj] = m.rb;
+        row_max = std::max<std::uint64_t>(row_max, m.rb);
+        eb += m.bytes.size();
+      }
+      X.vram = e < 2 || e == ne ? 1u : 0u;  // experts 0, 1 and the shared expert "in the bank"; 2-5 "from the file"
+      ebytes_max = std::max(ebytes_max, eb);
+    }
+    Dev<g::ExpertPtr> dtab(tab), dshx(std::vector<g::ExpertPtr>{shx});
+    const int K = 4;
+    const std::uint64_t slot = (ebytes_max + 255) & ~std::uint64_t{255};
+    Dev<std::uint8_t> cmem(static_cast<std::size_t>(K) * slot);
+    Dev<int> ctag(std::vector<int>(K, -1));
+    Dev<unsigned> cuse(std::vector<unsigned>(K, 0u)), cst(std::vector<unsigned>(1, 0u));
+    g::ReaderCache rc;
+    rc.K = K;
+    rc.tag = ctag.p;
+    rc.use = cuse.p;
+    rc.stamp = cst.p;
+    rc.base = cmem.p;
+    rc.slot_bytes = slot;
+    for (const std::int64_t T : {std::int64_t{1}, std::int64_t{2}, std::int64_t{4}}) {
+      const std::int64_t P = T * (nu + 1);
+      const std::vector<float> x = wave(T * H, static_cast<std::uint32_t>(17 + T + F), 1.0f);
+      std::vector<std::int32_t> sel(static_cast<std::size_t>(T * nu));
+      std::vector<float> wsel(static_cast<std::size_t>(T * nu)), gshv(static_cast<std::size_t>(T));
+      for (std::int64_t t = 0; t < T; ++t) {
+        gshv[static_cast<std::size_t>(t)] = 0.3f + 0.1f * static_cast<float>(t);
+        for (int j = 0; j < nu; ++j) {
+          sel[static_cast<std::size_t>(t * nu + j)] = static_cast<std::int32_t>((t + 2 * j + (j == 2 ? 1 : 0)) % ne);
+          wsel[static_cast<std::size_t>(t * nu + j)] = 0.2f + 0.15f * static_cast<float>(j);
+        }
+      }
+      Dev<float> dx(x), dw(wsel), dg(gshv), dgu(static_cast<std::size_t>(P * 2 * F)), dh(static_cast<std::size_t>(P * F)), dyd(static_cast<std::size_t>(P * H)),
+          y24(static_cast<std::size_t>(T * H)), y3(static_cast<std::size_t>(T * H)), yc1(static_cast<std::size_t>(T * H)), yc2(static_cast<std::size_t>(T * H)),
+          ysh(static_cast<std::size_t>(T * H));
+      Dev<std::int32_t> ds(sel);
+      Dev<int> dgrp(static_cast<std::size_t>(1 + 6 * P));
+      Dev<g::ExpertPtr> gsrc(static_cast<std::size_t>(P)), gfill(static_cast<std::size_t>(P));
+      CHECK(g::moe_reader_v24(dtab.p, ds.p, dw.p, nu, dx.p, T, H, F, dgu.p, dh.p, y24.p));
+      CHECK(g::moe_reader3(dtab.p, nullptr, ds.p, dw.p, nullptr, nu, dx.p, T, H, F, row_max, nullptr, dgu.p, dh.p, dyd.p, dgrp.p, gsrc.p, gfill.p, y3.p));
+      CHECK(g::moe_reader3(dtab.p, nullptr, ds.p, dw.p, nullptr, nu, dx.p, T, H, F, row_max, &rc, dgu.p, dh.p, dyd.p, dgrp.p, gsrc.p, gfill.p, yc1.p));
+      CHECK(g::moe_reader3(dtab.p, nullptr, ds.p, dw.p, nullptr, nu, dx.p, T, H, F, row_max, &rc, dgu.p, dh.p, dyd.p, dgrp.p, gsrc.p, gfill.p, yc2.p));
+      CHECK(g::sync());
+      const std::vector<g::ExpertPtr> src2 = gsrc.get();
+      const std::vector<int> grp2 = dgrp.get();
+      // the second cached call: every group from VRAM if the step's file experts fit in the K slots
+      int file_groups = 0, from_vram = 0;
+      for (int u = 0; u < grp2[0]; ++u) {
+        const int ex = grp2[static_cast<std::size_t>(1 + 6 * u)];
+        if (ex >= 2) ++file_groups;
+        if (ex >= 2 && src2[static_cast<std::size_t>(u)].vram) ++from_vram;
+      }
+      if (file_groups <= K) cache_hits_ok = cache_hits_ok && from_vram == file_groups;
+      CHECK(g::moe_reader3(dtab.p, dshx.p, ds.p, dw.p, dg.p, nu, dx.p, T, H, F, row_max, nullptr, dgu.p, dh.p, dyd.p, dgrp.p, gsrc.p, gfill.p, ysh.p));
+      CHECK(g::sync());
+      const std::vector<float> a24 = y24.get(), a3 = y3.get(), c1 = yc1.get(), c2 = yc2.get(), sh = ysh.get();
+      const std::size_t nb = a24.size() * sizeof(float);
+      eq_all = eq_all && std::memcmp(a24.data(), a3.data(), nb) == 0;
+      cache_eq = cache_eq && std::memcmp(a24.data(), c1.data(), nb) == 0 && std::memcmp(a24.data(), c2.data(), nb) == 0;
+      // the shared term: sh - routed = gsh x the shared expert (fp64, the per-32 rounding of silu x up as the reader)
+      double num = 0.0, den = 0.0;
+      for (std::int64_t t = 0; t < T; ++t) {
+        const Mat &mg = M[static_cast<std::size_t>(3 * ne)], &mu = M[static_cast<std::size_t>(3 * ne + 1)], &md = M[static_cast<std::size_t>(3 * ne + 2)];
+        std::vector<float> hh(static_cast<std::size_t>(F));
+        for (std::int64_t b = 0; b < F / 32; ++b) {
+          float v[32], am = 0.0f;
+          for (int i = 0; i < 32; ++i) {
+            const std::int64_t r = 32 * b + i;
+            double gg = 0.0, uu = 0.0;
+            for (std::int64_t k = 0; k < H; ++k) {
+              gg += static_cast<double>(mg.deq[static_cast<std::size_t>(r * H + k)]) * x[static_cast<std::size_t>(t * H + k)];
+              uu += static_cast<double>(mu.deq[static_cast<std::size_t>(r * H + k)]) * x[static_cast<std::size_t>(t * H + k)];
+            }
+            const float gf = static_cast<float>(gg);
+            v[i] = (gf / (1.0f + std::exp(-gf))) * static_cast<float>(uu);
+            am = std::max(am, std::fabs(v[i]));
+          }
+          const float sc = am > 0.0f ? am / 127.0f : 1.0f, inv = 1.0f / sc;
+          for (int i = 0; i < 32; ++i) hh[static_cast<std::size_t>(32 * b + i)] = sc * std::min(127.0f, std::max(-127.0f, std::rint(v[i] * inv)));
+        }
+        for (std::int64_t r = 0; r < H; ++r) {
+          double acc = 0.0;
+          for (std::int64_t k = 0; k < F; ++k) acc += static_cast<double>(md.deq[static_cast<std::size_t>(r * F + k)]) * hh[static_cast<std::size_t>(k)];
+          const double want = gshv[static_cast<std::size_t>(t)] * acc;
+          const double got = static_cast<double>(sh[static_cast<std::size_t>(t * H + r)]) - a3[static_cast<std::size_t>(t * H + r)];
+          num += (got - want) * (got - want);
+          den += want * want;
+        }
+      }
+      const double rel = std::sqrt(num / std::max(den, 1e-300));
+      worst_sh = std::max(worst_sh, rel);
+      shared_ok = shared_ok && std::isfinite(rel) && rel <= 2e-3;
+    }
+    for (void* d : dmem) g::dfree(d);
+  }
+  CHECK(eq_all);
+  CHECK(cache_eq);
+  CHECK(cache_hits_ok);
+  CHECK(shared_ok);
+  std::printf("    F 256 (half-warp down) / 1024 (warp down), 1 / 2 / 4 tokens, q8_0 / q6_k / q4_tg2: v3 = v24 %s; cached (fill, then read) %s, "
+              "second call from VRAM %s; shared expert folded in: worst rel L2 %.3e against fp64\n",
+              eq_all ? "bit for bit" : "DIFFERS", cache_eq ? "bit for bit" : "DIFFERS", cache_hits_ok ? "yes" : "NO", worst_sh);
+}
+
 TEST(rung1_attention_against_fp64) {
   if (!gpu_or_skip()) return;
   const std::int64_t nh = 16, nkv = 2, hd = 256, qh = 2 * hd, qs = nh * qh, kv_w = nkv * hd;

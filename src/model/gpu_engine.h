@@ -81,6 +81,16 @@ struct EngineOptions {
   // bytes from VRAM / the file, and the reader's four launch times (GPU stamps), and per step the wall time; read with
   // trace_take(). Off by default (stamps cost launches).
   bool trace = false;
+  // v26 (author 20:39 "don't hold back"): the reader v3 kernels (Q4_TG2 grid per lane in shared memory, two rows staged
+  // per warp, half-warp down rows; bit for bit with v25's reader); false: v25's reader
+  bool reader_v3 = true;
+  // v26: VRAM cache of file experts for the reader, slots per layer (0: none). Its bytes come out of the bank's budget
+  // before the bank is filled (the bank's least-used experts make room); misses are written into the least recently used
+  // slot as the reader stages them.
+  int reader_cache = 0;
+  // v26: the shared expert as one more pick of the reader (its weights in VRAM; its sigmoid gate as the weight, added after
+  // the routed picks). Needs reader_v3 and the shared expert's shape equal to a routed expert's.
+  bool fold_shared = false;
 };
 
 struct EngineStats {

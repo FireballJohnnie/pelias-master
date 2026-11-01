@@ -246,7 +246,8 @@ namespace {
 // GP3-14 stages 1-2: the engine over a sequence fed in pieces (prefill chunks, then one token at a time) against the
 // reference's fresh pass with the same roundings. hot: experts 0 .. hot-1 of every layer in the GPU bank, the rest on
 // the CPU (0: every expert on the CPU; 8: every expert on the GPU).
-std::vector<float> engine_case(const Small& sm, int hot, const char* what, bool bell = true, bool timeline = false, bool reader = false, float band = 0.0f) {
+std::vector<float> engine_case(const Small& sm, int hot, const char* what, bool bell = true, bool timeline = false, bool reader = false, float band = 0.0f,
+                               int cache = 0, bool fold = false) {
   const m::Qwen35MoeSpec& s = sm.spec;
   const int n = std::getenv("PELIAS_GPU_QUICK") ? 20 : 48, nv = static_cast<int>(s.n_vocab);
   std::vector<std::int32_t> tok(static_cast<std::size_t>(n));
@@ -264,6 +265,8 @@ std::vector<float> engine_case(const Small& sm, int hot, const char* what, bool 
   eo.timeline = timeline;
   eo.cold_on_gpu = reader;
   eo.trace = reader;  // v25: the trace only reads stamps and picks
+  eo.reader_cache = cache;  // v26
+  eo.fold_shared = fold;
   eo.router_tie = band;
   if (hot > 0) {
     eo.hot_order.assign(s.n_layer, {});
@@ -406,6 +409,13 @@ TEST(rung4_engine_decode_against_the_reference) {
   engine_case(sm, 0, "engine, reader, no bank", true, false, true);
   engine_case(sm, 4, "engine, tie band 0.01", true, false, false, 0.01f);
   engine_case(sm, 4, "engine, reader + tie band 0.01", true, false, true, 0.01f);
+  // v26: the cache changes where bytes come from, never the arithmetic: logits bit for bit with and without it
+  const std::vector<float> r0 = engine_case(sm, 2, "engine, reader v3, bank 2", true, false, true);
+  const std::vector<float> r1 = engine_case(sm, 2, "engine, reader v3 + cache 3", true, false, true, 0.0f, 3);
+  CHECK(!r0.empty() && r0.size() == r1.size() && std::memcmp(r0.data(), r1.data(), r0.size() * sizeof(float)) == 0);
+  std::printf("    reader cache on vs off: logits bit for bit %s\n",
+              !r0.empty() && r0.size() == r1.size() && std::memcmp(r0.data(), r1.data(), r0.size() * sizeof(float)) == 0 ? "equal" : "DIFFERENT");
+  engine_case(sm, 2, "engine, reader v3 + cache + shared fold", true, false, true, 0.0f, 3, true);
 }
 
 // GP3-14 stage 3: verify batches and keep() (the MTP rollback) on the small model: after a 16-token prefill, batches of 4
