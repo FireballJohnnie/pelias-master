@@ -1000,6 +1000,44 @@ PELIAS_TARGET_AVX2 void fused_q4_tg_seg(const std::uint8_t* p, int version, cons
   }
 }
 
+
+// v40 (author 02:30): two rows of Q4_TG / Q4_TG2 against one float vector, the grids loaded once by the caller and each x
+// load shared. Per row the same products in the same order as fused_q4_tg_seg with nt = 1 (bit for bit).
+PELIAS_TARGET_AVX2 void fused_q4_tg_seg2(const std::uint8_t* p0, const std::uint8_t* p1, const __m256* glo, const __m256* ghi, const float* x,
+                                         __m256* a0, __m256* a1) {
+  const float d0 = h2f(p0), d1 = h2f(p1);
+  std::uint64_t pk0 = 0, pk1 = 0;
+  for (int b = 0; b < 6; ++b) {
+    pk0 |= static_cast<std::uint64_t>(p0[2 + b]) << (8 * b);
+    pk1 |= static_cast<std::uint64_t>(p1[2 + b]) << (8 * b);
+  }
+  const __m128i m4 = _mm_set1_epi8(0x0F);
+  for (int j = 0; j < 8; ++j) {
+    const __m256 sv0 = _mm256_set1_ps(q::q8_z_scale(d0, static_cast<int>((pk0 >> (6 * j)) & 63u)));
+    const __m256 sv1 = _mm256_set1_ps(q::q8_z_scale(d1, static_cast<int>((pk1 >> (6 * j)) & 63u)));
+    const std::uint8_t tg0 = p0[8 + j], tg1 = p1[8 + j];
+    const __m128i v0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p0 + 16 + 16 * j));
+    const __m128i v1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p1 + 16 + 16 * j));
+    const __m128i lo0 = _mm_and_si128(v0, m4), hi0 = _mm_and_si128(_mm_srli_epi16(v0, 4), m4);
+    const __m128i lo1 = _mm_and_si128(v1, m4), hi1 = _mm_and_si128(_mm_srli_epi16(v1, 4), m4);
+    const __m128i c00 = _mm_unpacklo_epi8(lo0, hi0), c01 = _mm_unpackhi_epi8(lo0, hi0);
+    const __m128i c10 = _mm_unpacklo_epi8(lo1, hi1), c11 = _mm_unpackhi_epi8(lo1, hi1);
+    const __m128i cg0[4] = {c00, _mm_srli_si128(c00, 8), c01, _mm_srli_si128(c01, 8)};
+    const __m128i cg1[4] = {c10, _mm_srli_si128(c10, 8), c11, _mm_srli_si128(c11, 8)};
+    for (int g = 0; g < 4; ++g) {
+      const __m256 xv = _mm256_loadu_ps(x + 32 * j + 8 * g);
+      const int t0 = (tg0 >> (2 * g)) & 3, t1 = (tg1 >> (2 * g)) & 3;
+      const __m256i i0 = _mm256_cvtepu8_epi32(cg0[g]), i1 = _mm256_cvtepu8_epi32(cg1[g]);
+      const __m256 w0 = _mm256_mul_ps(sv0, _mm256_blendv_ps(_mm256_permutevar8x32_ps(glo[t0], i0), _mm256_permutevar8x32_ps(ghi[t0], i0),
+                                                            _mm256_castsi256_ps(_mm256_slli_epi32(i0, 28))));
+      const __m256 w1 = _mm256_mul_ps(sv1, _mm256_blendv_ps(_mm256_permutevar8x32_ps(glo[t1], i1), _mm256_permutevar8x32_ps(ghi[t1], i1),
+                                                            _mm256_castsi256_ps(_mm256_slli_epi32(i1, 28))));
+      a0[g] = _mm256_fmadd_ps(w0, xv, a0[g]);
+      a1[g] = _mm256_fmadd_ps(w1, xv, a1[g]);
+    }
+  }
+}
+
 PELIAS_TARGET_AVX2 void planes_seg_avx2(const std::uint8_t* o, int k_stored, int k_use, float* w) {
   const std::uint8_t* bits = o + 2 * k_stored;
   const __m256i bitsel = _mm256_setr_epi32(1, 2, 4, 8, 16, 32, 64, 128);
@@ -1618,6 +1656,41 @@ void force_isa(Isa isa) { g_forced.store(static_cast<int>(isa), std::memory_orde
 
 bool dot_supported(q::Type t) { return q::can_dequantize(t); }
 bool dot_has_fast_path(q::Type t) { return is_fast(t); }
+
+#if defined(PELIAS_KERN_X86)
+namespace {
+PELIAS_TARGET_AVX2 void dot_rows2_tg_avx2(int version, const std::uint8_t* r0, const std::uint8_t* r1, std::int64_t k, std::uint64_t seg_bytes,
+                                          const float* x, float* out) {
+  __m256 glo[4], ghi[4];
+  for (int t = 0; t < 4; ++t) {
+    const float* g = q::q4_tg_grid(t, version);
+    glo[t] = _mm256_loadu_ps(g);
+    ghi[t] = _mm256_loadu_ps(g + 8);
+  }
+  __m256 a0[4], a1[4];
+  for (int r = 0; r < 4; ++r) {
+    a0[r] = _mm256_setzero_ps();
+    a1[r] = _mm256_setzero_ps();
+  }
+  for (std::int64_t sgi = 0; sgi < k / kSeg; ++sgi)
+    fused_q4_tg_seg2(r0 + static_cast<std::uint64_t>(sgi) * seg_bytes, r1 + static_cast<std::uint64_t>(sgi) * seg_bytes, glo, ghi, x + sgi * kSeg, a0, a1);
+  out[0] = reduce_avx2(a0);
+  out[1] = reduce_avx2(a1);
+}
+}  // namespace
+#endif
+
+void dot_rows2_f32(q::Type t, const std::uint8_t* r0, const std::uint8_t* r1, std::int64_t k, const float* x, float* out) {
+#if defined(PELIAS_KERN_X86)
+  if (active_isa() == Isa::avx2 && (t == q::Type::q4_tg || t == q::Type::q4_tg2) && k % kSeg == 0) {
+    dot_rows2_tg_avx2(t == q::Type::q4_tg2 ? 2 : 1, r0, r1, k, q::row_bytes(static_cast<std::uint32_t>(t), kSeg), x, out);
+    return;
+  }
+#endif
+  const float* xs[1] = {x};
+  dot_row(t, r0, k, nullptr, xs, 1, out);
+  dot_row(t, r1, k, nullptr, xs, 1, out + 1);
+}
 
 void dot_row(q::Type t, const std::uint8_t* row, std::int64_t k, const RowPlanes* planes, const float* const* xs, int nt, float* out) {
   if (planes && !planes->data) planes = nullptr;

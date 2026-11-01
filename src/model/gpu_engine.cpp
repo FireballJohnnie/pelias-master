@@ -36,6 +36,21 @@ namespace g = pelias::kern::gpu;
 using std::int64_t;
 
 namespace {
+// v40: a software prefetch of one row of weights (each 64-byte line), and a small index per pool thread for the stamps
+inline void prefetch_row(const std::uint8_t* p, std::uint64_t bytes) {
+#if defined(__x86_64__) || defined(_M_X64)
+  for (std::uint64_t off = 0; off < bytes; off += 64) _mm_prefetch(reinterpret_cast<const char*>(p + off), _MM_HINT_T0);
+#else
+  (void)p;
+  (void)bytes;
+#endif
+}
+std::atomic<int> g_tid_next{0};
+inline int pool_tid() {
+  thread_local const int t = std::min(31, g_tid_next.fetch_add(1, std::memory_order_relaxed));
+  return t;
+}
+inline int pool_tid_count() { return g_tid_next.load(std::memory_order_relaxed); }
 
 using Clock = std::chrono::steady_clock;
 inline double since(Clock::time_point t0) { return std::chrono::duration<double>(Clock::now() - t0).count(); }
@@ -360,6 +375,7 @@ struct GpuEngine::Impl {
   std::vector<std::int32_t> sel_h;
   std::vector<kern::ActQ8x32> actx, acth;
   std::vector<float> gbuf, ubuf, dbuf;
+  std::atomic<std::uint64_t> down2_n{0}, down2_bad{0};  // v40 --cpu-check
   std::vector<ColdPick> cold;
   std::vector<std::uint8_t> need;
   // v20: cold picks grouped by expert (up to 4 tokens each) and each group's gate / up blocks still to finish
@@ -779,7 +795,8 @@ struct GpuEngine::Impl {
     // alone); and the silu + rounding of a group done by the thread that finishes its last gate / up block (one thread
     // hand-off less per layer). Outputs stay per pick (gbuf / ubuf / dbuf at the pick's index), so the combine below is
     // unchanged and deterministic.
-    constexpr int64_t kRowsUp = 64, kRowsDown = 128, kGroup = 4;
+    constexpr int64_t kRowsDown = 128, kGroup = 4;
+    const int64_t kRowsUp = std::max<int64_t>(8, o.cpu_up_rows);
     grp.clear();
     {
       ord.resize(z(np));
@@ -808,6 +825,7 @@ struct GpuEngine::Impl {
       }
       float o4[kGroup];
       for (int64_t r = r0; r < r1; ++r) {
+        if (o.cpu_prefetch && r + 2 < r1) prefetch_row(R.base + static_cast<std::uint64_t>(r + 2) * R.rb, R.rb);
         kern::dot_row_q8(R.t, R.base + static_cast<std::uint64_t>(r) * R.rb, e, nullptr, acts, gp.m, o4);
         for (int j = 0; j < gp.m; ++j) outs[j][r] = o4[j];
       }
@@ -922,7 +940,31 @@ struct GpuEngine::Impl {
           outs[j] = dbuf.data() + static_cast<int64_t>(gp.p[j]) * e;
         }
         float o4[kGroup];
-        for (int64_t r = r0; r < r1; ++r) {
+        int64_t r = r0;
+        if (o.cpu_down2 && gp.m == 1 && kern::dot_q8_has_int_path(R.t) == false) {  // v40: two rows per call, one token
+          const float* xv = acts[0]->x.data();
+          for (; r + 1 < r1; r += 2) {
+            const std::uint8_t* q0 = R.base + static_cast<std::uint64_t>(r) * R.rb;
+            if (o.cpu_prefetch && r + 5 < r1) {
+              prefetch_row(q0 + 4 * R.rb, R.rb);
+              prefetch_row(q0 + 5 * R.rb, R.rb);
+            }
+            float o2[2];
+            kern::dot_rows2_f32(R.t, q0, q0 + R.rb, ff, xv, o2);
+            if (o.cpu_check) {
+              float c0[kGroup], c1[kGroup];
+              kern::dot_row_q8(R.t, q0, ff, nullptr, acts, 1, c0);
+              kern::dot_row_q8(R.t, q0 + R.rb, ff, nullptr, acts, 1, c1);
+              if (std::memcmp(&c0[0], &o2[0], sizeof(float)) != 0 || std::memcmp(&c1[0], &o2[1], sizeof(float)) != 0)
+                down2_bad.fetch_add(1, std::memory_order_relaxed);
+              down2_n.fetch_add(2, std::memory_order_relaxed);
+            }
+            outs[0][r] = o2[0];
+            outs[0][r + 1] = o2[1];
+          }
+        }
+        for (; r < r1; ++r) {
+          if (o.cpu_prefetch && r + 2 < r1) prefetch_row(R.base + static_cast<std::uint64_t>(r + 2) * R.rb, R.rb);
           kern::dot_row_q8(R.t, R.base + static_cast<std::uint64_t>(r) * R.rb, ff, nullptr, acts, gp.m, o4);
           for (int j = 0; j < gp.m; ++j) outs[j][r] = o4[j];
         }
@@ -948,6 +990,7 @@ struct GpuEngine::Impl {
     std::atomic<int64_t> left1{n1};
     const Clock::time_point t0 = Clock::now();
     auto tns = [&](Clock::time_point t) { return std::chrono::duration_cast<std::chrono::nanoseconds>(t - t0).count(); };
+    std::atomic<std::int64_t> tu[32] = {}, td[32] = {};
     const std::function<void(int64_t)> up_t = [&](int64_t u) {
       const Clock::time_point a = Clock::now();
       std::int64_t none = -1;
@@ -955,18 +998,28 @@ struct GpuEngine::Impl {
       up_fn(u);
       const Clock::time_point b = Clock::now();
       b1.fetch_add(tns(b) - tns(a), std::memory_order_relaxed);
+      tu[z(pool_tid())].fetch_add(tns(b) - tns(a), std::memory_order_relaxed);
       if (left1.fetch_sub(1, std::memory_order_acq_rel) == 1) end1.store(tns(b), std::memory_order_relaxed);
     };
     const std::function<void(int64_t)> down_t = [&](int64_t u) {
       const Clock::time_point a = Clock::now();
       down_fn(u);
-      b2.fetch_add(tns(Clock::now()) - tns(a), std::memory_order_relaxed);
+      const std::int64_t dt = tns(Clock::now()) - tns(a);
+      b2.fetch_add(dt, std::memory_order_relaxed);
+      td[z(pool_tid())].fetch_add(dt, std::memory_order_relaxed);
     };
     const double tround = std::chrono::duration<double>(t0 - tq).count();
     pool->run2(n1, up_t, db, down_t);
     const double wall = std::chrono::duration<double>(Clock::now() - t0).count();
     const double p1 = static_cast<double>(end1.load()) * 1e-9;
     tlp->split_stamps = true;
+    for (int q2 = 0; q2 < 32; ++q2) {
+      tlp->thr_up[q2] += static_cast<double>(tu[q2].load()) * 1e-9;
+      tlp->thr_dn[q2] += static_cast<double>(td[q2].load()) * 1e-9;
+    }
+    tlp->thr_n = std::max(tlp->thr_n, std::min(32, pool_tid_count()));
+    tlp->down2_rows = down2_n.load();
+    tlp->down2_mismatch = down2_bad.load();
     tlp->stage[0] += tround;
     tlp->stage[1] += p1;
     tlp->stage[3] += wall - p1;

@@ -2328,7 +2328,7 @@ int cmd_engine_check(const Args& a) {
                  "                           [--no-doorbell] [--timeline-ops] [--split-ref] [--bank-selftest MIXES] [--probe-pos P]\n"
                  "                           [--router-tie BAND] [--cold-on-gpu] [--trace OUT.tsv] [--reader-v25] [--reader-cache K] [--fold-shared]\n"
                  "                           [--batch-identical] [--graph] [--prefetch] [--plane-tail N] [--cpu-light] [--reader-rpw 1|2]\n"
-                 "                           [--pin-gap-kib K] [--pin-huge-ok] [--ref-threads N] [--no-cpu-light] [--split-slow] [--preload-light]\n");
+                 "                           [--pin-gap-kib K] [--pin-huge-ok] [--cpu-up-rows N] [--cpu-down2] [--cpu-prefetch] [--cpu-check] [--ref-threads N] [--no-cpu-light] [--split-slow] [--preload-light]\n");
     return 1;
   }
   auto num = [&](const char* k, std::uint64_t d, std::uint64_t lo, std::uint64_t hi, std::uint64_t& out) {
@@ -2443,6 +2443,17 @@ int cmd_engine_check(const Args& a) {
     eo.pin_gap = pgk.value << 10;
   }
   if (a.has("pin-huge-ok")) eo.pin_small_pages = false;  // v34: leave the registered ranges on 2 MB pages (the v33 stall)
+  if (a.has("cpu-up-rows")) {  // v40
+    const Result<std::uint64_t> ur = io::parse_whole(a.get("cpu-up-rows"), 512);
+    if (!ur.ok() || ur.value < 8) {
+      std::fprintf(stderr, "pelias: --cpu-up-rows takes 8 .. 512\n");
+      return 1;
+    }
+    eo.cpu_up_rows = static_cast<int>(ur.value);
+  }
+  eo.cpu_down2 = a.has("cpu-down2");
+  eo.cpu_prefetch = a.has("cpu-prefetch");
+  eo.cpu_check = a.has("cpu-check");
 
   // v25 trace: a new file (nothing is overwritten); the reader's steps, per layer
   const std::string trace_path = a.get("trace");
@@ -2644,6 +2655,20 @@ int cmd_engine_check(const Args& a) {
       if (T.split_stamps)
         std::printf("  timeline (split path, v39): silu is inside gate/up and the combine inside down; the first item starts %.1f us after a layer's job opens\n",
                     T.wake_n ? 1e6 * T.wake / T.wake_n : 0.0);
+      if (T.split_stamps && T.thr_n > 0) {  // v40: per thread, ms per token of item time
+        double umin = 1e30, umax = 0.0, dmin = 1e30, dmax = 0.0;
+        std::printf("  timeline (v40) per thread, ms per token, gate/up | down:");
+        for (int q2 = 0; q2 < T.thr_n; ++q2) {
+          const double u = T.thr_up[q2] * k, d = T.thr_dn[q2] * k;
+          if (u <= 0.0 && d <= 0.0) continue;
+          umin = std::min(umin, u); umax = std::max(umax, u); dmin = std::min(dmin, d); dmax = std::max(dmax, d);
+          std::printf(" [%d] %.2f | %.2f", q2, u, d);
+        }
+        std::printf("\n  timeline (v40): gate/up per thread %.2f .. %.2f ms, down %.2f .. %.2f ms per token\n", umin, umax, dmin, dmax);
+      }
+      if (T.down2_rows > 0)
+        std::printf("  check (v40): two-row down vs one-row path: %llu rows compared, %llu differ (bit for bit)\n", static_cast<unsigned long long>(T.down2_rows),
+                    static_cast<unsigned long long>(T.down2_mismatch));
       for (std::size_t il = 0; il < T.gpu_dense.size(); ++il) {
         std::printf("    layer %2zu: GPU dense %.3f, bank + shared %.3f, idle %.3f | CPU wait %.3f, cold %.3f ms", il, T.gpu_dense[il] * k, T.gpu_hot[il] * k, T.gpu_idle[il] * k,
                     T.cpu_wait[il] * k, T.cpu_cold[il] * k);

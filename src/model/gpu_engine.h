@@ -118,6 +118,12 @@ struct EngineOptions {
   // run)
   std::uint64_t pin_gap = std::uint64_t{8} << 20;
   bool pin_small_pages = true;  // v34: madvise small pages on the ranges registered for the GPU (Linux; see hal/host_alloc_pages.h)
+  // v40 (author 02:30, CPU turn of the split): gate/up rows per work item (64 = before; smaller tiles, less tail), the
+  // two-row down kernel for one-token steps, and a software prefetch of the rows ahead. All exact (same per-row math).
+  int cpu_up_rows = 64;
+  bool cpu_down2 = false;
+  bool cpu_prefetch = false;
+  bool cpu_check = false;  // compare the two-row down against the one-row path, row by row (bit for bit); counts mismatches
   // v28b: the split's CPU side through v20's per-stage jobs (the pool sleeping between them) instead of the one-dispatch path
   // with the pool held hot; for comparison
   bool split_slow = false;
@@ -145,6 +151,10 @@ struct EngineTimeline {
   std::vector<double> gpu_dense, gpu_hot, gpu_idle, cpu_wait, cpu_cold;
   std::vector<double> cpu_picks, cpu_groups;  // v39: the split path's CPU picks and expert groups per layer (summed over steps)
   bool split_stamps = false;                  // v39: stage[] / busy[] came from the split path (gate/up incl. silu, down incl. combine)
+  // v40: per pool thread (index by first use, up to 32): item time in the gate/up and down phases; the check's mismatches
+  double thr_up[32] = {}, thr_dn[32] = {};
+  int thr_n = 0;
+  std::uint64_t down2_rows = 0, down2_mismatch = 0;
   double stage[5] = {}, busy[5] = {};
   double wake = 0.0;
   int wake_n = 0;
