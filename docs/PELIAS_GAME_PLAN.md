@@ -27,6 +27,24 @@ Copyright (c) 2026 John Lipka and the Pelias contributors
 
 ---
 
+## THE PLAN to the speed ceiling (author 2026-11-01 17:54: "Save this. Save this plan. This is the plan." It governs everything below.)
+
+**Direction (author 17:46):** the GPU does all of the decoding, as originally intended. The CPU only does work that is free and never on the token's path. Every other pathway and the trainer's methods are measured; the only goal left is the speed.
+
+**Build order** (each stage: prediction, gate, log, push; nothing reordered without the author):
+1. **Clean-up.** The reader compiled without the plane-test code (-1.3 ms per token, MEASURED v29); all-GPU (R1) the default again; the CPU split code kept, switched off.
+2. **46a. One persistent R3 launch per token (Line A):** dense layers, router + top-k, and the VRAM experts (bank + cache) in one launch; per-expert counters at gate/up -> down instead of global barriers.
+3. **46b. Misses inside the launch:** experts not in VRAM read zero-copy from pinned RAM by the same launch (21.0 GB/s MEASURED), alongside the VRAM streaming.
+4. **46c. Capacity and prefetch:** token_embd to host RAM (B10, one row per token, lossless; 540 MB freed) and the spare VRAM as expert cache slots (+23 per layer, DERIVED); the copy engines (no SMs) prefetch the next layer's predicted misses into slots; **slot-ready flags**: a slot not ready is read zero-copy, so the GPU never waits.
+5. **46d. Head sketch** (2-bit sketch of the output head + 64 exact rows; first its top-1-in-top-64 recall from existing logits), then **MTP** on the new launch.
+6. **One Windows-native measurement** of the same build.
+Then, a separate track: **prefill** (~50 tok/s today vs the 1,670 tok/s at 12k gate).
+
+**The CPU's roles (all free, none gating):** issue the prefetch copies and set the slot-ready flags; accuracy planes (top-4 picks, GPU first / exact CPU late); the token_embd row gather.
+**Stopped:** CPU decoding on the token path, CPU kernel tuning, WSL thread / scheduler experiments, any design in which the GPU waits on the CPU, planes traded for VRAM room.
+
+**Expected (sandbox model46.py, DERIVED from MEASURED inputs; details in "v46 sandbox model" below):** 46a-b 12.7-14.7 ms per token; + 46c slots 11.2-13.2; + prefetch 8.2-10.2 ms (98-122 tok/s); + head sketch -0.73 ms; + MTP 144-174 tok/s. Largest unknowns, measured stage by stage: the non-GEMV work inside the launch (1-3 ms assumed) and R3's rate on this file (318-467 GB/s).
+
 ## Open items, whole build (sweep 2026-10-31 14:3x; merged with the author's consolidation 15:09)
 
 ~~Struck~~ = done or superseded by where the build stands now. "(confirm)" = no clear ruling found in the logs. "Corrected:" = a number or name in the author's 15:09 draft checked against the logs and fixed. Every leftover in Appendix E maps to an item below. The Theories section's tests are all GP3-10, GP3-14 or GP4-02.
