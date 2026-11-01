@@ -517,7 +517,7 @@ struct GpuEngine::Impl {
       if (!g::matmul(W.dtype, W.d, W.drb, W.n_out, W.k, xin, n, W.k, yout, W.n_out)) return gfail("engine: product " + v.name);
       return Status::good();
     }
-    if (n == 1 && W.r3) return prod_r3({{&W, yout}}, xin);
+    if (W.r3 && (n == 1 || (bi_now && n <= kReaderMax))) return prod_r3({{&W, yout}}, xin, n);
     if (!g::act_q8x32(xin, W.k, n, W.k, v.rot32, xr, W.k, q, scale, sum)) return gfail("engine: rounding for " + v.name);
     if (W.int8) {
       if (!g::act_digits(scale, sum, n, W.k, dig) || !g::prompt_gemm(W.pw, W.n_out, q, scale, dig, n, yout)) return gfail("engine: int8 product " + v.name);
@@ -532,12 +532,26 @@ struct GpuEngine::Impl {
     std::unique_ptr<g::StreamPlan> plan;
     std::vector<int64_t> off;  // each job's output offset in r3y
   };
-  std::map<const DevW*, R3Group> r3plans;
+  std::map<std::pair<const DevW*, int>, R3Group> r3plans;  // v26: per group and token count
+  bool bi_now = false;  // v26 option B: this step's products of 2-4 tokens go through R3 (set by run())
+  // v26 CUDA graph
+  g::Stream stm = nullptr;
+  int* pos_d = nullptr;
+  int* pos_hp = nullptr;
+  void* pos_hv = nullptr;
+  float *knew = nullptr, *vnew = nullptr;
+  bool graph_ok = false;
+  bool trunk_dp = false;  // the trunk's step reads the device position (not the MTP block's own attention)
+  std::string graph_note = "off";
+  std::map<std::tuple<int, int, int, int>, void*> graphs;
+  std::map<std::tuple<int, int, int, int>, int> graph_seen;
+  std::uint64_t graph_replays = 0, graph_captures = 0;
   float* r3y = nullptr;
   std::size_t r3y_floats = 0;
-  Status prod_r3(std::initializer_list<std::pair<const DevW*, float*>> jobs, const float* xin) {
+  Status prod_r3(std::initializer_list<std::pair<const DevW*, float*>> jobs, const float* xin, int64_t n = 1) {
     const DevW& W0 = *jobs.begin()->first;
-    R3Group& G = r3plans[&W0];
+    if (n < 1 || n > kReaderMax) return Status::fail(Code::internal, "engine: R3 takes 1-4 tokens");
+    R3Group& G = r3plans[{&W0, static_cast<int>(n)}];
     if (!G.plan) {
       std::vector<g::StreamJob> js;
       int64_t at = 0;
@@ -549,10 +563,14 @@ struct GpuEngine::Impl {
         j.xq = q;
         j.xs = scale;
         j.xsum = sum;
-        if (static_cast<std::size_t>(at + W->n_out) > r3y_floats) return Status::fail(Code::internal, "engine: R3 scratch too small");
+        if (static_cast<std::size_t>(at + n * W->n_out) > r3y_floats) return Status::fail(Code::internal, "engine: R3 scratch too small");
         j.y = r3y + at;
+        j.ntok = static_cast<int>(n);  // v26: rows of n tokens back to back (stride n_out)
+        j.xq_stride = W0.k;
+        j.xs_stride = W0.k / 32;
+        j.y_stride = W->n_out;
         G.off.push_back(at);
-        at += (W->n_out + 63) / 64 * 64;
+        at += (n * W->n_out + 63) / 64 * 64;
         js.push_back(j);
       }
       const int stage_end[1] = {static_cast<int>(js.size())};
@@ -560,22 +578,23 @@ struct GpuEngine::Impl {
       if (!G.plan->build(js.data(), static_cast<int>(js.size()), stage_end, 1, 0))
         return Status::fail(Code::internal, std::string("engine: R3 plan: ") + g::stream_last_error());
     }
-    if (!g::act_q8x32(xin, W0.k, 1, W0.k, W0.v->rot32, xr, W0.k, q, scale, sum)) return gfail("engine: rounding for R3");
-    if (!G.plan->run()) return Status::fail(Code::internal, std::string("engine: R3 run: ") + g::stream_last_error());
+    if (!g::act_q8x32(xin, W0.k, n, W0.k, W0.v->rot32, xr, W0.k, q, scale, sum)) return gfail("engine: rounding for R3");
+    if (!(o.graph ? G.plan->run_reset() : G.plan->run())) return Status::fail(Code::internal, std::string("engine: R3 run: ") + g::stream_last_error());
     std::size_t i = 0;
     for (const auto& [W, yo] : jobs)
-      if (!g::dcopy(yo, r3y + G.off[i++], z(W->n_out) * sizeof(float))) return gfail("engine: R3 output");
+      if (!g::dcopy(yo, r3y + G.off[i++], z(n * W->n_out) * sizeof(float))) return gfail("engine: R3 output");
     return Status::good();
   }
 
   Status attention_block(Layer& D, int64_t n, int64_t p0) {
     const int64_t hd = s.head_dim, nh = s.n_head, nkv = s.n_head_kv;
     const int64_t qh = s.attn_gate ? 2 * hd : hd, q_w = qh * nh;
-    float* kn = D.K + p0 * kv_w;  // the new keys and values go straight into the cache
-    float* vn = D.V + p0 * kv_w;
+    const bool gp = trunk_dp;  // v26: new rows in scratch, stored at the device position; rope / attention read it there
+    float* kn = gp ? knew : D.K + p0 * kv_w;  // the new keys and values go straight into the cache
+    float* vn = gp ? vnew : D.V + p0 * kv_w;
     Status st;
-    if (n == 1 && D.wq.r3 && D.wk.r3 && D.wv.r3 && D.wq.k == D.wk.k && D.wk.k == D.wv.k) {
-      if (!(st = prod_r3({{&D.wq, qg}, {&D.wk, kn}, {&D.wv, vn}}, xn))) return st;
+    if ((n == 1 || bi_now) && D.wq.r3 && D.wk.r3 && D.wv.r3 && D.wq.k == D.wk.k && D.wk.k == D.wv.k) {
+      if (!(st = prod_r3({{&D.wq, qg}, {&D.wk, kn}, {&D.wv, vn}}, xn, n))) return st;
     } else if (!(st = prod(D.wq, xn, n, qg)) || !(st = prod(D.wk, xn, n, kn)) || !(st = prod(D.wv, xn, n, vn))) {
       return st;
     }
@@ -583,12 +602,14 @@ struct GpuEngine::Impl {
     if (D.q_norm && !g::rms_norm(qg, D.q_norm, qg, hd, nh, qh, q_w, n, s.rms_eps)) return gfail("engine: q norm");
     if (D.k_norm && !g::rms_norm(kn, D.k_norm, kn, hd, nkv, hd, kv_w, n, s.rms_eps)) return gfail("engine: k norm");
     const int sec[4] = {s.rope_sections[0], s.rope_sections[1], s.rope_sections[2], s.rope_sections[3]};
-    if (!g::rope(qg, nh, qh, q_w, n, p0, static_cast<int>(s.n_rot), s.rope_freq_base, sec, s.rope_neox, rope_ff) ||
-        !g::rope(kn, nkv, hd, kv_w, n, p0, static_cast<int>(s.n_rot), s.rope_freq_base, sec, s.rope_neox, rope_ff))
+    if (!g::rope(qg, nh, qh, q_w, n, p0, static_cast<int>(s.n_rot), s.rope_freq_base, sec, s.rope_neox, rope_ff, nullptr, gp ? pos_d : nullptr) ||
+        !g::rope(kn, nkv, hd, kv_w, n, p0, static_cast<int>(s.n_rot), s.rope_freq_base, sec, s.rope_neox, rope_ff, nullptr, gp ? pos_d : nullptr))
       return gfail("engine: rope");
+    if (gp && !g::kv_store(D.K, D.V, kn, vn, kv_w, n, pos_d)) return gfail("engine: K / V store");
     const float scl = s.attn_scale != 0.0f ? s.attn_scale : 1.0f / std::sqrt(static_cast<float>(hd));
     if (!opstamp(3)) return gfail("engine: stamp");
-    if (!g::attention(qg, q_w, qh, D.K, D.V, kv_w, nh, nkv, hd, n, p0, scl, s.attn_gate, att, ascr)) return gfail("engine: attention");
+    if (!g::attention(qg, q_w, qh, D.K, D.V, kv_w, nh, nkv, hd, n, p0, scl, s.attn_gate, att, ascr, nullptr, gp ? pos_d : nullptr, o.max_ctx))
+      return gfail("engine: attention");
     if (!opstamp(4) || !opstamp(5)) return gfail("engine: stamp");
     if (Status ps = prod(D.wo, att, n, y); !ps) return ps;
     return opstamp(6) ? Status::good() : gfail("engine: stamp");
@@ -597,8 +618,8 @@ struct GpuEngine::Impl {
   Status deltanet_block(Layer& D, int64_t n) {
     const int64_t ch = s.conv_channels(), ds = s.ssm_d_state, nk = s.ssm_n_group, nv = s.ssm_dt_rank, taps = s.ssm_d_conv;
     Status st;
-    if (n == 1 && D.wqkv.r3 && D.wgate.r3 && D.wqkv.k == D.wgate.k) {
-      if (!(st = prod_r3({{&D.wqkv, mixed}, {&D.wgate, zg}}, xn))) return st;
+    if ((n == 1 || bi_now) && D.wqkv.r3 && D.wgate.r3 && D.wqkv.k == D.wgate.k) {
+      if (!(st = prod_r3({{&D.wqkv, mixed}, {&D.wgate, zg}}, xn, n))) return st;
     } else if (!(st = prod(D.wqkv, xn, n, mixed)) || !(st = prod(D.wgate, xn, n, zg))) {
       return st;
     }
@@ -952,8 +973,8 @@ struct GpuEngine::Impl {
       return gfail("engine: trace copy");
     if (!opstamp(11)) return gfail("engine: stamp");
     if (!fold) {
-      if (n == 1 && D.gate_sh.r3 && D.up_sh.r3 && D.gate_sh.k == D.up_sh.k) {
-        if (!(st = prod_r3({{&D.gate_sh, gs}, {&D.up_sh, us}}, xn))) return st;
+      if ((n == 1 || bi_now) && D.gate_sh.r3 && D.up_sh.r3 && D.gate_sh.k == D.up_sh.k) {
+        if (!(st = prod_r3({{&D.gate_sh, gs}, {&D.up_sh, us}}, xn, n))) return st;
       } else if (!(st = prod(D.gate_sh, xn, n, gs)) || !(st = prod(D.up_sh, xn, n, us))) {
         return st;
       }
@@ -1214,6 +1235,8 @@ GpuEngine::~GpuEngine() {
     p_->bcv.notify_all();
     p_->bell_th.join();
   }
+  for (auto& kv : p_->graphs) g::graph_free(kv.second);
+  p_->graphs.clear();
   if (p_->reg_base) g::host_unregister(p_->reg_base);
   g::dfree(p_->rtab);
   g::dfree(p_->rgu);
@@ -1249,6 +1272,15 @@ GpuEngine::~GpuEngine() {
   g::dfree(p_->act_mem);
   g::dfree(p_->dense_mem);
   g::dfree(p_->state_mem);
+  if (p_->stm) {  // v26
+    g::sync();
+    g::set_stream(nullptr);
+    g::stream_free(p_->stm);
+  }
+  g::dfree(p_->pos_d);
+  g::dfree(p_->knew);
+  g::dfree(p_->vnew);
+  g::host_free(p_->pos_hv);
 }
 
 std::int64_t GpuEngine::pos() const { return p_ ? p_->pos : 0; }
@@ -1288,6 +1320,9 @@ bool GpuEngine::probe_get_ops(std::vector<float>* block_out, std::vector<float>*
   if (router_logits) *router_logits = I.probe_lh;
   if (moe_out) *moe_out = I.probe_mh;
   return true;
+}
+std::string GpuEngine::graph_report() const {
+  return p_->graph_note + "; captures " + std::to_string(p_->graph_captures) + ", replays " + std::to_string(p_->graph_replays);
 }
 std::string GpuEngine::trace_take() {
   std::string out;
@@ -1422,11 +1457,12 @@ void GpuEngine::timeline_reset() {
 
 std::string GpuEngine::summary() const {
   const Impl& I = *p_;
-  char b[768];
-  std::snprintf(b, sizeof b, "engine: %.2f GB on the device (dense + output %.2f GB, bank %.2f GB = %d experts of %u, cache + state %.2f GB); %d CPU threads; ctx %d, batch %d; hand-off %s; router tie band %g; expert reader %s",
+  char b[1024];
+  std::snprintf(b, sizeof b, "engine: %.2f GB on the device (dense + output %.2f GB, bank %.2f GB = %d experts of %u, cache + state %.2f GB); %d CPU threads; ctx %d, batch %d; hand-off %s; router tie band %g; expert reader %s; batch-identical %s; graph %s",
                 static_cast<double>(I.dev_bytes) / 1e9, static_cast<double>(I.dense_bytes_total) / 1e9, static_cast<double>(I.bank_bytes_total) / 1e9, I.bank_count,
                 I.s.n_layer * I.s.n_expert, static_cast<double>(I.cache_bytes) / 1e9, I.pool ? I.pool->threads() : 0, I.o.max_ctx, I.o.max_batch,
-                I.bell ? "doorbell" : "device sync per layer", static_cast<double>(I.o.router_tie), I.reader_note.c_str());
+                I.bell ? "doorbell" : "device sync per layer", static_cast<double>(I.o.router_tie), I.reader_note.c_str(), I.o.batch_identical ? "on" : "off",
+                I.graph_note.c_str());
   return b;
 }
 
@@ -1483,11 +1519,11 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
       {reinterpret_cast<void**>(&I.gsh), np * 4},               {reinterpret_cast<void**>(&I.galpha), np * 4},
       {reinterpret_cast<void**>(&I.zero2), 256},                {reinterpret_cast<void**>(&I.yc), np * z(e) * 4},
       {reinterpret_cast<void**>(&I.cat), o.mtp ? np * z(2 * e) * 4 : 256},
-      {reinterpret_cast<void**>(&I.r3y), (z(s.n_vocab) + z(qh * nh) + z(4 * I.kv_w) + z(2 * ch) + z(2 * di) + z(4 * ffs) + 1024) * 4},
+      {reinterpret_cast<void**>(&I.r3y), 4 * (z(s.n_vocab) + z(qh * nh) + z(4 * I.kv_w) + z(2 * ch) + z(2 * di) + z(4 * ffs) + 1024) * 4},
       {reinterpret_cast<void**>(&I.lg), z(Impl::kOutRows) * z(s.n_vocab) * 4}};
   std::size_t total = 0;
   for (const Buf& b : bufs) total += al(b.bytes);
-  I.r3y_floats = z(s.n_vocab) + z(qh * nh) + z(4 * I.kv_w) + z(2 * ch) + z(2 * di) + z(4 * ffs) + 1024;
+  I.r3y_floats = 4 * (z(s.n_vocab) + z(qh * nh) + z(4 * I.kv_w) + z(2 * ch) + z(2 * di) + z(4 * ffs) + 1024);  // v26: up to 4 tokens
   I.act_mem = g::dalloc(total);
   if (!I.act_mem || !g::dzero(I.act_mem, total)) return R::fail(Status::fail(Code::over_ceiling, "engine: activation memory"));
   auto* cur = static_cast<std::uint8_t*>(I.act_mem);
@@ -1709,6 +1745,26 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
   }
   const Status rs = I.reset_state();
   if (!rs) return R::fail(rs);
+  if (o.graph && I.reader) {  // v26: the engine's own stream (a graph cannot record the default stream), the device position
+    I.graph_note = "off (setup failed)";
+    void* pdev = nullptr;
+    const std::size_t kvb = z(o.max_batch) * z(I.kv_w) * sizeof(float);
+    if (g::sync() && (I.stm = g::stream_new()) != nullptr) {
+      I.pos_hv = g::host_alloc_mapped(64, &pdev);
+      I.pos_d = static_cast<int*>(g::dalloc(256));
+      I.knew = static_cast<float*>(g::dalloc(kvb));
+      I.vnew = static_cast<float*>(g::dalloc(kvb));
+      if (I.pos_hv && I.pos_d && I.knew && I.vnew) {
+        I.pos_hp = static_cast<int*>(I.pos_hv);
+        g::set_stream(I.stm);
+        I.graph_ok = true;
+        I.graph_note = "on (reader steps of 1-4 tokens)";
+        I.dev_bytes += 256 + 2 * kvb;
+      }
+    }
+  } else if (o.graph) {
+    I.graph_note = "off (needs the expert reader)";
+  }
   return R::good(std::unique_ptr<GpuEngine>(new GpuEngine(std::move(p))));
 }
 
@@ -1762,6 +1818,11 @@ Status GpuEngine::Impl::run(const std::int32_t* tokens, int n, float* logits, bo
   const unsigned g0 = I.gen + 1;
   const bool rd = I.reader && n <= Impl::kReaderMax;  // v24: the reader's steps use no doorbell
   const bool bl = I.bell && !rd;
+  I.bi_now = rd && I.o.batch_identical;  // v26 option B
+  struct BiReset {
+    bool& f;
+    ~BiReset() { f = false; }
+  } bi_reset{I.bi_now};
   if (bl) {  // the CPU side starts waiting for this step's rings
     {
       std::lock_guard<std::mutex> lk(I.bmu);
@@ -1786,6 +1847,16 @@ Status GpuEngine::Impl::run(const std::int32_t* tokens, int n, float* logits, bo
     }
   } guard{I, bl};
   Status st;
+  if (I.graph_ok) {  // v26: the step's position for the device-side readers (on the engine's stream, before the layers)
+    *I.pos_hp = static_cast<int>(I.pos);
+    if (!g::h2d_async(I.pos_d, I.pos_hp, sizeof(int))) return gfail("engine: position");
+  }
+  I.trunk_dp = I.graph_ok;
+  struct DpReset {
+    bool& f;
+    ~DpReset() { f = false; }
+  } dp_reset{I.trunk_dp};
+  auto layers = [&]() -> Status {
   for (std::uint32_t il = 0; il < s.n_layer; ++il) {
     const Qwen35MoeLayer& l = wt.layers[il];
     Layer& D = I.L[il];
@@ -1815,6 +1886,49 @@ Status GpuEngine::Impl::run(const std::int32_t* tokens, int n, float* logits, bo
           !g::dcopy(I.probe_wd + static_cast<int64_t>(il) * nuq, I.wsel + r * nuq, z(nuq) * sizeof(float)))
         return gfail("engine: probe copy");
     }
+  }
+  return Status::good();
+  };
+  // v26: replay a recorded graph of this kind of step, record it the second time this kind is seen, else plain launches
+  const bool probe_here = I.probe_pos >= I.pos && I.probe_pos < I.pos + n && I.probe_xd;
+  if (I.graph_ok && rd && !probe_here) {
+    int parity = 0;
+    for (std::uint32_t il = 0; il < s.n_layer; ++il)
+      if (wt.layers[il].recurrent) {
+        parity = I.L[il].cur;
+        break;
+      }
+    const std::tuple<int, int, int, int> key{n, parity, I.ckpt_mode && n > 1 ? 1 : 0, (I.ops_d && n == 1) ? 1 : 0};
+    auto flip = [&]() {
+      for (std::uint32_t il = 0; il < s.n_layer; ++il)
+        if (wt.layers[il].recurrent) I.L[il].cur = 1 - I.L[il].cur;
+    };
+    auto it = I.graphs.find(key);
+    if (it != I.graphs.end()) {
+      if (!g::graph_launch(it->second, nullptr)) return gfail("engine: graph replay");
+      flip();  // the host side of the DeltaNet tails, as the plain step would have done
+      ++I.graph_replays;
+    } else if (I.graph_seen[key]++ >= 1) {
+      void* ex = nullptr;
+      const bool began = g::capture_begin(nullptr);
+      const Status cs = began ? layers() : Status::fail(Code::internal, "capture did not begin");
+      const bool ended = began && g::capture_end(nullptr, &ex);
+      if (cs.ok() && ended && ex) {
+        I.graphs[key] = ex;
+        ++I.graph_captures;
+        if (!g::graph_launch(ex, nullptr)) return gfail("engine: graph launch");
+      } else {  // the attempt ran the host side only: undo its tail flips, stop using graphs, run this step plainly
+        if (began) flip();
+        g::graph_free(ex);
+        I.graph_ok = false;
+        I.graph_note = std::string("off after a failed capture (") + (cs.ok() ? g::last_error() : cs.text()) + ")";
+        if (!(st = layers())) return st;
+      }
+    } else if (!(st = layers())) {
+      return st;
+    }
+  } else if (!(st = layers())) {
+    return st;
   }
   if (I.probe_pos >= I.pos && I.probe_pos < I.pos + n && I.probe_xd) {
     const std::size_t nl = s.n_layer, nuq = s.n_expert_used;

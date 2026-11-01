@@ -142,6 +142,16 @@ cudaError_t cudaMemset(void*, int, size_t);
 cudaError_t cudaDriverGetVersion(int*);
 cudaError_t cudaRuntimeGetVersion(int*);
 cudaError_t cudaStreamQuery(cudaStream_t);
+// v26: CUDA graphs (stream capture)
+typedef struct CUgraph_st* cudaGraph_t;
+typedef struct CUgraphExec_st* cudaGraphExec_t;
+enum cudaStreamCaptureMode { cudaStreamCaptureModeGlobal = 0, cudaStreamCaptureModeThreadLocal = 1, cudaStreamCaptureModeRelaxed = 2 };
+cudaError_t cudaStreamBeginCapture(cudaStream_t, cudaStreamCaptureMode);
+cudaError_t cudaStreamEndCapture(cudaStream_t, cudaGraph_t*);
+cudaError_t cudaGraphInstantiate(cudaGraphExec_t*, cudaGraph_t, unsigned long long);
+cudaError_t cudaGraphLaunch(cudaGraphExec_t, cudaStream_t);
+cudaError_t cudaGraphExecDestroy(cudaGraphExec_t);
+cudaError_t cudaGraphDestroy(cudaGraph_t);
 cudaError_t cudaEventQuery(cudaEvent_t);
 __device__ float atomicAdd(float*, float);
 __device__ int atomicAdd(int*, int);

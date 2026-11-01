@@ -19,6 +19,7 @@
 #include "quant/quant_cpu.h"
 
 namespace pelias::kern::gpu {
+cudaStream_t cur_stream_raw();  // gpu_ops.cu (v26)
 namespace {
 
 enum Fmt : int { kQ7ZT = 0, kQ4TG2 = 1, kQ5K = 2, kQ6K = 3, kQ8_0 = 4, kQ4K = 5, kIQ4XS = 6 };
@@ -35,6 +36,8 @@ struct DJob {
   const float* xs;
   const int* xsum;
   float* y;
+  int ntok;                 // v26: tokens (1-4); token t reads xq + t xqs, xs / xsum + t xss, writes y + t ys
+  long long xqs, xss, ys;
 };
 
 __constant__ float c_grid[4][16];  // the Q4_TG2 grids (quant::q4_tg_grid(tag, 2)), uploaded once
@@ -48,7 +51,7 @@ bool sck(cudaError_t e, const char* what) {
   if (e == cudaSuccess) return true;
   return sfail(std::string(what) + ": " + cudaGetErrorString(e));
 }
-cudaStream_t sst(Stream s) { return static_cast<cudaStream_t>(s); }
+cudaStream_t sst(Stream s) { return s ? static_cast<cudaStream_t>(s) : cur_stream_raw(); }  // v26
 
 int fmt_of(std::uint32_t type) {
   switch (type) {
@@ -68,6 +71,10 @@ __device__ __forceinline__ int4 ld_cs4(const void* p) {
   asm volatile("ld.global.cs.v4.s32 {%0, %1, %2, %3}, [%4];" : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "l"(p));
   return r;
 }
+
+// v26: weight loads stream past the caches for one token (as before); with several tokens they stay cached, since the
+// same row is read again for the next token (L1 / L2 instead of DRAM). The values are the same either way.
+__device__ __forceinline__ int4 ldw(bool cs, const void* p) { return cs ? ld_cs4(p) : __ldg(reinterpret_cast<const int4*>(p)); }
 
 __device__ __forceinline__ int sx8(const int* xw, int i) {  // int8 value i of a 128-value activation slice in 32 words
   return static_cast<int>(static_cast<std::int8_t>((xw[i >> 2] >> (8 * (i & 3))) & 0xff));
@@ -93,13 +100,13 @@ __device__ __forceinline__ int iq4_levels(std::uint32_t v) {
 }
 
 // one lane's part (128 values = 4 sub-blocks of 32) of one row; returns the partial dot product
-__device__ float lane_part(const DJob& J, int r, int part) {
+__device__ float lane_part(const DJob& J, int r, int part, const std::int8_t* xq, const float* xs, const int* xsum, bool cs) {
   const int B = part >> 1, half = part & 1, nB = J.K / 256;
   const long long rb = static_cast<long long>(r) * nB + B;
   const int jg0 = B * 8 + half * 4;  // first 32-block of the part in the row
   int xw[32];
   {
-    const int4* x4 = reinterpret_cast<const int4*>(J.xq + jg0 * 32);
+    const int4* x4 = reinterpret_cast<const int4*>(xq + jg0 * 32);
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
       const int4 t = __ldg(x4 + i);
@@ -115,7 +122,7 @@ __device__ float lane_part(const DJob& J, int r, int part) {
     const std::uint8_t* bp = J.w + rb * 224 + half * 112;
 #pragma unroll
     for (int i = 0; i < 7; ++i) {
-      const int4 t = ld_cs4(bp + 16 * i);
+      const int4 t = ldw(cs, bp + 16 * i);
       wd[4 * i] = static_cast<std::uint32_t>(t.x);
       wd[4 * i + 1] = static_cast<std::uint32_t>(t.y);
       wd[4 * i + 2] = static_cast<std::uint32_t>(t.z);
@@ -148,16 +155,16 @@ __device__ float lane_part(const DJob& J, int r, int part) {
           hx = __dp4a(static_cast<int>((nib * 0x00204081u) & 0x01010101u), xw[8 * jj + g], hx);
         }
       }
-      const int P = 2 * pb - 127 * __ldg(J.xsum + jg) + hx;  // sum (2b + h - 127) x
+      const int P = 2 * pb - 127 * __ldg(xsum + jg) + hx;  // sum (2b + h - 127) x
       const float s = (d * static_cast<float>((h >> (16 + 6 * j)) & 63u)) / 63.f;
-      acc += s * __ldg(J.xs + jg) * static_cast<float>(P);
+      acc += s * __ldg(xs + jg) * static_cast<float>(P);
     }
   } else if (J.fmt == kQ4TG2) {
     const std::uint8_t* bp = J.w + rb * 144;
-    const int4 hd = ld_cs4(bp);
+    const int4 hd = ldw(cs, bp);
     int4 c[4];
 #pragma unroll
-    for (int i = 0; i < 4; ++i) c[i] = ld_cs4(bp + 16 + half * 64 + 16 * i);
+    for (int i = 0; i < 4; ++i) c[i] = ldw(cs, bp + 16 + half * 64 + 16 * i);
     const std::uint32_t cw[16] = {static_cast<std::uint32_t>(c[0].x), static_cast<std::uint32_t>(c[0].y), static_cast<std::uint32_t>(c[0].z),
                                   static_cast<std::uint32_t>(c[0].w), static_cast<std::uint32_t>(c[1].x), static_cast<std::uint32_t>(c[1].y),
                                   static_cast<std::uint32_t>(c[1].z), static_cast<std::uint32_t>(c[1].w), static_cast<std::uint32_t>(c[2].x),
@@ -186,15 +193,15 @@ __device__ float lane_part(const DJob& J, int r, int part) {
         }
       }
       const float s = (d * static_cast<float>((lv >> (6 * j)) & 63u)) / 63.f;
-      acc += s * __ldg(J.xs + jg) * sum;
+      acc += s * __ldg(xs + jg) * sum;
     }
   } else if (J.fmt == kQ5K) {
     const std::uint8_t* bp = J.w + rb * 176;
-    const int4 hd = ld_cs4(bp);
-    const int4 qa = ld_cs4(bp + 16), qb4 = ld_cs4(bp + 32);
+    const int4 hd = ldw(cs, bp);
+    const int4 qa = ldw(cs, bp + 16), qb4 = ldw(cs, bp + 32);
     int4 ql[4];
 #pragma unroll
-    for (int i = 0; i < 4; ++i) ql[i] = ld_cs4(bp + 48 + half * 64 + 16 * i);
+    for (int i = 0; i < 4; ++i) ql[i] = ldw(cs, bp + 48 + half * 64 + 16 * i);
     std::uint8_t hb[4], qh[32], qlb[64];
     memcpy(hb, &hd, 4);
     memcpy(qh, &qa, 16);
@@ -223,8 +230,8 @@ __device__ float lane_part(const DJob& J, int r, int part) {
         const int lo = (j & 1) ? (q[l] >> 4) : (q[l] & 0xF);
         sq += (lo + (((qh[l] >> j) & 1) << 4)) * sx8(xw, 32 * jj + l);
       }
-      acc += __ldg(J.xs + jg) *
-             (d * static_cast<float>(sc) * static_cast<float>(sq) - dmin * static_cast<float>(mn) * static_cast<float>(__ldg(J.xsum + jg)));
+      acc += __ldg(xs + jg) *
+             (d * static_cast<float>(sc) * static_cast<float>(sq) - dmin * static_cast<float>(mn) * static_cast<float>(__ldg(xsum + jg)));
     }
   } else if (J.fmt == kQ8_0) {  // repacked per 256: qs[256] (int8) | d[8] (fp16); the half's 128 values and 4 d's
     const std::uint8_t* bp = J.w + rb * 272;
@@ -232,7 +239,7 @@ __device__ float lane_part(const DJob& J, int r, int part) {
 #pragma unroll
     for (int jj = 0; jj < 4; ++jj) {
       const int jg = jg0 + jj;
-      const int4 qa = ld_cs4(bp + half * 128 + 32 * jj), qb = ld_cs4(bp + half * 128 + 32 * jj + 16);
+      const int4 qa = ldw(cs, bp + half * 128 + 32 * jj), qb = ldw(cs, bp + half * 128 + 32 * jj + 16);
       int P = 0;
       P = __dp4a(qa.x, xw[8 * jj], P);
       P = __dp4a(qa.y, xw[8 * jj + 1], P);
@@ -244,14 +251,14 @@ __device__ float lane_part(const DJob& J, int r, int part) {
       P = __dp4a(qb.w, xw[8 * jj + 7], P);
       const std::uint32_t dw = (jj < 2 ? dd.x : dd.y) >> (16 * (jj & 1));
       const float d = __half2float(__ushort_as_half(static_cast<unsigned short>(dw & 0xffffu)));
-      acc += d * __ldg(J.xs + jg) * static_cast<float>(P);
+      acc += d * __ldg(xs + jg) * static_cast<float>(P);
     }
   } else if (J.fmt == kQ4K) {  // as stored (144 bytes): d | dmin | scales[12] | qs[128]; Q5_K without qh
     const std::uint8_t* bp = J.w + rb * 144;
-    const int4 hd = ld_cs4(bp);
+    const int4 hd = ldw(cs, bp);
     int4 ql[4];
 #pragma unroll
-    for (int i = 0; i < 4; ++i) ql[i] = ld_cs4(bp + 16 + half * 64 + 16 * i);
+    for (int i = 0; i < 4; ++i) ql[i] = ldw(cs, bp + 16 + half * 64 + 16 * i);
     const std::uint32_t qw[16] = {static_cast<std::uint32_t>(ql[0].x), static_cast<std::uint32_t>(ql[0].y), static_cast<std::uint32_t>(ql[0].z),
                                   static_cast<std::uint32_t>(ql[0].w), static_cast<std::uint32_t>(ql[1].x), static_cast<std::uint32_t>(ql[1].y),
                                   static_cast<std::uint32_t>(ql[1].z), static_cast<std::uint32_t>(ql[1].w), static_cast<std::uint32_t>(ql[2].x),
@@ -279,12 +286,12 @@ __device__ float lane_part(const DJob& J, int r, int part) {
       int sq = 0;
 #pragma unroll
       for (int g = 0; g < 8; ++g) sq = __dp4a(static_cast<int>((qw[8 * (jj >> 1) + g] >> sh) & 0x0F0F0F0Fu), xw[8 * jj + g], sq);
-      acc += __ldg(J.xs + jg) *
-             (d * static_cast<float>(sc) * static_cast<float>(sq) - dmin * static_cast<float>(mn) * static_cast<float>(__ldg(J.xsum + jg)));
+      acc += __ldg(xs + jg) *
+             (d * static_cast<float>(sc) * static_cast<float>(sq) - dmin * static_cast<float>(mn) * static_cast<float>(__ldg(xsum + jg)));
     }
   } else if (J.fmt == kIQ4XS) {  // repacked per 256 (144 bytes): d | scales_h | scales_l[4] | 8 zero bytes | qs[128]
     const std::uint8_t* bp = J.w + rb * 144;
-    const int4 hd = ld_cs4(bp);
+    const int4 hd = ldw(cs, bp);
     const std::uint32_t h0 = static_cast<std::uint32_t>(hd.x), sl = static_cast<std::uint32_t>(hd.y);
     const float d = __half2float(__ushort_as_half(static_cast<unsigned short>(h0 & 0xffffu)));
     const std::uint32_t sh = h0 >> 16;
@@ -292,7 +299,7 @@ __device__ float lane_part(const DJob& J, int r, int part) {
     for (int jj = 0; jj < 4; ++jj) {
       const int ib = half * 4 + jj, jg = jg0 + jj;
       const int ls = static_cast<int>(((sl >> (4 * ib)) & 0xfu) | (((sh >> (2 * ib)) & 3u) << 4));
-      const int4 qv = ld_cs4(bp + 16 + 16 * ib);  // 16 bytes: value l (low nibble of byte l) and l + 16 (high nibble)
+      const int4 qv = ldw(cs, bp + 16 + 16 * ib);  // 16 bytes: value l (low nibble of byte l) and l + 16 (high nibble)
       const std::uint32_t qw[4] = {static_cast<std::uint32_t>(qv.x), static_cast<std::uint32_t>(qv.y), static_cast<std::uint32_t>(qv.z),
                                    static_cast<std::uint32_t>(qv.w)};
       int P = 0;
@@ -301,14 +308,14 @@ __device__ float lane_part(const DJob& J, int r, int part) {
         P = __dp4a(iq4_levels(qw[w] & 0x0F0F0F0Fu), xw[8 * jj + w], P);
         P = __dp4a(iq4_levels((qw[w] >> 4) & 0x0F0F0F0Fu), xw[8 * jj + 4 + w], P);
       }
-      acc += d * static_cast<float>(ls - 32) * __ldg(J.xs + jg) * static_cast<float>(P);
+      acc += d * static_cast<float>(ls - 32) * __ldg(xs + jg) * static_cast<float>(P);
     }
   } else {  // kQ6K
     const std::uint8_t* bp = J.w + rb * 208;
     int4 l4[4];
 #pragma unroll
-    for (int i = 0; i < 4; ++i) l4[i] = ld_cs4(bp + half * 64 + 16 * i);
-    const int4 h4a = ld_cs4(bp + 128 + half * 32), h4b = ld_cs4(bp + 128 + half * 32 + 16);
+    for (int i = 0; i < 4; ++i) l4[i] = ldw(cs, bp + half * 64 + 16 * i);
+    const int4 h4a = ldw(cs, bp + 128 + half * 32), h4b = ldw(cs, bp + 128 + half * 32 + 16);
     const uint2 s2 = *reinterpret_cast<const uint2*>(bp + 192 + half * 8);
     std::uint8_t ql[64], qh[32];
     std::int8_t sc[8];
@@ -332,7 +339,7 @@ __device__ float lane_part(const DJob& J, int r, int part) {
         if (l < 16) s0 += v;
         else s1 += v;
       }
-      acc += d * __ldg(J.xs + jg) * static_cast<float>(sc[2 * p] * s0 + sc[2 * p + 1] * s1);
+      acc += d * __ldg(xs + jg) * static_cast<float>(sc[2 * p] * s0 + sc[2 * p + 1] * s1);
     }
   }
   return acc;
@@ -350,9 +357,13 @@ __device__ __forceinline__ void run_task(const DJob* __restrict__ jobs, int njob
   const DJob& J = jobs[find_job(jobs, njobs, t, hint)];
   const int lane = static_cast<int>(threadIdx.x & 31), rpw = 32 / J.lpr;
   const int r = static_cast<int>((t - J.task0) * rpw) + lane / J.lpr, part = lane % J.lpr;
-  float acc = r < J.n ? lane_part(J, r, part) : 0.f;
-  for (int o = J.lpr / 2; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
-  if (r < J.n && part == 0) J.y[r] = acc;
+  // v26: each token's arithmetic is the one-token path's (lane_part on that token's inputs), so a row of a several-token
+  // job equals the same token alone bit for bit
+  for (int tk = 0; tk < J.ntok; ++tk) {
+    float acc = r < J.n ? lane_part(J, r, part, J.xq + tk * J.xqs, J.xs + tk * J.xss, J.xsum + tk * J.xss, J.ntok == 1) : 0.f;
+    for (int o = J.lpr / 2; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+    if (r < J.n && part == 0) J.y[tk * J.ys + r] = acc;
+  }
 }
 
 __device__ __forceinline__ void lut_setup() {
@@ -584,6 +595,12 @@ bool StreamPlan::build(const StreamJob* jobs, int njobs, const int* stage_end, i
     D.xs = J.xs;
     D.xsum = J.xsum;
     D.y = J.y;
+    if (J.ntok < 1 || J.ntok > 4) return sfail("StreamPlan::build: job " + std::to_string(j) + ": 1-4 tokens");
+    D.ntok = J.ntok;
+    D.xqs = J.xq_stride > 0 ? J.xq_stride : J.w->k;
+    D.xss = J.xs_stride > 0 ? J.xs_stride : J.w->k / 32;
+    D.ys = J.y_stride > 0 ? J.y_stride : J.w->n;
+    if (J.ntok > 1 && D.xqs % 16 != 0) return sfail("StreamPlan::build: job " + std::to_string(j) + ": xq stride must keep 16-byte alignment");
     grp[static_cast<std::size_t>(j)] = J.signal;
     dep[static_cast<std::size_t>(j)] = J.wait;
     if (J.signal >= 0) {
@@ -593,7 +610,7 @@ bool StreamPlan::build(const StreamJob* jobs, int njobs, const int* stage_end, i
     }
     t += D.ntask;
     send[static_cast<std::size_t>(stage)] = t;
-    bytes_ += J.w->bytes;
+    bytes_ += J.w->bytes;  // read once from DRAM whatever ntok
   }
   for (int j = 0; j < njobs; ++j) {  // a waited group is signalled, and only by earlier jobs
     const int g = jobs[j].wait;
@@ -652,6 +669,27 @@ bool StreamPlan::run(Stream s) {
     return false;
   epoch_ = ep;
   return true;
+}
+
+// v26: for CUDA graphs: the counters cleared on the stream before the launch, run number 1 every time (a captured launch
+// keeps its arguments, so the host-side epoch cannot advance between replays)
+bool StreamPlan::run_reset(Stream s) {
+  if (!dev_) return sfail("StreamPlan::run_reset: not built");
+  auto* b = static_cast<std::uint8_t*>(dev_);
+  const std::uint64_t cbytes = off_gdone_ + 8 * static_cast<std::uint64_t>(ngroups_ > 0 ? ngroups_ : 1) - off_done_;
+  if (!sck(cudaMemsetAsync(b + off_done_, 0, cbytes, sst(s)), "stream: counter reset")) return false;
+  const DJob* jobs = reinterpret_cast<const DJob*>(b + off_jobs_);
+  const long long* stage_end = reinterpret_cast<const long long*>(b + off_stage_);
+  auto* done = reinterpret_cast<unsigned long long*>(b + off_done_);
+  const int* grp = reinterpret_cast<const int*>(b + off_grp_);
+  const int* dep = reinterpret_cast<const int*>(b + off_dep_);
+  const long long* gtasks = reinterpret_cast<const long long*>(b + off_gtasks_);
+  auto* gdone = reinterpret_cast<unsigned long long*>(b + off_gdone_);
+  int nj = njobs_, ns = nstages_;
+  unsigned long long ep = 1;
+  void* args[] = {&jobs, &nj, &stage_end, &ns, &done, &grp, &dep, &gtasks, &gdone, &ep};
+  return sck(cudaLaunchCooperativeKernel(reinterpret_cast<void*>(k_staged), dim3(static_cast<unsigned>(grid_)), dim3(256), args, kLutBytes, sst(s)),
+             "stream: cooperative launch (reset)");
 }
 
 bool StreamPlan::run_unstaged(Stream s) {

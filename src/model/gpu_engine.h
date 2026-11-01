@@ -91,6 +91,15 @@ struct EngineOptions {
   // v26: the shared expert as one more pick of the reader (its weights in VRAM; its sigmoid gate as the weight, added after
   // the routed picks). Needs reader_v3 and the shared expert's shape equal to a routed expert's.
   bool fold_shared = false;
+  // v26 option B (author 20:20-20:39): steps of 2-4 tokens with the reader run every quantized product through R3 with the
+  // weights read once for all the tokens and each token's arithmetic the one-token path's, so a verify batch's rows equal
+  // the same tokens decoded one at a time bit for bit (no split) while sharing the weight reads. false: batched kernels.
+  bool batch_identical = false;
+  // v26: the layers of a reader step (1-4 tokens) recorded once as a CUDA graph per (tokens, DeltaNet tail parity, verify
+  // checkpoints, op stamps) and replayed (one launch instead of ~1,200). The engine then runs on its own stream; the position
+  // is read on the device (rope, attention, the K / V store), so a replay serves any position. The first step of each kind
+  // runs plainly (it builds the plans), the second is captured. Falls back to plain launches if capture fails (summary()).
+  bool graph = false;
 };
 
 struct EngineStats {
@@ -184,6 +193,8 @@ class GpuEngine {
   bool probe_get_ops(std::vector<float>* block_out, std::vector<float>* router_logits, std::vector<float>* moe_out);
   // v25 trace text gathered since the last call (EngineOptions::trace), tab-separated lines
   std::string trace_take();
+  // v26: the graph's state: "<note>; captures C, replays R"
+  std::string graph_report() const;
   // v19 timeline (empty unless EngineOptions::timeline and the doorbell are on)
   [[nodiscard]] const EngineTimeline& timeline() const;
   void timeline_reset();

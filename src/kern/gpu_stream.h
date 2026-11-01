@@ -53,6 +53,10 @@ struct StreamJob {
   float* y = nullptr;               // n outputs
   int signal = -1;                  // group this job's tasks count into, -1 none
   int wait = -1;                    // group that must be complete before this job's tasks start, -1 none
+  // v26 (option B): tokens of the job (1-4) and their strides (0: k bytes, k / 32 scales, n outputs). A row's weights are
+  // read once per warp and used for every token; each token's arithmetic is the one-token job's, bit for bit.
+  int ntok = 1;
+  std::int64_t xq_stride = 0, xs_stride = 0, y_stride = 0;
 };
 
 // A token's table, built once (the device copy is kept) and run any number of times. stage_end[s] is one past the last
@@ -69,6 +73,7 @@ class StreamPlan {
   // Runs of one plan go on one stream, one after another (they share the plan's counters).
   bool run(Stream s = nullptr);           // the token: stages, barriers, group waits (one cooperative launch)
   bool run_unstaged(Stream s = nullptr);  // every job at once, no barriers or waits (independent jobs only: the read ceiling)
+  bool run_reset(Stream s = nullptr);     // v26: as run, the counters cleared on the stream first (graph capture)
 
   int jobs() const { return njobs_; }
   long long tasks() const { return ntasks_; }

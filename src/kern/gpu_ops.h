@@ -74,7 +74,7 @@ bool l2_norm(float* x, std::int64_t n, std::int64_t n_seg, std::int64_t seg_stri
 // IMRoPE / NEOX / adjacent-pair rope over the first n_rot values of each head: head g of row t at v + t * ld + g * head_stride,
 // row t at position pos0 + t. sections: the 4 rope sections (all 0: plain rope); freq_factors: n_rot / 2 device floats or null.
 bool rope(float* v, std::int64_t n_heads, std::int64_t head_stride, std::int64_t ld, std::int64_t rows, std::int64_t pos0, int n_rot,
-          float freq_base, const int sections[4], bool neox, const float* freq_factors, Stream s = nullptr);
+          float freq_base, const int sections[4], bool neox, const float* freq_factors, Stream s = nullptr, const int* pos_d = nullptr);
 // out[i] = silu(g[i]) * u[i]
 bool silu_mul(const float* g, const float* u, float* out, std::int64_t n, Stream s = nullptr);
 // y[t * ldy + i] += a[t] * x[t * ldx + i] (a null: weight 1); the weighted sums of the experts and the residual adds
@@ -96,7 +96,19 @@ bool router_topk(const float* logits, std::int64_t n_expert, std::int64_t rows, 
 // attends to 0 .. p0 + t. out: n_tok rows of n_head * head_dim. scratch: n_tok * n_head * (p0 + n_tok) floats.
 bool attention(const float* q, std::int64_t q_stride, std::int64_t q_head, const float* K, const float* V, std::int64_t kv_w,
                std::int64_t n_head, std::int64_t n_head_kv, std::int64_t head_dim, std::int64_t n_tok, std::int64_t p0, float scale,
-               bool gate, float* out, float* scratch, Stream s = nullptr);
+               bool gate, float* out, float* scratch, Stream s = nullptr, const int* pos_d = nullptr, std::int64_t l_max = 0);
+// v26 (CUDA graph): the position from the device (pos_d: the int the step's first copy writes). kv_store: n new K / V rows
+// into the caches at row *pos_d. A null Stream means the current one (set_stream); capture_* record a stream's work as a
+// graph (relaxed mode) and instantiate it; graph_launch replays it.
+bool kv_store(float* K, float* V, const float* kn, const float* vn, std::int64_t kv_w, std::int64_t n, const int* pos_d, Stream s = nullptr);
+void set_stream(Stream s);
+Stream stream_new();
+void stream_free(Stream s);
+bool h2d_async(void* dst, const void* src, std::size_t bytes, Stream s = nullptr);
+bool capture_begin(Stream s);
+bool capture_end(Stream s, void** exec);
+bool graph_launch(void* exec, Stream s);
+void graph_free(void* exec);
 
 // ---- Gated DeltaNet (30 of the 40 layers)
 // causal depthwise conv over [taps - 1 rows of tail, n rows of mixed] then SiLU; w: ch x taps (tap kk of channel c at c * taps

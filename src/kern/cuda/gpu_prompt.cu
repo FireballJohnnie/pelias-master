@@ -23,6 +23,7 @@
 #include "quant/quant_cpu.h"
 
 namespace pelias::kern::gpu {
+cudaStream_t cur_stream_raw();  // gpu_ops.cu (v26)
 namespace {
 
 thread_local std::string p_err;
@@ -34,7 +35,7 @@ bool pck(cudaError_t e, const char* what) {
   if (e == cudaSuccess) return true;
   return pfail(std::string(what) + ": " + cudaGetErrorString(e));
 }
-cudaStream_t pst(Stream s) { return static_cast<cudaStream_t>(s); }
+cudaStream_t pst(Stream s) { return s ? static_cast<cudaStream_t>(s) : cur_stream_raw(); }  // v26
 
 constexpr int kQK = 256, kBN = 128, kTile = 64, kVecMax = 8, kStages = 3;
 constexpr int kQ8Lda = 64 + 16, kQsLd = 32 + 16, kMinLd = 12;  // kMinLd: 8 floats + 4 (48-byte rows, float4 reads without bank conflicts)

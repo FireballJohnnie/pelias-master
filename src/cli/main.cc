@@ -2233,7 +2233,8 @@ int cmd_engine_check(const Args& a) {
                  "                           [--budget-gb G] [--hot-max N] [--mtp-draft K] [--fast-cpu] [--no-cpu] [--float-ref]\n"
                  "                           [--text FILE [--skip-tokens N]] [--timeline] [--dump-top OUT.tsv] [--dump-split [--split-sizes 2,3,4] [--split-step]]\n"
                  "                           [--no-doorbell] [--timeline-ops] [--split-ref] [--bank-selftest MIXES] [--probe-pos P]\n"
-                 "                           [--router-tie BAND] [--cold-on-gpu] [--trace OUT.tsv] [--reader-v25] [--reader-cache K] [--fold-shared]\n");
+                 "                           [--router-tie BAND] [--cold-on-gpu] [--trace OUT.tsv] [--reader-v25] [--reader-cache K] [--fold-shared]\n"
+                 "                           [--batch-identical] [--graph]\n");
     return 1;
   }
   auto num = [&](const char* k, std::uint64_t d, std::uint64_t lo, std::uint64_t hi, std::uint64_t& out) {
@@ -2306,6 +2307,8 @@ int cmd_engine_check(const Args& a) {
   // v26 switches (each measured on its own in the run)
   eo.reader_v3 = !a.has("reader-v25");
   eo.fold_shared = a.has("fold-shared");
+  eo.batch_identical = a.has("batch-identical");
+  eo.graph = a.has("graph");
   if (a.has("reader-cache")) {
     const Result<std::uint64_t> rc = io::parse_whole(a.get("reader-cache"), 64);
     if (!rc.ok()) {
@@ -2443,6 +2446,7 @@ int cmd_engine_check(const Args& a) {
                 share(tot_dec), tot_dec.cold_seconds * 1e3 / static_cast<double>(ndec), tot_dec.wait_seconds * 1e3 / static_cast<double>(ndec));
   }
   tflush("decode (the speed numbers above)");
+  std::printf("  graph: %s\n", eng.value->graph_report().c_str());
   if (a.has("timeline-ops") && ndec > 0) {  // v21: per operation, one-token steps
     const model::EngineTimeline& T = eng.value->timeline();
     if (T.ops_steps == 0) {

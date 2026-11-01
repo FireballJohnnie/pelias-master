@@ -421,6 +421,68 @@ TEST(rung4_engine_decode_against_the_reference) {
 // GP3-14 stage 3: verify batches and keep() (the MTP rollback) on the small model: after a 16-token prefill, batches of 4
 // are verified and only their first k tokens kept (k cycling 1 .. 4); the kept rows' logits against the reference's
 // fresh pass over the kept sequence, and the position after each keep.
+// v26 option B and the CUDA graph: with the reader, tokens decoded one at a time and the same tokens verified 4 at a time
+// give the same logits bit for bit when batch_identical is on (each product's per-token arithmetic is the one-token path's);
+// with the graph on, the same again and equal to the plain launches (replays from the third step of each kind)
+TEST(rung4_engine_batch_identical_and_graph) {
+  if (!g::available()) return;
+  Small sm;
+  small_model(sm);
+  CHECK(sm.ok);
+  if (!sm.ok) return;
+  const m::Qwen35MoeSpec& s = sm.spec;
+  const int nv = static_cast<int>(s.n_vocab), npre = 16, ndec = 12;
+  const std::size_t row = static_cast<std::size_t>(nv);
+  std::vector<std::int32_t> tok(static_cast<std::size_t>(npre + ndec));
+  for (std::size_t i = 0; i < tok.size(); ++i) tok[i] = static_cast<std::int32_t>((i * 37 + 11) % 1000);
+  std::vector<std::vector<float>> one(3), ver(3);
+  for (int cfg = 0; cfg < 3; ++cfg) {  // 0: plain batched kernels; 1: batch-identical; 2: batch-identical + graph
+    m::EngineOptions eo;
+    eo.max_ctx = 128;
+    eo.max_batch = 16;
+    eo.max_verify = 4;
+    eo.cpu_threads = 4;
+    eo.cold_on_gpu = true;
+    eo.hot_order.assign(s.n_layer, {});
+    for (auto& v : eo.hot_order)
+      for (int e = 0; e < static_cast<int>(s.n_expert); ++e) v.push_back(e);
+    eo.max_hot_per_layer = 2;
+    eo.batch_identical = cfg >= 1;
+    eo.graph = cfg == 2;
+    auto f = m::GpuEngine::open(s, sm.w, eo);
+    CHECK(f.ok());
+    if (!f.ok()) {
+      std::printf("    batch-identical / graph: open failed: %s\n", f.status.text().c_str());
+      return;
+    }
+    m::GpuEngine& E = *f.value;
+    std::vector<float> pre(static_cast<std::size_t>(npre) * row);
+    one[static_cast<std::size_t>(cfg)].assign(static_cast<std::size_t>(ndec) * row, 0.0f);
+    ver[static_cast<std::size_t>(cfg)].assign(static_cast<std::size_t>(ndec) * row, 0.0f);
+    CHECK(E.reset().ok());
+    CHECK(E.step(tok.data(), npre, pre.data(), false).ok());
+    for (int i = 0; i < ndec; ++i)
+      CHECK(E.step(tok.data() + npre + i, 1, one[static_cast<std::size_t>(cfg)].data() + static_cast<std::size_t>(i) * row, true).ok());
+    CHECK(E.reset().ok());
+    CHECK(E.step(tok.data(), npre, pre.data(), false).ok());
+    std::vector<float> bh(4 * static_cast<std::size_t>(s.n_embd));
+    for (int b = 0; b < ndec / 4; ++b) {
+      CHECK(E.verify(tok.data() + npre + 4 * b, 4, ver[static_cast<std::size_t>(cfg)].data() + static_cast<std::size_t>(4 * b) * row, bh.data()).ok());
+      CHECK(E.keep(4).ok());
+    }
+    std::printf("    config %d (%s): %s\n", cfg, cfg == 0 ? "batched kernels" : cfg == 1 ? "batch-identical" : "batch-identical + graph", E.graph_report().c_str());
+    if (cfg == 2) CHECK(E.graph_report().find("replays 0") == std::string::npos);
+  }
+  const std::size_t nb = static_cast<std::size_t>(ndec) * row * sizeof(float);
+  const bool plain_split = std::memcmp(one[0].data(), ver[0].data(), nb) != 0;
+  const bool bi_eq = std::memcmp(one[1].data(), ver[1].data(), nb) == 0;
+  const bool gr_eq = std::memcmp(one[2].data(), ver[2].data(), nb) == 0 && std::memcmp(one[1].data(), one[2].data(), nb) == 0;
+  CHECK(bi_eq);
+  CHECK(gr_eq);
+  std::printf("    one token at a time vs verify batches of 4: batched kernels %s; batch-identical %s; with the graph %s (and equal to plain launches)\n",
+              plain_split ? "differ (the split)" : "equal", bi_eq ? "bit for bit" : "DIFFER", gr_eq ? "bit for bit" : "DIFFER");
+}
+
 TEST(rung4_engine_verify_and_keep) {
   if (!g::available()) return;
   Small sm;

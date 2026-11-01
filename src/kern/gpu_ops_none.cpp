@@ -44,6 +44,18 @@ bool moe_reader(const ExpertPtr*, const std::int32_t*, const float*, int, const 
                 float*, int*, float*, unsigned long long*, Stream) {
   return false;
 }
+bool kv_store(float*, float*, const float*, const float*, std::int64_t, std::int64_t, const int*, Stream) { return false; }
+void set_stream(Stream) {}
+Stream stream_new() { return nullptr; }
+void stream_free(Stream) {}
+bool h2d_async(void*, const void*, std::size_t, Stream) { return false; }
+bool capture_begin(Stream) { return false; }
+bool capture_end(Stream, void** exec) {
+  *exec = nullptr;
+  return false;
+}
+bool graph_launch(void*, Stream) { return false; }
+void graph_free(void*) {}
 bool moe_reader3(const ExpertPtr*, const ExpertPtr*, const std::int32_t*, const float*, const float*, int, const float*, std::int64_t, std::int64_t, std::int64_t,
                  std::uint64_t, const ReaderCache*, float*, float*, float*, int*, ExpertPtr*, ExpertPtr*, float*, unsigned long long*, Stream) {
   return false;
@@ -69,14 +81,14 @@ bool rms_norm(const float*, const float*, float*, std::int64_t, std::int64_t, st
   return false;
 }
 bool l2_norm(float*, std::int64_t, std::int64_t, std::int64_t, std::int64_t, std::int64_t, float, Stream) { return false; }
-bool rope(float*, std::int64_t, std::int64_t, std::int64_t, std::int64_t, std::int64_t, int, float, const int*, bool, const float*, Stream) {
+bool rope(float*, std::int64_t, std::int64_t, std::int64_t, std::int64_t, std::int64_t, int, float, const int*, bool, const float*, Stream, const int*) {
   return false;
 }
 bool silu_mul(const float*, const float*, float*, std::int64_t, Stream) { return false; }
 bool add_rows(float*, std::int64_t, const float*, std::int64_t, const float*, std::int64_t, std::int64_t, Stream) { return false; }
 bool router_topk(const float*, std::int64_t, std::int64_t, int, float, std::int32_t*, float*, Stream, float) { return false; }
 bool attention(const float*, std::int64_t, std::int64_t, const float*, const float*, std::int64_t, std::int64_t, std::int64_t, std::int64_t,
-               std::int64_t, std::int64_t, float, bool, float*, float*, Stream) {
+               std::int64_t, std::int64_t, float, bool, float*, float*, Stream, const int*, std::int64_t) {
   return false;
 }
 bool deltanet_conv(const float*, const float*, const float*, std::int64_t, std::int64_t, std::int64_t, float*, float*, Stream) { return false; }
@@ -119,6 +131,7 @@ StreamPlan::~StreamPlan() {  // nothing was allocated; the fields are named so e
 bool StreamPlan::build(const StreamJob*, int, const int*, int, int) { return false; }
 bool StreamPlan::run(Stream) { return false; }
 bool StreamPlan::run_unstaged(Stream) { return false; }
+bool StreamPlan::run_reset(Stream) { return false; }
 
 // the int8 prompt path (kern/gpu_prompt.h)
 bool prompt_type_ok(std::uint32_t, std::int64_t) { return false; }

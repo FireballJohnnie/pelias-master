@@ -40,7 +40,8 @@ bool ck(cudaError_t e, const char* what) {
 
 bool launched(const char* what) { return ck(cudaGetLastError(), what); }
 
-cudaStream_t st(Stream s) { return static_cast<cudaStream_t>(s); }
+cudaStream_t g_cur_stream = nullptr;  // v26: the stream a null Stream means (set_stream; the CUDA graph captures it)
+cudaStream_t st(Stream s) { return s ? static_cast<cudaStream_t>(s) : g_cur_stream; }
 
 unsigned blocks_for(std::int64_t n, int per) { return static_cast<unsigned>((n + per - 1) / per); }
 
@@ -301,8 +302,9 @@ __global__ void __launch_bounds__(256) k_rms_norm_q8x32(const float* __restrict_
 }
 
 // one thread per rotated pair; the angle grows by one multiply per pair, as model::rope_cache does
-__global__ void k_rope(float* v, std::int64_t n_heads, std::int64_t hs, std::int64_t ld, std::int64_t rows, std::int64_t pos0, int n_rot,
-                       float theta_scale, int s0, int s1, int s2, int s3, int neox, const float* __restrict__ ff) {
+__global__ void k_rope(float* v, std::int64_t n_heads, std::int64_t hs, std::int64_t ld, std::int64_t rows, std::int64_t pos0_arg, int n_rot,
+                       float theta_scale, int s0, int s1, int s2, int s3, int neox, const float* __restrict__ ff, const int* __restrict__ pos_d) {
+  const std::int64_t pos0 = pos_d ? static_cast<std::int64_t>(*pos_d) : pos0_arg;  // v26: the position from the device (graph replay)
   const std::int64_t pairs = n_rot / 2;
   const std::int64_t id = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (id >= rows * n_heads * pairs) return;
@@ -477,24 +479,26 @@ __global__ void __launch_bounds__(256) k_router_fast(const float* __restrict__ l
 // scores[t][h][u] = (q . k_u) * scale for u <= p0 + t; one warp per position
 __global__ void __launch_bounds__(256) k_attn_scores(const float* __restrict__ q, std::int64_t qs, std::int64_t qh, const float* __restrict__ K,
                                                      std::int64_t kv_w, std::int64_t nh, std::int64_t group, std::int64_t hd, std::int64_t p0,
-                                                     std::int64_t L, float scale, float* __restrict__ sc) {
+                                                     std::int64_t L, float scale, float* __restrict__ sc, const int* __restrict__ pos_d) {
   const std::int64_t h = blockIdx.y, t = blockIdx.z;
-  const std::int64_t u = static_cast<std::int64_t>(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32;
+  const std::int64_t p0r = pos_d ? static_cast<std::int64_t>(*pos_d) : p0;  // v26
   const int lane = static_cast<int>(threadIdx.x & 31);
-  if (u > p0 + t) return;
-  const float* qq = q + t * qs + h * qh;
-  const float* kk = K + u * kv_w + (h / group) * hd;
-  float d = 0.0f;
-  for (std::int64_t i = lane; i < hd; i += 32) d += qq[i] * kk[i];
-  d = warp_sum(d);
-  if (lane == 0) sc[(t * nh + h) * L + u] = mul(d, scale);
+  const std::int64_t wstep = static_cast<std::int64_t>(gridDim.x) * (blockDim.x / 32);
+  for (std::int64_t u = static_cast<std::int64_t>(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32; u <= p0r + t; u += wstep) {
+    const float* qq = q + t * qs + h * qh;
+    const float* kk = K + u * kv_w + (h / group) * hd;
+    float d = 0.0f;
+    for (std::int64_t i = lane; i < hd; i += 32) d += qq[i] * kk[i];
+    d = warp_sum(d);
+    if (lane == 0) sc[(t * nh + h) * L + u] = mul(d, scale);
+  }
 }
 
 // softmax of each (t, h) row of scores over 0 .. p0 + t: max, exp, sum in double, times 1 / sum (model::softmax)
-__global__ void __launch_bounds__(256) k_attn_softmax(float* __restrict__ sc, std::int64_t nh, std::int64_t p0, std::int64_t L) {
+__global__ void __launch_bounds__(256) k_attn_softmax(float* __restrict__ sc, std::int64_t nh, std::int64_t p0, std::int64_t L, const int* __restrict__ pos_d) {
   __shared__ float shm[33];
   __shared__ double shd[33];
-  const std::int64_t row = blockIdx.x, t = row / nh, len = p0 + t + 1;
+  const std::int64_t row = blockIdx.x, t = row / nh, len = (pos_d ? static_cast<std::int64_t>(*pos_d) : p0) + t + 1;
   float* s = sc + row * L;
   float m = -INFINITY;
   for (std::int64_t u = threadIdx.x; u < len; u += blockDim.x) m = fmaxf(m, s[u]);
@@ -513,8 +517,8 @@ __global__ void __launch_bounds__(256) k_attn_softmax(float* __restrict__ sc, st
 // out[t][h][i] = sum_u p_u v_u[i] (u in order), then times sigmoid(gate[i]); one thread per i
 __global__ void k_attn_out(const float* __restrict__ sc, const float* __restrict__ V, std::int64_t kv_w, std::int64_t nh, std::int64_t group,
                            std::int64_t hd, std::int64_t p0, std::int64_t L, const float* __restrict__ q, std::int64_t qs, std::int64_t qh,
-                           int gate, float* __restrict__ out) {
-  const std::int64_t row = blockIdx.x, t = row / nh, h = row % nh, len = p0 + t + 1;
+                           int gate, float* __restrict__ out, const int* __restrict__ pos_d) {
+  const std::int64_t row = blockIdx.x, t = row / nh, h = row % nh, len = (pos_d ? static_cast<std::int64_t>(*pos_d) : p0) + t + 1;
   const std::int64_t i = static_cast<std::int64_t>(blockIdx.y) * blockDim.x + threadIdx.x;
   if (i >= hd) return;
   const float* s = sc + row * L;
@@ -1729,13 +1733,14 @@ bool l2_norm(float* x, std::int64_t n, std::int64_t n_seg, std::int64_t seg_stri
 }
 
 bool rope(float* v, std::int64_t n_heads, std::int64_t head_stride, std::int64_t ld, std::int64_t rows, std::int64_t pos0, int n_rot, float freq_base,
-          const int sections[4], bool neox, const float* freq_factors, Stream s) {
+          const int sections[4], bool neox, const float* freq_factors, Stream s, const int* pos_d) {
   if (n_rot <= 0 || n_rot % 2 != 0 || n_heads <= 0 || !v) return fail("rope: bad shape");
   if (rows <= 0) return true;
   const float theta_scale = std::pow(freq_base, -2.0f / static_cast<float>(n_rot));  // as model::rope_cache, on the host
   const int s0 = sections ? sections[0] : 0, s1 = sections ? sections[1] : 0, s2 = sections ? sections[2] : 0, s3 = sections ? sections[3] : 0;
   const std::int64_t total = rows * n_heads * (n_rot / 2);
-  k_rope<<<blocks_for(total, 128), 128, 0, st(s)>>>(v, n_heads, head_stride, ld, rows, pos0, n_rot, theta_scale, s0, s1, s2, s3, neox ? 1 : 0, freq_factors);
+  k_rope<<<blocks_for(total, 128), 128, 0, st(s)>>>(v, n_heads, head_stride, ld, rows, pos0, n_rot, theta_scale, s0, s1, s2, s3, neox ? 1 : 0, freq_factors,
+                                                    pos_d);
   return launched("rope");
 }
 
@@ -1781,21 +1786,24 @@ bool router_topk(const float* logits, std::int64_t n_expert, std::int64_t rows, 
 
 bool attention(const float* q, std::int64_t q_stride, std::int64_t q_head, const float* K, const float* V, std::int64_t kv_w, std::int64_t n_head,
                std::int64_t n_head_kv, std::int64_t head_dim, std::int64_t n_tok, std::int64_t p0, float scale, bool gate, float* out, float* scratch,
-               Stream s) {
+               Stream s, const int* pos_d, std::int64_t l_max) {
   if (n_head <= 0 || n_head_kv <= 0 || n_head % n_head_kv != 0 || head_dim <= 0 || head_dim > 1024 || kv_w < n_head_kv * head_dim || p0 < 0 ||
       q_head < (gate ? 2 : 1) * head_dim || !q || !K || !V || !out || !scratch)
     return fail("attention: bad shape or pointer");
   if (n_tok <= 0) return true;
   if (n_tok > 65535 || n_head > 65535) return fail("attention: at most 65535 tokens and heads per call (grid limit; split a longer prompt)");
-  const std::int64_t L = p0 + n_tok, group = n_head / n_head_kv;
-  const dim3 g1(blocks_for(L, 8), static_cast<unsigned>(n_head), static_cast<unsigned>(n_tok));
-  k_attn_scores<<<g1, 256, 0, st(s)>>>(q, q_stride, q_head, K, kv_w, n_head, group, head_dim, p0, L, scale, scratch);
+  // v26: with pos_d the position is read on the device (graph replay): the score rows have stride l_max and the key blocks
+  // loop (64 per row-head); the per-score arithmetic is the same either way
+  if (pos_d && l_max < p0 + n_tok) return fail("attention: l_max below the position");
+  const std::int64_t L = pos_d ? l_max : p0 + n_tok, group = n_head / n_head_kv;
+  const dim3 g1(pos_d ? 64u : blocks_for(L, 8), static_cast<unsigned>(n_head), static_cast<unsigned>(n_tok));
+  k_attn_scores<<<g1, 256, 0, st(s)>>>(q, q_stride, q_head, K, kv_w, n_head, group, head_dim, p0, L, scale, scratch, pos_d);
   if (!launched("attention scores")) return false;
-  k_attn_softmax<<<static_cast<unsigned>(n_tok * n_head), 256, 0, st(s)>>>(scratch, n_head, p0, L);
+  k_attn_softmax<<<static_cast<unsigned>(n_tok * n_head), 256, 0, st(s)>>>(scratch, n_head, p0, L, pos_d);
   if (!launched("attention softmax")) return false;
   const int tpb = head_dim >= 256 ? 256 : 128;
   const dim3 g3(static_cast<unsigned>(n_tok * n_head), blocks_for(head_dim, tpb));
-  k_attn_out<<<g3, tpb, 0, st(s)>>>(scratch, V, kv_w, n_head, group, head_dim, p0, L, q, q_stride, q_head, gate ? 1 : 0, out);
+  k_attn_out<<<g3, tpb, 0, st(s)>>>(scratch, V, kv_w, n_head, group, head_dim, p0, L, q, q_stride, q_head, gate ? 1 : 0, out, pos_d);
   return launched("attention output");
 }
 
@@ -1929,4 +1937,49 @@ bool gated_norm(float* core, const float* z, const float* w, std::int64_t n, std
   return launched("gated_norm");
 }
 
+
+// ------------------------------------------------------------------------------------------------ v26 streams, graphs
+__global__ void k_kv_store(float* __restrict__ K, float* __restrict__ V, const float* __restrict__ kn, const float* __restrict__ vn, std::int64_t kv_w,
+                           std::int64_t n, const int* __restrict__ pos_d) {
+  const std::int64_t id = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (id >= n * kv_w) return;
+  const std::int64_t at = static_cast<std::int64_t>(*pos_d) * kv_w + id;
+  K[at] = kn[id];
+  V[at] = vn[id];
+}
+bool kv_store(float* K, float* V, const float* kn, const float* vn, std::int64_t kv_w, std::int64_t n, const int* pos_d, Stream s) {
+  if (!K || !V || !kn || !vn || !pos_d || kv_w <= 0) return fail("kv_store: bad pointer");
+  if (n <= 0) return true;
+  k_kv_store<<<blocks_for(n * kv_w, 256), 256, 0, st(s)>>>(K, V, kn, vn, kv_w, n, pos_d);
+  return launched("kv_store");
+}
+cudaStream_t cur_stream_raw() { return g_cur_stream; }
+void set_stream(Stream s) { g_cur_stream = static_cast<cudaStream_t>(s); }
+Stream stream_new() {
+  cudaStream_t s = nullptr;
+  if (!ck(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking), "cudaStreamCreate")) return nullptr;
+  return s;
+}
+void stream_free(Stream s) {
+  if (s) cudaStreamDestroy(static_cast<cudaStream_t>(s));
+}
+bool h2d_async(void* dst, const void* src, std::size_t bytes, Stream s) {
+  return ck(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, st(s)), "copy to the device (async)");
+}
+bool capture_begin(Stream s) { return ck(cudaStreamBeginCapture(st(s), cudaStreamCaptureModeRelaxed), "graph capture begin"); }
+bool capture_end(Stream s, void** exec) {
+  cudaGraph_t gr = nullptr;
+  *exec = nullptr;
+  if (!ck(cudaStreamEndCapture(st(s), &gr), "graph capture end")) return false;
+  cudaGraphExec_t ex = nullptr;
+  const bool ok = ck(cudaGraphInstantiate(&ex, gr, 0ull), "graph instantiate");
+  cudaGraphDestroy(gr);
+  if (!ok) return false;
+  *exec = ex;
+  return true;
+}
+bool graph_launch(void* exec, Stream s) { return ck(cudaGraphLaunch(static_cast<cudaGraphExec_t>(exec), st(s)), "graph launch"); }
+void graph_free(void* exec) {
+  if (exec) cudaGraphExecDestroy(static_cast<cudaGraphExec_t>(exec));
+}
 }  // namespace pelias::kern::gpu
