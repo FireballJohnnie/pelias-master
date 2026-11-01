@@ -33,7 +33,7 @@ Copyright (c) 2026 John Lipka and the Pelias contributors
 
 **Build order** (each stage: prediction, gate, log, push; nothing reordered without the author):
 1. **Clean-up. DONE 18:05-18:07, PASS: R1 23.64-23.78 ms (42.1-42.3 tok/s median), G KL 3.357e-03 PASS.** The reader compiled without the plane-test code (-1.3 ms per token, MEASURED v29); all-GPU (R1) the default again; the CPU split code kept, switched off.
-2. **46a. One persistent R3 launch per token (Line A):** dense layers, router + top-k, and the VRAM experts (bank + cache) in one launch; per-expert counters at gate/up -> down instead of global barriers.
+2. **46a. One persistent R3 launch per token (Line A).** 46a-1 (experts only, one R3 launch per layer, --r3-experts) MEASURED 18:24-18:26: 24.38-24.48 ms vs reader 23.68, GX PASS; predicted 16.6-18.8 (missed): the expert time is not set by the VRAM read rate in either path; per-layer trace of both paths next. Line A: dense layers, router + top-k, and the VRAM experts (bank + cache) in one launch; per-expert counters at gate/up -> down instead of global barriers.
 3. **46b. Misses inside the launch:** experts not in VRAM read zero-copy from pinned RAM by the same launch (21.0 GB/s MEASURED), alongside the VRAM streaming.
 4. **46c. Capacity and prefetch:** token_embd to host RAM (B10, one row per token, lossless; 540 MB freed) and the spare VRAM as expert cache slots (+23 per layer, DERIVED); the copy engines (no SMs) prefetch the next layer's predicted misses into slots; **slot-ready flags**: a slot not ready is read zero-copy, so the GPU never waits.
 5. **46d. Head sketch** (2-bit sketch of the output head + 64 exact rows; first its top-1-in-top-64 recall from existing logits), then **MTP** on the new launch.
