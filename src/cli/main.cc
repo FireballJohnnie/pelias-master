@@ -13,6 +13,8 @@
 // Exit codes: 0 ok; 1 usage; 2 the input could not be read (missing, corrupt, unsupported); 3 a gate refused (plan
 // over the ceiling); 4 no device; 5 verify found differences; 6 quantize or convert failed while writing (disk, I/O).
 #include <cerrno>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -2133,7 +2135,7 @@ double kl_rows(const float* ra, const float* rb, std::size_t nv) {
 int cmd_pin_probe(const Args& a) {
   const std::string path = a.get("model");
   if (path.empty()) {
-    std::fprintf(stderr, "usage: pelias pin-probe --model FILE [--mb 1024]\n");
+    std::fprintf(stderr, "usage: pelias pin-probe --model FILE [--mb 1024] [--joint]\n");
     return 1;
   }
   std::uint64_t mb = 1024;
@@ -2199,6 +2201,94 @@ int cmd_pin_probe(const Args& a) {
             }
             std::printf("  (1s) scattered: %d chunks of %zu KiB in %.4f s = %.2f GB/s\n", nchunks, kb, sec,
                         static_cast<double>(chunk) * nchunks / sec / 1e9);
+          }
+        }
+      }
+      if (a.has("joint")) {
+        // v28 joint read test (author 22:18 "roll it"): the GPU reads expert-sized chunks of the registered region while
+        // CPU threads stream a second, unregistered region of the same file mapping (the light experts' path), each
+        // alone and then together, for about 2 s per cell
+        const std::uint64_t offb = off >= bytes ? off - bytes : off + bytes;
+        const std::uint8_t* cpu_reg = m.data() + offb;
+        if (offb + bytes > m.size()) {
+          std::printf("  (J) no room for the CPU region\n");
+        } else {
+          Timer tt;
+          for (std::size_t i = 0; i < bytes; i += 4096) sink = static_cast<std::uint8_t>(sink ^ cpu_reg[i]);
+          std::printf("  (J) CPU region of %llu MiB at offset %llu paged in: %.2f s\n", static_cast<unsigned long long>(mb),
+                      static_cast<unsigned long long>(offb), tt.seconds());
+          const std::size_t chunk = std::size_t{2} << 20;
+          const int nchunks = 320;
+          std::vector<std::uint64_t> offs(static_cast<std::size_t>(nchunks));
+          std::uint64_t st = 0x2545f4914f6cdd1dull;
+          for (auto& of : offs) {
+            st = st * 6364136223846793005ull + 1442695040888963407ull;
+            of = ((st >> 17) % ((bytes - chunk) / 4096)) * 4096;
+          }
+          auto gpu_run = [&](double secs, double* gbs) {
+            double tot = 0.0, bytes_done = 0.0;
+            while (tot < secs) {
+              double sec = 0.0;
+              if (!kern::gpu::read_chunks_rate(dev, offs.data(), nchunks, chunk, &sec)) return false;
+              tot += sec;
+              bytes_done += static_cast<double>(chunk) * nchunks;
+            }
+            *gbs = bytes_done / tot / 1e9;
+            return true;
+          };
+          // one CPU reader thread: random 2 MiB chunks of the CPU region, summed (4 accumulators), until stop
+          auto cpu_body = [&](int t, const std::atomic<bool>& stop, double* bytes_read, std::uint64_t* xr) {
+            std::uint64_t s0 = 0x9e3779b97f4a7c15ull * (static_cast<std::uint64_t>(static_cast<unsigned>(t)) + 1u);
+            std::uint64_t x = 0;
+            double n = 0.0;
+            while (!stop.load(std::memory_order_relaxed)) {
+              s0 = s0 * 6364136223846793005ull + 1442695040888963407ull;
+              const std::uint64_t o = ((s0 >> 17) % ((bytes - chunk) / 4096)) * 4096;
+              const auto* q = reinterpret_cast<const std::uint64_t*>(cpu_reg + o);
+              std::uint64_t a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+              for (std::size_t i = 0; i < chunk / 8; i += 4) {
+                a0 += q[i];
+                a1 += q[i + 1];
+                a2 += q[i + 2];
+                a3 += q[i + 3];
+              }
+              x += a0 ^ a1 ^ a2 ^ a3;
+              n += static_cast<double>(chunk);
+            }
+            *bytes_read = n;
+            *xr = x;
+          };
+          // CPU threads run while `during` runs (the GPU loop, or a 2 s sleep); returns the CPU rate in GB/s
+          auto with_cpu = [&](int nt, const std::function<void()>& during) {
+            std::atomic<bool> stop{false};
+            std::vector<double> got(static_cast<std::size_t>(nt), 0.0);
+            std::vector<std::uint64_t> xs(static_cast<std::size_t>(nt), 0);
+            std::vector<std::thread> th;
+            Timer tc;
+            for (int t = 0; t < nt; ++t) th.emplace_back(cpu_body, t, std::cref(stop), &got[static_cast<std::size_t>(t)], &xs[static_cast<std::size_t>(t)]);
+            during();
+            stop = true;
+            for (auto& h : th) h.join();
+            const double secs = tc.seconds();
+            double n = 0.0;
+            for (double g : got) n += g;
+            for (std::uint64_t v : xs) sink = static_cast<std::uint8_t>(sink ^ v);
+            return n / secs / 1e9;
+          };
+          double g_alone = 0.0;
+          if (!gpu_run(2.0, &g_alone)) {
+            std::printf("  (J) GPU read failed: %s\n", kern::gpu::last_error());
+          } else {
+            std::printf("  (J) GPU alone: 2 MiB chunks x %d from the registered mapping: %.2f GB/s\n", nchunks, g_alone);
+            for (const int nt : {2, 4, 8}) {
+              double c_alone = 0.0, c_joint = 0.0, g_joint = 0.0;
+              c_alone = with_cpu(nt, [] { std::this_thread::sleep_for(std::chrono::milliseconds(2000)); });
+              bool gok = true;
+              c_joint = with_cpu(nt, [&] { gok = gpu_run(2.0, &g_joint); });
+              if (!gok) std::printf("  (J) GPU read failed: %s\n", kern::gpu::last_error());
+              std::printf("  (J) CPU %d threads alone %.2f GB/s | together: CPU %.2f GB/s + GPU %.2f GB/s = %.2f GB/s (CPU %+.1f %%, GPU %+.1f %%)\n", nt,
+                          c_alone, c_joint, g_joint, c_joint + g_joint, 100.0 * (c_joint / c_alone - 1.0), 100.0 * (g_joint / g_alone - 1.0));
+            }
           }
         }
       }
