@@ -116,6 +116,9 @@ struct EngineOptions {
   // cooperative launch: gate and up of every pick, silu x up rounded to int8 per 32, down, with per-expert counters
   // between them) instead of the reader v3 kernels; the same grouping, cache and combine. Off: the reader v3 kernels.
   bool r3_experts = false;
+  // v46a-2: how the stage loads expert rows: 0 each lane its own 16-byte pieces (v46a-1), 1 a warp copies its task's rows
+  // contiguously into shared memory first for experts read from RAM, 2 the same for every expert (outputs equal in all three)
+  int rx_load = 0;
   // v28: gate / up rows per warp in the reader v3 kernels (1 or 2; 2 = v26's shape)
   int reader_rows_per_warp = 2;
   // v28: pinned ranges are merged across gaps smaller than this (bytes; v27 used 8 MiB; 0 = exact ranges, one per matrix

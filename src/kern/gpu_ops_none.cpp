@@ -148,7 +148,7 @@ bool rx_type_ok(std::uint32_t, std::int64_t) { return false; }
 std::uint64_t rx_scratch_bytes(int) { return 0; }
 bool moe_r3(const ExpertPtr*, const ExpertPtr*, const std::int32_t*, const float*, const float*, int, const std::int8_t*, const float*, const int*,
             std::int64_t, std::int64_t, std::int64_t, const ReaderCache*, float*, std::int8_t*, float*, int*, float*, int*, ExpertPtr*, ExpertPtr*, void*,
-            int, float*, unsigned long long*, Stream) {
+            int, float*, unsigned long long*, Stream, int) {
   return false;
 }
 

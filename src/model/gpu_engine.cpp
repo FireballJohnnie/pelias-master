@@ -1409,7 +1409,7 @@ struct GpuEngine::Impl {
     const bool rd_ok =
         use_rx ? g::moe_r3(rtab + static_cast<int64_t>(il) * ne, fold ? rshx + il : nullptr, sel, wsel, gsh, static_cast<int>(nu), q, scale, sum, n, e,
                            s.n_ff_exp, rcache.empty() ? nullptr : &rcache[il], rgu, rhq, rhs, rhsum, ryd, rgrp, rgsrc, rgfill, rxplan, rx_maxp, y, tsl,
-                           nullptr)
+                           nullptr, o.rx_load)
         : o.reader_v3
             ? g::moe_reader3(rtab + static_cast<int64_t>(il) * ne, fold ? rshx + il : nullptr, sel, wsel, gsh, static_cast<int>(nu), xr, n, e, s.n_ff_exp,
                              rrow_max, rcache.empty() ? nullptr : &rcache[il], rgu, rh, ryd, rgrp, rgsrc, rgfill, y, tsl, nullptr, o.plane_tail,
@@ -2115,7 +2115,7 @@ std::string GpuEngine::summary() const {
                 I.bell ? "doorbell" : "device sync per layer", static_cast<double>(I.o.router_tie), I.reader_note.c_str(), I.o.batch_identical ? "on" : "off",
                 I.graph_note.c_str(), I.pf_ok ? "on" : "off", I.split_note.c_str());
   std::string r = b;
-  if (I.o.r3_experts) r += "; R3 expert stage " + I.rx_note;  // v46a-1
+  if (I.o.r3_experts) r += "; R3 expert stage " + I.rx_note + (I.o.rx_load == 2 ? ", rows staged for every expert" : I.o.rx_load == 1 ? ", rows staged for experts read from RAM" : ", lane loads");  // v46a-1 / v46a-2
   if (!I.o.pin_pool.empty() || I.o.pin_host >= 0) {  // v43
     char c[256];
     std::snprintf(c, sizeof c, "; pinned: %d of %zu workers, doorbell %s, host %s", I.pool ? I.pool->pinned() : 0, I.o.pin_pool.empty() ? std::size_t{0} : I.o.pin_pool.size() - 1,

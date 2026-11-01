@@ -101,6 +101,9 @@ std::uint64_t rx_scratch_bytes(int max_picks);         // the plan buffer for up
 bool moe_r3(const ExpertPtr* tab, const ExpertPtr* shx, const std::int32_t* sel, const float* wsel, const float* gsh, int n_used,
             const std::int8_t* xq, const float* xs, const int* xsum, std::int64_t tokens, std::int64_t H, std::int64_t F, const ReaderCache* cache,
             float* gu, std::int8_t* hq, float* hs, int* hsum, float* yd, int* grp, ExpertPtr* gsrc, ExpertPtr* gfill, void* plan, int max_picks,
-            float* y, unsigned long long* ts, Stream s = nullptr);
+            float* y, unsigned long long* ts, Stream s = nullptr, int load_mode = 0);
+// v46a-2 load_mode: 0 each lane loads its own 16-byte pieces (v46a-1); 1 a warp first copies its task's rows contiguously into
+// shared memory for experts read from RAM (every 32-byte sector over PCIe once; the slot filled by the same copy); 2 the same
+// for every expert. The arithmetic is the same in all three, so the outputs are equal bit for bit.
 
 }  // namespace pelias::kern::gpu

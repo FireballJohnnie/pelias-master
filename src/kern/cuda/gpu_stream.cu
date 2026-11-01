@@ -53,6 +53,7 @@ struct DJob {
   std::int8_t* hq;          // kEpi: int8 per pick (F at hq + ypk F), scale and sum per 32 (hs / hsum + ypk F / 32)
   float* hs;
   int* hsum;
+  int stg;                  // v46a-2: 1 = the warp stages its task's rows contiguously in shared memory first (lane_part M = 3)
 };
 
 __constant__ float c_grid[4][16];  // the Q4_TG2 grids (quant::q4_tg_grid(tag, 2)), uploaded once
@@ -129,8 +130,10 @@ __device__ __forceinline__ int ldxi(const int* p) {
   else return ld_cgi(p);
 }
 // a weight load; with M = 2 (a cache miss being filled) and st, the 16 bytes also go to the same offset in the slot
+// v46a-2: M = 3 reads the warp's staged copy in shared memory (generic loads; the staging copy did any slot fill)
 template <int M>
 __device__ __forceinline__ int4 ldwf(const DJob& J, bool cs, const std::uint8_t* p, bool st) {
+  if constexpr (M == 3) return *reinterpret_cast<const int4*>(p);
   const int4 v = ldw(cs, p);
   if constexpr (M == 2) {
     if (st) *reinterpret_cast<int4*>(const_cast<std::uint8_t*>(p) + J.fd) = v;
@@ -143,9 +146,15 @@ template <int M, int N>
 __device__ __forceinline__ void q6s_words(const DJob& J, bool cs, const std::uint8_t* p, unsigned mis, std::uint32_t* out) {
   const std::uint32_t* a = reinterpret_cast<const std::uint32_t*>(p - mis);
   std::uint32_t r[N + 1];
+  if constexpr (M == 3) {
 #pragma unroll
-  for (int i = 0; i < N; ++i) r[i] = cs ? ld_cs1(a + i) : __ldg(a + i);
-  r[N] = mis ? (cs ? ld_cs1(a + N) : __ldg(a + N)) : 0u;  // only when the bytes straddle: never past the block
+    for (int i = 0; i < N; ++i) r[i] = a[i];
+    r[N] = mis ? a[N] : 0u;
+  } else {
+#pragma unroll
+    for (int i = 0; i < N; ++i) r[i] = cs ? ld_cs1(a + i) : __ldg(a + i);
+    r[N] = mis ? (cs ? ld_cs1(a + N) : __ldg(a + N)) : 0u;  // only when the bytes straddle: never past the block
+  }
   if constexpr (M == 2) {
     std::uint32_t* f = reinterpret_cast<std::uint32_t*>(const_cast<std::uint8_t*>(reinterpret_cast<const std::uint8_t*>(a)) + J.fd);
 #pragma unroll
@@ -182,9 +191,13 @@ __device__ __forceinline__ int iq4_levels(std::uint32_t v) {
 // one lane's part (128 values = 4 sub-blocks of 32) of one row; returns the partial dot product. v46a-1: M as above (the
 // dense instantiation, M = 0, is the code as measured: no fill, no stored Q6_K branch, __ldg inputs)
 template <int M>
-__device__ float lane_part(const DJob& J, int r, int part, const std::int8_t* xq, const float* xs, const int* xsum, bool cs) {
+__device__ float lane_part(const DJob& J, int r, int part, const std::int8_t* xq, const float* xs, const int* xsum, bool cs,
+                           const std::uint8_t* wb = nullptr, long long rb0 = 0) {
   const int B = part >> 1, half = part & 1, nB = J.K / 256;
   const long long rb = static_cast<long long>(r) * nB + B;
+  // v46a-2: with M = 3 the rows come from the warp's staged copy (wb holds block rb0 onwards); else from J.w as before
+  const std::uint8_t* const W = M == 3 ? wb : J.w;
+  const long long rbw = M == 3 ? rb - rb0 : rb;
   const int jg0 = B * 8 + half * 4;  // first 32-block of the part in the row
   int xw[32];
   {
@@ -242,7 +255,7 @@ __device__ float lane_part(const DJob& J, int r, int part, const std::int8_t* xq
       acc += s * ldxs<M>(xs + jg) * static_cast<float>(P);
     }
   } else if (J.fmt == kQ4TG2) {
-    const std::uint8_t* bp = J.w + rb * 144;
+    const std::uint8_t* bp = W + rbw * 144;
     const int4 hd = ldwf<M>(J, cs, bp, half == 0);
     int4 c[4];
 #pragma unroll
@@ -278,7 +291,7 @@ __device__ float lane_part(const DJob& J, int r, int part, const std::int8_t* xq
       acc += s * ldxs<M>(xs + jg) * sum;
     }
   } else if (J.fmt == kQ5K) {
-    const std::uint8_t* bp = J.w + rb * 176;
+    const std::uint8_t* bp = W + rbw * 176;
     const int4 hd = ldwf<M>(J, cs, bp, half == 0);
     const int4 qa = ldwf<M>(J, cs, bp + 16, half == 0), qb4 = ldwf<M>(J, cs, bp + 32, half == 0);
     int4 ql[4];
@@ -316,12 +329,12 @@ __device__ float lane_part(const DJob& J, int r, int part, const std::int8_t* xq
              (d * static_cast<float>(sc) * static_cast<float>(sq) - dmin * static_cast<float>(mn) * static_cast<float>(ldxi<M>(xsum + jg)));
     }
   } else if (J.fmt == kQ8_0) {  // repacked per 256: qs[256] (int8) | d[8] (fp16); the half's 128 values and 4 d's
-    const std::uint8_t* bp = J.w + rb * 272;
+    const std::uint8_t* bp = W + rbw * 272;
     const uint2 dd = *reinterpret_cast<const uint2*>(bp + 256 + half * 8);
 #pragma unroll
     for (int jj = 0; jj < 4; ++jj) {
       const int jg = jg0 + jj;
-      const int4 qa = ldw(cs, bp + half * 128 + 32 * jj), qb = ldw(cs, bp + half * 128 + 32 * jj + 16);
+      const int4 qa = ldwf<M>(J, cs, bp + half * 128 + 32 * jj, false), qb = ldwf<M>(J, cs, bp + half * 128 + 32 * jj + 16, false);
       int P = 0;
       P = __dp4a(qa.x, xw[8 * jj], P);
       P = __dp4a(qa.y, xw[8 * jj + 1], P);
@@ -336,7 +349,7 @@ __device__ float lane_part(const DJob& J, int r, int part, const std::int8_t* xq
       acc += d * ldxs<M>(xs + jg) * static_cast<float>(P);
     }
   } else if (J.fmt == kQ4K) {  // as stored (144 bytes): d | dmin | scales[12] | qs[128]; Q5_K without qh
-    const std::uint8_t* bp = J.w + rb * 144;
+    const std::uint8_t* bp = W + rbw * 144;
     const int4 hd = ldwf<M>(J, cs, bp, half == 0);
     int4 ql[4];
 #pragma unroll
@@ -372,7 +385,7 @@ __device__ float lane_part(const DJob& J, int r, int part, const std::int8_t* xq
              (d * static_cast<float>(sc) * static_cast<float>(sq) - dmin * static_cast<float>(mn) * static_cast<float>(ldxi<M>(xsum + jg)));
     }
   } else if (J.fmt == kIQ4XS) {  // repacked per 256 (144 bytes): d | scales_h | scales_l[4] | 8 zero bytes | qs[128]
-    const std::uint8_t* bp = J.w + rb * 144;
+    const std::uint8_t* bp = W + rbw * 144;
     const int4 hd = ldw(cs, bp);
     const std::uint32_t h0 = static_cast<std::uint32_t>(hd.x), sl = static_cast<std::uint32_t>(hd.y);
     const float d = __half2float(__ushort_as_half(static_cast<unsigned short>(h0 & 0xffffu)));
@@ -393,7 +406,7 @@ __device__ float lane_part(const DJob& J, int r, int part, const std::int8_t* xq
       acc += d * static_cast<float>(ls - 32) * ldxs<M>(xs + jg) * static_cast<float>(P);
     }
   } else if (M != 0 && J.fmt == kQ6KS) {  // v46a-1: as stored: ql[128] | qh[64] | scales[16] | d (210 bytes, 2-byte aligned)
-    const std::uint8_t* bp = J.w + rb * 210;
+    const std::uint8_t* bp = W + rbw * 210;
     const unsigned mis = static_cast<unsigned>(reinterpret_cast<std::uintptr_t>(bp) & 3u);
     std::uint32_t qlw[16], qhw[8], scw[2];
     q6s_words<M, 16>(J, cs, bp + half * 64, mis, qlw);
@@ -592,7 +605,7 @@ __host__ __device__ inline RxLayout rx_layout(int maxp) {
 // has the shape (F x H gate and up, H x F down), so each job's first task follows from its index alone.
 __global__ void __launch_bounds__(128) k_rx_plan(const int* __restrict__ grp, const ExpertPtr* __restrict__ gsrc, const ExpertPtr* __restrict__ gfill,
                                                  int tokens, int nu, int H, int F, const std::int8_t* xq, const float* xs, const int* xsum, float* gu,
-                                                 std::int8_t* hq, float* hs, int* hsum, float* yd, std::uint8_t* plan, int maxp) {
+                                                 std::int8_t* hq, float* hs, int* hsum, float* yd, std::uint8_t* plan, int maxp, int load_mode) {
   const RxLayout Lo = rx_layout(maxp);
   auto* hd = reinterpret_cast<RxHdr*>(plan);
   auto* jobs = reinterpret_cast<DJob*>(plan + Lo.jobs);
@@ -645,6 +658,7 @@ __global__ void __launch_bounds__(128) k_rx_plan(const int* __restrict__ grp, co
         J.ntask = kind < 2 ? nt_gu : nt_dn;
         J.w = X.w[kind];
         J.fd = FL.w[kind] ? static_cast<long long>(FL.w[kind] - X.w[kind]) : 0;
+        J.stg = load_mode == 2 || (load_mode == 1 && !X.vram);  // v46a-2: all experts, or those read from RAM
         if (kind < 2) {
           J.xq = xq;
           J.xs = xs;
@@ -728,12 +742,65 @@ __device__ __forceinline__ void rx_rows(const DJob& J, long long t) {
     if (r < J.n && part == 0) J.y[J.ypk[tk] * J.ys + r] = acc;
   }
 }
+// v46a-2: bytes per 256-value block of the stage's formats (as read: Q8_0 in R3's repacked layout)
+__device__ __forceinline__ int rx_blk(int fmt) {
+  return fmt == kQ5K ? 176 : fmt == kQ6KS ? 210 : fmt == kQ8_0 ? 272 : 144;  // Q4_TG2, Q4_K: 144
+}
+// a warp copies n contiguous bytes from src into its shared buffer, keeping src's 16-byte phase (32 lanes x 16 bytes per
+// instruction: every 32-byte sector requested once, as the reader's staging) and, with fill, into the cache slot at the
+// same offset; returns where the copy of src[0] is
+__device__ __forceinline__ const std::uint8_t* rx_stage(const std::uint8_t* src, long long n, std::uint8_t* buf, std::uint8_t* fill, int lane) {
+  const unsigned mis = static_cast<unsigned>(reinterpret_cast<std::uintptr_t>(src) & 15u);
+  std::uint8_t* dst = buf + mis;
+  long long head = static_cast<long long>((16u - mis) & 15u);
+  if (head > n) head = n;
+  for (long long i = lane; i < head; i += 32) {
+    const std::uint8_t b = src[i];
+    dst[i] = b;
+    if (fill) fill[i] = b;
+  }
+  const long long n4 = (n - head) / 16;
+  const int4* s4 = reinterpret_cast<const int4*>(src + head);
+  int4* d4 = reinterpret_cast<int4*>(dst + head);
+  int4* f4 = fill ? reinterpret_cast<int4*>(fill + head) : nullptr;
+  for (long long i = lane; i < n4; i += 32) {
+    const int4 v = ld_cs4(s4 + i);
+    d4[i] = v;
+    if (f4) f4[i] = v;
+  }
+  for (long long i = head + n4 * 16 + lane; i < n; i += 32) {
+    const std::uint8_t b = src[i];
+    dst[i] = b;
+    if (fill) fill[i] = b;
+  }
+  __syncwarp();
+  return dst;
+}
+// v46a-2: one warp task with its rows staged first (a task's rows are consecutive: 16 blocks of 256 values in one range)
+__device__ __forceinline__ void rx_rows_staged(const DJob& J, long long t, std::uint8_t* sbuf) {
+  const int lane = static_cast<int>(threadIdx.x & 31), rpw = 32 / J.lpr, nB = J.K / 256;
+  const int r0 = static_cast<int>((t - J.task0) * rpw);
+  const int r = r0 + lane / J.lpr, part = lane % J.lpr;
+  const int nr = J.n - r0 < rpw ? J.n - r0 : rpw;
+  const long long rowb = static_cast<long long>(nB) * rx_blk(J.fmt);
+  const std::uint8_t* src = J.w + static_cast<long long>(r0) * rowb;
+  const std::uint8_t* wb = rx_stage(src, nr * rowb, sbuf, J.fd ? const_cast<std::uint8_t*>(src) + J.fd : nullptr, lane);
+  for (int tk = 0; tk < J.ntok; ++tk) {
+    const long long xo = J.tokx[tk];
+    float acc = 0.f;
+    if (r < J.n) acc = lane_part<3>(J, r, part, J.xq + xo * J.xqs, J.xs + xo * J.xss, J.xsum + xo * J.xss, false, wb, static_cast<long long>(r0) * nB);
+    for (int o = J.lpr / 2; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+    if (r < J.n && part == 0) J.y[J.ypk[tk] * J.ys + r] = acc;
+  }
+  __syncwarp();  // the buffer is reused by the warp's next task
+}
 // the layer's experts: every warp walks the tasks in table order (gate and up of all experts first, then the roundings,
 // then the downs); a task whose job waits for a group starts once the group's count is complete (acquire), and a task of
 // a signalling job adds 1 (release). All blocks are resident (cooperative launch), and a job waits only for groups of
 // jobs before it, so the lowest unfinished task can always run: no deadlock.
-__global__ void __launch_bounds__(256) k_rx(const std::uint8_t* __restrict__ plan, int maxp) {
+__global__ void __launch_bounds__(256) k_rx(const std::uint8_t* __restrict__ plan, int maxp, int sbytes) {
   lut_setup();
+  std::uint8_t* sbuf = reinterpret_cast<std::uint8_t*>(s_lut) + kLutBytes + static_cast<long long>(threadIdx.x / 32) * sbytes;  // v46a-2
   const RxLayout Lo = rx_layout(maxp);
   const auto* hd = reinterpret_cast<const RxHdr*>(plan);
   const auto* jobs = reinterpret_cast<const DJob*>(plan + Lo.jobs);
@@ -759,6 +826,7 @@ __global__ void __launch_bounds__(256) k_rx(const std::uint8_t* __restrict__ pla
     }
     const DJob& J = jobs[j];
     if (J.fmt == kEpi) rx_epi(J);
+    else if (J.stg) rx_rows_staged(J, t, sbuf);
     else if (J.fd) rx_rows<2>(J, t);
     else rx_rows<1>(J, t);
     const int sg = sig[j];
@@ -1041,7 +1109,8 @@ std::uint64_t rx_scratch_bytes(int max_picks) { return max_picks > 0 ? rx_layout
 bool moe_r3(const ExpertPtr* tab, const ExpertPtr* shx, const std::int32_t* sel, const float* wsel, const float* gsh, int n_used,
             const std::int8_t* xq, const float* xs, const int* xsum, std::int64_t tokens, std::int64_t H, std::int64_t F, const ReaderCache* cache,
             float* gu, std::int8_t* hq, float* hs, int* hsum, float* yd, int* grp, ExpertPtr* gsrc, ExpertPtr* gfill, void* plan, int max_picks,
-            float* y, unsigned long long* ts, Stream s) {
+            float* y, unsigned long long* ts, Stream s, int load_mode) {
+  if (load_mode < 0 || load_mode > 2) return sfail("moe_r3: load_mode 0 (lane), 1 (staged for RAM experts) or 2 (staged for all)");
   if (!tab || !sel || !wsel || !xq || !xs || !xsum || !gu || !hq || !hs || !hsum || !yd || !grp || !gsrc || !gfill || !plan || !y || n_used <= 0 ||
       n_used > 8 || (shx && !gsh))
     return sfail("moe_r3: bad pointer or n_used");
@@ -1053,12 +1122,17 @@ bool moe_r3(const ExpertPtr* tab, const ExpertPtr* shx, const std::int32_t* sel,
   if (picks > max_picks) return sfail("moe_r3: more picks than the plan buffer holds");
   if (reinterpret_cast<std::uintptr_t>(xq) % 16 != 0 || reinterpret_cast<std::uintptr_t>(hq) % 16 != 0) return sfail("moe_r3: xq / hq must be 16-byte aligned");
   if (!grid_ready()) return false;
-  static int grid = 0;
+  // v46a-2: the staging buffer per warp: one task's 16 blocks of the largest format (Q8_0 repacked, 272 bytes) + the 16-byte
+  // phase, 8 warps per block: 8 KB grid + 34.3 KB (under the 48 KB a launch gets without opting in)
+  const int sbytes = load_mode ? 16 * 272 + 32 : 0;
+  const int smem = kLutBytes + 8 * sbytes;
+  static int grids[3] = {0, 0, 0};
+  int& grid = grids[load_mode];
   if (!grid) {
     int dev = 0, sms = 0, occ = 0, coop = 0;
     if (!sck(cudaGetDevice(&dev), "cudaGetDevice") || !sck(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev), "SM count") ||
         !sck(cudaDeviceGetAttribute(&coop, cudaDevAttrCooperativeLaunch, dev), "cooperative launch attribute") ||
-        !sck(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, k_rx, 256, kLutBytes), "occupancy (expert stage)"))
+        !sck(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, k_rx, 256, smem), "occupancy (expert stage)"))
       return false;
     if (!coop) return sfail("moe_r3: the device has no cooperative launch");
     if (occ < 1) return sfail("moe_r3: the expert stage kernel does not fit on an SM");
@@ -1069,13 +1143,13 @@ bool moe_r3(const ExpertPtr* tab, const ExpertPtr* shx, const std::int32_t* sel,
   if (ts) stamp_launch(ts + 1, s);
   auto* pb = static_cast<std::uint8_t*>(plan);
   k_rx_plan<<<1, 128, 0, sst(s)>>>(grp, gsrc, gfill, static_cast<int>(tokens), n_used, static_cast<int>(H), static_cast<int>(F), xq, xs, xsum, gu, hq, hs,
-                                   hsum, yd, pb, max_picks);
+                                   hsum, yd, pb, max_picks, load_mode);
   if (!sck(cudaGetLastError(), "moe_r3: plan launch")) return false;
   if (ts) stamp_launch(ts + 2, s);
   const std::uint8_t* cp = pb;
-  int mp = max_picks;
-  void* args[] = {&cp, &mp};
-  if (!sck(cudaLaunchCooperativeKernel(reinterpret_cast<void*>(k_rx), dim3(static_cast<unsigned>(grid)), dim3(256), args, kLutBytes, sst(s)),
+  int mp = max_picks, sb = sbytes;
+  void* args[] = {&cp, &mp, &sb};
+  if (!sck(cudaLaunchCooperativeKernel(reinterpret_cast<void*>(k_rx), dim3(static_cast<unsigned>(grid)), dim3(256), args, static_cast<std::size_t>(smem), sst(s)),
            "moe_r3: cooperative launch"))
     return false;
   if (ts) {
