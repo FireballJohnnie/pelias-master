@@ -131,6 +131,9 @@ cudaError_t cudaMallocHost(void**, size_t);
 cudaError_t cudaFreeHost(void*);
 cudaError_t cudaGetDeviceProperties(cudaDeviceProp*, int);
 cudaError_t cudaEventCreate(cudaEvent_t*);
+cudaError_t cudaEventCreateWithFlags(cudaEvent_t*, unsigned);
+cudaError_t cudaStreamWaitEvent(cudaStream_t, cudaEvent_t, unsigned = 0);
+#define cudaEventDisableTiming 2
 cudaError_t cudaEventDestroy(cudaEvent_t);
 cudaError_t cudaEventRecord(cudaEvent_t, cudaStream_t = 0);
 cudaError_t cudaEventSynchronize(cudaEvent_t);

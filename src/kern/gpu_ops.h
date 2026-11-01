@@ -109,6 +109,10 @@ bool capture_begin(Stream s);
 bool capture_end(Stream s, void** exec);
 bool graph_launch(void* exec, Stream s);
 void graph_free(void* exec);
+void* event_new();
+void event_free(void* e);
+bool event_record(void* e, Stream s);
+bool stream_wait(Stream s, void* e);
 
 // ---- Gated DeltaNet (30 of the 40 layers)
 // causal depthwise conv over [taps - 1 rows of tail, n rows of mixed] then SiLU; w: ch x taps (tap kk of channel c at c * taps
@@ -211,6 +215,11 @@ bool moe_reader(const ExpertPtr* tab, const std::int32_t* sel, const float* wsel
 bool moe_reader3(const ExpertPtr* tab, const ExpertPtr* shx, const std::int32_t* sel, const float* wsel, const float* gsh, int n_used, const float* xr,
                  std::int64_t tokens, std::int64_t H, std::int64_t F, std::uint64_t row_max, const ReaderCache* cache, float* gu, float* h, float* yd,
                  int* grp, ExpertPtr* gsrc, ExpertPtr* gfill, float* y, unsigned long long* ts = nullptr, Stream s = nullptr);
+// v26 prefetch: the next layer's predicted picks (npicks, its router on this layer's output) into the cache before that
+// layer's reader runs: each predicted file expert not cached gets a slot and is copied into it (job: scratch 1 + 2 x npicks
+// ints). Run on a second stream; events order it (event_record / stream_wait).
+bool reader_prefetch(const ExpertPtr* tab, const std::int32_t* sel_pred, int npicks, const ReaderCache* cache, std::int64_t H, std::int64_t F, int* job,
+                     Stream s);
 // device to device copy (stream ordered)
 bool dcopy(void* dst, const void* src, std::size_t bytes, Stream s = nullptr);
 // per value head: o = rms_norm(o) * w * silu(z), in place on core (n rows of nv * ds), z alike

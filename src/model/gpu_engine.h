@@ -100,6 +100,10 @@ struct EngineOptions {
   // is read on the device (rope, attention, the K / V store), so a replay serves any position. The first step of each kind
   // runs plainly (it builds the plans), the second is captured. Falls back to plain launches if capture fails (summary()).
   bool graph = false;
+  // v26: prefetch for the reader cache: after each layer, the next layer's router on this layer's output predicts its
+  // picks; a second stream copies the predicted file experts into cache slots while the next layer's attention / DeltaNet
+  // block runs; that layer's reader waits for it. Needs reader_cache > 0.
+  bool prefetch = false;
 };
 
 struct EngineStats {

@@ -1982,4 +1982,80 @@ bool graph_launch(void* exec, Stream s) { return ck(cudaGraphLaunch(static_cast<
 void graph_free(void* exec) {
   if (exec) cudaGraphExecDestroy(static_cast<cudaGraphExec_t>(exec));
 }
+
+// ------------------------------------------------------------------------------------------------ v26 reader prefetch
+// One thread: the step's predicted picks of the next layer (sel_pred, the next layer's router on this layer's output);
+// each predicted file expert not yet cached gets the least recently used slot, marked as used by the coming step (so that
+// step's own misses do not evict it). The list of (expert, slot) goes to `job` ([0] = count).
+__global__ void k_pf_assign(const ExpertPtr* __restrict__ tab, const std::int32_t* __restrict__ sel_pred, int npicks, ReaderCache c,
+                            int* __restrict__ job) {
+  if (threadIdx.x != 0 || blockIdx.x != 0) return;
+  const unsigned next = *c.stamp + 1u;
+  int nj = 0;
+  for (int pi = 0; pi < npicks; ++pi) {
+    const int e = sel_pred[pi];
+    if (tab[e].vram) continue;
+    bool have = false;
+    for (int k = 0; k < c.K && !have; ++k)
+      if (c.tag[k] == e) {
+        have = true;
+        c.use[k] = next;
+      }
+    if (have) continue;
+    int victim = -1;
+    unsigned best = 0xffffffffu;
+    for (int k = 0; k < c.K; ++k)
+      if (c.use[k] != next && c.use[k] < best) {
+        best = c.use[k];
+        victim = k;
+      }
+    if (victim < 0) break;
+    c.tag[victim] = e;
+    c.use[victim] = next;
+    job[1 + 2 * nj] = e;
+    job[2 + 2 * nj] = victim;
+    ++nj;
+  }
+  job[0] = nj;
+}
+// copy the listed experts' three matrices into their slots (blockIdx.y = item; blocks stride over the bytes)
+__global__ void k_pf_copy(const ExpertPtr* __restrict__ tab, const int* __restrict__ job, ReaderCache c, std::int64_t H, std::int64_t F) {
+  const int it = static_cast<int>(blockIdx.y);
+  if (it >= job[0]) return;
+  const ExpertPtr& X = tab[job[1 + 2 * it]];
+  std::uint8_t* sb = c.base + static_cast<std::uint64_t>(job[2 + 2 * it]) * c.slot_bytes;
+  const std::uint64_t len[3] = {X.rb[0] * static_cast<std::uint64_t>(F), X.rb[1] * static_cast<std::uint64_t>(F), X.rb[2] * static_cast<std::uint64_t>(H)};
+  std::uint64_t off = 0;
+  const std::uint64_t tid = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x, nth = static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
+  for (int pj = 0; pj < 3; ++pj) {
+    const std::uint8_t* src = X.w[pj];
+    std::uint8_t* dst = sb + off;
+    const std::uint64_t n = len[pj];
+    if (((reinterpret_cast<std::uintptr_t>(src) | reinterpret_cast<std::uintptr_t>(dst) | n) & 15u) == 0) {
+      const uint4* s4 = reinterpret_cast<const uint4*>(src);
+      uint4* d4 = reinterpret_cast<uint4*>(dst);
+      for (std::uint64_t i = tid; i < n / 16; i += nth) d4[i] = s4[i];
+    } else {
+      for (std::uint64_t i = tid; i < n; i += nth) dst[i] = src[i];
+    }
+    off += n;
+  }
+}
+bool reader_prefetch(const ExpertPtr* tab, const std::int32_t* sel_pred, int npicks, const ReaderCache* cache, std::int64_t H, std::int64_t F, int* job,
+                     Stream s) {
+  if (!tab || !sel_pred || !cache || cache->K <= 0 || !job || npicks <= 0 || npicks > 64) return fail("reader_prefetch: bad arguments");
+  k_pf_assign<<<1, 32, 0, st(s)>>>(tab, sel_pred, npicks, *cache, job);
+  k_pf_copy<<<dim3(32u, static_cast<unsigned>(npicks)), 256, 0, st(s)>>>(tab, job, *cache, H, F);
+  return launched("reader_prefetch");
+}
+void* event_new() {
+  cudaEvent_t e = nullptr;
+  if (!ck(cudaEventCreateWithFlags(&e, cudaEventDisableTiming), "cudaEventCreate")) return nullptr;
+  return e;
+}
+void event_free(void* e) {
+  if (e) cudaEventDestroy(static_cast<cudaEvent_t>(e));
+}
+bool event_record(void* e, Stream s) { return ck(cudaEventRecord(static_cast<cudaEvent_t>(e), st(s)), "cudaEventRecord"); }
+bool stream_wait(Stream s, void* e) { return ck(cudaStreamWaitEvent(st(s), static_cast<cudaEvent_t>(e), 0), "cudaStreamWaitEvent"); }
 }  // namespace pelias::kern::gpu

@@ -56,6 +56,11 @@ bool capture_end(Stream, void** exec) {
 }
 bool graph_launch(void*, Stream) { return false; }
 void graph_free(void*) {}
+bool reader_prefetch(const ExpertPtr*, const std::int32_t*, int, const ReaderCache*, std::int64_t, std::int64_t, int*, Stream) { return false; }
+void* event_new() { return nullptr; }
+void event_free(void*) {}
+bool event_record(void*, Stream) { return false; }
+bool stream_wait(Stream, void*) { return false; }
 bool moe_reader3(const ExpertPtr*, const ExpertPtr*, const std::int32_t*, const float*, const float*, int, const float*, std::int64_t, std::int64_t, std::int64_t,
                  std::uint64_t, const ReaderCache*, float*, float*, float*, int*, ExpertPtr*, ExpertPtr*, float*, unsigned long long*, Stream) {
   return false;

@@ -546,6 +546,14 @@ struct GpuEngine::Impl {
   std::map<std::tuple<int, int, int, int>, void*> graphs;
   std::map<std::tuple<int, int, int, int>, int> graph_seen;
   std::uint64_t graph_replays = 0, graph_captures = 0;
+  // v26 prefetch
+  bool pf_ok = false;
+  g::Stream side = nullptr;
+  std::vector<void*> ev_a, ev_b;
+  float *xp = nullptr, *lp = nullptr, *wselp = nullptr;
+  std::int32_t* selp = nullptr;
+  int* pfjob = nullptr;
+  std::vector<std::uint8_t> pf_issued;  // per layer: a prefetch for it is in flight this step
   float* r3y = nullptr;
   std::size_t r3y_floats = 0;
   Status prod_r3(std::initializer_list<std::pair<const DevW*, float*>> jobs, const float* xin, int64_t n = 1) {
@@ -956,6 +964,10 @@ struct GpuEngine::Impl {
                  !g::deltanet_gates(gsh, galpha, zero2, zero2, n, 1)))
       return gfail("engine: shared gate");
     unsigned long long* tsl = trc_ts_d ? trc_ts_d + 6 * static_cast<int64_t>(il) : nullptr;
+    if (pf_ok && il < pf_issued.size() && pf_issued[il]) {  // v26: this layer's prefetch (issued after the previous layer) is done
+      if (!g::stream_wait(nullptr, ev_b[il - 1])) return gfail("engine: prefetch wait");
+      pf_issued[il] = 0;
+    }
     const bool rd_ok =
         o.reader_v3
             ? g::moe_reader3(rtab + static_cast<int64_t>(il) * ne, fold ? rshx + il : nullptr, sel, wsel, gsh, static_cast<int>(nu), xr, n, e, s.n_ff_exp,
@@ -1272,6 +1284,17 @@ GpuEngine::~GpuEngine() {
   g::dfree(p_->act_mem);
   g::dfree(p_->dense_mem);
   g::dfree(p_->state_mem);
+  if (p_->side) {  // v26 prefetch
+    g::sync(p_->side);
+    g::stream_free(p_->side);
+  }
+  for (void* ev : p_->ev_a) g::event_free(ev);
+  for (void* ev : p_->ev_b) g::event_free(ev);
+  g::dfree(p_->xp);
+  g::dfree(p_->lp);
+  g::dfree(p_->wselp);
+  g::dfree(p_->selp);
+  g::dfree(p_->pfjob);
   if (p_->stm) {  // v26
     g::sync();
     g::set_stream(nullptr);
@@ -1458,11 +1481,11 @@ void GpuEngine::timeline_reset() {
 std::string GpuEngine::summary() const {
   const Impl& I = *p_;
   char b[1024];
-  std::snprintf(b, sizeof b, "engine: %.2f GB on the device (dense + output %.2f GB, bank %.2f GB = %d experts of %u, cache + state %.2f GB); %d CPU threads; ctx %d, batch %d; hand-off %s; router tie band %g; expert reader %s; batch-identical %s; graph %s",
+  std::snprintf(b, sizeof b, "engine: %.2f GB on the device (dense + output %.2f GB, bank %.2f GB = %d experts of %u, cache + state %.2f GB); %d CPU threads; ctx %d, batch %d; hand-off %s; router tie band %g; expert reader %s; batch-identical %s; graph %s; prefetch %s",
                 static_cast<double>(I.dev_bytes) / 1e9, static_cast<double>(I.dense_bytes_total) / 1e9, static_cast<double>(I.bank_bytes_total) / 1e9, I.bank_count,
                 I.s.n_layer * I.s.n_expert, static_cast<double>(I.cache_bytes) / 1e9, I.pool ? I.pool->threads() : 0, I.o.max_ctx, I.o.max_batch,
                 I.bell ? "doorbell" : "device sync per layer", static_cast<double>(I.o.router_tie), I.reader_note.c_str(), I.o.batch_identical ? "on" : "off",
-                I.graph_note.c_str());
+                I.graph_note.c_str(), I.pf_ok ? "on" : "off");
   return b;
 }
 
@@ -1765,6 +1788,23 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
   } else if (o.graph) {
     I.graph_note = "off (needs the expert reader)";
   }
+  if (o.prefetch && I.reader && !I.rcache.empty()) {  // v26
+    const int64_t nuq = s.n_expert_used, np4 = Impl::kReaderMax;
+    I.side = g::stream_new();
+    I.xp = static_cast<float*>(g::dalloc(z(np4 * s.n_embd) * sizeof(float)));
+    I.lp = static_cast<float*>(g::dalloc(z(np4 * s.n_expert) * sizeof(float)));
+    I.wselp = static_cast<float*>(g::dalloc(z(np4 * nuq) * sizeof(float)));
+    I.selp = static_cast<std::int32_t*>(g::dalloc(z(np4 * nuq) * sizeof(std::int32_t)));
+    I.pfjob = static_cast<int*>(g::dalloc(z(1 + 2 * np4 * nuq) * sizeof(int)));
+    bool ok = I.side && I.xp && I.lp && I.wselp && I.selp && I.pfjob;
+    for (std::uint32_t il = 0; ok && il < s.n_layer; ++il) {
+      I.ev_a.push_back(g::event_new());
+      I.ev_b.push_back(g::event_new());
+      ok = I.ev_a.back() && I.ev_b.back();
+    }
+    I.pf_issued.assign(s.n_layer, 0);
+    I.pf_ok = ok;
+  }
   return R::good(std::unique_ptr<GpuEngine>(new GpuEngine(std::move(p))));
 }
 
@@ -1851,6 +1891,7 @@ Status GpuEngine::Impl::run(const std::int32_t* tokens, int n, float* logits, bo
     *I.pos_hp = static_cast<int>(I.pos);
     if (!g::h2d_async(I.pos_d, I.pos_hp, sizeof(int))) return gfail("engine: position");
   }
+  std::fill(I.pf_issued.begin(), I.pf_issued.end(), std::uint8_t{0});  // v26: no prefetch in flight from an earlier step
   I.trunk_dp = I.graph_ok;
   struct DpReset {
     bool& f;
@@ -1878,6 +1919,19 @@ Status GpuEngine::Impl::run(const std::int32_t* tokens, int n, float* logits, bo
         return gfail("engine: probe copy");
     }
     if (!g::add_rows(I.x, e, I.y, e, nullptr, e, n)) return gfail("engine: residual");
+    if (rd && I.pf_ok && il + 1 < s.n_layer) {  // v26: predict the next layer's picks, prefetch its file experts on the side stream
+      Layer& Dn = I.L[il + 1];
+      const int64_t nuq = s.n_expert_used;
+      if (!g::rms_norm(I.x, Dn.post_norm, I.xp, e, 1, e, e, n, s.rms_eps)) return gfail("engine: prefetch norm");
+      if (!(st = I.prod(Dn.gate_inp, I.xp, n, I.lp))) return st;
+      if (!g::router_topk(I.lp, s.n_expert, n, static_cast<int>(nuq), s.expert_weights_scale, I.selp, I.wselp, nullptr, I.o.router_tie) ||
+          !g::event_record(I.ev_a[il], nullptr) || !g::stream_wait(I.side, I.ev_a[il]) ||
+          !g::reader_prefetch(I.rtab + static_cast<int64_t>(il + 1) * s.n_expert, I.selp, static_cast<int>(n * nuq), &I.rcache[il + 1], e, s.n_ff_exp, I.pfjob,
+                              I.side) ||
+          !g::event_record(I.ev_b[il], I.side))
+        return gfail("engine: prefetch");
+      I.pf_issued[il + 1] = 1;
+    }
     if (!I.opstamp(15)) return gfail("engine: stamp");
     if (I.probe_pos >= I.pos && I.probe_pos < I.pos + n && I.probe_xd) {  // v23: this row's residual and picks after the layer
       const int64_t r = I.probe_pos - I.pos, nuq = s.n_expert_used;
