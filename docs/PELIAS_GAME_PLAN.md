@@ -32,7 +32,7 @@ Copyright (c) 2026 John Lipka and the Pelias contributors
 **Direction (author 17:46):** the GPU does all of the decoding, as originally intended. The CPU only does work that is free and never on the token's path. Every other pathway and the trainer's methods are measured; the only goal left is the speed.
 
 **Build order** (each stage: prediction, gate, log, push; nothing reordered without the author):
-1. **Clean-up.** The reader compiled without the plane-test code (-1.3 ms per token, MEASURED v29); all-GPU (R1) the default again; the CPU split code kept, switched off.
+1. **Clean-up. DONE 18:05-18:07, PASS: R1 23.64-23.78 ms (42.1-42.3 tok/s median), G KL 3.357e-03 PASS.** The reader compiled without the plane-test code (-1.3 ms per token, MEASURED v29); all-GPU (R1) the default again; the CPU split code kept, switched off.
 2. **46a. One persistent R3 launch per token (Line A):** dense layers, router + top-k, and the VRAM experts (bank + cache) in one launch; per-expert counters at gate/up -> down instead of global barriers.
 3. **46b. Misses inside the launch:** experts not in VRAM read zero-copy from pinned RAM by the same launch (21.0 GB/s MEASURED), alongside the VRAM streaming.
 4. **46c. Capacity and prefetch:** token_embd to host RAM (B10, one row per token, lossless; 540 MB freed) and the spare VRAM as expert cache slots (+23 per layer, DERIVED); the copy engines (no SMs) prefetch the next layer's predicted misses into slots; **slot-ready flags**: a slot not ready is read zero-copy, so the GPU never waits.
@@ -41,6 +41,7 @@ Copyright (c) 2026 John Lipka and the Pelias contributors
 Then, a separate track: **prefill** (~50 tok/s today vs the 1,670 tok/s at 12k gate).
 
 **The CPU's roles (all free, none gating):** issue the prefetch copies and set the slot-ready flags; accuracy planes (top-4 picks, GPU first / exact CPU late); the token_embd row gather.
+**CPU accuracy check (author 18:05-18:07):** off the token path, may skip, never waits. After each token the GPU copies a small sample (a few layers / experts) of its inputs and outputs to pinned RAM; the CPU recomputes it exactly on its own time and logs differences. It recomputes only experts whose weights stay resident in its L3 (a small rotating set; size from lscpu, UNMEASURED, read at 46b), so it reads no RAM and does not compete with the GPU's pinned reads (heavy CPU load cost the GPU's RAM bandwidth 4.8% in v45 SNOOP, MEASURED). If the GPU's RAM reads slow, prefetch starts earlier and fills more VRAM slots. Guard: the check pauses if the per-token time rises. Test at 46b: tok/s with the check off / L3-only / unrestricted; it stays on only at 0% cost.
 **Stopped:** CPU decoding on the token path, CPU kernel tuning, WSL thread / scheduler experiments, any design in which the GPU waits on the CPU, planes traded for VRAM room.
 
 **Expected (sandbox model46.py, DERIVED from MEASURED inputs; details in "v46 sandbox model" below):** 46a-b 12.7-14.7 ms per token; + 46c slots 11.2-13.2; + prefetch 8.2-10.2 ms (98-122 tok/s); + head sketch -0.73 ms; + MTP 144-174 tok/s. Largest unknowns, measured stage by stage: the non-GEMV work inside the launch (1-3 ms assumed) and R3's rate on this file (318-467 GB/s).
