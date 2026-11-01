@@ -2325,7 +2325,7 @@ int cmd_engine_check(const Args& a) {
                  "                           [--no-doorbell] [--timeline-ops] [--split-ref] [--bank-selftest MIXES] [--probe-pos P]\n"
                  "                           [--router-tie BAND] [--cold-on-gpu] [--trace OUT.tsv] [--reader-v25] [--reader-cache K] [--fold-shared]\n"
                  "                           [--batch-identical] [--graph] [--prefetch] [--plane-tail N] [--cpu-light] [--reader-rpw 1|2]\n"
-                 "                           [--pin-gap-kib K] [--ref-threads N]\n");
+                 "                           [--pin-gap-kib K] [--ref-threads N] [--no-cpu-light] [--split-slow]\n");
     return 1;
   }
   auto num = [&](const char* k, std::uint64_t d, std::uint64_t lo, std::uint64_t hi, std::uint64_t& out) {
@@ -2418,7 +2418,10 @@ int cmd_engine_check(const Args& a) {
     eo.reader_cache = static_cast<int>(rc.value);
   }
   // v28: the author's split (light experts on the CPU, heavy pinned for the GPU), rows per warp, the pin merge gap
-  eo.cpu_light = a.has("cpu-light");
+  // v28b (author 23:14): the split is the default start-up path (heavy experts pinned, light ones on the CPU); --no-cpu-light
+  // pins every expert outside the bank and reads them all on the GPU
+  eo.cpu_light = !a.has("no-cpu-light");
+  eo.split_slow = a.has("split-slow");
   if (a.has("reader-rpw")) {
     const Result<std::uint64_t> rw = io::parse_whole(a.get("reader-rpw"), 2);
     if (!rw.ok() || rw.value < 1) {
@@ -2691,6 +2694,12 @@ int cmd_engine_check(const Args& a) {
       std::printf("  MTP time: prompt %.3f s; drafts %d x %.1f ms = %.3f s; verify %.3f s (by batch size %s); keep %.3f s; MTP catch-up %.3f s; promote %.3f s; host argmax %.3f s\n",
                   tmg.prompt_s, tmg.drafts, tmg.drafts ? 1e3 * tmg.draft_s / tmg.drafts : 0.0, tmg.draft_s, vs, vb_s.c_str(), tmg.keep_s, tmg.catchup_s, tmg.promote_s,
                   tmg.argmax_s);
+      // v28b (author 23:14, the unlisted ~1.5 s): the MTP run's total minus the plain run's prefill still holds the MTP run's own
+      // longer prompt phase; here the decode phase alone, and what is left after the listed parts
+      const double mtp_dec = mtp_s + pre_s - tmg.prompt_s;
+      const double listed = tmg.draft_s + vs + tmg.keep_s + tmg.catchup_s + tmg.promote_s + tmg.argmax_s;
+      std::printf("  MTP check: plain prefill %.3f s, MTP prompt %.3f s (%.3f s more, charged to the MTP run above); decode phase alone: plain %.3f s vs MTP %.3f s = %.2fx; listed parts %.3f s, not listed %.3f s\n",
+                  pre_s, tmg.prompt_s, tmg.prompt_s - pre_s, plain_s, mtp_dec, mtp_dec > 0 ? plain_s / mtp_dec : 0.0, listed, mtp_dec - listed);
       if (a.has("timeline")) {
         const model::EngineTimeline& T = eng.value->timeline();
         for (int b2 = 1; b2 < 10; ++b2) {

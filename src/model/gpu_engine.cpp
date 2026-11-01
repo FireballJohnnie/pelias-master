@@ -16,6 +16,9 @@
 #include <map>
 #include <mutex>
 #include <thread>
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
 
 #include "kern/cpu_dot.h"
 #include "kern/gpu_ops.h"
@@ -71,6 +74,37 @@ class Pool {
     std::atomic<std::int64_t> busy_ns{0};
     std::atomic<std::int64_t> wake_ns{-1};
   };
+  // v28b (author 23:14): while hot, idle workers spin (no sleep, no OS wake-up) so a split step's per-layer jobs start at once
+  void set_hot(bool h) { hot_.store(h, std::memory_order_release); }
+  // v28b: two phases in one dispatch: items 0 .. n1-1 run fn1, then (each worker waits until every phase-1 item is done)
+  // items 0 .. n2-1 run fn2. One generation bump per call: one wake-up per layer instead of one per stage.
+  void run2(int64_t n1, const std::function<void(int64_t)>& fn1, int64_t n2, const std::function<void(int64_t)>& fn2) {
+    if (n1 + n2 <= 0) return;
+    rs_ = nullptr;
+    t0_ = Clock::now();
+    if (th_.empty()) {
+      for (int64_t i = 0; i < n1; ++i) fn1(i);
+      for (int64_t i = 0; i < n2; ++i) fn2(i);
+      return;
+    }
+    fn_ = &fn1;
+    fn2_ = &fn2;
+    n_ = n1;
+    n2_ = n2;
+    done1_.store(0, std::memory_order_relaxed);
+    next_.store(0, std::memory_order_relaxed);
+    active_.store(static_cast<int>(th_.size()), std::memory_order_relaxed);
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      gen_.fetch_add(1, std::memory_order_release);
+    }
+    if (!hot_.load(std::memory_order_acquire)) cv_.notify_all();
+    work2(true);
+    for (int spin = 0; active_.load(std::memory_order_acquire) != 0; ++spin)
+      if (spin > kSpin && !hot_.load(std::memory_order_relaxed)) std::this_thread::yield();
+    fn2_ = nullptr;
+    n2_ = 0;
+  }
   void run(int64_t n, const std::function<void(int64_t)>& fn, RunStats* rs = nullptr) {
     if (n <= 0) return;
     rs_ = rs;
@@ -80,6 +114,7 @@ class Pool {
       return;
     }
     fn_ = &fn;
+    fn2_ = nullptr;
     n_ = n;
     next_.store(0, std::memory_order_relaxed);
     active_.store(static_cast<int>(th_.size()), std::memory_order_relaxed);
@@ -95,6 +130,26 @@ class Pool {
 
  private:
   static constexpr int kSpin = 4000;
+  static void relax() {
+#if defined(__x86_64__) || defined(_M_X64)
+    _mm_pause();
+#else
+    std::this_thread::yield();
+#endif
+  }
+  // v28b: the phased job's items (phase 2 waits for every phase-1 item)
+  void work2(bool) {
+    const int64_t n1 = n_, n2 = n2_;
+    for (int64_t i = next_.fetch_add(1, std::memory_order_relaxed); i < n1 + n2; i = next_.fetch_add(1, std::memory_order_relaxed)) {
+      if (i < n1) {
+        (*fn_)(i);
+        done1_.fetch_add(1, std::memory_order_acq_rel);
+      } else {
+        while (done1_.load(std::memory_order_acquire) < n1) relax();
+        (*fn2_)(i - n1);
+      }
+    }
+  }
   static std::int64_t ns(Clock::duration d) { return std::chrono::duration_cast<std::chrono::nanoseconds>(d).count(); }
   void work(const std::function<void(int64_t)>& fn, int64_t n, bool worker) {
     RunStats* rs = rs_;
@@ -124,14 +179,20 @@ class Pool {
     std::uint64_t seen = 0;
     for (;;) {
       bool got = false;
-      for (int spin = 0; spin < kSpin && !got; ++spin) got = gen_.load(std::memory_order_acquire) != seen || stop_.load(std::memory_order_acquire);
+      for (int spin = 0; !got; ++spin) {
+        got = gen_.load(std::memory_order_acquire) != seen || stop_.load(std::memory_order_acquire);
+        if (got) break;
+        if (spin >= kSpin && !hot_.load(std::memory_order_acquire)) break;  // v28b: a hot pool never sleeps
+        if (spin >= kSpin) relax();
+      }
       if (!got) {
         std::unique_lock<std::mutex> lk(mu_);
         cv_.wait(lk, [&] { return stop_.load(std::memory_order_acquire) || gen_.load(std::memory_order_acquire) != seen; });
       }
       if (stop_.load(std::memory_order_acquire)) return;
       seen = gen_.load(std::memory_order_acquire);
-      work(*fn_, n_, true);
+      if (fn2_) work2(true);
+      else work(*fn_, n_, true);
       active_.fetch_sub(1, std::memory_order_acq_rel);
     }
   }
@@ -139,7 +200,10 @@ class Pool {
   std::mutex mu_;
   std::condition_variable cv_;
   const std::function<void(int64_t)>* fn_ = nullptr;
-  int64_t n_ = 0;
+  const std::function<void(int64_t)>* fn2_ = nullptr;  // v28b: phase 2 of a run2 job (nullptr: a plain job)
+  int64_t n_ = 0, n2_ = 0;
+  std::atomic<int64_t> done1_{0};
+  std::atomic<bool> hot_{false};
   RunStats* rs_ = nullptr;  // written before the job's generation is released; read by the workers after they see it
   Clock::time_point t0_{};
   std::atomic<int64_t> next_{0};
@@ -778,6 +842,88 @@ struct GpuEngine::Impl {
     mark(4);
   }
 
+  // v28b (author 23:14, the split's CPU side in one dispatch per layer): the inputs rounded by the calling thread (1-4 rows),
+  // then one pool job in two phases: (1) gate / up row blocks of every expert group, the group's last block doing its silu
+  // and rounding (as v20); (2) down rows in blocks, each block computing every group's rows and then summing them per token in
+  // pick-slot order (the old combine's order and arithmetic, fused: no separate combine job). The pool is held hot for the
+  // whole step by the doorbell thread, so no worker sleeps between layers.
+  void cold_experts_fast(const Qwen35MoeLayer& l, int64_t n, const float* xsrc, float* ydst) {
+    const int64_t e = s.n_embd, ff = s.n_ff_exp;
+    const int64_t np = static_cast<int64_t>(cold.size());
+    std::fill(need.begin(), need.begin() + n, std::uint8_t{0});
+    for (const ColdPick& c : cold) need[z(c.t)] = 1;
+    for (int64_t t = 0; t < n; ++t)
+      if (need[z(t)]) kern::act_q8x32_quantize(xsrc + t * e, e, actx[z(t)]);
+    constexpr int64_t kRowsUp = 64, kRowsDown = 128, kGroup = 4;
+    grp.clear();
+    ord.resize(z(np));
+    for (int64_t p = 0; p < np; ++p) ord[z(p)] = static_cast<int>(p);
+    std::stable_sort(ord.begin(), ord.end(), [&](int pa, int pb) { return cold[z(pa)].e < cold[z(pb)].e; });
+    for (int64_t i = 0; i < np;) {
+      const int ex = cold[z(ord[z(i)])].e;
+      PickGroup gp;
+      gp.e = ex;
+      while (i < np && cold[z(ord[z(i)])].e == ex && gp.m < kGroup) gp.p[gp.m++] = ord[z(i++)];
+      grp.push_back(gp);
+    }
+    const int64_t ng = static_cast<int64_t>(grp.size());
+    const int64_t ub = (ff + kRowsUp - 1) / kRowsUp, db = (e + kRowsDown - 1) / kRowsDown;
+    for (int64_t gi = 0; gi < ng; ++gi) grp_left[z(gi)].store(static_cast<int>(2 * ub), std::memory_order_relaxed);
+    const std::function<void(int64_t)> up_fn = [&](int64_t u) {
+      const int64_t gi = u / (2 * ub), rem = u % (2 * ub), proj = rem / ub, r0 = (rem % ub) * kRowsUp, r1 = std::min(ff, r0 + kRowsUp);
+      const PickGroup& gp = grp[z(gi)];
+      const ExpRows R = exp_rows(proj == 0 ? l.gate_exps : l.up_exps, gp.e);
+      const kern::ActQ8x32* acts[kGroup] = {};
+      float* outs[kGroup] = {};
+      for (int j = 0; j < gp.m; ++j) {
+        acts[j] = &actx[z(cold[z(gp.p[j])].t)];
+        outs[j] = (proj == 0 ? gbuf.data() : ubuf.data()) + static_cast<int64_t>(gp.p[j]) * ff;
+      }
+      float o4[kGroup];
+      for (int64_t r = r0; r < r1; ++r) {
+        kern::dot_row_q8(R.t, R.base + static_cast<std::uint64_t>(r) * R.rb, e, nullptr, acts, gp.m, o4);
+        for (int j = 0; j < gp.m; ++j) outs[j][r] = o4[j];
+      }
+      if (grp_left[z(gi)].fetch_sub(1, std::memory_order_acq_rel) == 1)
+        for (int j = 0; j < gp.m; ++j) {
+          const int64_t pk = gp.p[j];
+          float* gg = gbuf.data() + pk * ff;
+          const float* uu = ubuf.data() + pk * ff;
+          for (int64_t i = 0; i < ff; ++i) gg[i] = silu(gg[i]) * uu[i];
+          kern::act_q8x32_quantize(gg, ff, acth[z(pk)]);
+        }
+    };
+    const std::function<void(int64_t)> down_fn = [&](int64_t u) {
+      const int64_t r0 = u * kRowsDown, r1 = std::min(e, r0 + kRowsDown);
+      for (int64_t gi = 0; gi < ng; ++gi) {
+        const PickGroup& gp = grp[z(gi)];
+        const ExpRows R = exp_rows(l.down_exps, gp.e);
+        const kern::ActQ8x32* acts[kGroup] = {};
+        float* outs[kGroup] = {};
+        for (int j = 0; j < gp.m; ++j) {
+          acts[j] = &acth[z(gp.p[j])];
+          outs[j] = dbuf.data() + static_cast<int64_t>(gp.p[j]) * e;
+        }
+        float o4[kGroup];
+        for (int64_t r = r0; r < r1; ++r) {
+          kern::dot_row_q8(R.t, R.base + static_cast<std::uint64_t>(r) * R.rb, ff, nullptr, acts, gp.m, o4);
+          for (int j = 0; j < gp.m; ++j) outs[j][r] = o4[j];
+        }
+      }
+      for (int64_t t = 0; t < n; ++t) {  // this block's rows of each token's sum, picks in slot order (the combine's order)
+        float* yt = ydst + t * e;
+        std::fill(yt + r0, yt + r1, 0.0f);
+        for (int64_t p = 0; p < np; ++p) {
+          if (cold[z(p)].t != t) continue;
+          const float wgt = cold[z(p)].w;
+          const float* d = dbuf.data() + p * e;
+          for (int64_t i = r0; i < r1; ++i) yt[i] += wgt * d[i];
+        }
+      }
+    };
+    pool->run2(ng * 2 * ub, up_fn, db, down_fn);
+  }
+
   Status moe_block(const Qwen35MoeLayer& l, Layer& D, int64_t n, EngineStats& es) {
     const int64_t e = s.n_embd, ne = s.n_expert, nu = s.n_expert_used, ffs = s.n_ff_shexp;
     Status st;
@@ -873,6 +1019,7 @@ struct GpuEngine::Impl {
       EngineStats es;
       std::string err;
       const int64_t e = s.n_embd, ne = s.n_expert, nu = s.n_expert_used;
+      if (split) pool->set_hot(true);  // v28b: the workers spin through the whole step
       for (std::uint32_t il = 0; il < s.n_layer; ++il) {
         const unsigned g = g0 + il;
         const Clock::time_point tw = Clock::now();
@@ -914,6 +1061,7 @@ struct GpuEngine::Impl {
           }
           const Clock::time_point tc = Clock::now();
           if (cold.empty()) std::fill(yd, yd + n * e, 0.0f);
+          else if (split && !o.split_slow) cold_experts_fast(w->layers[il], n, xn_m, yd);
           else cold_experts_io(w->layers[il], n, xn_m, yd, tlp);
           const double ct_l = since(tc);
           es.cold_seconds += ct_l;
@@ -922,6 +1070,7 @@ struct GpuEngine::Impl {
         std::atomic_thread_fence(std::memory_order_seq_cst);
         std::atomic_ref<unsigned>(*fb_h).store(g, std::memory_order_release);
       }
+      if (split) pool->set_hot(false);
       {
         std::lock_guard<std::mutex> lk(bmu);
         bst = es;
@@ -2185,7 +2334,10 @@ Status GpuEngine::Impl::run(const std::int32_t* tokens, int n, float* logits, bo
     es.hot_picks += I.bst.hot_picks;
     es.cold_picks += I.bst.cold_picks;
     es.cold_bytes += I.bst.cold_bytes;
-    if (cl) es.hot_picks -= std::min<std::uint64_t>(es.hot_picks, I.bst.cold_picks);  // the reader step counted every pick on the GPU
+    if (cl) {  // v28b: per layer on both sides (the reader step had counted n x nu once for the whole step)
+      const std::uint64_t all = static_cast<std::uint64_t>(n) * static_cast<std::uint64_t>(s.n_expert_used) * s.n_layer;
+      es.hot_picks = all - std::min<std::uint64_t>(all, I.bst.cold_picks);
+    }
     if (bl && I.tl_on && I.ts_h) {  // the GPU's timestamps of this step (synced above), per layer
       auto d = [](unsigned long long a, unsigned long long b) { return static_cast<double>(static_cast<std::int64_t>(b - a)) * 1e-9; };
       for (std::uint32_t il = 0; il < s.n_layer; ++il) {
