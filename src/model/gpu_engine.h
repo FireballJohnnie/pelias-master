@@ -108,6 +108,15 @@ struct EngineOptions {
   // base plane (each code's value replaced by the mean of the four sharing its top two bits). Lossy: for the accuracy gate
   // (the bytes read do not change yet). 0: off.
   int plane_tail = 0;
+  // v28 (author 22:02-22:27, the author's split): with the reader, light experts (every matrix Q4_TG2, not in the bank) are
+  // computed by the CPU from the unpinned file through the doorbell (cpu_threads workers), while the GPU reads the heavy
+  // file experts and the bank; only the heavy experts are pinned. The CPU's sum is added after the reader.
+  bool cpu_light = false;
+  // v28: gate / up rows per warp in the reader v3 kernels (1 or 2; 2 = v26's shape)
+  int reader_rows_per_warp = 2;
+  // v28: pinned ranges are merged across gaps smaller than this (bytes; v27 used 8 MiB; 0 = exact ranges, one per matrix
+  // run)
+  std::uint64_t pin_gap = std::uint64_t{8} << 20;
 };
 
 struct EngineStats {
@@ -115,6 +124,7 @@ struct EngineStats {
   double cold_seconds = 0.0; // the CPU's cold-expert work (inside the step; overlaps the GPU's bank experts)
   double wait_seconds = 0.0; // host waiting on the device (router picks, the cold sum's hand-back)
   std::uint64_t hot_picks = 0, cold_picks = 0;
+  std::uint64_t cold_bytes = 0;  // v28: bytes of the cold experts the CPU computed (gate + up + down matrices, each pick)
 };
 
 // v19 timeline (EngineOptions::timeline), summed over the steps since timeline_reset(). Per layer, GPU clock: dense = from

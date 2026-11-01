@@ -180,6 +180,8 @@ struct Layer {
   std::vector<g::PromptWeights> bg, bu, bd;
   std::vector<std::uint8_t> hot;  // n_expert flags
   int n_hot = 0;
+  std::vector<std::uint8_t> light;  // v28 split: n_expert flags (every matrix Q4_TG2, not in the bank): the CPU computes them
+  int n_light = 0;
   void* bank_mem = nullptr;
   // state
   float *K = nullptr, *V = nullptr;          // full attention: max_ctx x kv_w each
@@ -255,6 +257,13 @@ struct GpuEngine::Impl {
   // v26 reader v3: the shared expert per layer (device), the groups' sources / fills, the cache
   g::ExpertPtr *rshx = nullptr, *rgsrc = nullptr, *rgfill = nullptr;
   bool fold_ok = false;
+  // v28 the author's split: the light experts' mask (n_layer x n_expert, device), the doorbell generation on the device
+  std::uint8_t* lmask_d = nullptr;
+  unsigned* gen_d = nullptr;
+  unsigned* gen_hp = nullptr;
+  void* gen_hv = nullptr;
+  bool split_ok = false;
+  std::string split_note = "off";
   std::uint64_t cache_reserved = 0, cslot = 0;
   void* cache_mem = nullptr;
   void* cache_meta = nullptr;
@@ -307,6 +316,7 @@ struct GpuEngine::Impl {
   std::mutex bmu;
   std::condition_variable bcv;
   bool bstop = false, bjob = false, bbusy = false;
+  bool bsplit = false;  // v28: this step's CPU side takes the light picks (reader step) rather than every non-bank pick
   int bn = 0;
   unsigned bg0 = 0;
   std::atomic<bool> bcancel{false};
@@ -850,6 +860,7 @@ struct GpuEngine::Impl {
     for (;;) {
       int n = 0;
       unsigned g0 = 0;
+      bool split = false;
       {
         std::unique_lock<std::mutex> lk(bmu);
         bcv.wait(lk, [&] { return bstop || bjob; });
@@ -857,6 +868,7 @@ struct GpuEngine::Impl {
         bjob = false;
         n = bn;
         g0 = bg0;
+        split = bsplit;
       }
       EngineStats es;
       std::string err;
@@ -886,10 +898,20 @@ struct GpuEngine::Impl {
             for (int64_t j = 0; j < nu; ++j) {
               const int ex = sel_m[z(t * nu + j)];
               if (ex < 0 || ex >= ne) continue;
-              if (L[il].hot[z(ex)]) ++es.hot_picks;
-              else cold.push_back(ColdPick{static_cast<int>(t), ex, wsel_m[z(t * nu + j)]});
+              if (split) {  // v28: only the light experts are the CPU's; the GPU counts the rest
+                if (!L[il].light.empty() && L[il].light[z(ex)]) cold.push_back(ColdPick{static_cast<int>(t), ex, wsel_m[z(t * nu + j)]});
+              } else if (L[il].hot[z(ex)]) {
+                ++es.hot_picks;
+              } else {
+                cold.push_back(ColdPick{static_cast<int>(t), ex, wsel_m[z(t * nu + j)]});
+              }
             }
           es.cold_picks += cold.size();
+          {
+            const Qwen35MoeLayer& lw = w->layers[il];
+            for (const ColdPick& c : cold)
+              for (const WeightView* v : {&lw.gate_exps, &lw.up_exps, &lw.down_exps}) es.cold_bytes += exp_rows(*v, c.e).rb * v->ne[1];
+          }
           const Clock::time_point tc = Clock::now();
           if (cold.empty()) std::fill(yd, yd + n * e, 0.0f);
           else cold_experts_io(w->layers[il], n, xn_m, yd, tlp);
@@ -964,6 +986,11 @@ struct GpuEngine::Impl {
                  !g::deltanet_gates(gsh, galpha, zero2, zero2, n, 1)))
       return gfail("engine: shared gate");
     unsigned long long* tsl = trc_ts_d ? trc_ts_d + 6 * static_cast<int64_t>(il) : nullptr;
+    if (split_ok) {  // v28: the picks and the normed rows to the CPU, ring: it computes the light picks while the GPU reads the rest
+      if (!g::to_host_async(sel_m, sel, z(n * nu) * sizeof(std::int32_t)) || !g::to_host_async(wsel_m, wsel, z(n * nu) * sizeof(float)) ||
+          !g::to_host_async(xn_m, xn, z(n * e) * sizeof(float)) || !g::bell_ring_dev(fa_d, gen_d, il))
+        return gfail("engine: split (picks to the CPU)");
+    }
     if (pf_ok && il < pf_issued.size() && pf_issued[il]) {  // v26: this layer's prefetch (issued after the previous layer) is done
       if (!g::stream_wait(nullptr, ev_b[il - 1])) return gfail("engine: prefetch wait");
       pf_issued[il] = 0;
@@ -971,7 +998,8 @@ struct GpuEngine::Impl {
     const bool rd_ok =
         o.reader_v3
             ? g::moe_reader3(rtab + static_cast<int64_t>(il) * ne, fold ? rshx + il : nullptr, sel, wsel, gsh, static_cast<int>(nu), xr, n, e, s.n_ff_exp,
-                             rrow_max, rcache.empty() ? nullptr : &rcache[il], rgu, rh, ryd, rgrp, rgsrc, rgfill, y, tsl, nullptr, o.plane_tail)
+                             rrow_max, rcache.empty() ? nullptr : &rcache[il], rgu, rh, ryd, rgrp, rgsrc, rgfill, y, tsl, nullptr, o.plane_tail,
+                             split_ok ? lmask_d + static_cast<int64_t>(il) * ne : nullptr, o.reader_rows_per_warp)
             : g::moe_reader(rtab + static_cast<int64_t>(il) * ne, sel, wsel, static_cast<int>(nu), xr, n, e, s.n_ff_exp, rrow_max, rgu, rh, ryd, rgrp, y, tsl);
     if (!rd_ok) return gfail("engine: expert reader");
     if (trc_src_d && o.reader_v3) {
@@ -997,6 +1025,8 @@ struct GpuEngine::Impl {
         return gfail("engine: shared gate");
       if (!g::add_rows(y, e, sh, e, gsh, e, n)) return gfail("engine: shared add");
     }
+    if (split_ok && (!g::bell_wait_dev(fb_d, gen_d, il) || !g::add_rows(y, e, yc_md, e, nullptr, e, n)))  // v28: the CPU's light sum
+      return gfail("engine: split (the CPU's sum)");
     if (!opstamp(12) || !opstamp(13) || !opstamp(14)) return gfail("engine: stamp");
     return Status::good();
   }
@@ -1082,14 +1112,40 @@ struct GpuEngine::Impl {
         }
       }
     if (hi <= lo) return;
+    // v28 the author's split: light experts (every matrix Q4_TG2, not in the bank) go to the CPU and are not pinned
+    const bool split = o.cpu_light && o.doorbell && o.reader_v3;
+    int n_light_all = 0;
+    std::uint64_t light_b = 0;
+    for (std::uint32_t il = 0; il < s.n_layer; ++il) {
+      L[il].light.assign(z(ne), 0);
+      L[il].n_light = 0;
+      if (!split) continue;
+      const WeightView* vv[3] = {&w->layers[il].gate_exps, &w->layers[il].up_exps, &w->layers[il].down_exps};
+      for (int64_t ex = 0; ex < ne; ++ex) {
+        if (L[il].hot[z(ex)]) continue;
+        bool lt = true;
+        std::uint64_t b = 0;
+        for (const WeightView* v : vv) {
+          const ExpRows r = exp_rows(*v, static_cast<int>(ex));
+          if (r.t != quant::Type::q4_tg2) lt = false;
+          b += r.rb * v->ne[1];
+        }
+        if (!lt) continue;
+        L[il].light[z(ex)] = 1;
+        ++L[il].n_light;
+        ++n_light_all;
+        light_b += b;
+      }
+    }
     // v27: pin only the experts the bank does not hold (the GPU reads the bank's from VRAM): their matrices as page-aligned
-    // ranges, merged where the gap between them is under 8 MiB (fewer, larger registrations); each range's device address
+    // ranges, merged where the gap between them is under o.pin_gap (v27: 8 MiB; fewer, larger registrations); each range's
+    // device address. v28: not the light experts either when the split is on.
     const std::uintptr_t pg = 4096;
     std::vector<std::pair<std::uintptr_t, std::uintptr_t>> want;
     for (std::uint32_t il = 0; il < s.n_layer; ++il)
       for (const WeightView* v : {&w->layers[il].gate_exps, &w->layers[il].up_exps, &w->layers[il].down_exps})
         for (int64_t ex = 0; ex < ne; ++ex) {
-          if (L[il].hot[z(ex)]) continue;
+          if (L[il].hot[z(ex)] || L[il].light[z(ex)]) continue;
           const ExpRows r = exp_rows(*v, static_cast<int>(ex));
           const auto a = reinterpret_cast<std::uintptr_t>(r.base);
           want.emplace_back(a & ~(pg - 1), (a + static_cast<std::uintptr_t>(r.rb * v->ne[1]) + pg - 1) & ~(pg - 1));
@@ -1097,7 +1153,7 @@ struct GpuEngine::Impl {
     std::sort(want.begin(), want.end());
     std::vector<std::pair<std::uintptr_t, std::uintptr_t>> runs;
     for (const auto& iv : want) {
-      if (!runs.empty() && iv.first <= runs.back().second + (std::uintptr_t{8} << 20)) runs.back().second = std::max(runs.back().second, iv.second);
+      if (!runs.empty() && iv.first <= runs.back().second + static_cast<std::uintptr_t>(o.pin_gap)) runs.back().second = std::max(runs.back().second, iv.second);
       else runs.push_back(iv);
     }
     std::vector<const std::uint8_t*> run_dev;
@@ -1135,18 +1191,44 @@ struct GpuEngine::Impl {
         for (int pj = 0; pj < 3; ++pj) {
           const ExpRows r = exp_rows(*vv[pj], static_cast<int>(ex));
           const std::uint8_t* bank = L[il].hot[z(ex)] && !L[il].bank_at[pj].empty() ? L[il].bank_at[pj][z(ex)] : nullptr;
-          X.w[pj] = bank ? bank : dev_of(r.base);
+          X.w[pj] = bank ? bank : L[il].light[z(ex)] ? nullptr : dev_of(r.base);
           X.type[pj] = static_cast<std::uint32_t>(r.t);
           X.rb[pj] = r.rb;
           if (bank) X.vram = 1;
         }
       }
     }
-    for (const g::ExpertPtr& X : tab)
+    for (std::size_t ti = 0; ti < tab.size(); ++ti) {
+      const g::ExpertPtr& X = tab[ti];
+      const std::uint32_t til = static_cast<std::uint32_t>(static_cast<int64_t>(ti) / ne);
+      if (L[til].light[z(static_cast<int64_t>(ti) % ne)]) continue;  // v28: the CPU's, never read by the GPU
       if (!X.w[0] || !X.w[1] || !X.w[2]) {
         reader_note = "off (an expert outside the pinned ranges)";
         return;
       }
+    }
+    if (split && n_light_all > 0) {  // v28: the mask; the doorbell generation on the device (written before each step)
+      std::vector<std::uint8_t> mask(z(static_cast<int64_t>(s.n_layer) * ne), 0);
+      for (std::uint32_t il = 0; il < s.n_layer; ++il)
+        for (int64_t ex = 0; ex < ne; ++ex) mask[z(static_cast<int64_t>(il) * ne + ex)] = L[il].light[z(ex)];
+      lmask_d = static_cast<std::uint8_t*>(g::dalloc(mask.size()));
+      gen_d = static_cast<unsigned*>(g::dalloc(256));
+      void* gdev = nullptr;
+      gen_hv = g::host_alloc_mapped(64, &gdev);
+      if (!lmask_d || !gen_d || !gen_hv || !g::to_device(lmask_d, mask.data(), mask.size())) {
+        reader_note = "off (device memory for the split's mask)";
+        return;
+      }
+      gen_hp = static_cast<unsigned*>(gen_hv);
+      dev_bytes += mask.size() + 256;
+      char sb[200];
+      std::snprintf(sb, sizeof sb, "on (%d light experts of %lld, %.2f GB, computed by the CPU from the unpinned file; %d CPU threads)", n_light_all,
+                    static_cast<long long>(ne) * static_cast<long long>(s.n_layer), static_cast<double>(light_b) / 1e9,
+                    o.cpu_threads > 0 ? o.cpu_threads : static_cast<int>(std::max(1u, std::thread::hardware_concurrency())));
+      split_note = sb;
+    } else if (o.cpu_light) {
+      split_note = split ? "off (no light experts outside the bank)" : "off (needs the doorbell and reader v3)";
+    }
     // v26: the shared expert as a pick (its three matrices as the batched kernels read them, in VRAM)
     std::vector<g::ExpertPtr> shx_h;
     if (o.fold_shared && o.reader_v3 && s.n_ff_shexp == s.n_ff_exp) {
@@ -1253,10 +1335,11 @@ struct GpuEngine::Impl {
     }
     reader = true;
     char b[160];
-    char b2[480];
-    std::snprintf(b2, sizeof b2, "on (%s, steps of 1-%d tokens; %.2f GB of the file (the experts outside the bank) registered in %zu ranges in %.2f s%s%s)",
-                  o.reader_v3 ? "v3" : "v25", kReaderMax, static_cast<double>(b1 - b0) / 1e9, runs.size(), reg_s, fold_ok ? "; shared expert folded in" : "",
-                  cache_note.c_str());
+    char b2[640];
+    std::snprintf(b2, sizeof b2, "on (%s, %d rows per warp, steps of 1-%d tokens; %.2f GB of the file (%s) registered in %zu ranges (gap %llu KiB) in %.2f s%s%s)",
+                  o.reader_v3 ? "v3" : "v25", o.reader_rows_per_warp, kReaderMax, static_cast<double>(b1 - b0) / 1e9,
+                  lmask_d ? "the heavy experts outside the bank" : "the experts outside the bank", runs.size(),
+                  static_cast<unsigned long long>(o.pin_gap >> 10), reg_s, fold_ok ? "; shared expert folded in" : "", cache_note.c_str());
     reader_note = b2;
     (void)b;
   }
@@ -1344,6 +1427,9 @@ GpuEngine::~GpuEngine() {
   g::dfree(p_->knew);
   g::dfree(p_->vnew);
   g::host_free(p_->pos_hv);
+  g::dfree(p_->lmask_d);
+  g::dfree(p_->gen_d);
+  g::host_free(p_->gen_hv);
 }
 
 std::int64_t GpuEngine::pos() const { return p_ ? p_->pos : 0; }
@@ -1520,12 +1606,12 @@ void GpuEngine::timeline_reset() {
 
 std::string GpuEngine::summary() const {
   const Impl& I = *p_;
-  char b[1024];
-  std::snprintf(b, sizeof b, "engine: %.2f GB on the device (dense + output %.2f GB, bank %.2f GB = %d experts of %u, cache + state %.2f GB); %d CPU threads; ctx %d, batch %d; hand-off %s; router tie band %g; expert reader %s; batch-identical %s; graph %s; prefetch %s",
+  char b[2048];
+  std::snprintf(b, sizeof b, "engine: %.2f GB on the device (dense + output %.2f GB, bank %.2f GB = %d experts of %u, cache + state %.2f GB); %d CPU threads; ctx %d, batch %d; hand-off %s; router tie band %g; expert reader %s; batch-identical %s; graph %s; prefetch %s; split %s",
                 static_cast<double>(I.dev_bytes) / 1e9, static_cast<double>(I.dense_bytes_total) / 1e9, static_cast<double>(I.bank_bytes_total) / 1e9, I.bank_count,
                 I.s.n_layer * I.s.n_expert, static_cast<double>(I.cache_bytes) / 1e9, I.pool ? I.pool->threads() : 0, I.o.max_ctx, I.o.max_batch,
                 I.bell ? "doorbell" : "device sync per layer", static_cast<double>(I.o.router_tie), I.reader_note.c_str(), I.o.batch_identical ? "on" : "off",
-                I.graph_note.c_str(), I.pf_ok ? "on" : "off");
+                I.graph_note.c_str(), I.pf_ok ? "on" : "off", I.split_note.c_str());
   return b;
 }
 
@@ -1806,6 +1892,10 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
       I.bell_th = std::thread([ip] { ip->bell_loop(); });
     }
   }
+  if (I.lmask_d) {  // v28: the split runs through the doorbell's CPU side
+    if (!I.bell) return R::fail(Status::fail(Code::internal, "engine: the split (cpu_light) needs the doorbell's mapped memory"));
+    I.split_ok = true;
+  }
   const Status rs = I.reset_state();
   if (!rs) return R::fail(rs);
   if (o.graph && I.reader) {  // v26: the engine's own stream (a graph cannot record the default stream), the device position
@@ -1828,7 +1918,7 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
   } else if (o.graph) {
     I.graph_note = "off (needs the expert reader)";
   }
-  if (o.prefetch && I.reader && !I.rcache.empty()) {  // v26
+  if (o.prefetch && I.reader && !I.rcache.empty() && !I.split_ok) {  // v26 (not with the v28 split: light experts have no device address)
     const int64_t nuq = s.n_expert_used, np4 = Impl::kReaderMax;
     I.side = g::stream_new();
     I.xp = static_cast<float*>(g::dalloc(z(np4 * s.n_embd) * sizeof(float)));
@@ -1898,16 +1988,22 @@ Status GpuEngine::Impl::run(const std::int32_t* tokens, int n, float* logits, bo
   const unsigned g0 = I.gen + 1;
   const bool rd = I.reader && n <= Impl::kReaderMax;  // v24: the reader's steps use no doorbell
   const bool bl = I.bell && !rd;
+  const bool cl = rd && I.split_ok;  // v28: a reader step whose light picks the CPU computes
   I.bi_now = rd && I.o.batch_identical;  // v26 option B
   struct BiReset {
     bool& f;
     ~BiReset() { f = false; }
   } bi_reset{I.bi_now};
-  if (bl) {  // the CPU side starts waiting for this step's rings
+  if (bl || cl) {  // the CPU side starts waiting for this step's rings
+    if (cl) {  // v28: the generation the reader steps' rings carry (device-resident, so a graph replay rings this step's)
+      *I.gen_hp = g0;
+      if (!g::h2d_async(I.gen_d, I.gen_hp, sizeof(unsigned))) return gfail("engine: split generation");
+    }
     {
       std::lock_guard<std::mutex> lk(I.bmu);
       I.bn = n;
       I.bg0 = g0;
+      I.bsplit = cl;
       I.bjob = true;
       I.bbusy = true;
       I.bcancel.store(false, std::memory_order_relaxed);
@@ -1925,7 +2021,7 @@ Status GpuEngine::Impl::run(const std::int32_t* tokens, int n, float* logits, bo
       std::unique_lock<std::mutex> lk(I.bmu);
       I.bcv.wait(lk, [&] { return !I.bbusy; });
     }
-  } guard{I, bl};
+  } guard{I, bl || cl};
   Status st;
   if (I.graph_ok) {  // v26: the step's position for the device-side readers (on the engine's stream, before the layers)
     *I.pos_hp = static_cast<int>(I.pos);
@@ -2079,7 +2175,7 @@ Status GpuEngine::Impl::run(const std::int32_t* tokens, int n, float* logits, bo
       ++I.tline.ops_steps;
     }
   }
-  if (bl) {
+  if (bl || cl) {
     guard.armed = false;
     std::unique_lock<std::mutex> lk(I.bmu);
     I.bcv.wait(lk, [&] { return !I.bbusy; });
@@ -2088,7 +2184,9 @@ Status GpuEngine::Impl::run(const std::int32_t* tokens, int n, float* logits, bo
     es.cold_seconds += I.bst.cold_seconds;
     es.hot_picks += I.bst.hot_picks;
     es.cold_picks += I.bst.cold_picks;
-    if (I.tl_on && I.ts_h) {  // the GPU's timestamps of this step (synced above), per layer
+    es.cold_bytes += I.bst.cold_bytes;
+    if (cl) es.hot_picks -= std::min<std::uint64_t>(es.hot_picks, I.bst.cold_picks);  // the reader step counted every pick on the GPU
+    if (bl && I.tl_on && I.ts_h) {  // the GPU's timestamps of this step (synced above), per layer
       auto d = [](unsigned long long a, unsigned long long b) { return static_cast<double>(static_cast<std::int64_t>(b - a)) * 1e-9; };
       for (std::uint32_t il = 0; il < s.n_layer; ++il) {
         const unsigned long long* q4 = I.ts_h + 4 * il;

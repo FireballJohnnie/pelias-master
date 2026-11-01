@@ -2324,7 +2324,8 @@ int cmd_engine_check(const Args& a) {
                  "                           [--text FILE [--skip-tokens N]] [--timeline] [--dump-top OUT.tsv] [--dump-split [--split-sizes 2,3,4] [--split-step]]\n"
                  "                           [--no-doorbell] [--timeline-ops] [--split-ref] [--bank-selftest MIXES] [--probe-pos P]\n"
                  "                           [--router-tie BAND] [--cold-on-gpu] [--trace OUT.tsv] [--reader-v25] [--reader-cache K] [--fold-shared]\n"
-                 "                           [--batch-identical] [--graph] [--prefetch] [--plane-tail N]\n");
+                 "                           [--batch-identical] [--graph] [--prefetch] [--plane-tail N] [--cpu-light] [--reader-rpw 1|2]\n"
+                 "                           [--pin-gap-kib K] [--ref-threads N]\n");
     return 1;
   }
   auto num = [&](const char* k, std::uint64_t d, std::uint64_t lo, std::uint64_t hi, std::uint64_t& out) {
@@ -2415,6 +2416,24 @@ int cmd_engine_check(const Args& a) {
       return 1;
     }
     eo.reader_cache = static_cast<int>(rc.value);
+  }
+  // v28: the author's split (light experts on the CPU, heavy pinned for the GPU), rows per warp, the pin merge gap
+  eo.cpu_light = a.has("cpu-light");
+  if (a.has("reader-rpw")) {
+    const Result<std::uint64_t> rw = io::parse_whole(a.get("reader-rpw"), 2);
+    if (!rw.ok() || rw.value < 1) {
+      std::fprintf(stderr, "pelias: --reader-rpw takes 1 or 2\n");
+      return 1;
+    }
+    eo.reader_rows_per_warp = static_cast<int>(rw.value);
+  }
+  if (a.has("pin-gap-kib")) {
+    const Result<std::uint64_t> pgk = io::parse_whole(a.get("pin-gap-kib"), 1u << 20);
+    if (!pgk.ok()) {
+      std::fprintf(stderr, "pelias: --pin-gap-kib takes 0 (exact ranges) .. 1048576\n");
+      return 1;
+    }
+    eo.pin_gap = pgk.value << 10;
   }
   // v25 trace: a new file (nothing is overwritten); the reader's steps, per layer
   const std::string trace_path = a.get("trace");
@@ -2512,6 +2531,7 @@ int cmd_engine_check(const Args& a) {
     a2.wait_seconds += b2.wait_seconds;
     a2.hot_picks += b2.hot_picks;
     a2.cold_picks += b2.cold_picks;
+    a2.cold_bytes += b2.cold_bytes;
   };
   int t = 0;
   while (t < static_cast<int>(npre)) {
@@ -2543,6 +2563,9 @@ int cmd_engine_check(const Args& a) {
     std::printf("  decode %llu tokens: %.3f s = %.1f tokens/s (median step %.2f ms = %.1f tokens/s, slowest %.2f ms); picks on the GPU %.1f %%; CPU cold work %.2f ms, host waits %.2f ms per token\n",
                 static_cast<unsigned long long>(ndec), tot_dec.seconds, static_cast<double>(ndec) / tot_dec.seconds, med * 1e3, 1.0 / med, sorted.back() * 1e3,
                 share(tot_dec), tot_dec.cold_seconds * 1e3 / static_cast<double>(ndec), tot_dec.wait_seconds * 1e3 / static_cast<double>(ndec));
+    if (tot_dec.cold_bytes > 0 && tot_dec.cold_seconds > 0.0)  // v28: the CPU's rate on its picks (bytes / its cold work time)
+      std::printf("  CPU cold experts: %llu picks, %.1f MB per token, %.2f GB/s over its cold work time\n", static_cast<unsigned long long>(tot_dec.cold_picks),
+                  static_cast<double>(tot_dec.cold_bytes) / 1e6 / static_cast<double>(ndec), static_cast<double>(tot_dec.cold_bytes) / tot_dec.cold_seconds / 1e9);
   }
   tflush("decode (the speed numbers above)");
   std::printf("  graph: %s\n", eng.value->graph_report().c_str());
@@ -2881,6 +2904,14 @@ int cmd_engine_check(const Args& a) {
   if (a.has("no-cpu")) return selftest_bad > 0 ? 4 : 0;
   model::ForwardOptions o = model::GpuForward::matching_reference_options();
   o.threads = static_cast<int>(thr);
+  if (a.has("ref-threads")) {  // v28: the CPU reference's threads apart from the engine's cold-path workers (--threads)
+    const Result<std::uint64_t> rt = io::parse_whole(a.get("ref-threads"), 4096);
+    if (!rt.ok()) {
+      std::fprintf(stderr, "pelias: --ref-threads takes a whole number\n");
+      return 1;
+    }
+    o.threads = static_cast<int>(rt.value);
+  }
   o.fast_cpu = a.has("fast-cpu");
   o.router_tie_band = tie_band;
   std::vector<float> ref(lg.size());

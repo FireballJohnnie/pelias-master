@@ -740,7 +740,7 @@ TEST(rung1_moe_reader_against_fp64) {
 TEST(rung1_moe_reader3_equals_v25_cache_and_shared) {
   if (!gpu_or_skip()) return;
   const q::Type types[3] = {q::Type::q8_0, q::Type::q6_k, q::Type::q4_tg2};
-  bool eq_all = true, cache_eq = true, cache_hits_ok = true, shared_ok = true, plane_ok = true;
+  bool eq_all = true, cache_eq = true, cache_hits_ok = true, shared_ok = true, plane_ok = true, rpw_ok = true, mask_ok = true;
   double worst_sh = 0.0, worst_plane = 0.0;
   for (const std::int64_t F : {std::int64_t{256}, std::int64_t{1024}}) {
     const std::int64_t H = 512, ne = 6;
@@ -819,6 +819,26 @@ TEST(rung1_moe_reader3_equals_v25_cache_and_shared) {
       }
       if (file_groups <= K) cache_hits_ok = cache_hits_ok && from_vram == file_groups;
       CHECK(g::moe_reader3(dtab.p, dshx.p, ds.p, dw.p, dg.p, nu, dx.p, T, H, F, row_max, nullptr, dgu.p, dh.p, dyd.p, dgrp.p, gsrc.p, gfill.p, ysh.p));
+      // v28: one row per warp equals two bit for bit; the CPU mask (experts 3 and 4 skipped) equals the same picks with weight 0
+      {
+        Dev<float> yr1(static_cast<std::size_t>(T * H)), ym(static_cast<std::size_t>(T * H)), yz(static_cast<std::size_t>(T * H));
+        std::vector<std::uint8_t> mask(static_cast<std::size_t>(ne), 0);
+        mask[3] = mask[4] = 1;
+        std::vector<float> wz = wsel;
+        for (std::size_t i = 0; i < sel.size(); ++i)
+          if (mask[static_cast<std::size_t>(sel[i])]) wz[i] = 0.0f;
+        Dev<std::uint8_t> dm(mask);
+        Dev<float> dwz(wz);
+        CHECK(g::moe_reader3(dtab.p, nullptr, ds.p, dw.p, nullptr, nu, dx.p, T, H, F, row_max, nullptr, dgu.p, dh.p, dyd.p, dgrp.p, gsrc.p, gfill.p, yr1.p, nullptr,
+                             nullptr, 0, nullptr, 1));
+        CHECK(g::moe_reader3(dtab.p, nullptr, ds.p, dw.p, nullptr, nu, dx.p, T, H, F, row_max, nullptr, dgu.p, dh.p, dyd.p, dgrp.p, gsrc.p, gfill.p, ym.p, nullptr,
+                             nullptr, 0, dm.p, 2));
+        CHECK(g::moe_reader3(dtab.p, nullptr, ds.p, dwz.p, nullptr, nu, dx.p, T, H, F, row_max, nullptr, dgu.p, dh.p, dyd.p, dgrp.p, gsrc.p, gfill.p, yz.p));
+        CHECK(g::sync());
+        const std::vector<float> r1 = yr1.get(), m1 = ym.get(), z1 = yz.get(), ref = y3.get();
+        rpw_ok = rpw_ok && std::memcmp(r1.data(), ref.data(), r1.size() * sizeof(float)) == 0;
+        for (std::size_t i = 0; i < m1.size(); ++i) mask_ok = mask_ok && m1[i] == z1[i];
+      }
       // v27 plane test: tail 0 is the plain reader bit for bit; tail 1 changes the output (the last pick's Q4_TG2 rows on the
       // 2-bit base plane), finite and close
       Dev<float> yt0(static_cast<std::size_t>(T * H)), yt1(static_cast<std::size_t>(T * H));
@@ -886,6 +906,10 @@ TEST(rung1_moe_reader3_equals_v25_cache_and_shared) {
   CHECK(cache_hits_ok);
   CHECK(shared_ok);
   CHECK(plane_ok);
+  CHECK(rpw_ok);
+  CHECK(mask_ok);
+  std::printf("    v28: one row per warp = two %s; CPU mask (experts 3, 4 skipped) = those picks at weight 0 %s\n", rpw_ok ? "bit for bit" : "DIFFERS",
+              mask_ok ? "(equal values)" : "DIFFERS");
   std::printf("    plane test (last pick's Q4_TG2 rows on the 2-bit base plane): tail 0 bit for bit; tail 1 changes the output by up to %.3e (rel L2)\n", worst_plane);
   std::printf("    F 256 (half-warp down) / 1024 (warp down), 1 / 2 / 4 tokens, q8_0 / q6_k / q4_tg2: v3 = v24 %s; cached (fill, then read) %s, "
               "second call from VRAM %s; shared expert folded in: worst rel L2 %.3e against fp64\n",

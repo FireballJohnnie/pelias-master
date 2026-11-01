@@ -27,6 +27,8 @@ void* host_alloc_mapped(std::size_t, void**) { return nullptr; }
 void host_free(void*) {}
 bool bell_ring(unsigned*, unsigned, Stream, unsigned long long*) { return false; }
 bool bell_wait(const unsigned*, unsigned, Stream, unsigned long long*) { return false; }
+bool bell_ring_dev(unsigned*, const unsigned*, unsigned, Stream) { return false; }
+bool bell_wait_dev(const unsigned*, const unsigned*, unsigned, Stream) { return false; }
 bool stamp(unsigned long long*, Stream) { return false; }
 void router_topk_serial_for_tests(bool) {}
 bool host_register(void*, std::size_t, void**, std::string* why) {
@@ -62,7 +64,8 @@ void event_free(void*) {}
 bool event_record(void*, Stream) { return false; }
 bool stream_wait(Stream, void*) { return false; }
 bool moe_reader3(const ExpertPtr*, const ExpertPtr*, const std::int32_t*, const float*, const float*, int, const float*, std::int64_t, std::int64_t, std::int64_t,
-                 std::uint64_t, const ReaderCache*, float*, float*, float*, int*, ExpertPtr*, ExpertPtr*, float*, unsigned long long*, Stream, int) {
+                 std::uint64_t, const ReaderCache*, float*, float*, float*, int*, ExpertPtr*, ExpertPtr*, float*, unsigned long long*, Stream, int,
+                 const std::uint8_t*, int) {
   return false;
 }
 bool to_host_async(void*, const void*, std::size_t, Stream) { return false; }

@@ -162,6 +162,10 @@ void* host_alloc_mapped(std::size_t bytes, void** dev);
 void host_free(void* p);
 bool bell_ring(unsigned* flag, unsigned value, Stream s = nullptr, unsigned long long* ts = nullptr);
 bool bell_wait(const unsigned* flag, unsigned value, Stream s = nullptr, unsigned long long* ts = nullptr);
+// v28: ring / wait for the value *gen + add (gen device-resident, written before each step), so a captured graph rings the
+// right generation on every replay
+bool bell_ring_dev(unsigned* flag, const unsigned* gen, unsigned add, Stream s = nullptr);
+bool bell_wait_dev(const unsigned* flag, const unsigned* gen, unsigned add, Stream s = nullptr);
 bool to_host_async(void* dst, const void* src, std::size_t bytes, Stream s = nullptr);
 // v21 (per-operation timeline): a one-thread kernel writes the GPU's globaltimer (ns) to *p (a device address, e.g. of
 // mapped memory) when the stream reaches it
@@ -214,7 +218,11 @@ bool moe_reader(const ExpertPtr* tab, const std::int32_t* sel, const float* wsel
 // grp 1 + 6 x tokens x P ints; gsrc / gfill tokens x P ExpertPtr (device).
 bool moe_reader3(const ExpertPtr* tab, const ExpertPtr* shx, const std::int32_t* sel, const float* wsel, const float* gsh, int n_used, const float* xr,
                  std::int64_t tokens, std::int64_t H, std::int64_t F, std::uint64_t row_max, const ReaderCache* cache, float* gu, float* h, float* yd,
-                 int* grp, ExpertPtr* gsrc, ExpertPtr* gfill, float* y, unsigned long long* ts = nullptr, Stream s = nullptr, int plane_tail = 0);
+                 int* grp, ExpertPtr* gsrc, ExpertPtr* gfill, float* y, unsigned long long* ts = nullptr, Stream s = nullptr, int plane_tail = 0,
+                 const std::uint8_t* cpu_mask = nullptr, int rows_per_warp = 2);
+// v28: cpu_mask (n_expert bytes, device; the author's split): picks of experts marked 1 are skipped here (no group, nothing
+// read) and left out of the combine; the CPU computes them and the caller adds its sum. rows_per_warp (1 or 2): gate / up
+// rows each warp takes per block; the grid covers every row (v26's shape, no cap: v27's cap of 16 blocks cut occupancy)
 // v27 plane test: plane_tail > 0 makes each token's lowest-ranked plane_tail routed picks use the 2-bit base plane of their
 // Q4_TG2 rows (each 4-bit code's value replaced by the mean of the four values sharing its top two bits); lossy, for the gate
 // v26 prefetch: the next layer's predicted picks (npicks, its router on this layer's output) into the cache before that
