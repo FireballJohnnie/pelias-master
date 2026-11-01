@@ -973,20 +973,38 @@ PELIAS_TARGET_AVX2 void deq_q7_zt(const std::uint8_t* p, float* y) {  // d, 8 le
 // v45 (Fable review 03:3x): q::q8_z_scale lives in another file (a call per 32 values, no LTO); the same two operations in the
 // same order, inline here: (d * lv) / 63, bit for bit.
 inline float z_scale_local(float d, int lv) { return (d * static_cast<float>(lv)) / 63.0f; }
+// v45b (author 17:21): the eight scales of a 256-value segment from one vector multiply and one vector division. IEEE
+// division and multiplication are exact per lane, so each lane equals z_scale_local (checked for every fp16 d and level).
+// The six level bytes come from one 8-byte load (bytes 2..9 of the segment; the top 16 bits masked off).
+PELIAS_TARGET_AVX2 inline void tg_scales8(const std::uint8_t* p, float d, float* sc) {
+  std::uint64_t packed = 0;
+  std::memcpy(&packed, p + 2, 8);
+  packed &= 0xFFFFFFFFFFFFull;
+  const __m256i lv = _mm256_setr_epi32(static_cast<int>(packed & 63u), static_cast<int>((packed >> 6) & 63u), static_cast<int>((packed >> 12) & 63u),
+                                       static_cast<int>((packed >> 18) & 63u), static_cast<int>((packed >> 24) & 63u), static_cast<int>((packed >> 30) & 63u),
+                                       static_cast<int>((packed >> 36) & 63u), static_cast<int>((packed >> 42) & 63u));
+  _mm256_storeu_ps(sc, _mm256_div_ps(_mm256_mul_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(lv)), _mm256_set1_ps(63.0f)));
+}
+// v45b: the Q4_TG grids' addresses, fetched from quant once (q4_tg_grid lives in another file: no call per segment)
+inline const float* tg_grid(int t, int version) {
+  static const float* const g[2][4] = {{q::q4_tg_grid(0, 1), q::q4_tg_grid(1, 1), q::q4_tg_grid(2, 1), q::q4_tg_grid(3, 1)},
+                                       {q::q4_tg_grid(0, 2), q::q4_tg_grid(1, 2), q::q4_tg_grid(2, 2), q::q4_tg_grid(3, 2)}};
+  return g[version == 2 ? 1 : 0][t & 3];
+}
 
 PELIAS_TARGET_AVX2 void fused_q4_tg_seg(const std::uint8_t* p, int version, const float* const* xs, int nt, __m256 (*acc)[4]) {
   const float d = h2f(p);
-  std::uint64_t packed = 0;
-  for (int b = 0; b < 6; ++b) packed |= static_cast<std::uint64_t>(p[2 + b]) << (8 * b);
+  alignas(32) float sc[8];
+  tg_scales8(p, d, sc);
   __m256 glo[4], ghi[4];
   for (int t = 0; t < 4; ++t) {
-    const float* g = q::q4_tg_grid(t, version);
+    const float* g = tg_grid(t, version);
     glo[t] = _mm256_loadu_ps(g);
     ghi[t] = _mm256_loadu_ps(g + 8);
   }
   const __m128i m4 = _mm_set1_epi8(0x0F);
   for (int j = 0; j < 8; ++j) {
-    const __m256 sv = _mm256_set1_ps(z_scale_local(d, static_cast<int>((packed >> (6 * j)) & 63u)));
+    const __m256 sv = _mm256_set1_ps(sc[j]);
     const std::uint8_t tags = p[8 + j];
     // the block's 32 codes in value order (value 2i: low nibble of byte i, value 2i + 1: high nibble)
     const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + 16 + 16 * j));
@@ -1009,16 +1027,13 @@ PELIAS_TARGET_AVX2 void fused_q4_tg_seg(const std::uint8_t* p, int version, cons
 // load shared. Per row the same products in the same order as fused_q4_tg_seg with nt = 1 (bit for bit).
 PELIAS_TARGET_AVX2 void fused_q4_tg_seg2(const std::uint8_t* p0, const std::uint8_t* p1, const __m256* glo, const __m256* ghi, const float* x,
                                          __m256* a0, __m256* a1) {
-  const float d0 = h2f(p0), d1 = h2f(p1);
-  std::uint64_t pk0 = 0, pk1 = 0;
-  for (int b = 0; b < 6; ++b) {
-    pk0 |= static_cast<std::uint64_t>(p0[2 + b]) << (8 * b);
-    pk1 |= static_cast<std::uint64_t>(p1[2 + b]) << (8 * b);
-  }
+  alignas(32) float sc0[8], sc1[8];
+  tg_scales8(p0, h2f(p0), sc0);
+  tg_scales8(p1, h2f(p1), sc1);
   const __m128i m4 = _mm_set1_epi8(0x0F);
   for (int j = 0; j < 8; ++j) {
-    const __m256 sv0 = _mm256_set1_ps(z_scale_local(d0, static_cast<int>((pk0 >> (6 * j)) & 63u)));
-    const __m256 sv1 = _mm256_set1_ps(z_scale_local(d1, static_cast<int>((pk1 >> (6 * j)) & 63u)));
+    const __m256 sv0 = _mm256_set1_ps(sc0[j]);
+    const __m256 sv1 = _mm256_set1_ps(sc1[j]);
     const std::uint8_t tg0 = p0[8 + j], tg1 = p1[8 + j];
     const __m128i v0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p0 + 16 + 16 * j));
     const __m128i v1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p1 + 16 + 16 * j));
@@ -1537,8 +1552,10 @@ PELIAS_TARGET_AVX2 void act_q8x32_quantize_avx2(const float* x, std::int64_t k, 
     alignas(32) std::int32_t qi[32];
     for (int r = 0; r < 4; ++r) {
       const __m256 q = _mm256_min_ps(hi, _mm256_max_ps(lo, _mm256_round_ps(_mm256_mul_ps(v[r], iv), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC)));
-      _mm256_store_si256(reinterpret_cast<__m256i*>(qi + 8 * r), _mm256_cvttps_epi32(q));
-      _mm256_storeu_ps(a.x.data() + 32 * b + 8 * r, _mm256_mul_ps(sv, q));
+      const __m256i qn = _mm256_cvttps_epi32(q);
+      _mm256_store_si256(reinterpret_cast<__m256i*>(qi + 8 * r), qn);
+      // from the integer, as the scalar form does (a value rounded to -0 gives +0 here, as there: bit for bit)
+      _mm256_storeu_ps(a.x.data() + 32 * b + 8 * r, _mm256_mul_ps(sv, _mm256_cvtepi32_ps(qn)));
     }
     std::int32_t s0 = 0, s1 = 0;
     for (int j = 0; j < 32; ++j) {
@@ -1718,7 +1735,7 @@ PELIAS_TARGET_AVX2 void dot_rows2_tg_avx2(int version, const std::uint8_t* r0, c
                                           const float* x, float* out) {
   __m256 glo[4], ghi[4];
   for (int t = 0; t < 4; ++t) {
-    const float* g = q::q4_tg_grid(t, version);
+    const float* g = tg_grid(t, version);
     glo[t] = _mm256_loadu_ps(g);
     ghi[t] = _mm256_loadu_ps(g + 8);
   }
@@ -1731,6 +1748,31 @@ PELIAS_TARGET_AVX2 void dot_rows2_tg_avx2(int version, const std::uint8_t* r0, c
     fused_q4_tg_seg2(r0 + static_cast<std::uint64_t>(sgi) * seg_bytes, r1 + static_cast<std::uint64_t>(sgi) * seg_bytes, glo, ghi, x + sgi * kSeg, a0, a1);
   out[0] = reduce_avx2(a0);
   out[1] = reduce_avx2(a1);
+}
+// v45b (author 17:19-17:21): a tile of row pairs in one call, the grids loaded once per tile. Pair i is the rows at
+// b0 + i * stride and b1 + i * stride; each pair's arithmetic is dot_rows2_tg_avx2's (bit for bit).
+PELIAS_TARGET_AVX2 void dot_tile2_tg_avx2(int version, const std::uint8_t* b0, const std::uint8_t* b1, std::uint64_t stride, std::int64_t n, std::int64_t k,
+                                          std::uint64_t seg_bytes, const float* x, float* o0, float* o1, std::int64_t os) {
+  __m256 glo[4], ghi[4];
+  for (int t = 0; t < 4; ++t) {
+    const float* g = tg_grid(t, version);
+    glo[t] = _mm256_loadu_ps(g);
+    ghi[t] = _mm256_loadu_ps(g + 8);
+  }
+  const std::int64_t nseg = k / kSeg;
+  for (std::int64_t i = 0; i < n; ++i) {
+    const std::uint8_t* r0 = b0 + static_cast<std::uint64_t>(i) * stride;
+    const std::uint8_t* r1 = b1 + static_cast<std::uint64_t>(i) * stride;
+    __m256 a0[4], a1[4];
+    for (int r = 0; r < 4; ++r) {
+      a0[r] = _mm256_setzero_ps();
+      a1[r] = _mm256_setzero_ps();
+    }
+    for (std::int64_t sgi = 0; sgi < nseg; ++sgi)
+      fused_q4_tg_seg2(r0 + static_cast<std::uint64_t>(sgi) * seg_bytes, r1 + static_cast<std::uint64_t>(sgi) * seg_bytes, glo, ghi, x + sgi * kSeg, a0, a1);
+    o0[i * os] = reduce_avx2(a0);
+    o1[i * os] = reduce_avx2(a1);
+  }
 }
 }  // namespace
 #endif
@@ -1745,6 +1787,22 @@ void dot_rows2_f32(q::Type t, const std::uint8_t* r0, const std::uint8_t* r1, st
   const float* xs[1] = {x};
   dot_row(t, r0, k, nullptr, xs, 1, out);
   dot_row(t, r1, k, nullptr, xs, 1, out + 1);
+}
+
+void dot_tile2_f32(q::Type t, const std::uint8_t* b0, const std::uint8_t* b1, std::uint64_t stride, std::int64_t n, std::int64_t k, const float* x, float* o0,
+                   float* o1, std::int64_t os) {
+#if defined(PELIAS_KERN_X86)
+  if (active_isa() == Isa::avx2 && (t == q::Type::q4_tg || t == q::Type::q4_tg2) && k % kSeg == 0) {
+    dot_tile2_tg_avx2(t == q::Type::q4_tg2 ? 2 : 1, b0, b1, stride, n, k, q::row_bytes(static_cast<std::uint32_t>(t), kSeg), x, o0, o1, os);
+    return;
+  }
+#endif
+  for (std::int64_t i = 0; i < n; ++i) {
+    float o2[2];
+    dot_rows2_f32(t, b0 + static_cast<std::uint64_t>(i) * stride, b1 + static_cast<std::uint64_t>(i) * stride, k, x, o2);
+    o0[i * os] = o2[0];
+    o1[i * os] = o2[1];
+  }
 }
 
 void dot_row(q::Type t, const std::uint8_t* row, std::int64_t k, const RowPlanes* planes, const float* const* xs, int nt, float* out) {

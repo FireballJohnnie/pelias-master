@@ -123,7 +123,9 @@ struct EngineOptions {
   int cpu_up_rows = 64;
   bool cpu_down2 = false;
   bool cpu_prefetch = false;
-  bool cpu_gu2 = false;    // v45: gate row r and up row r in one call (one-token steps), bit for bit
+  bool cpu_gu2 = false;
+  bool cpu_tile = false;    // v45b: gate/up pairs and down row pairs as one call per block (grids loaded once), bit for bit
+  bool spin_pause = false;  // v45b: a pause in every spin (Hyper-V pause-loop A/B); the counter padding is always on    // v45: gate row r and up row r in one call (one-token steps), bit for bit
   bool cpu_check = false;  // compare the two-row down against the one-row path, row by row (bit for bit); counts mismatches
   // v43: pin the CPU threads: pin_pool[0] = the doorbell thread (it works as the pool's first thread), pin_pool[1..] = the
   // pool workers in order, pin_host = the thread that drives the engine (-1: leave it). Empty: no pinning (as before).
@@ -161,6 +163,7 @@ struct EngineTimeline {
   int thr_n = 0;
   std::uint64_t down2_rows = 0, down2_mismatch = 0;
   std::uint64_t gu2_rows = 0, gu2_mismatch = 0, round_n = 0, round_mismatch = 0;  // v45 checks
+  std::uint64_t gx_n = 0, gx_mismatch = 0;  // v45b: GPU rounded input vs the CPU's
   double lag_sum = 0.0, lag_max = 0.0;  // v45: each thread's first down item minus the end of gate/up (seconds)
   std::uint64_t lag_n = 0;
   double stage[5] = {}, busy[5] = {};

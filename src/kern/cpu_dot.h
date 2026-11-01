@@ -82,6 +82,10 @@ bool dot_q8_has_int_path(quant::Type t);
 // v40: two rows against one float vector (decode's down projection, one token): out[0], out[1] exactly what dot_row gives
 // each row (nt = 1, no planes). Q4_TG / Q4_TG2 on AVX2 load the grids once and share each x load; other types call dot_row twice.
 void dot_rows2_f32(quant::Type t, const std::uint8_t* r0, const std::uint8_t* r1, std::int64_t k, const float* x, float* out);
+// v45b: n row pairs in one call (pair i: b0 + i * stride and b1 + i * stride, outputs o0[i * os] and o1[i * os]); each
+// pair as dot_rows2_f32, bit for bit, the grids loaded once per call.
+void dot_tile2_f32(quant::Type t, const std::uint8_t* b0, const std::uint8_t* b1, std::uint64_t stride, std::int64_t n, std::int64_t k, const float* x, float* o0,
+                   float* o1, std::int64_t os);
 // k a multiple of 32; nt rows (1..4) of acts, each acts[i]->k == k.
 void dot_row_q8(quant::Type t, const std::uint8_t* row, std::int64_t k, const RowPlanes* planes, const ActQ8x32* const* acts, int nt,
                 float* out);

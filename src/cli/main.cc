@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <functional>
@@ -32,6 +33,7 @@
 #include <vector>
 
 #include "hal/device.h"
+#include "hal/host_alloc_pages.h"
 #include "hal/vram_governor.h"
 #include "ingest/stage_a.h"
 #include "io/gguf_compare.h"
@@ -332,7 +334,7 @@ int cmd_bench_dot(const Args& a) {
   std::uint64_t mb, k, threads, reps, kp;
   const std::uint64_t hw = std::max(1u, std::thread::hardware_concurrency());
   if (!num("mb", 1024, 16, 65536, &mb) || !num("k", 2048, 256, 65536, &k) || !num("threads", hw, 1, 1024, &threads) ||
-      !num("reps", 5, 1, 100, &reps) || !num("planes", 0, 0, quant::kPlaneMaxK, &kp))
+      !num("reps", 5, 1, 1000, &reps) || !num("planes", 0, 0, quant::kPlaneMaxK, &kp))
     return 1;
   std::uint64_t ntok;
   if (!num("tokens", 1, 1, 512, &ntok))
@@ -435,7 +437,14 @@ int cmd_bench_dot(const Args& a) {
   auto report = [&](const char* name, bool reference) {
     (void)pass(reference);  // warm-up
     std::vector<double> ts;
-    for (std::uint64_t i = 0; i < reps; ++i) ts.push_back(pass(reference));
+    const bool stamps = a.has("stamps");  // v45b (snoop probe): each rep's end time (unix ms) and rate, to slice by another run's window
+    for (std::uint64_t i = 0; i < reps; ++i) {
+      ts.push_back(pass(reference));
+      if (stamps)
+        std::printf("  rep %llu end_ms %lld %.3f GB/s\n", static_cast<unsigned long long>(i),
+                    static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count()),
+                    bytes / ts.back() / 1e9);
+    }
     std::sort(ts.begin(), ts.end());
     const double best = ts.front(), med = ts[ts.size() / 2];
     std::printf("  %-9s best %.2f GB/s (%.1f ms), median %.2f GB/s; %.2f G weights/s; %.2f G multiply-adds/s\n", name, bytes / best / 1e9,
@@ -450,6 +459,61 @@ int cmd_bench_dot(const Args& a) {
   double chk = 0.0;
   for (const float v : y) chk += static_cast<double>(v);
   std::printf("  checksum %.6g\n", chk);
+  return 0;
+}
+
+// v45b (author 17:19-17:21): does the host back WSL's memory with 2 MB pages? A random pointer chase over 65,536 cache
+// lines (4 MB of data, so the data sits in L3 in every case) in three layouts: A dense (4 MB span, 2 MB pages advised),
+// B spread (one line per 4 KB page over 256 MB, 2 MB pages advised), C spread with 4 KB pages (MADV_NOHUGEPAGE). B
+// needs 128 TLB entries if the 2 MB pages hold through the host, 65,536 if the host backs them with 4 KB pages. So B ~ A:
+// the host keeps 2 MB; B ~ C: the host backs with 4 KB pages (each spread access pays a nested page walk).
+int cmd_page_probe(const Args& a) {
+  (void)a;
+  constexpr std::size_t kLines = 65536, kSpan = 256ull << 20, kAlign = 2ull << 20;
+  auto anon_huge = []() {
+    std::ifstream f("/proc/self/smaps_rollup");
+    std::string l;
+    while (std::getline(f, l))
+      if (l.rfind("AnonHugePages:", 0) == 0) return l;
+    return std::string("AnonHugePages: (not found)");
+  };
+  auto chase = [&](std::uint8_t* buf, std::size_t stride, const char* name) {
+    std::vector<std::size_t> off(kLines);
+    for (std::size_t i = 0; i < kLines; ++i) off[i] = i * stride + (stride > 64 ? (i % (stride / 64)) * 64 : 0);  // spread lines over the cache sets
+    std::vector<std::size_t> ord(kLines);
+    for (std::size_t i = 0; i < kLines; ++i) ord[i] = i;
+    std::mt19937_64 rng(45);
+    for (std::size_t i = kLines - 1; i > 0; --i) std::swap(ord[i], ord[static_cast<std::size_t>(rng() % i)]);  // Sattolo: one cycle
+    for (std::size_t i = 0; i < kLines; ++i) {
+      const std::uint64_t nx = off[ord[(i + 1) % kLines]];
+      std::memcpy(buf + off[ord[i]], &nx, sizeof nx);
+    }
+    std::uint64_t q = off[ord[0]];
+    for (std::size_t i = 0; i < 4 * kLines; ++i) std::memcpy(&q, buf + q, sizeof q);  // warm
+    constexpr std::size_t kSteps = 20000000;
+    const Timer tm;
+    for (std::size_t i = 0; i < kSteps; ++i) std::memcpy(&q, buf + q, sizeof q);
+    const double sec = tm.seconds();
+    std::printf("  %-38s %.2f ns per access (end %llu)\n", name, sec * 1e9 / static_cast<double>(kSteps), static_cast<unsigned long long>(q % 7));
+  };
+  std::printf("page-probe: 65,536 lines in a random cycle, 20 M dependent loads per layout; %s at start\n", anon_huge().c_str());
+  auto* h = static_cast<std::uint8_t*>(std::aligned_alloc(kAlign, kSpan));
+  auto* s4 = static_cast<std::uint8_t*>(std::aligned_alloc(kAlign, kSpan));
+  if (!h || !s4) {
+    std::fprintf(stderr, "pelias page-probe: allocation failed\n");
+    return 1;
+  }
+  const bool ah = hal::advise_huge_pages(h, kSpan), as = hal::advise_small_pages(s4, kSpan);
+  std::memset(h, 1, kSpan);
+  std::memset(s4, 1, kSpan);
+  std::printf("  advice: 2 MB %s, 4 KB %s; after touching 512 MiB: %s\n", ah ? "taken" : "refused", as ? "taken" : "refused", anon_huge().c_str());
+  chase(h, 64, "A0 dense (warm-up, clocks)");
+  chase(h, 64, "A dense, 4 MB span, 2 MB pages");
+  chase(h, 4096, "B spread, 256 MB span, 2 MB pages");
+  chase(s4, 4096, "C spread, 256 MB span, 4 KB pages");
+  chase(h, 64, "A again (drift check)");
+  std::free(h);
+  std::free(s4);
   return 0;
 }
 
@@ -2339,7 +2403,7 @@ int cmd_engine_check(const Args& a) {
                  "                           [--no-doorbell] [--timeline-ops] [--split-ref] [--bank-selftest MIXES] [--probe-pos P]\n"
                  "                           [--router-tie BAND] [--cold-on-gpu] [--trace OUT.tsv] [--reader-v25] [--reader-cache K] [--fold-shared]\n"
                  "                           [--batch-identical] [--graph] [--prefetch] [--plane-tail N] [--cpu-light] [--reader-rpw 1|2]\n"
-                 "                           [--pin-gap-kib K] [--pin-huge-ok] [--cpu-up-rows N] [--cpu-down2] [--cpu-gu2] [--cpu-prefetch] [--cpu-check] [--host-wait auto|spin|yield|block] [--pin-cpus 0,2,4,...] [--pin-host N] [--ref-threads N] [--no-cpu-light] [--split-slow] [--preload-light]\n");
+                 "                           [--pin-gap-kib K] [--pin-huge-ok] [--cpu-up-rows N] [--cpu-down2] [--cpu-gu2] [--cpu-tile] [--spin-pause] [--cpu-prefetch] [--cpu-check] [--host-wait auto|spin|yield|block] [--pin-cpus 0,2,4,...] [--pin-host N] [--ref-threads N] [--no-cpu-light] [--split-slow] [--preload-light]\n");
     return 1;
   }
   auto num = [&](const char* k, std::uint64_t d, std::uint64_t lo, std::uint64_t hi, std::uint64_t& out) {
@@ -2465,6 +2529,8 @@ int cmd_engine_check(const Args& a) {
   eo.cpu_down2 = a.has("cpu-down2");
   eo.cpu_prefetch = a.has("cpu-prefetch");
   eo.cpu_gu2 = a.has("cpu-gu2");
+  eo.cpu_tile = a.has("cpu-tile");
+  eo.spin_pause = a.has("spin-pause");
   eo.cpu_check = a.has("cpu-check");
   if (a.has("pin-cpus")) {  // v43: comma list; the first is the doorbell thread, the rest the pool workers in order
     std::string lst = a.get("pin-cpus");
@@ -2711,6 +2777,9 @@ int cmd_engine_check(const Args& a) {
       if (T.round_n > 0)
         std::printf("  check (v45): AVX2 input rounding vs scalar: %llu vectors compared, %llu differ (bit for bit)\n", static_cast<unsigned long long>(T.round_n),
                     static_cast<unsigned long long>(T.round_mismatch));
+      if (T.gx_n > 0)
+        std::printf("  check (v45b): GPU rounded input vs CPU rounded input: %llu vectors compared, %llu differ (bit for bit)\n", static_cast<unsigned long long>(T.gx_n),
+                    static_cast<unsigned long long>(T.gx_mismatch));
       if (T.down2_rows > 0)
         std::printf("  check (v40): two-row down vs one-row path: %llu rows compared, %llu differ (bit for bit)\n", static_cast<unsigned long long>(T.down2_rows),
                     static_cast<unsigned long long>(T.down2_mismatch));
@@ -3590,6 +3659,7 @@ int main(int argc, char** argv) {
   if (cmd == "gpu-check") return cmd_gpu_check(a);
   if (cmd == "engine-check") return cmd_engine_check(a);
   if (cmd == "pin-probe") return cmd_pin_probe(a);
+  if (cmd == "page-probe") return cmd_page_probe(a);
   if (cmd == "inspect") return cmd_inspect(a);
   if (cmd == "key") return cmd_key(a);
   if (cmd == "plan") return cmd_plan(a);

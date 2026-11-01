@@ -22,6 +22,16 @@ bool advise_small_pages(void* p, std::size_t bytes) {
 #endif
 }
 
+bool advise_huge_pages(void* p, std::size_t bytes) {
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+  return madvise(p, bytes, MADV_HUGEPAGE) == 0;
+#else
+  (void)p;
+  (void)bytes;
+  return true;
+#endif
+}
+
 bool pin_this_thread(int cpu) {
 #if defined(__linux__)
   if (cpu < 0 || cpu >= CPU_SETSIZE) return false;

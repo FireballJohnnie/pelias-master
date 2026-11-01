@@ -15,6 +15,8 @@ namespace pelias::hal {
 // Linux: madvise(MADV_NOHUGEPAGE) on [p, p + bytes) (page-aligned by the caller). Windows and other systems: nothing to
 // do, returns true. Returns false if the OS refused the advice (the caller may still register the range).
 bool advise_small_pages(void* p, std::size_t bytes);
+// v45b (page-probe): madvise(MADV_HUGEPAGE) on [p, p + bytes). Elsewhere: nothing, returns true.
+bool advise_huge_pages(void* p, std::size_t bytes);
 
 // v43 (author 02:52 "lets pin and go"): bind the calling thread to one logical CPU (Linux: pthread_setaffinity_np). Kept in
 // this file because it is one of the two places allowed OS headers (BC6). Windows / other systems: nothing, returns false.

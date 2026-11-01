@@ -37,6 +37,11 @@ using std::int64_t;
 
 namespace {
 // v40: a software prefetch of one row of weights (each 64-byte line), and a small index per pool thread for the stamps
+inline void relax_cpu() {
+#if defined(__x86_64__) || defined(_M_X64)
+  _mm_pause();
+#endif
+}
 inline void prefetch_row(const std::uint8_t* p, std::uint64_t bytes) {
 #if defined(__x86_64__) || defined(_M_X64)
   for (std::uint64_t off = 0; off < bytes; off += 64) _mm_prefetch(reinterpret_cast<const char*>(p + off), _MM_HINT_T0);
@@ -82,6 +87,9 @@ class Pool {
     }
   }
   [[nodiscard]] int pinned() const { return pinned_.load(std::memory_order_relaxed); }
+  // v45b (author 17:21, --spin-pause): a pause in every spin (the hot waits included); off = v45's spins (A/B for Hyper-V's
+  // pause-loop exits)
+  void set_pause(bool p) { pause_.store(p, std::memory_order_relaxed); }
   ~Pool() {
     {
       std::lock_guard<std::mutex> lk(mu_);
@@ -130,8 +138,11 @@ class Pool {
     }
     cv_.notify_all();  // v29 fix: always (v29 skipped it when hot; a worker asleep from before the step then never woke: S4 hung)
     work2(true);
-    for (int spin = 0; active_.load(std::memory_order_acquire) != 0; ++spin)
+    const bool pz = pause_.load(std::memory_order_relaxed);
+    for (int spin = 0; active_.load(std::memory_order_acquire) != 0; ++spin) {
+      if (pz) relax();
       if (spin > kSpin && !hot_.load(std::memory_order_relaxed)) std::this_thread::yield();
+    }
     fn2_ = nullptr;
     n2_ = 0;
   }
@@ -154,8 +165,11 @@ class Pool {
     }
     cv_.notify_all();
     work(fn, n, false);
-    for (int spin = 0; active_.load(std::memory_order_acquire) != 0; ++spin)
+    const bool pz = pause_.load(std::memory_order_relaxed);
+    for (int spin = 0; active_.load(std::memory_order_acquire) != 0; ++spin) {
+      if (pz) relax();
       if (spin > kSpin) std::this_thread::yield();
+    }
   }
 
  private:
@@ -213,7 +227,7 @@ class Pool {
         got = gen_.load(std::memory_order_acquire) != seen || stop_.load(std::memory_order_acquire);
         if (got) break;
         if (spin >= kSpin && !hot_.load(std::memory_order_acquire)) break;  // v28b: a hot pool never sleeps
-        if (spin >= kSpin) relax();
+        if (spin >= kSpin || pause_.load(std::memory_order_relaxed)) relax();
       }
       if (!got) {
         std::unique_lock<std::mutex> lk(mu_);
@@ -232,14 +246,17 @@ class Pool {
   const std::function<void(int64_t)>* fn_ = nullptr;
   const std::function<void(int64_t)>* fn2_ = nullptr;  // v28b: phase 2 of a run2 job (nullptr: a plain job)
   int64_t n_ = 0, n2_ = 0;
-  std::atomic<int64_t> done1_{0};
-  std::atomic<bool> hot_{false};
+  // v45b (author 17:21): the four shared counters each on their own 64-byte line (spinning readers of one no longer pull
+  // the line a working thread is adding to)
+  alignas(64) std::atomic<int64_t> done1_{0};
+  alignas(64) std::atomic<bool> hot_{false};
+  std::atomic<bool> pause_{false};
   RunStats* rs_ = nullptr;  // written before the job's generation is released; read by the workers after they see it
   Clock::time_point t0_{};
-  std::atomic<int64_t> next_{0};
-  std::atomic<int> active_{0};
-  std::atomic<std::uint64_t> gen_{0};
-  std::atomic<int> pinned_{0};
+  alignas(64) std::atomic<int64_t> next_{0};
+  alignas(64) std::atomic<int> active_{0};
+  alignas(64) std::atomic<std::uint64_t> gen_{0};
+  alignas(64) std::atomic<int> pinned_{0};
   std::atomic<bool> stop_{false};
 };
 
@@ -386,6 +403,9 @@ struct GpuEngine::Impl {
   std::vector<float> gbuf, ubuf, dbuf;
   std::atomic<std::uint64_t> down2_n{0}, down2_bad{0};  // v40 --cpu-check
   std::atomic<std::uint64_t> gu2_n{0}, gu2_bad{0}, round_n{0}, round_bad{0};  // v45 --cpu-check
+  std::atomic<std::uint64_t> gx_n{0}, gx_bad{0};  // v45b --cpu-check: GPU rounded input vs the CPU's
+  void* xr_h = nullptr;  // v45b: pinned mapped copy of the GPU's rounded input (--cpu-check only)
+  float* xr_m = nullptr;
   std::vector<ColdPick> cold;
   std::vector<std::uint8_t> need;
   // v20: cold picks grouped by expert (up to 4 tokens each) and each group's gate / up blocks still to finish
@@ -907,6 +927,10 @@ struct GpuEngine::Impl {
                             std::memcmp(rf.x.data(), av.x.data(), rf.x.size() * sizeof(float)) == 0;
           round_n.fetch_add(1, std::memory_order_relaxed);
           if (!same) round_bad.fetch_add(1, std::memory_order_relaxed);
+          if (xr_m) {  // v45b (author 17:21): the GPU's rounded input (act_q8x32's xr) against the CPU's, bit for bit (B5's question)
+            gx_n.fetch_add(1, std::memory_order_relaxed);
+            if (std::memcmp(xr_m + t * e, av.x.data(), static_cast<std::size_t>(e) * sizeof(float)) != 0) gx_bad.fetch_add(1, std::memory_order_relaxed);
+          }
         }
       }
     constexpr int64_t kRowsDown = 128, kGroup = 4;
@@ -944,7 +968,23 @@ struct GpuEngine::Impl {
         const ExpRows U = exp_rows(l.up_exps, gp.e);
         const bool pair_ok = gp.m == 1 && U.t == R.t && !kern::dot_q8_has_int_path(R.t);
         float* uo = ubuf.data() + static_cast<int64_t>(gp.p[0]) * ff;
-        for (int64_t r = r0; r < r1; ++r) {
+        int64_t r = r0;
+        if (o.cpu_tile && pair_ok && R.rb == U.rb) {  // v45b: the whole block of pairs in one call, the grids loaded once
+          float* uo2 = ubuf.data() + static_cast<int64_t>(gp.p[0]) * ff;
+          kern::dot_tile2_f32(R.t, R.base + static_cast<std::uint64_t>(r0) * R.rb, U.base + static_cast<std::uint64_t>(r0) * U.rb, R.rb, r1 - r0, e,
+                              acts[0]->x.data(), outs[0] + r0, uo2 + r0, 1);
+          if (o.cpu_check)
+            for (int64_t rr = r0; rr < r1; ++rr) {
+              float c0[kGroup], c1[kGroup];
+              kern::dot_row_q8(R.t, R.base + static_cast<std::uint64_t>(rr) * R.rb, e, nullptr, acts, 1, c0);
+              kern::dot_row_q8(U.t, U.base + static_cast<std::uint64_t>(rr) * U.rb, e, nullptr, acts, 1, c1);
+              if (std::memcmp(&c0[0], outs[0] + rr, sizeof(float)) != 0 || std::memcmp(&c1[0], uo2 + rr, sizeof(float)) != 0)
+                gu2_bad.fetch_add(1, std::memory_order_relaxed);
+              gu2_n.fetch_add(2, std::memory_order_relaxed);
+            }
+          r = r1;
+        }
+        for (; r < r1; ++r) {
           const std::uint8_t* gr = R.base + static_cast<std::uint64_t>(r) * R.rb;
           const std::uint8_t* ur = U.base + static_cast<std::uint64_t>(r) * U.rb;
           if (o.cpu_prefetch && r + 2 < r1) {
@@ -1002,6 +1042,19 @@ struct GpuEngine::Impl {
         }
         float o4[kGroup];
         int64_t r = r0;
+        if (o.cpu_tile && gp.m == 1 && kern::dot_q8_has_int_path(R.t) == false && r1 - r0 >= 2) {  // v45b: the block's row pairs in one call
+          const int64_t np2 = (r1 - r0) / 2;
+          const std::uint8_t* q0 = R.base + static_cast<std::uint64_t>(r0) * R.rb;
+          kern::dot_tile2_f32(R.t, q0, q0 + R.rb, 2 * R.rb, np2, ff, acts[0]->x.data(), outs[0] + r0, outs[0] + r0 + 1, 2);
+          if (o.cpu_check)
+            for (int64_t rr = r0; rr < r0 + 2 * np2; ++rr) {
+              float c0[kGroup];
+              kern::dot_row_q8(R.t, R.base + static_cast<std::uint64_t>(rr) * R.rb, ff, nullptr, acts, 1, c0);
+              if (std::memcmp(&c0[0], outs[0] + rr, sizeof(float)) != 0) down2_bad.fetch_add(1, std::memory_order_relaxed);
+              down2_n.fetch_add(1, std::memory_order_relaxed);
+            }
+          r = r0 + 2 * np2;
+        }
         if (o.cpu_down2 && gp.m == 1 && kern::dot_q8_has_int_path(R.t) == false) {  // v40: two rows per call, one token
           const float* xv = acts[0]->x.data();
           for (; r + 1 < r1; r += 2) {
@@ -1099,6 +1152,8 @@ struct GpuEngine::Impl {
     tlp->gu2_mismatch = gu2_bad.load();
     tlp->round_n = round_n.load();
     tlp->round_mismatch = round_bad.load();
+    tlp->gx_n = gx_n.load();
+    tlp->gx_mismatch = gx_bad.load();
     tlp->down2_rows = down2_n.load();
     tlp->down2_mismatch = down2_bad.load();
     tlp->stage[0] += tround;
@@ -1219,6 +1274,7 @@ struct GpuEngine::Impl {
         const Clock::time_point tw = Clock::now();
         std::atomic_ref<unsigned> fa(*fa_h);
         for (std::uint64_t spin = 0; static_cast<int>(fa.load(std::memory_order_acquire) - g) < 0; ++spin) {
+          if (o.spin_pause) relax_cpu();  // v45b --spin-pause
           if (bcancel.load(std::memory_order_relaxed)) break;
           if ((spin & 1023) == 1023 && since(tw) > 30.0) {
             err = "engine: doorbell stall (layer " + std::to_string(il) + ")";
@@ -1331,7 +1387,8 @@ struct GpuEngine::Impl {
     unsigned long long* tsl = trc_ts_d ? trc_ts_d + 6 * static_cast<int64_t>(il) : nullptr;
     if (split_ok) {  // v28: the picks and the normed rows to the CPU, ring: it computes the light picks while the GPU reads the rest
       if (!g::to_host_async(sel_m, sel, z(n * nu) * sizeof(std::int32_t)) || !g::to_host_async(wsel_m, wsel, z(n * nu) * sizeof(float)) ||
-          !g::to_host_async(xn_m, xn, z(n * e) * sizeof(float)) || !g::bell_ring_dev(fa_d, gen_d, il))
+          !g::to_host_async(xn_m, xn, z(n * e) * sizeof(float)) || (xr_m && !g::to_host_async(xr_m, xr, z(n * e) * sizeof(float))) ||
+          !g::bell_ring_dev(fa_d, gen_d, il))
         return gfail("engine: split (picks to the CPU)");
     }
     if (pf_ok && il < pf_issued.size() && pf_issued[il]) {  // v26: this layer's prefetch (issued after the previous layer) is done
@@ -1772,6 +1829,7 @@ GpuEngine::~GpuEngine() {
   g::dfree(p_->probe_ld);
   g::dfree(p_->probe_md);
   g::host_free(p_->bell_h);
+  g::host_free(p_->xr_h);
   g::host_free(p_->ts_hv);
   g::host_free(p_->ops_hv);
   g::dfree(p_->probe_xd);
@@ -2230,6 +2288,7 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
     std::vector<int> wk;
     for (std::size_t q2 = 1; q2 < o.pin_pool.size(); ++q2) wk.push_back(o.pin_pool[q2]);
     I.pool = std::make_unique<Pool>(threads, wk);
+    I.pool->set_pause(o.spin_pause);  // v45b
     if (o.pin_host >= 0) I.pin_host_ok = hal::pin_this_thread(o.pin_host);
   }
   const int64_t mb = o.max_batch, maxp = mb * nu;
@@ -2265,6 +2324,11 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
       I.yc_m = reinterpret_cast<float*>(hb + 512 + 2 * sel_b + xn_b);
       I.yc_md = reinterpret_cast<float*>(db2 + 512 + 2 * sel_b + xn_b);
       I.bell = true;
+      if (o.cpu_check) {  // v45b
+        void* xdev = nullptr;
+        I.xr_h = g::host_alloc_mapped(xn_b, &xdev);
+        I.xr_m = static_cast<float*>(I.xr_h);
+      }
       if (o.timeline_ops) {
         void* odev = nullptr;
         I.ops_hv = g::host_alloc_mapped(z(s.n_layer) * z(EngineTimeline::kOps) * sizeof(unsigned long long), &odev);
