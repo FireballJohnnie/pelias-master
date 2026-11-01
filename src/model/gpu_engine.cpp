@@ -1851,7 +1851,7 @@ void GpuEngine::timeline_reset() {
   const std::size_t nl = t.gpu_dense.size();
   t = EngineTimeline{};
   t.threads = th;
-  for (std::vector<double>* v : {&t.gpu_dense, &t.gpu_hot, &t.gpu_idle, &t.cpu_wait, &t.cpu_cold}) v->assign(nl, 0.0);
+  for (std::vector<double>* v : {&t.gpu_dense, &t.gpu_hot, &t.gpu_idle, &t.cpu_wait, &t.cpu_cold, &t.cpu_picks, &t.cpu_groups}) v->assign(nl, 0.0);
 }
 
 std::string GpuEngine::summary() const {
