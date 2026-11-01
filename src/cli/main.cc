@@ -2496,9 +2496,9 @@ int cmd_engine_check(const Args& a) {
     eo.reader_cache = static_cast<int>(rc.value);
   }
   // v28: the author's split (light experts on the CPU, heavy pinned for the GPU), rows per warp, the pin merge gap
-  // v28b (author 23:14): the split is the default start-up path (heavy experts pinned, light ones on the CPU); --no-cpu-light
-  // pins every expert outside the bank and reads them all on the GPU
-  eo.cpu_light = !a.has("no-cpu-light");
+  // v28b (author 23:14) made the CPU split the default. v46 step 1 (THE PLAN, author 2026-11-01 17:46-17:54): the GPU does
+  // all of the decoding again; the split (light experts on the CPU) only with --cpu-light. --no-cpu-light is still accepted.
+  eo.cpu_light = a.has("cpu-light") && !a.has("no-cpu-light");
   eo.split_slow = a.has("split-slow");
   eo.preload_light = a.has("preload-light");
   if (a.has("reader-rpw")) {

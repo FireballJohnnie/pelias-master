@@ -124,6 +124,9 @@ struct cudaDeviceProp { char name[256]; size_t totalGlobalMem; int multiProcesso
 cudaError_t cudaStreamDestroy(cudaStream_t);
 cudaError_t cudaStreamCreateWithFlags(cudaStream_t*, unsigned);
 cudaError_t cudaSetDevice(int);
+// v41 (host wait mode)
+enum : unsigned { cudaDeviceScheduleAuto = 0u, cudaDeviceScheduleSpin = 1u, cudaDeviceScheduleYield = 2u, cudaDeviceScheduleBlockingSync = 4u };
+cudaError_t cudaSetDeviceFlags(unsigned);
 cudaError_t cudaHostUnregister(void*);
 cudaError_t cudaHostRegister(void*, size_t, unsigned);
 cudaError_t cudaHostAlloc(void**, size_t, unsigned);

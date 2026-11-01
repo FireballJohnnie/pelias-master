@@ -1468,7 +1468,10 @@ __device__ __forceinline__ void rd3_lut(const Tables& tb, float* lut, float* lut
 // (v26 built it per 8 rows: ~28 MB of shared stores per layer), and only when the group's matrices are Q4_TG2. tail > 0
 // (the plane test): routed picks of rank >= n_used - tail use the 2-bit base plane of Q4_TG2 rows (lut2).
 __device__ __forceinline__ bool rd3_tail_pick(int pk, int picks_routed, int nu, int tail) { return tail > 0 && pk < picks_routed && pk % nu >= nu - tail; }
-// gate and up: a warp takes two rows (r0, r0 + 1 of the 2F gate|up rows) of one group, stages both, then decodes
+// gate and up: a warp takes two rows (r0, r0 + 1 of the 2F gate|up rows) of one group, stages both, then decodes.
+// v46 step 1 (v29 MEASURED: the plane-test code in these loops cost ~1.3 ms per token even when off): kTail is a template
+// parameter, so the plain instantiation carries no second decode buffer, rank check or second grid.
+template <bool kTail>
 __global__ void __launch_bounds__(128) k_rd3_gate_up(const ExpertPtr* __restrict__ gsrc, const ExpertPtr* __restrict__ gfill, const int* __restrict__ grp,
                                                      int nu, int picks_routed, const float* __restrict__ xr, std::int64_t H, std::int64_t F,
                                                      std::uint64_t slot, float* __restrict__ gu, const Tables tb, int tail, int lut_bytes, int rpw) {
@@ -1480,7 +1483,8 @@ __global__ void __launch_bounds__(128) k_rd3_gate_up(const ExpertPtr* __restrict
   const ExpertPtr& X = gsrc[u];
   const ExpertPtr& FL = gfill[u];
   bool any_tail = false;
-  for (int c = 0; c < cnt; ++c) any_tail = any_tail || rd3_tail_pick(G[2 + c], picks_routed, nu, tail);
+  if (kTail)
+    for (int c = 0; c < cnt; ++c) any_tail = any_tail || rd3_tail_pick(G[2 + c], picks_routed, nu, tail);
   const bool tg = X.type[0] == g_q4_tg2 || X.type[1] == g_q4_tg2;
   float* lut = reinterpret_cast<float*>(rd3_sh);
   float* lut2 = any_tail ? lut + 2048 : nullptr;
@@ -1508,7 +1512,7 @@ __global__ void __launch_bounds__(128) k_rd3_gate_up(const ExpertPtr* __restrict
     for (int q = 0; q < rpw; ++q) {
       if (!rows[q]) break;
       const int pj = pjs[q];
-      const bool shadow = any_tail && X.type[pj] == g_q4_tg2;
+      const bool shadow = kTail && any_tail && X.type[pj] == g_q4_tg2;
       float acc[kRdMaxTok] = {0.0f, 0.0f, 0.0f, 0.0f};
       for (std::int64_t j = lane; j < H / 32; j += 32) {
         float wv[32], wv2[32];
@@ -1534,6 +1538,7 @@ __global__ void __launch_bounds__(128) k_rd3_gate_up(const ExpertPtr* __restrict
   }
 }
 // down: rows of F values; with F / 32 <= 16 a half-warp per row (two rows per warp), else a warp per row (two in turn)
+template <bool kTail>
 __global__ void __launch_bounds__(128) k_rd3_down(const ExpertPtr* __restrict__ gsrc, const ExpertPtr* __restrict__ gfill, const int* __restrict__ grp,
                                                   int nu, int picks_routed, const float* __restrict__ h, std::int64_t H, std::int64_t F, std::uint64_t slot,
                                                   float* __restrict__ yd, const Tables tb, int tail, int lut_bytes) {
@@ -1545,9 +1550,10 @@ __global__ void __launch_bounds__(128) k_rd3_down(const ExpertPtr* __restrict__ 
   const ExpertPtr& X = gsrc[u];
   const ExpertPtr& FL = gfill[u];
   bool any_tail = false;
-  for (int c = 0; c < cnt; ++c) any_tail = any_tail || rd3_tail_pick(G[2 + c], picks_routed, nu, tail);
+  if (kTail)
+    for (int c = 0; c < cnt; ++c) any_tail = any_tail || rd3_tail_pick(G[2 + c], picks_routed, nu, tail);
   const bool tg = X.type[2] == g_q4_tg2;
-  const bool shadow = any_tail && tg;
+  const bool shadow = kTail && any_tail && tg;
   float* lut = reinterpret_cast<float*>(rd3_sh);
   float* lut2 = shadow ? lut + 2048 : nullptr;
   if (tg) rd3_lut(tb, lut, lut2);
@@ -1661,13 +1667,21 @@ bool moe_reader3(const ExpertPtr* tab, const ExpertPtr* shx, const std::int32_t*
   if (ts) k_stamp<<<1, 1, 0, st(s)>>>(ts + 0);
   k_rd3_group<<<1, 32, 0, st(s)>>>(tab, shx, sel, static_cast<int>(tokens), n_used, c, H, F, grp, gsrc, gfill, cpu_mask);
   if (ts) k_stamp<<<1, 1, 0, st(s)>>>(ts + 1);
-  k_rd3_gate_up<<<dim3(gx_up, static_cast<unsigned>(picks)), 128, shm, st(s)>>>(gsrc, gfill, grp, n_used, static_cast<int>(routed), xr, H, F, slot, gu, tb,
-                                                                              plane_tail, lut_bytes, rows_per_warp);
+  if (plane_tail > 0)
+    k_rd3_gate_up<true><<<dim3(gx_up, static_cast<unsigned>(picks)), 128, shm, st(s)>>>(gsrc, gfill, grp, n_used, static_cast<int>(routed), xr, H, F, slot,
+                                                                                      gu, tb, plane_tail, lut_bytes, rows_per_warp);
+  else
+    k_rd3_gate_up<false><<<dim3(gx_up, static_cast<unsigned>(picks)), 128, shm, st(s)>>>(gsrc, gfill, grp, n_used, static_cast<int>(routed), xr, H, F, slot,
+                                                                                       gu, tb, 0, lut_bytes, rows_per_warp);
   if (ts) k_stamp<<<1, 1, 0, st(s)>>>(ts + 2);
   k_rd_silu_round<<<blocks_for(picks * (F / 32), 128), 128, 0, st(s)>>>(gu, picks, F, h);
   if (ts) k_stamp<<<1, 1, 0, st(s)>>>(ts + 3);
-  k_rd3_down<<<dim3(gx_dn, static_cast<unsigned>(picks)), 128, shm, st(s)>>>(gsrc, gfill, grp, n_used, static_cast<int>(routed), h, H, F, slot, yd, tb,
-                                                                          plane_tail, lut_bytes);
+  if (plane_tail > 0)
+    k_rd3_down<true><<<dim3(gx_dn, static_cast<unsigned>(picks)), 128, shm, st(s)>>>(gsrc, gfill, grp, n_used, static_cast<int>(routed), h, H, F, slot, yd,
+                                                                                  tb, plane_tail, lut_bytes);
+  else
+    k_rd3_down<false><<<dim3(gx_dn, static_cast<unsigned>(picks)), 128, shm, st(s)>>>(gsrc, gfill, grp, n_used, static_cast<int>(routed), h, H, F, slot, yd,
+                                                                                   tb, 0, lut_bytes);
   if (ts) k_stamp<<<1, 1, 0, st(s)>>>(ts + 4);
   k_rd3_combine<<<blocks_for(tokens * H, 256), 256, 0, st(s)>>>(yd, wsel, shx ? gsh : nullptr, n_used, tokens, H, y, sel, cpu_mask);
   if (ts) k_stamp<<<1, 1, 0, st(s)>>>(ts + 5);
