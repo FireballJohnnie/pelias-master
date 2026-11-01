@@ -117,6 +117,7 @@ struct EngineOptions {
   // v28: pinned ranges are merged across gaps smaller than this (bytes; v27 used 8 MiB; 0 = exact ranges, one per matrix
   // run)
   std::uint64_t pin_gap = std::uint64_t{8} << 20;
+  bool pin_small_pages = true;  // v34: madvise small pages on the ranges registered for the GPU (Linux; see hal/host_alloc_pages.h)
   // v28b: the split's CPU side through v20's per-stage jobs (the pool sleeping between them) instead of the one-dispatch path
   // with the pool held hot; for comparison
   bool split_slow = false;

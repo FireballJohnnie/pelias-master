@@ -20,6 +20,7 @@
 #include <immintrin.h>
 #endif
 
+#include "hal/host_alloc_pages.h"
 #include "kern/cpu_dot.h"
 #include "kern/gpu_ops.h"
 #include "kern/gpu_decode.h"
@@ -1321,6 +1322,10 @@ struct GpuEngine::Impl {
     std::uint64_t pinned = 0;
     std::string why;
     const Clock::time_point tr = Clock::now();
+    std::size_t small_ok = 0;
+    if (o.pin_small_pages)
+      for (const auto& rn : runs)
+        if (hal::advise_small_pages(reinterpret_cast<void*>(rn.first), static_cast<std::size_t>(rn.second - rn.first))) ++small_ok;
     for (const auto& rn : runs) {
       void* dv = nullptr;
       if (!g::host_register(reinterpret_cast<void*>(rn.first), static_cast<std::size_t>(rn.second - rn.first), &dv, &why)) {
@@ -1522,10 +1527,10 @@ struct GpuEngine::Impl {
     reader = true;
     char b[160];
     char b2[640];
-    std::snprintf(b2, sizeof b2, "on (%s, %d rows per warp, steps of 1-%d tokens; %.2f GB of the file (%s) registered in %zu ranges (gap %llu KiB) in %.2f s%s%s)",
+    std::snprintf(b2, sizeof b2, "on (%s, %d rows per warp, steps of 1-%d tokens; %.2f GB of the file (%s) registered in %zu ranges (gap %llu KiB; small pages advised on %zu) in %.2f s%s%s)",
                   o.reader_v3 ? "v3" : "v25", o.reader_rows_per_warp, kReaderMax, static_cast<double>(b1 - b0) / 1e9,
                   lmask_d ? "the heavy experts outside the bank" : "the experts outside the bank", runs.size(),
-                  static_cast<unsigned long long>(o.pin_gap >> 10), reg_s, fold_ok ? "; shared expert folded in" : "", cache_note.c_str());
+                  static_cast<unsigned long long>(o.pin_gap >> 10), small_ok, reg_s, fold_ok ? "; shared expert folded in" : "", cache_note.c_str());
     reader_note = b2;
     (void)b;
   }

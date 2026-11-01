@@ -2328,7 +2328,7 @@ int cmd_engine_check(const Args& a) {
                  "                           [--no-doorbell] [--timeline-ops] [--split-ref] [--bank-selftest MIXES] [--probe-pos P]\n"
                  "                           [--router-tie BAND] [--cold-on-gpu] [--trace OUT.tsv] [--reader-v25] [--reader-cache K] [--fold-shared]\n"
                  "                           [--batch-identical] [--graph] [--prefetch] [--plane-tail N] [--cpu-light] [--reader-rpw 1|2]\n"
-                 "                           [--pin-gap-kib K] [--ref-threads N] [--no-cpu-light] [--split-slow] [--preload-light]\n");
+                 "                           [--pin-gap-kib K] [--pin-huge-ok] [--ref-threads N] [--no-cpu-light] [--split-slow] [--preload-light]\n");
     return 1;
   }
   auto num = [&](const char* k, std::uint64_t d, std::uint64_t lo, std::uint64_t hi, std::uint64_t& out) {
@@ -2442,6 +2442,8 @@ int cmd_engine_check(const Args& a) {
     }
     eo.pin_gap = pgk.value << 10;
   }
+  if (a.has("pin-huge-ok")) eo.pin_small_pages = false;  // v34: leave the registered ranges on 2 MB pages (the v33 stall)
+
   // v25 trace: a new file (nothing is overwritten); the reader's steps, per layer
   const std::string trace_path = a.get("trace");
   if (!trace_path.empty()) {
