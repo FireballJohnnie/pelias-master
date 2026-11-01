@@ -120,6 +120,9 @@ struct EngineOptions {
   // v28b: the split's CPU side through v20's per-stage jobs (the pool sleeping between them) instead of the one-dispatch path
   // with the pool held hot; for comparison
   bool split_slow = false;
+  // v30 (author 00:04-00:05, "open the door"): after start-up a background thread touches every page of the light experts
+  // once (in place in the mapped file, no copy), so the CPU's split work stops paying the drive bridge's page faults
+  bool preload_light = false;
 };
 
 struct EngineStats {
@@ -216,6 +219,8 @@ class GpuEngine {
   std::string trace_take();
   // v26: the graph's state: "<note>; captures C, replays R"
   std::string graph_report() const;
+  // v30: wait for the light experts' pre-load (if any); its seconds and bytes; false if none was started
+  bool preload_wait(double* seconds, std::uint64_t* bytes);
   // v19 timeline (empty unless EngineOptions::timeline and the doorbell are on)
   [[nodiscard]] const EngineTimeline& timeline() const;
   void timeline_reset();

@@ -334,6 +334,12 @@ struct GpuEngine::Impl {
   void* gen_hv = nullptr;
   bool split_ok = false;
   std::string split_note = "off";
+  // v30 pre-load of the light experts (background, in place)
+  std::thread preload_th;
+  std::atomic<bool> preload_stop{false};
+  double preload_s = 0.0;
+  std::uint64_t preload_b = 0;
+  bool preload_on = false;
   std::uint64_t cache_reserved = 0, cslot = 0;
   void* cache_mem = nullptr;
   void* cache_meta = nullptr;
@@ -1381,6 +1387,31 @@ struct GpuEngine::Impl {
                     static_cast<long long>(ne) * static_cast<long long>(s.n_layer), static_cast<double>(light_b) / 1e9,
                     o.cpu_threads > 0 ? o.cpu_threads : static_cast<int>(std::max(1u, std::thread::hardware_concurrency())));
       split_note = sb;
+      if (o.preload_light) {  // v30: touch every page of the light experts once, in place, while the engine runs
+        std::vector<std::pair<const std::uint8_t*, std::uint64_t>> spans;
+        for (std::uint32_t il = 0; il < s.n_layer; ++il)
+          for (const WeightView* v : {&w->layers[il].gate_exps, &w->layers[il].up_exps, &w->layers[il].down_exps})
+            for (int64_t ex = 0; ex < ne; ++ex)
+              if (L[il].light[z(ex)]) {
+                const ExpRows r = exp_rows(*v, static_cast<int>(ex));
+                spans.emplace_back(r.base, r.rb * v->ne[1]);
+              }
+        preload_on = true;
+        preload_th = std::thread([this, spans = std::move(spans)] {
+          const Clock::time_point t0 = Clock::now();
+          volatile std::uint8_t sink = 0;
+          std::uint64_t b = 0;
+          for (const auto& sp : spans) {
+            if (preload_stop.load(std::memory_order_relaxed)) break;
+            for (std::uint64_t i = 0; i < sp.second; i += 4096) sink = static_cast<std::uint8_t>(sink ^ sp.first[i]);
+            sink = static_cast<std::uint8_t>(sink ^ sp.first[sp.second - 1]);
+            b += sp.second;
+          }
+          (void)sink;
+          preload_b = b;
+          preload_s = since(t0);
+        });
+      }
     } else if (o.cpu_light) {
       split_note = split ? "off (no light experts outside the bank)" : "off (needs the doorbell and reader v3)";
     }
@@ -1515,7 +1546,19 @@ struct GpuEngine::Impl {
 
 GpuEngine::GpuEngine(std::unique_ptr<Impl> p) : p_(std::move(p)) {}
 
+bool GpuEngine::preload_wait(double* seconds, std::uint64_t* bytes) {
+  if (!p_ || !p_->preload_on) return false;
+  if (p_->preload_th.joinable()) p_->preload_th.join();
+  if (seconds) *seconds = p_->preload_s;
+  if (bytes) *bytes = p_->preload_b;
+  return true;
+}
+
 GpuEngine::~GpuEngine() {
+  if (p_ && p_->preload_th.joinable()) {
+    p_->preload_stop.store(true, std::memory_order_relaxed);
+    p_->preload_th.join();
+  }
   if (!p_) return;
   if (p_->bell_th.joinable()) {
     {

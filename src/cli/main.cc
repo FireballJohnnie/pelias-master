@@ -26,6 +26,9 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#if defined(__linux__)
+#include <sys/resource.h>
+#endif
 #include <vector>
 
 #include "hal/device.h"
@@ -2325,7 +2328,7 @@ int cmd_engine_check(const Args& a) {
                  "                           [--no-doorbell] [--timeline-ops] [--split-ref] [--bank-selftest MIXES] [--probe-pos P]\n"
                  "                           [--router-tie BAND] [--cold-on-gpu] [--trace OUT.tsv] [--reader-v25] [--reader-cache K] [--fold-shared]\n"
                  "                           [--batch-identical] [--graph] [--prefetch] [--plane-tail N] [--cpu-light] [--reader-rpw 1|2]\n"
-                 "                           [--pin-gap-kib K] [--ref-threads N] [--no-cpu-light] [--split-slow]\n");
+                 "                           [--pin-gap-kib K] [--ref-threads N] [--no-cpu-light] [--split-slow] [--preload-light]\n");
     return 1;
   }
   auto num = [&](const char* k, std::uint64_t d, std::uint64_t lo, std::uint64_t hi, std::uint64_t& out) {
@@ -2422,6 +2425,7 @@ int cmd_engine_check(const Args& a) {
   // pins every expert outside the bank and reads them all on the GPU
   eo.cpu_light = !a.has("no-cpu-light");
   eo.split_slow = a.has("split-slow");
+  eo.preload_light = a.has("preload-light");
   if (a.has("reader-rpw")) {
     const Result<std::uint64_t> rw = io::parse_whole(a.get("reader-rpw"), 2);
     if (!rw.ok() || rw.value < 1) {
@@ -2546,6 +2550,17 @@ int cmd_engine_check(const Args& a) {
   }
   std::vector<double> per;
   eng.value->timeline_reset();
+  {  // v30: the light experts' pre-load finishes before the measured decode (so the decode is warm)
+    double pls = 0.0;
+    std::uint64_t plb = 0;
+    if (eng.value->preload_wait(&pls, &plb))
+      std::printf("  pre-load of the light experts: %.2f GB touched in place in %.2f s (%.2f GB/s, background from start-up)\n", static_cast<double>(plb) / 1e9, pls,
+                  pls > 0 ? static_cast<double>(plb) / 1e9 / pls : 0.0);
+  }
+#if defined(__linux__)
+  struct rusage ru0 {};
+  getrusage(RUSAGE_SELF, &ru0);
+#endif
   for (; t < n; ++t) {
     model::EngineStats es;
     if (Status st = eng.value->step(ids.data() + t, 1, lg.data() + static_cast<std::size_t>(t) * nv, true, &es); !st) return fail_input(st);
@@ -2566,6 +2581,14 @@ int cmd_engine_check(const Args& a) {
     std::printf("  decode %llu tokens: %.3f s = %.1f tokens/s (median step %.2f ms = %.1f tokens/s, slowest %.2f ms); picks on the GPU %.1f %%; CPU cold work %.2f ms, host waits %.2f ms per token\n",
                 static_cast<unsigned long long>(ndec), tot_dec.seconds, static_cast<double>(ndec) / tot_dec.seconds, med * 1e3, 1.0 / med, sorted.back() * 1e3,
                 share(tot_dec), tot_dec.cold_seconds * 1e3 / static_cast<double>(ndec), tot_dec.wait_seconds * 1e3 / static_cast<double>(ndec));
+#if defined(__linux__)
+    {  // v30: page faults during the decode (major: read from the file / drive; minor: mapped without reading)
+      struct rusage ru1 {};
+      getrusage(RUSAGE_SELF, &ru1);
+      std::printf("  page faults in the decode: %.1f major and %.0f minor per token\n",
+                  static_cast<double>(ru1.ru_majflt - ru0.ru_majflt) / static_cast<double>(ndec), static_cast<double>(ru1.ru_minflt - ru0.ru_minflt) / static_cast<double>(ndec));
+    }
+#endif
     if (tot_dec.cold_bytes > 0 && tot_dec.cold_seconds > 0.0)  // v28: the CPU's rate on its picks (bytes / its cold work time)
       std::printf("  CPU cold experts: %llu picks, %.1f MB per token, %.2f GB/s over its cold work time\n", static_cast<unsigned long long>(tot_dec.cold_picks),
                   static_cast<double>(tot_dec.cold_bytes) / 1e6 / static_cast<double>(ndec), static_cast<double>(tot_dec.cold_bytes) / tot_dec.cold_seconds / 1e9);
