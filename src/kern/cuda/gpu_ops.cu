@@ -980,6 +980,16 @@ bool to_host(void* dst, const void* src, std::size_t bytes, Stream s) {
 }
 bool dzero(void* p, std::size_t bytes, Stream s) { return ck(cudaMemsetAsync(p, 0, bytes, st(s)), "cudaMemset"); }
 bool sync(Stream s) { return ck(cudaStreamSynchronize(st(s)), "synchronize"); }
+bool set_host_wait(int mode, std::string* why) {
+  const unsigned f = mode == 1 ? cudaDeviceScheduleSpin : mode == 2 ? cudaDeviceScheduleYield : mode == 3 ? cudaDeviceScheduleBlockingSync : cudaDeviceScheduleAuto;
+  const cudaError_t e = cudaSetDeviceFlags(f);
+  if (e != cudaSuccess) {
+    if (why) *why = cudaGetErrorString(e);
+    (void)cudaGetLastError();
+    return false;
+  }
+  return true;
+}
 __device__ __forceinline__ unsigned long long gtimer() {
   unsigned long long t;
   asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));

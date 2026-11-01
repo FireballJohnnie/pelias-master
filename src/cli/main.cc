@@ -2319,6 +2319,17 @@ int cmd_pin_probe(const Args& a) {
 }
 
 int cmd_engine_check(const Args& a) {
+  if (a.has("host-wait")) {  // v41: before any CUDA call
+    const std::string hw = a.get("host-wait");
+    const int mode = hw == "spin" ? 1 : hw == "yield" ? 2 : hw == "block" ? 3 : hw == "auto" ? 0 : -1;
+    if (mode < 0) {
+      std::fprintf(stderr, "pelias: --host-wait takes auto, spin, yield or block\n");
+      return 1;
+    }
+    std::string why;
+    const bool hw_ok = kern::gpu::set_host_wait(mode, &why);
+    std::printf("pelias engine-check: host wait for the GPU: %s%s%s\n", hw.c_str(), hw_ok ? "" : " REFUSED: ", hw_ok ? "" : why.c_str());
+  }
   const std::string path = a.get("model");
   if (path.empty()) {
     std::fprintf(stderr,
@@ -2328,7 +2339,7 @@ int cmd_engine_check(const Args& a) {
                  "                           [--no-doorbell] [--timeline-ops] [--split-ref] [--bank-selftest MIXES] [--probe-pos P]\n"
                  "                           [--router-tie BAND] [--cold-on-gpu] [--trace OUT.tsv] [--reader-v25] [--reader-cache K] [--fold-shared]\n"
                  "                           [--batch-identical] [--graph] [--prefetch] [--plane-tail N] [--cpu-light] [--reader-rpw 1|2]\n"
-                 "                           [--pin-gap-kib K] [--pin-huge-ok] [--cpu-up-rows N] [--cpu-down2] [--cpu-prefetch] [--cpu-check] [--ref-threads N] [--no-cpu-light] [--split-slow] [--preload-light]\n");
+                 "                           [--pin-gap-kib K] [--pin-huge-ok] [--cpu-up-rows N] [--cpu-down2] [--cpu-prefetch] [--cpu-check] [--host-wait auto|spin|yield|block] [--ref-threads N] [--no-cpu-light] [--split-slow] [--preload-light]\n");
     return 1;
   }
   auto num = [&](const char* k, std::uint64_t d, std::uint64_t lo, std::uint64_t hi, std::uint64_t& out) {

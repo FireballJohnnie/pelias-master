@@ -21,6 +21,10 @@ bool to_device(void*, const void*, std::size_t, Stream) { return false; }
 bool to_host(void*, const void*, std::size_t, Stream) { return false; }
 bool dzero(void*, std::size_t, Stream) { return false; }
 bool sync(Stream) { return false; }
+bool set_host_wait(int, std::string* why) {
+  if (why) *why = "no CUDA in this build";
+  return false;
+}
 bool mem_info(std::size_t*, std::size_t*) { return false; }
 bool dcopy(void*, const void*, std::size_t, Stream) { return false; }
 void* host_alloc_mapped(std::size_t, void**) { return nullptr; }

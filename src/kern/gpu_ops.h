@@ -31,6 +31,10 @@ bool to_device(void* dst, const void* src, std::size_t bytes, Stream s = nullptr
 bool to_host(void* dst, const void* src, std::size_t bytes, Stream s = nullptr);
 bool dzero(void* p, std::size_t bytes, Stream s = nullptr);
 bool sync(Stream s = nullptr);
+// v41 (author 02:37 "yield for cuda, and if not then blocking"): how the host thread waits for the GPU in sync(): 0 the
+// driver's choice (spins while there are fewer contexts than logical CPUs), 1 spin, 2 yield, 3 block. Must run before the
+// first CUDA call of the process; false (with why) if the driver refused.
+bool set_host_wait(int mode, std::string* why);
 // free and total device memory now (cudaMemGetInfo); false when no device answers
 bool mem_info(std::size_t* free_bytes, std::size_t* total_bytes);
 
