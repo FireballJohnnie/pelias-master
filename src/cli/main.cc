@@ -2234,7 +2234,7 @@ int cmd_engine_check(const Args& a) {
                  "                           [--text FILE [--skip-tokens N]] [--timeline] [--dump-top OUT.tsv] [--dump-split [--split-sizes 2,3,4] [--split-step]]\n"
                  "                           [--no-doorbell] [--timeline-ops] [--split-ref] [--bank-selftest MIXES] [--probe-pos P]\n"
                  "                           [--router-tie BAND] [--cold-on-gpu] [--trace OUT.tsv] [--reader-v25] [--reader-cache K] [--fold-shared]\n"
-                 "                           [--batch-identical] [--graph] [--prefetch]\n");
+                 "                           [--batch-identical] [--graph] [--prefetch] [--plane-tail N]\n");
     return 1;
   }
   auto num = [&](const char* k, std::uint64_t d, std::uint64_t lo, std::uint64_t hi, std::uint64_t& out) {
@@ -2310,6 +2310,14 @@ int cmd_engine_check(const Args& a) {
   eo.batch_identical = a.has("batch-identical");
   eo.graph = a.has("graph");
   eo.prefetch = a.has("prefetch");
+  if (a.has("plane-tail")) {
+    const Result<std::uint64_t> pt = io::parse_whole(a.get("plane-tail"), 8);
+    if (!pt.ok()) {
+      std::fprintf(stderr, "pelias: --plane-tail takes 0 .. 8 picks\n");
+      return 1;
+    }
+    eo.plane_tail = static_cast<int>(pt.value);
+  }
   if (a.has("reader-cache")) {
     const Result<std::uint64_t> rc = io::parse_whole(a.get("reader-cache"), 64);
     if (!rc.ok()) {

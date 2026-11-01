@@ -245,7 +245,7 @@ struct GpuEngine::Impl {
   static constexpr int kReaderMax = 4;   // steps of up to this many tokens use it
   bool reader = false;
   std::string reader_note = "off";
-  void* reg_base = nullptr;              // the registered span of the model file's mapping (host)
+  std::vector<void*> reg_bases;          // v27: the registered ranges of the model file's mapping (host)
   g::ExpertPtr* rtab = nullptr;          // n_layer x n_expert entries (device)
   float *rgu = nullptr, *rh = nullptr;   // scratch: kReaderMax x nu x 2F, kReaderMax x nu x F
   float* ryd = nullptr;                  // v25 scratch: kReaderMax x nu x H (each pick's down row)
@@ -971,7 +971,7 @@ struct GpuEngine::Impl {
     const bool rd_ok =
         o.reader_v3
             ? g::moe_reader3(rtab + static_cast<int64_t>(il) * ne, fold ? rshx + il : nullptr, sel, wsel, gsh, static_cast<int>(nu), xr, n, e, s.n_ff_exp,
-                             rrow_max, rcache.empty() ? nullptr : &rcache[il], rgu, rh, ryd, rgrp, rgsrc, rgfill, y, tsl)
+                             rrow_max, rcache.empty() ? nullptr : &rcache[il], rgu, rh, ryd, rgrp, rgsrc, rgfill, y, tsl, nullptr, o.plane_tail)
             : g::moe_reader(rtab + static_cast<int64_t>(il) * ne, sel, wsel, static_cast<int>(nu), xr, n, e, s.n_ff_exp, rrow_max, rgu, rh, ryd, rgrp, y, tsl);
     if (!rd_ok) return gfail("engine: expert reader");
     if (trc_src_d && o.reader_v3) {
@@ -1082,15 +1082,49 @@ struct GpuEngine::Impl {
         }
       }
     if (hi <= lo) return;
-    const std::uintptr_t pg = 4096, b0 = lo & ~(pg - 1), b1 = (hi + pg - 1) & ~(pg - 1);
-    void* dev = nullptr;
+    // v27: pin only the experts the bank does not hold (the GPU reads the bank's from VRAM): their matrices as page-aligned
+    // ranges, merged where the gap between them is under 8 MiB (fewer, larger registrations); each range's device address
+    const std::uintptr_t pg = 4096;
+    std::vector<std::pair<std::uintptr_t, std::uintptr_t>> want;
+    for (std::uint32_t il = 0; il < s.n_layer; ++il)
+      for (const WeightView* v : {&w->layers[il].gate_exps, &w->layers[il].up_exps, &w->layers[il].down_exps})
+        for (int64_t ex = 0; ex < ne; ++ex) {
+          if (L[il].hot[z(ex)]) continue;
+          const ExpRows r = exp_rows(*v, static_cast<int>(ex));
+          const auto a = reinterpret_cast<std::uintptr_t>(r.base);
+          want.emplace_back(a & ~(pg - 1), (a + static_cast<std::uintptr_t>(r.rb * v->ne[1]) + pg - 1) & ~(pg - 1));
+        }
+    std::sort(want.begin(), want.end());
+    std::vector<std::pair<std::uintptr_t, std::uintptr_t>> runs;
+    for (const auto& iv : want) {
+      if (!runs.empty() && iv.first <= runs.back().second + (std::uintptr_t{8} << 20)) runs.back().second = std::max(runs.back().second, iv.second);
+      else runs.push_back(iv);
+    }
+    std::vector<const std::uint8_t*> run_dev;
+    std::uint64_t pinned = 0;
     std::string why;
     const Clock::time_point tr = Clock::now();
-    if (!g::host_register(reinterpret_cast<void*>(b0), static_cast<std::size_t>(b1 - b0), &dev, &why)) {
-      reader_note = "off (registering " + std::to_string((b1 - b0) >> 20) + " MiB of the file mapping failed: " + why + ")";
-      return;
+    for (const auto& rn : runs) {
+      void* dv = nullptr;
+      if (!g::host_register(reinterpret_cast<void*>(rn.first), static_cast<std::size_t>(rn.second - rn.first), &dv, &why)) {
+        for (void* rb2 : reg_bases) g::host_unregister(rb2);
+        reg_bases.clear();
+        reader_note = "off (registering " + std::to_string((rn.second - rn.first) >> 20) + " MiB of the file mapping failed: " + why + ")";
+        return;
+      }
+      reg_bases.push_back(reinterpret_cast<void*>(rn.first));
+      run_dev.push_back(static_cast<const std::uint8_t*>(dv));
+      pinned += rn.second - rn.first;
     }
-    reg_base = reinterpret_cast<void*>(b0);
+    auto dev_of = [&](const std::uint8_t* hp) -> const std::uint8_t* {
+      const auto a = reinterpret_cast<std::uintptr_t>(hp);
+      auto it = std::upper_bound(runs.begin(), runs.end(), std::make_pair(a, UINTPTR_MAX));
+      if (it == runs.begin()) return nullptr;
+      --it;
+      if (a >= it->second) return nullptr;
+      return run_dev[z(it - runs.begin())] + (a - it->first);
+    };
+    const std::uintptr_t b0 = 0, b1 = pinned;
     const double reg_s = since(tr);
     std::vector<g::ExpertPtr> tab(z(static_cast<int64_t>(s.n_layer) * ne));
     for (std::uint32_t il = 0; il < s.n_layer; ++il) {
@@ -1101,13 +1135,18 @@ struct GpuEngine::Impl {
         for (int pj = 0; pj < 3; ++pj) {
           const ExpRows r = exp_rows(*vv[pj], static_cast<int>(ex));
           const std::uint8_t* bank = L[il].hot[z(ex)] && !L[il].bank_at[pj].empty() ? L[il].bank_at[pj][z(ex)] : nullptr;
-          X.w[pj] = bank ? bank : static_cast<const std::uint8_t*>(dev) + (reinterpret_cast<std::uintptr_t>(r.base) - b0);
+          X.w[pj] = bank ? bank : dev_of(r.base);
           X.type[pj] = static_cast<std::uint32_t>(r.t);
           X.rb[pj] = r.rb;
           if (bank) X.vram = 1;
         }
       }
     }
+    for (const g::ExpertPtr& X : tab)
+      if (!X.w[0] || !X.w[1] || !X.w[2]) {
+        reader_note = "off (an expert outside the pinned ranges)";
+        return;
+      }
     // v26: the shared expert as a pick (its three matrices as the batched kernels read them, in VRAM)
     std::vector<g::ExpertPtr> shx_h;
     if (o.fold_shared && o.reader_v3 && s.n_ff_shexp == s.n_ff_exp) {
@@ -1134,7 +1173,7 @@ struct GpuEngine::Impl {
       for (int pj = 0; pj < 3; ++pj) rrow_max = std::max<std::uint64_t>(rrow_max, X.rb[pj]);
     for (const g::ExpertPtr& X : shx_h)
       for (int pj = 0; pj < 3; ++pj) rrow_max = std::max<std::uint64_t>(rrow_max, X.rb[pj]);
-    if (8192 + 8 * ((rrow_max + 32 + 15) & ~std::uint64_t{15}) > 48 * 1024) {
+    if (16384 + 8 * ((rrow_max + 32 + 15) & ~std::uint64_t{15}) > 48 * 1024) {
       reader_note = "off (expert rows too long for the reader's shared staging)";
       fold_ok = false;
       return;
@@ -1214,9 +1253,10 @@ struct GpuEngine::Impl {
     }
     reader = true;
     char b[160];
-    char b2[320];
-    std::snprintf(b2, sizeof b2, "on (%s, steps of 1-%d tokens; %.2f GB of the file registered in %.2f s%s%s)", o.reader_v3 ? "v3" : "v25", kReaderMax,
-                  static_cast<double>(b1 - b0) / 1e9, reg_s, fold_ok ? "; shared expert folded in" : "", cache_note.c_str());
+    char b2[480];
+    std::snprintf(b2, sizeof b2, "on (%s, steps of 1-%d tokens; %.2f GB of the file (the experts outside the bank) registered in %zu ranges in %.2f s%s%s)",
+                  o.reader_v3 ? "v3" : "v25", kReaderMax, static_cast<double>(b1 - b0) / 1e9, runs.size(), reg_s, fold_ok ? "; shared expert folded in" : "",
+                  cache_note.c_str());
     reader_note = b2;
     (void)b;
   }
@@ -1249,7 +1289,7 @@ GpuEngine::~GpuEngine() {
   }
   for (auto& kv : p_->graphs) g::graph_free(kv.second);
   p_->graphs.clear();
-  if (p_->reg_base) g::host_unregister(p_->reg_base);
+  for (void* rb2 : p_->reg_bases) g::host_unregister(rb2);
   g::dfree(p_->rtab);
   g::dfree(p_->rgu);
   g::dfree(p_->rh);

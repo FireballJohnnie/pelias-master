@@ -214,7 +214,9 @@ bool moe_reader(const ExpertPtr* tab, const std::int32_t* sel, const float* wsel
 // grp 1 + 6 x tokens x P ints; gsrc / gfill tokens x P ExpertPtr (device).
 bool moe_reader3(const ExpertPtr* tab, const ExpertPtr* shx, const std::int32_t* sel, const float* wsel, const float* gsh, int n_used, const float* xr,
                  std::int64_t tokens, std::int64_t H, std::int64_t F, std::uint64_t row_max, const ReaderCache* cache, float* gu, float* h, float* yd,
-                 int* grp, ExpertPtr* gsrc, ExpertPtr* gfill, float* y, unsigned long long* ts = nullptr, Stream s = nullptr);
+                 int* grp, ExpertPtr* gsrc, ExpertPtr* gfill, float* y, unsigned long long* ts = nullptr, Stream s = nullptr, int plane_tail = 0);
+// v27 plane test: plane_tail > 0 makes each token's lowest-ranked plane_tail routed picks use the 2-bit base plane of their
+// Q4_TG2 rows (each 4-bit code's value replaced by the mean of the four values sharing its top two bits); lossy, for the gate
 // v26 prefetch: the next layer's predicted picks (npicks, its router on this layer's output) into the cache before that
 // layer's reader runs: each predicted file expert not cached gets a slot and is copied into it (job: scratch 1 + 2 x npicks
 // ints). Run on a second stream; events order it (event_record / stream_wait).

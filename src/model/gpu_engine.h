@@ -104,6 +104,10 @@ struct EngineOptions {
   // picks; a second stream copies the predicted file experts into cache slots while the next layer's attention / DeltaNet
   // block runs; that layer's reader waits for it. Needs reader_cache > 0.
   bool prefetch = false;
+  // v27 plane test (author 21:25-21:27): each token's lowest-ranked plane_tail routed picks read their Q4_TG2 rows as a 2-bit
+  // base plane (each code's value replaced by the mean of the four sharing its top two bits). Lossy: for the accuracy gate
+  // (the bytes read do not change yet). 0: off.
+  int plane_tail = 0;
 };
 
 struct EngineStats {

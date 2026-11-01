@@ -1417,133 +1417,170 @@ __device__ __forceinline__ void rd3_decode(std::uint32_t type, const std::uint8_
   }
   decode32(type, row, j, tb, wv);
 }
-__device__ __forceinline__ void rd3_lut(const Tables& tb, float* lut) {
-  for (int i = static_cast<int>(threadIdx.x); i < 2048; i += static_cast<int>(blockDim.x)) lut[i] = tb.tg2[i >> 5];
+__device__ __forceinline__ void rd3_lut(const Tables& tb, float* lut, float* lut2) {
+  // the grid per lane (bank = lane); lut2 (v27 plane test): each code's value replaced by the mean of the four codes that
+  // share its top two bits (a 2-bit base plane of the grid)
+  for (int i = static_cast<int>(threadIdx.x); i < 2048; i += static_cast<int>(blockDim.x)) {
+    lut[i] = tb.tg2[i >> 5];
+    if (lut2) {
+      const int en = i >> 5, base = en & ~3;
+      lut2[i] = (tb.tg2[base] + tb.tg2[base + 1] + tb.tg2[base + 2] + tb.tg2[base + 3]) * 0.25f;
+    }
+  }
   __syncthreads();
 }
+// v27: the reader v3 kernels loop over row pairs (grid-stride), so each block builds its shared grid once for many rows
+// (v26 built it per 8 rows: ~28 MB of shared stores per layer), and only when the group's matrices are Q4_TG2. tail > 0
+// (the plane test): routed picks of rank >= n_used - tail use the 2-bit base plane of Q4_TG2 rows (lut2).
+__device__ __forceinline__ bool rd3_tail_pick(int pk, int picks_routed, int nu, int tail) { return tail > 0 && pk < picks_routed && pk % nu >= nu - tail; }
 // gate and up: a warp takes two rows (r0, r0 + 1 of the 2F gate|up rows) of one group, stages both, then decodes
 __global__ void __launch_bounds__(128) k_rd3_gate_up(const ExpertPtr* __restrict__ gsrc, const ExpertPtr* __restrict__ gfill, const int* __restrict__ grp,
                                                      int nu, int picks_routed, const float* __restrict__ xr, std::int64_t H, std::int64_t F,
-                                                     std::uint64_t slot, float* __restrict__ gu, const Tables tb) {
+                                                     std::uint64_t slot, float* __restrict__ gu, const Tables tb, int tail) {
   extern __shared__ __align__(16) std::uint8_t rd3_sh[];
-  float* lut = reinterpret_cast<float*>(rd3_sh);
-  rd3_lut(tb, lut);
   const int u = static_cast<int>(blockIdx.y);
   if (u >= grp[0]) return;
-  const int warp = static_cast<int>(threadIdx.x >> 5), lane = static_cast<int>(threadIdx.x & 31);
-  const std::int64_t r0 = (static_cast<std::int64_t>(blockIdx.x) * 4 + warp) * 2;
-  if (r0 >= 2 * F) return;
   const int* G = grp + 1 + 6 * u;
   const int cnt = G[1];
   const ExpertPtr& X = gsrc[u];
   const ExpertPtr& FL = gfill[u];
-  std::uint8_t* buf = rd3_sh + 8192 + slot * static_cast<std::uint64_t>(2 * warp);
-  const std::uint8_t* rows[2] = {nullptr, nullptr};
-  int pjs[2] = {0, 0};
-  std::int64_t rrs[2] = {0, 0};
-  for (int q = 0; q < 2; ++q) {
-    const std::int64_t r = r0 + q;
-    if (r >= 2 * F) break;
-    const int pj = r < F ? 0 : 1;
-    const std::int64_t rr = r < F ? r : r - F;
-    pjs[q] = pj;
-    rrs[q] = rr;
-    const std::uint64_t off = static_cast<std::uint64_t>(rr) * X.rb[pj];
-    rows[q] = rd3_stage(X.w[pj] + off, X.rb[pj], buf + slot * static_cast<std::uint64_t>(q), FL.w[pj] ? const_cast<std::uint8_t*>(FL.w[pj]) + off : nullptr,
-                        lane, 32);
-  }
-  for (int q = 0; q < 2; ++q) {
-    if (!rows[q]) break;
-    const int pj = pjs[q];
-    float acc[kRdMaxTok] = {0.0f, 0.0f, 0.0f, 0.0f};
-    for (std::int64_t j = lane; j < H / 32; j += 32) {
-      float wv[32];
-      rd3_decode(X.type[pj], rows[q], j, tb, lut, wv);
-      for (int c = 0; c < cnt; ++c) {
-        const int pk = G[2 + c];
-        const int tok = pk < picks_routed ? pk / nu : pk - picks_routed;
-        const float* x = xr + tok * H + 32 * j;
-        float s = 0.0f;
+  bool any_tail = false;
+  for (int c = 0; c < cnt; ++c) any_tail = any_tail || rd3_tail_pick(G[2 + c], picks_routed, nu, tail);
+  const bool tg = X.type[0] == g_q4_tg2 || X.type[1] == g_q4_tg2;
+  float* lut = reinterpret_cast<float*>(rd3_sh);
+  float* lut2 = any_tail ? lut + 2048 : nullptr;
+  if (tg) rd3_lut(tb, lut, lut2);
+  std::uint8_t* stage0 = rd3_sh + 16384;
+  const int warp = static_cast<int>(threadIdx.x >> 5), lane = static_cast<int>(threadIdx.x & 31);
+  std::uint8_t* buf = stage0 + slot * static_cast<std::uint64_t>(2 * warp);
+  for (std::int64_t chunk = blockIdx.x; chunk * 8 < 2 * F; chunk += gridDim.x) {
+    const std::int64_t r0 = (chunk * 4 + warp) * 2;
+    if (r0 >= 2 * F) continue;
+    const std::uint8_t* rows[2] = {nullptr, nullptr};
+    int pjs[2] = {0, 0};
+    std::int64_t rrs[2] = {0, 0};
+    for (int q = 0; q < 2; ++q) {
+      const std::int64_t r = r0 + q;
+      if (r >= 2 * F) break;
+      const int pj = r < F ? 0 : 1;
+      const std::int64_t rr = r < F ? r : r - F;
+      pjs[q] = pj;
+      rrs[q] = rr;
+      const std::uint64_t off = static_cast<std::uint64_t>(rr) * X.rb[pj];
+      rows[q] = rd3_stage(X.w[pj] + off, X.rb[pj], buf + slot * static_cast<std::uint64_t>(q), FL.w[pj] ? const_cast<std::uint8_t*>(FL.w[pj]) + off : nullptr,
+                          lane, 32);
+    }
+    for (int q = 0; q < 2; ++q) {
+      if (!rows[q]) break;
+      const int pj = pjs[q];
+      const bool shadow = any_tail && X.type[pj] == g_q4_tg2;
+      float acc[kRdMaxTok] = {0.0f, 0.0f, 0.0f, 0.0f};
+      for (std::int64_t j = lane; j < H / 32; j += 32) {
+        float wv[32], wv2[32];
+        rd3_decode(X.type[pj], rows[q], j, tb, lut, wv);
+        if (shadow) rd3_decode(X.type[pj], rows[q], j, tb, lut2, wv2);
+        for (int c = 0; c < cnt; ++c) {
+          const int pk = G[2 + c];
+          const int tok = pk < picks_routed ? pk / nu : pk - picks_routed;
+          const float* x = xr + tok * H + 32 * j;
+          const float* w = (shadow && rd3_tail_pick(pk, picks_routed, nu, tail)) ? wv2 : wv;
+          float s = 0.0f;
 #pragma unroll
-        for (int i = 0; i < 32; ++i) s += wv[i] * x[i];
-        acc[c] += s;
+          for (int i = 0; i < 32; ++i) s += w[i] * x[i];
+          acc[c] += s;
+        }
+      }
+      for (int c = 0; c < cnt; ++c) {
+        const float a = warp_sum(acc[c]);
+        if (lane == 0) gu[(static_cast<std::int64_t>(G[2 + c]) * 2 + pj) * F + rrs[q]] = a;
       }
     }
-    for (int c = 0; c < cnt; ++c) {
-      const float a = warp_sum(acc[c]);
-      if (lane == 0) gu[(static_cast<std::int64_t>(G[2 + c]) * 2 + pj) * F + rrs[q]] = a;
-    }
+    __syncwarp();
   }
 }
 // down: rows of F values; with F / 32 <= 16 a half-warp per row (two rows per warp), else a warp per row (two in turn)
 __global__ void __launch_bounds__(128) k_rd3_down(const ExpertPtr* __restrict__ gsrc, const ExpertPtr* __restrict__ gfill, const int* __restrict__ grp,
-                                                  const float* __restrict__ h, std::int64_t H, std::int64_t F, std::uint64_t slot, float* __restrict__ yd,
-                                                  const Tables tb) {
+                                                  int nu, int picks_routed, const float* __restrict__ h, std::int64_t H, std::int64_t F, std::uint64_t slot,
+                                                  float* __restrict__ yd, const Tables tb, int tail) {
   extern __shared__ __align__(16) std::uint8_t rd3_sh[];
-  float* lut = reinterpret_cast<float*>(rd3_sh);
-  rd3_lut(tb, lut);
   const int u = static_cast<int>(blockIdx.y);
   if (u >= grp[0]) return;
-  const int warp = static_cast<int>(threadIdx.x >> 5), lane = static_cast<int>(threadIdx.x & 31);
-  const std::int64_t r0 = (static_cast<std::int64_t>(blockIdx.x) * 4 + warp) * 2;
-  if (r0 >= H) return;
   const int* G = grp + 1 + 6 * u;
   const int cnt = G[1];
   const ExpertPtr& X = gsrc[u];
   const ExpertPtr& FL = gfill[u];
-  std::uint8_t* buf = rd3_sh + 8192 + slot * static_cast<std::uint64_t>(2 * warp);
+  bool any_tail = false;
+  for (int c = 0; c < cnt; ++c) any_tail = any_tail || rd3_tail_pick(G[2 + c], picks_routed, nu, tail);
+  const bool tg = X.type[2] == g_q4_tg2;
+  const bool shadow = any_tail && tg;
+  float* lut = reinterpret_cast<float*>(rd3_sh);
+  float* lut2 = shadow ? lut + 2048 : nullptr;
+  if (tg) rd3_lut(tb, lut, lut2);
+  std::uint8_t* stage0 = rd3_sh + 16384;
+  const int warp = static_cast<int>(threadIdx.x >> 5), lane = static_cast<int>(threadIdx.x & 31);
+  std::uint8_t* buf = stage0 + slot * static_cast<std::uint64_t>(2 * warp);
   const std::int64_t nb = F / 32;
   const bool halves = nb <= 16;
-  if (halves) {  // lanes 0-15 row r0, lanes 16-31 row r0 + 1
-    const int hq = lane >> 4, hl = lane & 15;
-    const std::int64_t r = r0 + hq;
-    const bool live = r < H;
-    const std::uint64_t off = static_cast<std::uint64_t>(live ? r : r0) * X.rb[2];
-    const std::uint8_t* row =
-        rd3_stage(X.w[2] + off, live ? X.rb[2] : 0, buf + slot * static_cast<std::uint64_t>(hq), (live && FL.w[2]) ? const_cast<std::uint8_t*>(FL.w[2]) + off : nullptr,
-                  hl, 16);
-    float acc[kRdMaxTok] = {0.0f, 0.0f, 0.0f, 0.0f};
-    if (live)
-      for (std::int64_t q = hl; q < nb; q += 16) {
-        float wv[32];
+  for (std::int64_t chunk = blockIdx.x; chunk * 8 < H; chunk += gridDim.x) {
+    const std::int64_t r0 = (chunk * 4 + warp) * 2;
+    if (r0 >= H) continue;
+    if (halves) {  // lanes 0-15 row r0, lanes 16-31 row r0 + 1
+      const int hq = lane >> 4, hl = lane & 15;
+      const std::int64_t r = r0 + hq;
+      const bool live = r < H;
+      const std::uint64_t off = static_cast<std::uint64_t>(live ? r : r0) * X.rb[2];
+      const std::uint8_t* row = rd3_stage(X.w[2] + off, live ? X.rb[2] : 0, buf + slot * static_cast<std::uint64_t>(hq),
+                                          (live && FL.w[2]) ? const_cast<std::uint8_t*>(FL.w[2]) + off : nullptr, hl, 16);
+      float acc[kRdMaxTok] = {0.0f, 0.0f, 0.0f, 0.0f};
+      if (live)
+        for (std::int64_t q = hl; q < nb; q += 16) {
+          float wv[32], wv2[32];
+          rd3_decode(X.type[2], row, q, tb, lut, wv);
+          if (shadow) rd3_decode(X.type[2], row, q, tb, lut2, wv2);
+          for (int c = 0; c < cnt; ++c) {
+            const int pk = G[2 + c];
+            const float* hv = h + static_cast<std::int64_t>(pk) * F + 32 * q;
+            const float* w = (shadow && rd3_tail_pick(pk, picks_routed, nu, tail)) ? wv2 : wv;
+            float s = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 32; ++i) s += w[i] * hv[i];
+            acc[c] += s;
+          }
+        }
+      for (int c = 0; c < cnt; ++c) {
+        float a = acc[c];
+        for (int o = 8; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+        if (live && hl == 0) yd[static_cast<std::int64_t>(G[2 + c]) * H + r] = a;
+      }
+      __syncwarp();
+      continue;
+    }
+    for (int qq = 0; qq < 2; ++qq) {
+      const std::int64_t r = r0 + qq;
+      if (r >= H) break;
+      const std::uint64_t off = static_cast<std::uint64_t>(r) * X.rb[2];
+      const std::uint8_t* row = rd3_stage(X.w[2] + off, X.rb[2], buf, FL.w[2] ? const_cast<std::uint8_t*>(FL.w[2]) + off : nullptr, lane, 32);
+      float acc[kRdMaxTok] = {0.0f, 0.0f, 0.0f, 0.0f};
+      for (std::int64_t q = lane; q < nb; q += 32) {
+        float wv[32], wv2[32];
         rd3_decode(X.type[2], row, q, tb, lut, wv);
+        if (shadow) rd3_decode(X.type[2], row, q, tb, lut2, wv2);
         for (int c = 0; c < cnt; ++c) {
-          const float* hv = h + static_cast<std::int64_t>(G[2 + c]) * F + 32 * q;
+          const int pk = G[2 + c];
+          const float* hv = h + static_cast<std::int64_t>(pk) * F + 32 * q;
+          const float* w = (shadow && rd3_tail_pick(pk, picks_routed, nu, tail)) ? wv2 : wv;
           float s = 0.0f;
 #pragma unroll
-          for (int i = 0; i < 32; ++i) s += wv[i] * hv[i];
+          for (int i = 0; i < 32; ++i) s += w[i] * hv[i];
           acc[c] += s;
         }
       }
-    for (int c = 0; c < cnt; ++c) {
-      float a = acc[c];
-      for (int o = 8; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
-      if (live && hl == 0) yd[static_cast<std::int64_t>(G[2 + c]) * H + r] = a;
-    }
-    return;
-  }
-  for (int qq = 0; qq < 2; ++qq) {
-    const std::int64_t r = r0 + qq;
-    if (r >= H) break;
-    const std::uint64_t off = static_cast<std::uint64_t>(r) * X.rb[2];
-    const std::uint8_t* row = rd3_stage(X.w[2] + off, X.rb[2], buf, FL.w[2] ? const_cast<std::uint8_t*>(FL.w[2]) + off : nullptr, lane, 32);
-    float acc[kRdMaxTok] = {0.0f, 0.0f, 0.0f, 0.0f};
-    for (std::int64_t q = lane; q < nb; q += 32) {
-      float wv[32];
-      rd3_decode(X.type[2], row, q, tb, lut, wv);
       for (int c = 0; c < cnt; ++c) {
-        const float* hv = h + static_cast<std::int64_t>(G[2 + c]) * F + 32 * q;
-        float s = 0.0f;
-#pragma unroll
-        for (int i = 0; i < 32; ++i) s += wv[i] * hv[i];
-        acc[c] += s;
+        const float a = warp_sum(acc[c]);
+        if (lane == 0) yd[static_cast<std::int64_t>(G[2 + c]) * H + r] = a;
       }
+      __syncwarp();
     }
-    for (int c = 0; c < cnt; ++c) {
-      const float a = warp_sum(acc[c]);
-      if (lane == 0) yd[static_cast<std::int64_t>(G[2 + c]) * H + r] = a;
-    }
-    __syncwarp();
   }
 }
 __global__ void k_rd3_combine(const float* __restrict__ yd, const float* __restrict__ wsel, const float* __restrict__ gsh, int nu, std::int64_t tokens,
@@ -1558,7 +1595,8 @@ __global__ void k_rd3_combine(const float* __restrict__ yd, const float* __restr
 }
 bool moe_reader3(const ExpertPtr* tab, const ExpertPtr* shx, const std::int32_t* sel, const float* wsel, const float* gsh, int n_used, const float* xr,
                  std::int64_t tokens, std::int64_t H, std::int64_t F, std::uint64_t row_max, const ReaderCache* cache, float* gu, float* h, float* yd,
-                 int* grp, ExpertPtr* gsrc, ExpertPtr* gfill, float* y, unsigned long long* ts, Stream s) {
+                 int* grp, ExpertPtr* gsrc, ExpertPtr* gfill, float* y, unsigned long long* ts, Stream s, int plane_tail) {
+  if (plane_tail < 0 || plane_tail > n_used) return fail("moe_reader3: plane_tail 0 .. n_used");
   if (!tab || !sel || !wsel || !xr || !gu || !h || !yd || !grp || !gsrc || !gfill || !y || n_used <= 0 || n_used > 8 || H % 32 != 0 || F % 32 != 0 ||
       row_max == 0 || (shx && !gsh))
     return fail("moe_reader3: bad shape or pointer");
@@ -1573,17 +1611,19 @@ bool moe_reader3(const ExpertPtr* tab, const ExpertPtr* shx, const std::int32_t*
   }
   const std::int64_t routed = tokens * n_used, picks = routed + (shx ? tokens : 0);
   const std::uint64_t slot = (row_max + 32 + 15) & ~std::uint64_t{15};
-  const std::size_t shm = 8192 + static_cast<std::size_t>(8 * slot);
+  const std::size_t shm = 16384 + static_cast<std::size_t>(8 * slot);  // v27: two grids (full, plane test) + staging
   if (shm > 48 * 1024) return fail("moe_reader3: rows too long for the shared staging");
+  const unsigned gx_up = static_cast<unsigned>(std::min<std::int64_t>(16, (2 * F + 7) / 8)), gx_dn = static_cast<unsigned>(std::min<std::int64_t>(16, (H + 7) / 8));
   if (ts) k_stamp<<<1, 1, 0, st(s)>>>(ts + 0);
   k_rd3_group<<<1, 32, 0, st(s)>>>(tab, shx, sel, static_cast<int>(tokens), n_used, c, H, F, grp, gsrc, gfill);
   if (ts) k_stamp<<<1, 1, 0, st(s)>>>(ts + 1);
-  k_rd3_gate_up<<<dim3(static_cast<unsigned>((2 * F + 7) / 8), static_cast<unsigned>(picks)), 128, shm, st(s)>>>(gsrc, gfill, grp, n_used,
-                                                                                                                  static_cast<int>(routed), xr, H, F, slot, gu, tb);
+  k_rd3_gate_up<<<dim3(gx_up, static_cast<unsigned>(picks)), 128, shm, st(s)>>>(gsrc, gfill, grp, n_used, static_cast<int>(routed), xr, H, F, slot, gu, tb,
+                                                                              plane_tail);
   if (ts) k_stamp<<<1, 1, 0, st(s)>>>(ts + 2);
   k_rd_silu_round<<<blocks_for(picks * (F / 32), 128), 128, 0, st(s)>>>(gu, picks, F, h);
   if (ts) k_stamp<<<1, 1, 0, st(s)>>>(ts + 3);
-  k_rd3_down<<<dim3(static_cast<unsigned>((H + 7) / 8), static_cast<unsigned>(picks)), 128, shm, st(s)>>>(gsrc, gfill, grp, h, H, F, slot, yd, tb);
+  k_rd3_down<<<dim3(gx_dn, static_cast<unsigned>(picks)), 128, shm, st(s)>>>(gsrc, gfill, grp, n_used, static_cast<int>(routed), h, H, F, slot, yd, tb,
+                                                                          plane_tail);
   if (ts) k_stamp<<<1, 1, 0, st(s)>>>(ts + 4);
   k_rd3_combine<<<blocks_for(tokens * H, 256), 256, 0, st(s)>>>(yd, wsel, shx ? gsh : nullptr, n_used, tokens, H, y);
   if (ts) k_stamp<<<1, 1, 0, st(s)>>>(ts + 5);

@@ -740,8 +740,8 @@ TEST(rung1_moe_reader_against_fp64) {
 TEST(rung1_moe_reader3_equals_v25_cache_and_shared) {
   if (!gpu_or_skip()) return;
   const q::Type types[3] = {q::Type::q8_0, q::Type::q6_k, q::Type::q4_tg2};
-  bool eq_all = true, cache_eq = true, cache_hits_ok = true, shared_ok = true;
-  double worst_sh = 0.0;
+  bool eq_all = true, cache_eq = true, cache_hits_ok = true, shared_ok = true, plane_ok = true;
+  double worst_sh = 0.0, worst_plane = 0.0;
   for (const std::int64_t F : {std::int64_t{256}, std::int64_t{1024}}) {
     const std::int64_t H = 512, ne = 6;
     const int nu = 3;
@@ -819,7 +819,28 @@ TEST(rung1_moe_reader3_equals_v25_cache_and_shared) {
       }
       if (file_groups <= K) cache_hits_ok = cache_hits_ok && from_vram == file_groups;
       CHECK(g::moe_reader3(dtab.p, dshx.p, ds.p, dw.p, dg.p, nu, dx.p, T, H, F, row_max, nullptr, dgu.p, dh.p, dyd.p, dgrp.p, gsrc.p, gfill.p, ysh.p));
+      // v27 plane test: tail 0 is the plain reader bit for bit; tail 1 changes the output (the last pick's Q4_TG2 rows on the
+      // 2-bit base plane), finite and close
+      Dev<float> yt0(static_cast<std::size_t>(T * H)), yt1(static_cast<std::size_t>(T * H));
+      CHECK(g::moe_reader3(dtab.p, nullptr, ds.p, dw.p, nullptr, nu, dx.p, T, H, F, row_max, nullptr, dgu.p, dh.p, dyd.p, dgrp.p, gsrc.p, gfill.p, yt0.p, nullptr,
+                           nullptr, 0));
+      CHECK(g::moe_reader3(dtab.p, nullptr, ds.p, dw.p, nullptr, nu, dx.p, T, H, F, row_max, nullptr, dgu.p, dh.p, dyd.p, dgrp.p, gsrc.p, gfill.p, yt1.p, nullptr,
+                           nullptr, 1));
       CHECK(g::sync());
+      {
+        const std::vector<float> a0 = yt0.get(), a1 = yt1.get(), ref3 = y3.get();
+        CHECK(std::memcmp(a0.data(), ref3.data(), a0.size() * sizeof(float)) == 0);
+        double dn = 0.0, dd = 0.0;
+        bool fin = true;
+        for (std::size_t i = 0; i < a0.size(); ++i) {
+          fin = fin && std::isfinite(a1[i]);
+          dn += (static_cast<double>(a1[i]) - a0[i]) * (static_cast<double>(a1[i]) - a0[i]);
+          dd += static_cast<double>(a0[i]) * a0[i];
+        }
+        const double rel = std::sqrt(dn / std::max(dd, 1e-300));
+        plane_ok = plane_ok && fin && rel > 0.0 && rel < 0.5;
+        worst_plane = std::max(worst_plane, rel);
+      }
       const std::vector<float> a24 = y24.get(), a3 = y3.get(), c1 = yc1.get(), c2 = yc2.get(), sh = ysh.get();
       const std::size_t nb = a24.size() * sizeof(float);
       eq_all = eq_all && std::memcmp(a24.data(), a3.data(), nb) == 0;
@@ -864,6 +885,8 @@ TEST(rung1_moe_reader3_equals_v25_cache_and_shared) {
   CHECK(cache_eq);
   CHECK(cache_hits_ok);
   CHECK(shared_ok);
+  CHECK(plane_ok);
+  std::printf("    plane test (last pick's Q4_TG2 rows on the 2-bit base plane): tail 0 bit for bit; tail 1 changes the output by up to %.3e (rel L2)\n", worst_plane);
   std::printf("    F 256 (half-warp down) / 1024 (warp down), 1 / 2 / 4 tokens, q8_0 / q6_k / q4_tg2: v3 = v24 %s; cached (fill, then read) %s, "
               "second call from VRAM %s; shared expert folded in: worst rel L2 %.3e against fp64\n",
               eq_all ? "bit for bit" : "DIFFERS", cache_eq ? "bit for bit" : "DIFFERS", cache_hits_ok ? "yes" : "NO", worst_sh);
