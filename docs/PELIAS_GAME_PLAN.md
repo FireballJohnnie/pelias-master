@@ -1926,6 +1926,18 @@ Builds noted (all bit for bit unless marked):
 - B6 the cap, once R1T measures the GPU's per-pick cost: the CPU takes only the picks it can finish inside the GPU's window (paper28 fit: GPU ~42 us per pick, CPU ~194 us per pick today, so 1 per layer; 2 if the CPU path reaches ~110 us per pick). Needs the light experts pinned too.
 Target (ESTIMATE): CPU path from 13.4 to ~9-10.5 ms per token removes it from the critical path; the split then runs at the GPU's pace, ~21-23 ms per token.
 
+### The author's ten-point list checked against the code (2026-11-01 17:2x EST, author 17:14; code and read-only checks)
+- SMT routing: no SMT-aware routing in the code. WSL shows vCPU pairs (0,1) ... (14,15) as siblings (lscpu, MEASURED) but the root scheduler places vCPUs on any host thread (v43 MEASURED), so guest pinning cannot pick a host pipeline. The doorbell thread is a worker (pool thread 0), not a helper; v43 pinned it to vCPU 0.
+- vCPU 0 takes the VMBus callback interrupts (8,689 vs 8-1,528 on the others since boot, MEASURED). Leaving vCPUs 0-1 out of the pool is untested.
+- Snooping: happening (cudaHostRegisterMapped | ReadOnly: coherent). Write-combined is only for cudaHostAlloc memory and no-snoop is the driver's choice, so neither is open to us under WSL. The snoops are for lines the CPU does not hold. Size UNMEASURED; plan: the CPU kernel bench alone vs during an R1 decode.
+- Barriers: happening, twice per layer (phase 2 waits on every phase-1 item; the doorbell thread waits for all workers). One thread per pick would be ~6x slower per layer at 1.73 picks (DERIVED); a team per pick with no layer-wide barrier is B2.
+- Combine: not happening. Each down item owns 128 output rows (512 B), no atomics.
+- Loads: plain loads; T0 prefetch only with --cpu-prefetch. x (8 KB) and the grids are reused every row, so they stay in L1 (DERIVED). A stream load equals a plain load on ordinary memory. An NTA-prefetch switch is untested.
+- Balloon / stage-2 pages: hv_balloon is loaded (Dynamic Memory, free page reporting, cold discard order 5; balloon 0 kB) (MEASURED). Guest mappings are 2 MB (v35); the host's backing page size is UNMEASURED and not visible from inside the VM. Plan: random-access latency probe at 4 KB vs 2 MB strides.
+- Spins: happening. The doorbell spin has no pause; worker spins on gen_ have no pause for the first 4,000 checks; the caller's hot wait on active_ has no pause. next_, done1_, active_ and gen_ share cache lines. B4.
+- Graph vs doorbell: the GPU reader does not wait for the CPU (the wait comes after the reader). But both sides start only after three copy-engine copies and the GPU rounding kernel, which the CPU does not use. B5.
+- Rounding: one thread (the doorbell) rounds while 7 spin. It is not repeated across threads, but it repeats the GPU's rounding (0.33 ms per token scalar, MEASURED v39). v45 makes it AVX2.
+
 ## Appendix A. ID map: old names to the names in this file (fixes the collisions found by the readers)
 
 | Old name (where) | Meaning | New ID |
