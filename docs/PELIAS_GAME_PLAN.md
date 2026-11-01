@@ -1945,6 +1945,19 @@ Target (ESTIMATE): CPU path from 13.4 to ~9-10.5 ms per token removes it from th
 - **Three more paths:** (a) an integer expert decode for the CPU (int8 x 3 24-bit grid, the GPU prompt tiles' locked trick at 1.1e-7; or the locked int4 core of the small-card layout): CPU int8 decoders run 28-39 GB/s on other types (MEASURED); exactness is the author's call; (b) CPU work the GPU never waits on: copy-engine prefetch of predicted misses (67 % one layer ahead), MTP head sketch (470 -> 117-180 MB per draft, DERIVED), residual planes top 4 (GPU first, exact CPU late); (c) Windows-native engine run (tier build was 5 ms/token faster on Windows; pin 12x faster; Windows GPU build proven).
 - **Also open and never addressed:** prefill ~50 tok/s vs the 1,670 tok/s at 12k gate (PG7).
 
+### v46 sandbox model: the #1 fold-in build (2026-11-01 17:5x EST, author 17:48; model46.py in the backup folder; every input MEASURED, every output DERIVED)
+Inputs: today's R1T trace (picks, bank / cache / live bytes per layer-step); tier_v1 header (dense Q8_0 1,379.6 MB, router 83.9, shared 134.0, head 417.2, embd 540.3 MB); R3 real token path 399.6 GB/s incl. 160 stage boundaries (10-29; 318-467 per format); zero-copy 21.0 GB/s (today); CPU Q4_TG2 12.3 GB/s during a GPU decode (today); prefetch removed 66 % of misses (v26 vs v29, same config); MTP kept 82.6 / 64.5 / 60.4 % (v27); VRAM 9.78 of 11.49 GB.
+| Build | Misses / token | ms / token | tok/s |
+|---|---|---|---|
+| Line A alone (one persistent launch), misses as today | 63.9 | 12.7-14.7 (ops 1-3 ms) | 68-79 |
+| + embd to host (B10, lossless) + spare VRAM as cache slots (+23 per layer) | 49.4 | 11.2-13.2 | 76-89 |
+| + copy-engine prefetch of next-layer predicted misses (66 % removed, MEASURED basis) | 16.8 | 8.2-10.2 | 98-122 |
+| CPU racing misses with a deadline at 12.3 / 25 GB/s | 16.8 | -0.0 / -0.16 | (no longer needed) |
+| + head sketch (2-bit + 64 exact rows; recall UNMEASURED) | | -0.73 | |
+| + MTP 1-3 drafts (verify reads weights once; per-token ops ESTIMATE) | | 6.8-6.9 (5.7-6.1 with sketch) | 144-148 (164-174) |
+Sensitivity: R3 rate 318 -> 10.8 ms, 467 -> 8.4 ms (the best row, ops 2). PCIe check: ~138 MB per token over the link vs 242 MB it can move in 9.2 ms. Ops inside the launch (1-3 ms) is the largest unmeasured term.
+Reading: with Line A + slots + prefetch the GPU's own streaming hides the remaining misses; the CPU's decode is not on the path (the author's vision, 17:46). CPU roles that are free: issue the prefetch copies (copy engines, no SMs) and set slot-ready flags; accuracy planes (GPU first, exact CPU late); token_embd row gather. The GPU never waits: a slot not ready is read zero-copy.
+
 ## Appendix A. ID map: old names to the names in this file (fixes the collisions found by the readers)
 
 | Old name (where) | Meaning | New ID |
