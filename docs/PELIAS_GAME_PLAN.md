@@ -1908,6 +1908,24 @@ The bf16 model is zero drift. The bar to beat is Unsloth UD-Q4_K_M.
 
 ---
 
+### Split CPU path: step-back review (2026-11-01 17:1x EST, author 17:06; code read, nothing run)
+Frame (author): the PC behaves as one shared bus; bytes are cheap, so look for the small costs. Findings, each labelled:
+- The bus is not the limit: the CPU uses ~9 GB/s of the 45.9-47.6 GB/s the RAM gives (MEASURED); 2 MB mappings were in use in the decode (v35 MEASURED), so page size is out.
+- The limit is instructions per weight in the Q4_TG2 float path: the kernel bench gives ~1.4 GB/s per thread = ~13.7 cycles per 8 weights at 4.24 GHz (DERIVED from v30 / v35 MEASURED). Read from the code, each 8 weights cost ~18 operations (ESTIMATE): two table permutes, a blend, a scale multiply, the multiply-add, the code widening, the tag shift, and per 32 values a scalar division for the scale.
+- Overheads around that core (code; sizes ESTIMATE): per row, a chain of calls (dot_row_q8 -> dot_row -> dot_row_avx2, row_bytes in another file) and a final horizontal sum; per 256 values, four calls to q4_tg_grid (another file) and eight grid loads; per 32 values, one scalar division; the six level bytes unpacked one at a time. Down rows are 512 wide (two segments), so their share of overhead is about 4x a gate/up row's.
+- The idle between phases: run2 makes every phase-2 item wait for every phase-1 item; items are ~45-55 us (64 rows x 1,152 B at ~1.4 GB/s; DERIVED), ~28 gate/up items and ~16 down items per layer over 8 threads, so the last round is part-empty. Busy 75-82 % (MEASURED) puts ~2.4-2.7 ms per token of the 13.4 ms in these tails (DERIVED).
+- Spin hygiene: next_, done1_, active_ and gen_ share cache lines; the first 4,000 spins on gen_, the doorbell's spin on the ring and the caller's hot spin on active_ have no pause. Under the root scheduler a spinning vCPU can sit on the sibling hyperthread of a working one. Size UNMEASURED (A/B in the build below).
+- The ring: the CPU's start waits on three copy-engine copies (picks, weights, x) plus a ring kernel per layer; the same bytes could be written by one kernel straight into the mapped block. Size UNMEASURED (A/B).
+- The CPU rounds x again although the GPU already rounded it (8 us per layer before v45's AVX2 rounding).
+Builds noted (all bit for bit unless marked):
+- B1 tile kernel: one call per tile of rows; grids loaded once per tile; the eight scales of a segment from one vector multiply and one vector division (IEEE division is exact per lane, so equal to the scalar ones); the level bytes from one 8-byte load; 2-4 rows interleaved, nt = 1 specialised. For gate, up (paired) and down.
+- B2 dataflow pool: no phase barrier; a group's down items start once that group's gate/up are done; each pick's down output in its own buffer, summed in pick order at the end (same order as today).
+- B3 finer items (16-32 rows); v45 GU2T is the first real test (v40's was void).
+- B4 pool hygiene: each shared atomic on its own 64-byte line; a pause in every spin.
+- B5 zero-copy ring: one kernel writes picks, weights and x (or the GPU's rounded x, if equal bit for bit) into the mapped block and rings.
+- B6 the cap, once R1T measures the GPU's per-pick cost: the CPU takes only the picks it can finish inside the GPU's window (paper28 fit: GPU ~42 us per pick, CPU ~194 us per pick today, so 1 per layer; 2 if the CPU path reaches ~110 us per pick). Needs the light experts pinned too.
+Target (ESTIMATE): CPU path from 13.4 to ~9-10.5 ms per token removes it from the critical path; the split then runs at the GPU's pace, ~21-23 ms per token.
+
 ## Appendix A. ID map: old names to the names in this file (fixes the collisions found by the readers)
 
 | Old name (where) | Meaning | New ID |
