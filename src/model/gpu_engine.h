@@ -112,6 +112,10 @@ struct EngineOptions {
   // computed by the CPU from the unpinned file through the doorbell (cpu_threads workers), while the GPU reads the heavy
   // file experts and the bank; only the heavy experts are pinned. The CPU's sum is added after the reader.
   bool cpu_light = false;
+  // v46a-1 (THE PLAN 46a, author 2026-11-01 17:55 "Get us to e"): with the reader, each layer's experts run on R3 (one
+  // cooperative launch: gate and up of every pick, silu x up rounded to int8 per 32, down, with per-expert counters
+  // between them) instead of the reader v3 kernels; the same grouping, cache and combine. Off: the reader v3 kernels.
+  bool r3_experts = false;
   // v28: gate / up rows per warp in the reader v3 kernels (1 or 2; 2 = v26's shape)
   int reader_rows_per_warp = 2;
   // v28: pinned ranges are merged across gaps smaller than this (bytes; v27 used 8 MiB; 0 = exact ranges, one per matrix

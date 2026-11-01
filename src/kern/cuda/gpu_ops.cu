@@ -1688,6 +1688,25 @@ bool moe_reader3(const ExpertPtr* tab, const ExpertPtr* shx, const std::int32_t*
   return launched("moe_reader3");
 }
 
+// v46a-1: for kern/gpu_stream's expert stage (moe_r3): the reader v3 grouping (cache lookup and slot choice included), its
+// combine, and a GPU stamp, as moe_reader3 launches them
+bool rd3_group_launch(const ExpertPtr* tab, const ExpertPtr* shx, const std::int32_t* sel, int tokens, int nu, const ReaderCache* cache, std::int64_t H,
+                      std::int64_t F, int* grp, ExpertPtr* gsrc, ExpertPtr* gfill, Stream s) {
+  ReaderCache c;
+  if (cache && cache->K > 0) {
+    c = *cache;
+    if (!c.tag || !c.use || !c.stamp || !c.base || c.slot_bytes == 0) return fail("rd3_group_launch: incomplete cache");
+  }
+  k_rd3_group<<<1, 32, 0, st(s)>>>(tab, shx, sel, tokens, nu, c, H, F, grp, gsrc, gfill, nullptr);
+  return launched("rd3 group");
+}
+bool rd3_combine_launch(const float* yd, const float* wsel, const float* gsh, int nu, std::int64_t tokens, std::int64_t H, float* y,
+                        const std::int32_t* sel, Stream s) {
+  k_rd3_combine<<<blocks_for(tokens * H, 256), 256, 0, st(s)>>>(yd, wsel, gsh, nu, tokens, H, y, sel, nullptr);
+  return launched("rd3 combine");
+}
+void stamp_launch(unsigned long long* p, Stream s) { k_stamp<<<1, 1, 0, st(s)>>>(p); }
+
 bool read_rate(const void* dev, std::size_t bytes, int blocks, double* seconds) {
   unsigned* o = static_cast<unsigned*>(dalloc(sizeof(unsigned)));
   if (!o) return false;

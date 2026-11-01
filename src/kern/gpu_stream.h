@@ -89,4 +89,18 @@ class StreamPlan {
   std::uint64_t off_jobs_ = 0, off_stage_ = 0, off_grp_ = 0, off_dep_ = 0, off_gtasks_ = 0, off_done_ = 0, off_gdone_ = 0;
 };
 
+// v46a-1 (THE PLAN, 46a): the routed and shared experts of one MoE layer on R3, in one cooperative launch. moe_reader3's
+// grouping picks each expert's source (bank, cache slot, file mapping) and on a miss the cache slot it is written into;
+// a small planning kernel turns the groups into R3 jobs on the device: per expert gate and up (signal the expert's
+// counter), silu(g) x u rounded to int8 per 32 (the rule of the reader's silu_round and act_q8x32, waits for gate and up),
+// down (waits for that); then the reader's combine. Experts read as stored: Q4_TG2, Q5_K, Q4_K, Q6_K (210-byte blocks)
+// and R3's repacked Q8_0 (the shared expert); a miss's bytes are copied into its slot by the lanes that load them.
+// Inputs: the int8 activations act_q8x32 wrote for xn (q, scale, sum; H per token). Scratch from rx_scratch_bytes.
+bool rx_type_ok(std::uint32_t type, std::int64_t k);  // an expert matrix the stage reads (gpu_decode.h g_* ids)
+std::uint64_t rx_scratch_bytes(int max_picks);         // the plan buffer for up to max_picks picks (routed + shared)
+bool moe_r3(const ExpertPtr* tab, const ExpertPtr* shx, const std::int32_t* sel, const float* wsel, const float* gsh, int n_used,
+            const std::int8_t* xq, const float* xs, const int* xsum, std::int64_t tokens, std::int64_t H, std::int64_t F, const ReaderCache* cache,
+            float* gu, std::int8_t* hq, float* hs, int* hsum, float* yd, int* grp, ExpertPtr* gsrc, ExpertPtr* gfill, void* plan, int max_picks,
+            float* y, unsigned long long* ts, Stream s = nullptr);
+
 }  // namespace pelias::kern::gpu

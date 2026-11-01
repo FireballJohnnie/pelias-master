@@ -386,6 +386,15 @@ struct GpuEngine::Impl {
   void* cache_mem = nullptr;
   void* cache_meta = nullptr;
   std::vector<g::ReaderCache> rcache;
+  // v46a-1 (THE PLAN 46a): the R3 expert stage instead of the reader v3 kernels (EngineOptions::r3_experts): the int8
+  // silu x up per pick, its scales and sums, the plan buffer; on only if every expert matrix is one the stage reads
+  std::int8_t* rhq = nullptr;
+  float* rhs = nullptr;
+  int* rhsum = nullptr;
+  void* rxplan = nullptr;
+  int rx_maxp = 0;
+  bool rx_ok = false;
+  std::string rx_note = "off";
   g::ExpertPtr *trc_src_h = nullptr, *trc_src_d = nullptr, *trc_fill_h = nullptr, *trc_fill_d = nullptr;
   // v25 trace: pinned mapped, per layer 6 reader stamps, the picks (kReaderMax x nu) and the group count
   void* trc_hv = nullptr;
@@ -1395,13 +1404,18 @@ struct GpuEngine::Impl {
       if (!g::stream_wait(nullptr, ev_b[il - 1])) return gfail("engine: prefetch wait");
       pf_issued[il] = 0;
     }
+    // v46a-1: the R3 expert stage (not with the split, whose CPU picks it does not skip, or the plane test)
+    const bool use_rx = rx_ok && !split_ok && o.plane_tail == 0;
     const bool rd_ok =
-        o.reader_v3
+        use_rx ? g::moe_r3(rtab + static_cast<int64_t>(il) * ne, fold ? rshx + il : nullptr, sel, wsel, gsh, static_cast<int>(nu), q, scale, sum, n, e,
+                           s.n_ff_exp, rcache.empty() ? nullptr : &rcache[il], rgu, rhq, rhs, rhsum, ryd, rgrp, rgsrc, rgfill, rxplan, rx_maxp, y, tsl,
+                           nullptr)
+        : o.reader_v3
             ? g::moe_reader3(rtab + static_cast<int64_t>(il) * ne, fold ? rshx + il : nullptr, sel, wsel, gsh, static_cast<int>(nu), xr, n, e, s.n_ff_exp,
                              rrow_max, rcache.empty() ? nullptr : &rcache[il], rgu, rh, ryd, rgrp, rgsrc, rgfill, y, tsl, nullptr, o.plane_tail,
                              split_ok ? lmask_d + static_cast<int64_t>(il) * ne : nullptr, o.reader_rows_per_warp)
             : g::moe_reader(rtab + static_cast<int64_t>(il) * ne, sel, wsel, static_cast<int>(nu), xr, n, e, s.n_ff_exp, rrow_max, rgu, rh, ryd, rgrp, y, tsl);
-    if (!rd_ok) return gfail("engine: expert reader");
+    if (!rd_ok) return use_rx ? Status::fail(Code::internal, std::string("engine: R3 expert stage: ") + g::stream_last_error()) : gfail("engine: expert reader");
     if (trc_src_d && o.reader_v3) {
       const int64_t P = kReaderMax * (nu + 1);
       if (!g::dcopy(trc_src_d + static_cast<int64_t>(il) * P, rgsrc, z(n * (nu + 1)) * sizeof(g::ExpertPtr)) ||
@@ -1741,6 +1755,48 @@ struct GpuEngine::Impl {
       if (rcache.empty()) cache_note = "; cache off (device memory)";
     }
     rtab_h = tab;
+    // v46a-1: the R3 expert stage. It reads the experts as stored (Q4_TG2 / Q5_K / Q4_K with 16-byte aligned rows, Q6_K
+    // 2-byte aligned) and the shared expert in R3's Q8_0 layout; each matrix's start 16-byte aligned (a miss's bytes go to
+    // the same offsets in its slot, so the slots keep that alignment too)
+    if (o.r3_experts) {
+      const int64_t H = s.n_embd, Fx = s.n_ff_exp;
+      auto mat_ok = [&](const g::ExpertPtr& X) {
+        for (int pj = 0; pj < 3; ++pj) {
+          if (!g::rx_type_ok(X.type[pj], pj < 2 ? H : Fx) || !X.w[pj]) return false;
+          if (reinterpret_cast<std::uintptr_t>(X.w[pj]) % 16 != 0) return false;
+          if (X.type[pj] == g::g_q6_k ? X.rb[pj] % 2 != 0 : X.rb[pj] % 16 != 0) return false;
+        }
+        return true;
+      };
+      bool ok = true;
+      for (const g::ExpertPtr& X : tab) ok = ok && mat_ok(X);
+      if (!ok) rx_note = "off (an expert matrix the stage cannot read: type or alignment)";
+      for (const g::ExpertPtr& X : shx_h)
+        if (ok && !mat_ok(X)) {
+          ok = false;
+          rx_note = "off (the shared expert's type or alignment)";
+        }
+      for (const g::ReaderCache& c : rcache)
+        if (ok && (c.slot_bytes % 16 != 0 || reinterpret_cast<std::uintptr_t>(c.base) % 16 != 0)) {
+          ok = false;
+          rx_note = "off (cache slots not 16-byte aligned)";
+        }
+      if (ok) {
+        rx_maxp = static_cast<int>(P);
+        rhq = static_cast<std::int8_t*>(g::dalloc(z(P * Fx)));
+        rhs = static_cast<float*>(g::dalloc(z(P * Fx / 32) * sizeof(float)));
+        rhsum = static_cast<int*>(g::dalloc(z(P * Fx / 32) * sizeof(int)));
+        const std::uint64_t pb = g::rx_scratch_bytes(rx_maxp);
+        rxplan = g::dalloc(pb);
+        if (rhq && rhs && rhsum && rxplan) {
+          dev_bytes += z(P * Fx) + z(P * Fx / 32) * 8 + pb;
+          rx_ok = true;
+          rx_note = "on (gate / up, silu x up, down of every pick in one R3 launch per layer)";
+        } else {
+          rx_note = "off (device memory)";
+        }
+      }
+    }
     if (o.trace) {
       const std::size_t nl = s.n_layer, b_ts = nl * 6 * sizeof(unsigned long long), b_sel = nl * z(mp) * sizeof(std::int32_t), b_u = nl * sizeof(int);
       const std::size_t b_src = nl * z(P) * sizeof(g::ExpertPtr);
@@ -1822,6 +1878,10 @@ GpuEngine::~GpuEngine() {
   g::dfree(p_->rgsrc);
   g::dfree(p_->rgfill);
   g::dfree(p_->rshx);
+  g::dfree(p_->rhq);
+  g::dfree(p_->rhs);
+  g::dfree(p_->rhsum);
+  g::dfree(p_->rxplan);
   g::dfree(p_->cache_mem);
   g::dfree(p_->cache_meta);
   g::host_free(p_->trc_hv);
@@ -2055,6 +2115,7 @@ std::string GpuEngine::summary() const {
                 I.bell ? "doorbell" : "device sync per layer", static_cast<double>(I.o.router_tie), I.reader_note.c_str(), I.o.batch_identical ? "on" : "off",
                 I.graph_note.c_str(), I.pf_ok ? "on" : "off", I.split_note.c_str());
   std::string r = b;
+  if (I.o.r3_experts) r += "; R3 expert stage " + I.rx_note;  // v46a-1
   if (!I.o.pin_pool.empty() || I.o.pin_host >= 0) {  // v43
     char c[256];
     std::snprintf(c, sizeof c, "; pinned: %d of %zu workers, doorbell %s, host %s", I.pool ? I.pool->pinned() : 0, I.o.pin_pool.empty() ? std::size_t{0} : I.o.pin_pool.size() - 1,

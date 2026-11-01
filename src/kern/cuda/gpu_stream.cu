@@ -14,15 +14,24 @@
 #include <string>
 #include <vector>
 
+#include "kern/gpu_decode.h"
 #include "kern/gpu_stream.h"
 #include "quant/block_types.h"
 #include "quant/quant_cpu.h"
 
 namespace pelias::kern::gpu {
 cudaStream_t cur_stream_raw();  // gpu_ops.cu (v26)
+// gpu_ops.cu (v46a-1): the reader v3 grouping and combine, a GPU stamp
+bool rd3_group_launch(const ExpertPtr* tab, const ExpertPtr* shx, const std::int32_t* sel, int tokens, int nu, const ReaderCache* cache, std::int64_t H,
+                      std::int64_t F, int* grp, ExpertPtr* gsrc, ExpertPtr* gfill, Stream s);
+bool rd3_combine_launch(const float* yd, const float* wsel, const float* gsh, int nu, std::int64_t tokens, std::int64_t H, float* y,
+                        const std::int32_t* sel, Stream s);
+void stamp_launch(unsigned long long* p, Stream s);
 namespace {
 
-enum Fmt : int { kQ7ZT = 0, kQ4TG2 = 1, kQ5K = 2, kQ6K = 3, kQ8_0 = 4, kQ4K = 5, kIQ4XS = 6 };
+// v46a-1: kQ6KS Q6_K as stored (210-byte blocks, 2-byte aligned: the expert stage reads the file's / bank's bytes); kEpi
+// the expert stage's silu(g) x u rounding (not a matrix: one warp task per expert group)
+enum Fmt : int { kQ7ZT = 0, kQ4TG2 = 1, kQ5K = 2, kQ6K = 3, kQ8_0 = 4, kQ4K = 5, kIQ4XS = 6, kQ6KS = 7, kEpi = 8 };
 
 struct DJob {
   int fmt, n, K, lpr;      // format, rows, inputs, lanes per row (K / 128)
@@ -36,8 +45,14 @@ struct DJob {
   const float* xs;
   const int* xsum;
   float* y;
-  int ntok;                 // v26: tokens (1-4); token t reads xq + t xqs, xs / xsum + t xss, writes y + t ys
+  int ntok;                 // v26: tokens (1-4); token t reads xq + tokx[t] xqs, xs / xsum + tokx[t] xss, writes y + ypk[t] ys
   long long xqs, xss, ys;
+  int tokx[4], ypk[4];      // v46a-1: input row and output row of each token (t and t for a plan's jobs; an expert's picks)
+  long long fd;             // v46a-1: 0, or the cache slot's offset from w: the loaded weight bytes are also stored at w + fd
+  float* gu;                // v46a-1 kEpi: gate | up rows per pick (2K floats at gu + ypk 2K), K = F
+  std::int8_t* hq;          // kEpi: int8 per pick (F at hq + ypk F), scale and sum per 32 (hs / hsum + ypk F / 32)
+  float* hs;
+  int* hsum;
 };
 
 __constant__ float c_grid[4][16];  // the Q4_TG2 grids (quant::q4_tg_grid(tag, 2)), uploaded once
@@ -76,6 +91,71 @@ __device__ __forceinline__ int4 ld_cs4(const void* p) {
 // same row is read again for the next token (L1 / L2 instead of DRAM). The values are the same either way.
 __device__ __forceinline__ int4 ldw(bool cs, const void* p) { return cs ? ld_cs4(p) : __ldg(reinterpret_cast<const int4*>(p)); }
 
+// v46a-1: the expert stage reads inputs written earlier in the same launch (the int8 silu x up), so its activation loads go
+// through L2 (ld.global.cg: no stale L1 line); the dense path (M = 0) keeps __ldg. M: 0 dense, 1 expert, 2 expert + fill.
+__device__ __forceinline__ int4 ld_cg4(const void* p) {
+  int4 r;
+  asm volatile("ld.global.cg.v4.s32 {%0, %1, %2, %3}, [%4];" : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "l"(p));
+  return r;
+}
+__device__ __forceinline__ float ld_cgf(const float* p) {
+  float v;
+  asm volatile("ld.global.cg.f32 %0, [%1];" : "=f"(v) : "l"(p));
+  return v;
+}
+__device__ __forceinline__ int ld_cgi(const int* p) {
+  int v;
+  asm volatile("ld.global.cg.s32 %0, [%1];" : "=r"(v) : "l"(p));
+  return v;
+}
+__device__ __forceinline__ std::uint32_t ld_cs1(const void* p) {
+  std::uint32_t v;
+  asm volatile("ld.global.cs.u32 %0, [%1];" : "=r"(v) : "l"(p));
+  return v;
+}
+template <int M>
+__device__ __forceinline__ int4 ldx4(const int4* p) {
+  if constexpr (M == 0) return __ldg(p);
+  else return ld_cg4(p);
+}
+template <int M>
+__device__ __forceinline__ float ldxs(const float* p) {
+  if constexpr (M == 0) return __ldg(p);
+  else return ld_cgf(p);
+}
+template <int M>
+__device__ __forceinline__ int ldxi(const int* p) {
+  if constexpr (M == 0) return __ldg(p);
+  else return ld_cgi(p);
+}
+// a weight load; with M = 2 (a cache miss being filled) and st, the 16 bytes also go to the same offset in the slot
+template <int M>
+__device__ __forceinline__ int4 ldwf(const DJob& J, bool cs, const std::uint8_t* p, bool st) {
+  const int4 v = ldw(cs, p);
+  if constexpr (M == 2) {
+    if (st) *reinterpret_cast<int4*>(const_cast<std::uint8_t*>(p) + J.fd) = v;
+  }
+  return v;
+}
+// v46a-1, Q6_K as stored: N words of the 2-byte aligned bytes at p (mis = p & 3, 0 or 2), from aligned 4-byte loads joined
+// by a funnel shift; with M = 2 the loaded words go to the slot as well (whole words, the same bytes the source holds there)
+template <int M, int N>
+__device__ __forceinline__ void q6s_words(const DJob& J, bool cs, const std::uint8_t* p, unsigned mis, std::uint32_t* out) {
+  const std::uint32_t* a = reinterpret_cast<const std::uint32_t*>(p - mis);
+  std::uint32_t r[N + 1];
+#pragma unroll
+  for (int i = 0; i < N; ++i) r[i] = cs ? ld_cs1(a + i) : __ldg(a + i);
+  r[N] = mis ? (cs ? ld_cs1(a + N) : __ldg(a + N)) : 0u;  // only when the bytes straddle: never past the block
+  if constexpr (M == 2) {
+    std::uint32_t* f = reinterpret_cast<std::uint32_t*>(const_cast<std::uint8_t*>(reinterpret_cast<const std::uint8_t*>(a)) + J.fd);
+#pragma unroll
+    for (int i = 0; i < N; ++i) f[i] = r[i];
+    if (mis) f[N] = r[N];
+  }
+#pragma unroll
+  for (int i = 0; i < N; ++i) out[i] = __funnelshift_r(r[i], r[i + 1], 8u * mis);
+}
+
 __device__ __forceinline__ int sx8(const int* xw, int i) {  // int8 value i of a 128-value activation slice in 32 words
   return static_cast<int>(static_cast<std::int8_t>((xw[i >> 2] >> (8 * (i & 3))) & 0xff));
 }
@@ -99,7 +179,9 @@ __device__ __forceinline__ int iq4_levels(std::uint32_t v) {
   return static_cast<int>((lo & ~m) | (hi & m));
 }
 
-// one lane's part (128 values = 4 sub-blocks of 32) of one row; returns the partial dot product
+// one lane's part (128 values = 4 sub-blocks of 32) of one row; returns the partial dot product. v46a-1: M as above (the
+// dense instantiation, M = 0, is the code as measured: no fill, no stored Q6_K branch, __ldg inputs)
+template <int M>
 __device__ float lane_part(const DJob& J, int r, int part, const std::int8_t* xq, const float* xs, const int* xsum, bool cs) {
   const int B = part >> 1, half = part & 1, nB = J.K / 256;
   const long long rb = static_cast<long long>(r) * nB + B;
@@ -109,7 +191,7 @@ __device__ float lane_part(const DJob& J, int r, int part, const std::int8_t* xq
     const int4* x4 = reinterpret_cast<const int4*>(xq + jg0 * 32);
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
-      const int4 t = __ldg(x4 + i);
+      const int4 t = ldx4<M>(x4 + i);
       xw[4 * i] = t.x;
       xw[4 * i + 1] = t.y;
       xw[4 * i + 2] = t.z;
@@ -155,16 +237,16 @@ __device__ float lane_part(const DJob& J, int r, int part, const std::int8_t* xq
           hx = __dp4a(static_cast<int>((nib * 0x00204081u) & 0x01010101u), xw[8 * jj + g], hx);
         }
       }
-      const int P = 2 * pb - 127 * __ldg(xsum + jg) + hx;  // sum (2b + h - 127) x
+      const int P = 2 * pb - 127 * ldxi<M>(xsum + jg) + hx;  // sum (2b + h - 127) x
       const float s = (d * static_cast<float>((h >> (16 + 6 * j)) & 63u)) / 63.f;
-      acc += s * __ldg(xs + jg) * static_cast<float>(P);
+      acc += s * ldxs<M>(xs + jg) * static_cast<float>(P);
     }
   } else if (J.fmt == kQ4TG2) {
     const std::uint8_t* bp = J.w + rb * 144;
-    const int4 hd = ldw(cs, bp);
+    const int4 hd = ldwf<M>(J, cs, bp, half == 0);
     int4 c[4];
 #pragma unroll
-    for (int i = 0; i < 4; ++i) c[i] = ldw(cs, bp + 16 + half * 64 + 16 * i);
+    for (int i = 0; i < 4; ++i) c[i] = ldwf<M>(J, cs, bp + 16 + half * 64 + 16 * i, true);
     const std::uint32_t cw[16] = {static_cast<std::uint32_t>(c[0].x), static_cast<std::uint32_t>(c[0].y), static_cast<std::uint32_t>(c[0].z),
                                   static_cast<std::uint32_t>(c[0].w), static_cast<std::uint32_t>(c[1].x), static_cast<std::uint32_t>(c[1].y),
                                   static_cast<std::uint32_t>(c[1].z), static_cast<std::uint32_t>(c[1].w), static_cast<std::uint32_t>(c[2].x),
@@ -193,15 +275,15 @@ __device__ float lane_part(const DJob& J, int r, int part, const std::int8_t* xq
         }
       }
       const float s = (d * static_cast<float>((lv >> (6 * j)) & 63u)) / 63.f;
-      acc += s * __ldg(xs + jg) * sum;
+      acc += s * ldxs<M>(xs + jg) * sum;
     }
   } else if (J.fmt == kQ5K) {
     const std::uint8_t* bp = J.w + rb * 176;
-    const int4 hd = ldw(cs, bp);
-    const int4 qa = ldw(cs, bp + 16), qb4 = ldw(cs, bp + 32);
+    const int4 hd = ldwf<M>(J, cs, bp, half == 0);
+    const int4 qa = ldwf<M>(J, cs, bp + 16, half == 0), qb4 = ldwf<M>(J, cs, bp + 32, half == 0);
     int4 ql[4];
 #pragma unroll
-    for (int i = 0; i < 4; ++i) ql[i] = ldw(cs, bp + 48 + half * 64 + 16 * i);
+    for (int i = 0; i < 4; ++i) ql[i] = ldwf<M>(J, cs, bp + 48 + half * 64 + 16 * i, true);
     std::uint8_t hb[4], qh[32], qlb[64];
     memcpy(hb, &hd, 4);
     memcpy(qh, &qa, 16);
@@ -230,8 +312,8 @@ __device__ float lane_part(const DJob& J, int r, int part, const std::int8_t* xq
         const int lo = (j & 1) ? (q[l] >> 4) : (q[l] & 0xF);
         sq += (lo + (((qh[l] >> j) & 1) << 4)) * sx8(xw, 32 * jj + l);
       }
-      acc += __ldg(xs + jg) *
-             (d * static_cast<float>(sc) * static_cast<float>(sq) - dmin * static_cast<float>(mn) * static_cast<float>(__ldg(xsum + jg)));
+      acc += ldxs<M>(xs + jg) *
+             (d * static_cast<float>(sc) * static_cast<float>(sq) - dmin * static_cast<float>(mn) * static_cast<float>(ldxi<M>(xsum + jg)));
     }
   } else if (J.fmt == kQ8_0) {  // repacked per 256: qs[256] (int8) | d[8] (fp16); the half's 128 values and 4 d's
     const std::uint8_t* bp = J.w + rb * 272;
@@ -251,14 +333,14 @@ __device__ float lane_part(const DJob& J, int r, int part, const std::int8_t* xq
       P = __dp4a(qb.w, xw[8 * jj + 7], P);
       const std::uint32_t dw = (jj < 2 ? dd.x : dd.y) >> (16 * (jj & 1));
       const float d = __half2float(__ushort_as_half(static_cast<unsigned short>(dw & 0xffffu)));
-      acc += d * __ldg(xs + jg) * static_cast<float>(P);
+      acc += d * ldxs<M>(xs + jg) * static_cast<float>(P);
     }
   } else if (J.fmt == kQ4K) {  // as stored (144 bytes): d | dmin | scales[12] | qs[128]; Q5_K without qh
     const std::uint8_t* bp = J.w + rb * 144;
-    const int4 hd = ldw(cs, bp);
+    const int4 hd = ldwf<M>(J, cs, bp, half == 0);
     int4 ql[4];
 #pragma unroll
-    for (int i = 0; i < 4; ++i) ql[i] = ldw(cs, bp + 16 + half * 64 + 16 * i);
+    for (int i = 0; i < 4; ++i) ql[i] = ldwf<M>(J, cs, bp + 16 + half * 64 + 16 * i, true);
     const std::uint32_t qw[16] = {static_cast<std::uint32_t>(ql[0].x), static_cast<std::uint32_t>(ql[0].y), static_cast<std::uint32_t>(ql[0].z),
                                   static_cast<std::uint32_t>(ql[0].w), static_cast<std::uint32_t>(ql[1].x), static_cast<std::uint32_t>(ql[1].y),
                                   static_cast<std::uint32_t>(ql[1].z), static_cast<std::uint32_t>(ql[1].w), static_cast<std::uint32_t>(ql[2].x),
@@ -286,8 +368,8 @@ __device__ float lane_part(const DJob& J, int r, int part, const std::int8_t* xq
       int sq = 0;
 #pragma unroll
       for (int g = 0; g < 8; ++g) sq = __dp4a(static_cast<int>((qw[8 * (jj >> 1) + g] >> sh) & 0x0F0F0F0Fu), xw[8 * jj + g], sq);
-      acc += __ldg(xs + jg) *
-             (d * static_cast<float>(sc) * static_cast<float>(sq) - dmin * static_cast<float>(mn) * static_cast<float>(__ldg(xsum + jg)));
+      acc += ldxs<M>(xs + jg) *
+             (d * static_cast<float>(sc) * static_cast<float>(sq) - dmin * static_cast<float>(mn) * static_cast<float>(ldxi<M>(xsum + jg)));
     }
   } else if (J.fmt == kIQ4XS) {  // repacked per 256 (144 bytes): d | scales_h | scales_l[4] | 8 zero bytes | qs[128]
     const std::uint8_t* bp = J.w + rb * 144;
@@ -308,7 +390,41 @@ __device__ float lane_part(const DJob& J, int r, int part, const std::int8_t* xq
         P = __dp4a(iq4_levels(qw[w] & 0x0F0F0F0Fu), xw[8 * jj + w], P);
         P = __dp4a(iq4_levels((qw[w] >> 4) & 0x0F0F0F0Fu), xw[8 * jj + 4 + w], P);
       }
-      acc += d * static_cast<float>(ls - 32) * __ldg(xs + jg) * static_cast<float>(P);
+      acc += d * static_cast<float>(ls - 32) * ldxs<M>(xs + jg) * static_cast<float>(P);
+    }
+  } else if (M != 0 && J.fmt == kQ6KS) {  // v46a-1: as stored: ql[128] | qh[64] | scales[16] | d (210 bytes, 2-byte aligned)
+    const std::uint8_t* bp = J.w + rb * 210;
+    const unsigned mis = static_cast<unsigned>(reinterpret_cast<std::uintptr_t>(bp) & 3u);
+    std::uint32_t qlw[16], qhw[8], scw[2];
+    q6s_words<M, 16>(J, cs, bp + half * 64, mis, qlw);
+    q6s_words<M, 8>(J, cs, bp + 128 + half * 32, mis, qhw);
+    q6s_words<M, 2>(J, cs, bp + 192 + half * 8, mis, scw);
+    const unsigned short dh = *reinterpret_cast<const unsigned short*>(bp + 208);
+    if constexpr (M == 2) {
+      if (half == 0) *reinterpret_cast<unsigned short*>(const_cast<std::uint8_t*>(bp) + 208 + J.fd) = dh;
+    }
+    std::uint8_t ql[64], qh[32];
+    std::int8_t sc[8];
+    memcpy(ql, qlw, 64);
+    memcpy(qh, qhw, 32);
+    memcpy(sc, scw, 8);
+    const float d = __half2float(__ushort_as_half(dh));
+#pragma unroll
+    for (int p = 0; p < 4; ++p) {
+      const int jg = jg0 + p;
+      int s0 = 0, s1 = 0;
+#pragma unroll
+      for (int l = 0; l < 32; ++l) {
+        int q;
+        if (p == 0) q = (ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4);
+        else if (p == 1) q = (ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4);
+        else if (p == 2) q = (ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4);
+        else q = (ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4);
+        const int v = (q - 32) * sx8(xw, 32 * p + l);
+        if (l < 16) s0 += v;
+        else s1 += v;
+      }
+      acc += d * ldxs<M>(xs + jg) * static_cast<float>(sc[2 * p] * s0 + sc[2 * p + 1] * s1);
     }
   } else {  // kQ6K
     const std::uint8_t* bp = J.w + rb * 208;
@@ -339,7 +455,7 @@ __device__ float lane_part(const DJob& J, int r, int part, const std::int8_t* xq
         if (l < 16) s0 += v;
         else s1 += v;
       }
-      acc += d * __ldg(xs + jg) * static_cast<float>(sc[2 * p] * s0 + sc[2 * p + 1] * s1);
+      acc += d * ldxs<M>(xs + jg) * static_cast<float>(sc[2 * p] * s0 + sc[2 * p + 1] * s1);
     }
   }
   return acc;
@@ -360,7 +476,7 @@ __device__ __forceinline__ void run_task(const DJob* __restrict__ jobs, int njob
   // v26: each token's arithmetic is the one-token path's (lane_part on that token's inputs), so a row of a several-token
   // job equals the same token alone bit for bit
   for (int tk = 0; tk < J.ntok; ++tk) {
-    float acc = r < J.n ? lane_part(J, r, part, J.xq + tk * J.xqs, J.xs + tk * J.xss, J.xsum + tk * J.xss, J.ntok == 1) : 0.f;
+    float acc = r < J.n ? lane_part<0>(J, r, part, J.xq + tk * J.xqs, J.xs + tk * J.xss, J.xsum + tk * J.xss, J.ntok == 1) : 0.f;
     for (int o = J.lpr / 2; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
     if (r < J.n && part == 0) J.y[tk * J.ys + r] = acc;
   }
@@ -433,6 +549,223 @@ __global__ void __launch_bounds__(256) k_staged(const DJob* __restrict__ jobs, i
     }
     __syncwarp();
     begin = end;
+  }
+}
+
+// ------------------------------------------------------------------------------------------------ v46a-1 expert stage
+// the stage's matrix formats by the GPU path's type ids (gpu_decode.h): the bank, cache and file hold experts as stored;
+// the shared expert is R3's repacked Q8_0 (g_q8_0r)
+__host__ __device__ inline int rx_fmt(std::uint32_t t) {
+  switch (t) {
+    case g_q4_tg2: return kQ4TG2;
+    case g_q5_k: return kQ5K;
+    case g_q4_k: return kQ4K;
+    case g_q6_k: return kQ6KS;
+    case g_q8_0r: return kQ8_0;
+    default: return -1;
+  }
+}
+// the plan buffer: header | jobs (4 per expert group: gate, up, silu x up, down) | signal and wait group per job | tasks
+// per group | the group counters (zeroed by the planner, so every launch counts from 0: graph replays need no reset)
+struct RxHdr {
+  int njobs, ngroups;
+  long long ntasks;
+  int err, pad[3];
+};
+struct RxLayout {
+  std::uint64_t jobs, sig, dep, gtasks, gdone, total;
+};
+__host__ __device__ inline std::uint64_t rx_al(std::uint64_t x, std::uint64_t a) { return (x + a - 1) / a * a; }
+__host__ __device__ inline RxLayout rx_layout(int maxp) {
+  RxLayout L;
+  const std::uint64_t nj = 4ull * static_cast<std::uint64_t>(maxp), ng = 2ull * static_cast<std::uint64_t>(maxp);
+  L.jobs = 64;
+  L.sig = rx_al(L.jobs + sizeof(DJob) * nj, 16);
+  L.dep = rx_al(L.sig + 4 * nj, 16);
+  L.gtasks = rx_al(L.dep + 4 * nj, 16);
+  L.gdone = rx_al(L.gtasks + 8 * ng, 128);
+  L.total = rx_al(L.gdone + 8 * ng, 128);
+  return L;
+}
+// one thread per job: the groups of moe_reader3's grouping kernel (grp: count, then per group expert, picks, pick list;
+// gsrc / gfill: where each group's rows are read from and, on a cache miss, the slot they are copied into). Every expert
+// has the shape (F x H gate and up, H x F down), so each job's first task follows from its index alone.
+__global__ void __launch_bounds__(128) k_rx_plan(const int* __restrict__ grp, const ExpertPtr* __restrict__ gsrc, const ExpertPtr* __restrict__ gfill,
+                                                 int tokens, int nu, int H, int F, const std::int8_t* xq, const float* xs, const int* xsum, float* gu,
+                                                 std::int8_t* hq, float* hs, int* hsum, float* yd, std::uint8_t* plan, int maxp) {
+  const RxLayout Lo = rx_layout(maxp);
+  auto* hd = reinterpret_cast<RxHdr*>(plan);
+  auto* jobs = reinterpret_cast<DJob*>(plan + Lo.jobs);
+  auto* sig = reinterpret_cast<int*>(plan + Lo.sig);
+  auto* dep = reinterpret_cast<int*>(plan + Lo.dep);
+  auto* gt = reinterpret_cast<long long*>(plan + Lo.gtasks);
+  auto* gd = reinterpret_cast<unsigned long long*>(plan + Lo.gdone);
+  const int U = grp[0], routed = tokens * nu;
+  const int lpr_gu = H / 128, lpr_dn = F / 128;
+  const long long nt_gu = (F + 32 / lpr_gu - 1) / (32 / lpr_gu), nt_dn = (H + 32 / lpr_dn - 1) / (32 / lpr_dn);
+  const int nj = 4 * U;
+  __shared__ int s_err;
+  if (threadIdx.x == 0) s_err = U > maxp ? 1 : 0;
+  __syncthreads();
+  if (s_err == 0)
+    for (int i = static_cast<int>(threadIdx.x); i < nj; i += static_cast<int>(blockDim.x)) {
+      // jobs: gate u, up u for every u (2U), then silu x up per u (U), then down per u (U)
+      const int kind = i < 2 * U ? (i & 1) : (i < 3 * U ? 3 : 2);  // 0 gate, 1 up, 2 down, 3 silu x up
+      const int u = i < 2 * U ? (i >> 1) : (i < 3 * U ? i - 2 * U : i - 3 * U);
+      const long long task0 = i < 2 * U ? i * nt_gu : (i < 3 * U ? 2 * U * nt_gu + (i - 2 * U) : 2 * U * nt_gu + U + (i - 3 * U) * nt_dn);
+      const int* G = grp + 1 + 6 * u;
+      const int cnt = G[1];
+      DJob J{};
+      J.task0 = task0;
+      J.ntok = cnt;
+      for (int c = 0; c < cnt; ++c) {
+        const int pk = G[2 + c];
+        J.ypk[c] = pk;
+        J.tokx[c] = kind < 2 ? (pk < routed ? pk / nu : pk - routed) : pk;
+      }
+      if (kind == 3) {
+        J.fmt = kEpi;
+        J.K = F;
+        J.lpr = 32;
+        J.ntask = 1;
+        J.gu = gu;
+        J.hq = hq;
+        J.hs = hs;
+        J.hsum = hsum;
+        sig[i] = U + u;
+        dep[i] = u;
+      } else {
+        const ExpertPtr& X = gsrc[u];
+        const ExpertPtr& FL = gfill[u];
+        J.fmt = rx_fmt(X.type[kind]);
+        if (J.fmt < 0) s_err = 2;  // every writer stores 2; read after the barrier
+        J.n = kind < 2 ? F : H;
+        J.K = kind < 2 ? H : F;
+        J.lpr = J.K / 128;
+        J.ntask = kind < 2 ? nt_gu : nt_dn;
+        J.w = X.w[kind];
+        J.fd = FL.w[kind] ? static_cast<long long>(FL.w[kind] - X.w[kind]) : 0;
+        if (kind < 2) {
+          J.xq = xq;
+          J.xs = xs;
+          J.xsum = xsum;
+          J.xqs = H;
+          J.xss = H / 32;
+          J.y = gu + static_cast<long long>(kind) * F;
+          J.ys = 2LL * F;
+          sig[i] = u;
+          dep[i] = -1;
+        } else {
+          J.xq = hq;
+          J.xs = hs;
+          J.xsum = hsum;
+          J.xqs = F;
+          J.xss = F / 32;
+          J.y = yd;
+          J.ys = H;
+          sig[i] = -1;
+          dep[i] = U + u;
+        }
+      }
+      jobs[i] = J;
+    }
+  for (int g = static_cast<int>(threadIdx.x); g < 2 * U && g < 2 * maxp; g += static_cast<int>(blockDim.x)) {
+    gt[g] = g < U ? 2 * nt_gu : 1;
+    gd[g] = 0ull;
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    hd->err = s_err;
+    hd->njobs = s_err ? 0 : nj;
+    hd->ngroups = 2 * U;
+    hd->ntasks = s_err ? 0 : 2LL * U * nt_gu + U + static_cast<long long>(U) * nt_dn;
+  }
+}
+// silu(g) x u of each pick of the group, rounded to int8 per 32: the reader's k_rd_silu_round and act_q8x32, operation for
+// operation (the down projection's inputs are the same numbers the reader used, as int8 and scale)
+__device__ __forceinline__ void rx_epi(const DJob& J) {
+  const int lane = static_cast<int>(threadIdx.x & 31), F = J.K, nb = F / 32;
+  for (int c = 0; c < J.ntok; ++c) {
+    const long long pk = J.ypk[c];
+    const float* g = J.gu + pk * 2 * F;
+    const float* u = g + F;
+    for (int b = lane; b < nb; b += 32) {
+      float v[32];
+      float a = 0.0f;
+#pragma unroll
+      for (int i = 0; i < 32; ++i) {
+        const float x = ld_cgf(g + 32 * b + i);
+        v[i] = mul(quo(x, add(1.0f, expf(-x))), ld_cgf(u + 32 * b + i));
+        a = fmaxf(a, fabsf(v[i]));
+      }
+      const float sc = a > 0.0f ? quo(a, 127.0f) : 1.0f;
+      const float inv = quo(1.0f, sc);
+      int sm = 0;
+#pragma unroll
+      for (int i = 0; i < 32; ++i) {
+        const float qv = fminf(127.0f, fmaxf(-127.0f, rintf(mul(v[i], inv))));
+        J.hq[pk * F + 32 * b + i] = static_cast<std::int8_t>(qv);
+        sm += static_cast<int>(qv);
+      }
+      J.hs[pk * nb + b] = sc;
+      J.hsum[pk * nb + b] = sm;
+    }
+  }
+}
+// one warp task of a matrix job: each pick's inputs (tokx) and output row (ypk); the first pick fills the slot on a miss
+template <int M>
+__device__ __forceinline__ void rx_rows(const DJob& J, long long t) {
+  const int lane = static_cast<int>(threadIdx.x & 31), rpw = 32 / J.lpr;
+  const int r = static_cast<int>((t - J.task0) * rpw) + lane / J.lpr, part = lane % J.lpr;
+  for (int tk = 0; tk < J.ntok; ++tk) {
+    const long long xo = J.tokx[tk];
+    const std::int8_t* xq = J.xq + xo * J.xqs;
+    const float* xs = J.xs + xo * J.xss;
+    const int* xsum = J.xsum + xo * J.xss;
+    float acc = 0.f;
+    if (r < J.n) acc = (M == 2 && tk == 0) ? lane_part<2>(J, r, part, xq, xs, xsum, J.ntok == 1) : lane_part<1>(J, r, part, xq, xs, xsum, J.ntok == 1);
+    for (int o = J.lpr / 2; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+    if (r < J.n && part == 0) J.y[J.ypk[tk] * J.ys + r] = acc;
+  }
+}
+// the layer's experts: every warp walks the tasks in table order (gate and up of all experts first, then the roundings,
+// then the downs); a task whose job waits for a group starts once the group's count is complete (acquire), and a task of
+// a signalling job adds 1 (release). All blocks are resident (cooperative launch), and a job waits only for groups of
+// jobs before it, so the lowest unfinished task can always run: no deadlock.
+__global__ void __launch_bounds__(256) k_rx(const std::uint8_t* __restrict__ plan, int maxp) {
+  lut_setup();
+  const RxLayout Lo = rx_layout(maxp);
+  const auto* hd = reinterpret_cast<const RxHdr*>(plan);
+  const auto* jobs = reinterpret_cast<const DJob*>(plan + Lo.jobs);
+  const auto* sig = reinterpret_cast<const int*>(plan + Lo.sig);
+  const auto* dep = reinterpret_cast<const int*>(plan + Lo.dep);
+  const auto* gt = reinterpret_cast<const long long*>(plan + Lo.gtasks);
+  auto* gd = reinterpret_cast<unsigned long long*>(const_cast<std::uint8_t*>(plan) + Lo.gdone);
+  const int njobs = hd->njobs;
+  const long long end = hd->ntasks;
+  const long long warps = static_cast<long long>(gridDim.x) * (blockDim.x / 32);
+  const long long w0 = static_cast<long long>(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32;
+  const int lane = static_cast<int>(threadIdx.x & 31);
+  int j = 0;
+  for (long long t = w0; t < end; t += warps) {
+    while (j + 1 < njobs && jobs[j + 1].task0 <= t) ++j;
+    const int dg = dep[j];
+    if (dg >= 0) {
+      if (lane == 0) {
+        const unsigned long long target = static_cast<unsigned long long>(gt[dg]);
+        while (ld_acquire_u64(gd + dg) < target) __nanosleep(32);
+      }
+      __syncwarp();
+    }
+    const DJob& J = jobs[j];
+    if (J.fmt == kEpi) rx_epi(J);
+    else if (J.fd) rx_rows<2>(J, t);
+    else rx_rows<1>(J, t);
+    const int sg = sig[j];
+    if (sg >= 0) {
+      __syncwarp();
+      if (lane == 0) red_release_add(gd + sg, 1ull);
+    }
   }
 }
 
@@ -700,5 +1033,58 @@ bool StreamPlan::run_unstaged(Stream s) {
 }
 
 const char* stream_last_error() { return s_err.c_str(); }
+
+bool rx_type_ok(std::uint32_t type, std::int64_t k) { return rx_fmt(type) >= 0 && (k == 256 || k == 512 || k == 1024 || k == 2048 || k == 4096); }
+
+std::uint64_t rx_scratch_bytes(int max_picks) { return max_picks > 0 ? rx_layout(max_picks).total : 0; }
+
+bool moe_r3(const ExpertPtr* tab, const ExpertPtr* shx, const std::int32_t* sel, const float* wsel, const float* gsh, int n_used,
+            const std::int8_t* xq, const float* xs, const int* xsum, std::int64_t tokens, std::int64_t H, std::int64_t F, const ReaderCache* cache,
+            float* gu, std::int8_t* hq, float* hs, int* hsum, float* yd, int* grp, ExpertPtr* gsrc, ExpertPtr* gfill, void* plan, int max_picks,
+            float* y, unsigned long long* ts, Stream s) {
+  if (!tab || !sel || !wsel || !xq || !xs || !xsum || !gu || !hq || !hs || !hsum || !yd || !grp || !gsrc || !gfill || !plan || !y || n_used <= 0 ||
+      n_used > 8 || (shx && !gsh))
+    return sfail("moe_r3: bad pointer or n_used");
+  auto k_ok = [](std::int64_t k) { return k == 256 || k == 512 || k == 1024 || k == 2048 || k == 4096; };
+  if (!k_ok(H) || !k_ok(F)) return sfail("moe_r3: H and F must be 256, 512, 1024, 2048 or 4096");
+  if (tokens <= 0) return true;
+  if (tokens > 4) return sfail("moe_r3: at most 4 tokens");
+  const std::int64_t routed = tokens * n_used, picks = routed + (shx ? tokens : 0);
+  if (picks > max_picks) return sfail("moe_r3: more picks than the plan buffer holds");
+  if (reinterpret_cast<std::uintptr_t>(xq) % 16 != 0 || reinterpret_cast<std::uintptr_t>(hq) % 16 != 0) return sfail("moe_r3: xq / hq must be 16-byte aligned");
+  if (!grid_ready()) return false;
+  static int grid = 0;
+  if (!grid) {
+    int dev = 0, sms = 0, occ = 0, coop = 0;
+    if (!sck(cudaGetDevice(&dev), "cudaGetDevice") || !sck(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev), "SM count") ||
+        !sck(cudaDeviceGetAttribute(&coop, cudaDevAttrCooperativeLaunch, dev), "cooperative launch attribute") ||
+        !sck(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, k_rx, 256, kLutBytes), "occupancy (expert stage)"))
+      return false;
+    if (!coop) return sfail("moe_r3: the device has no cooperative launch");
+    if (occ < 1) return sfail("moe_r3: the expert stage kernel does not fit on an SM");
+    grid = sms * occ;
+  }
+  if (ts) stamp_launch(ts + 0, s);
+  if (!rd3_group_launch(tab, shx, sel, static_cast<int>(tokens), n_used, cache, H, F, grp, gsrc, gfill, s)) return sfail("moe_r3: grouping launch");
+  if (ts) stamp_launch(ts + 1, s);
+  auto* pb = static_cast<std::uint8_t*>(plan);
+  k_rx_plan<<<1, 128, 0, sst(s)>>>(grp, gsrc, gfill, static_cast<int>(tokens), n_used, static_cast<int>(H), static_cast<int>(F), xq, xs, xsum, gu, hq, hs,
+                                   hsum, yd, pb, max_picks);
+  if (!sck(cudaGetLastError(), "moe_r3: plan launch")) return false;
+  if (ts) stamp_launch(ts + 2, s);
+  const std::uint8_t* cp = pb;
+  int mp = max_picks;
+  void* args[] = {&cp, &mp};
+  if (!sck(cudaLaunchCooperativeKernel(reinterpret_cast<void*>(k_rx), dim3(static_cast<unsigned>(grid)), dim3(256), args, kLutBytes, sst(s)),
+           "moe_r3: cooperative launch"))
+    return false;
+  if (ts) {
+    stamp_launch(ts + 3, s);
+    stamp_launch(ts + 4, s);
+  }
+  if (!rd3_combine_launch(yd, wsel, shx ? gsh : nullptr, n_used, tokens, H, y, sel, s)) return sfail("moe_r3: combine launch");
+  if (ts) stamp_launch(ts + 5, s);
+  return true;
+}
 
 }  // namespace pelias::kern::gpu
