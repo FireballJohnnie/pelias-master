@@ -143,6 +143,8 @@ struct EngineStats {
 struct EngineTimeline {
   int steps = 0, threads = 0;
   std::vector<double> gpu_dense, gpu_hot, gpu_idle, cpu_wait, cpu_cold;
+  std::vector<double> cpu_picks, cpu_groups;  // v39: the split path's CPU picks and expert groups per layer (summed over steps)
+  bool split_stamps = false;                  // v39: stage[] / busy[] came from the split path (gate/up incl. silu, down incl. combine)
   double stage[5] = {}, busy[5] = {};
   double wake = 0.0;
   int wake_n = 0;

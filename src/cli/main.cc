@@ -2641,9 +2641,15 @@ int cmd_engine_check(const Args& a) {
                   T.cold_bytes / T.steps / 1e6, cold > 0 ? T.cold_bytes / cold / 1e9 : 0.0, T.threads,
                   T.stage[1] > 0 ? 100.0 * T.busy[1] / (T.stage[1] * T.threads) : 0.0, T.stage[3] > 0 ? 100.0 * T.busy[3] / (T.stage[3] * T.threads) : 0.0,
                   T.wake_n ? 1e6 * T.wake / T.wake_n : 0.0, T.wake_n, picks > 0 ? 100.0 * static_cast<double>(T.hot_picks) / picks : 0.0);
-      for (std::size_t il = 0; il < T.gpu_dense.size(); ++il)
-        std::printf("    layer %2zu: GPU dense %.3f, bank + shared %.3f, idle %.3f | CPU wait %.3f, cold %.3f ms\n", il, T.gpu_dense[il] * k, T.gpu_hot[il] * k, T.gpu_idle[il] * k,
+      if (T.split_stamps)
+        std::printf("  timeline (split path, v39): silu is inside gate/up and the combine inside down; the first item starts %.1f us after a layer's job opens\n",
+                    T.wake_n ? 1e6 * T.wake / T.wake_n : 0.0);
+      for (std::size_t il = 0; il < T.gpu_dense.size(); ++il) {
+        std::printf("    layer %2zu: GPU dense %.3f, bank + shared %.3f, idle %.3f | CPU wait %.3f, cold %.3f ms", il, T.gpu_dense[il] * k, T.gpu_hot[il] * k, T.gpu_idle[il] * k,
                     T.cpu_wait[il] * k, T.cpu_cold[il] * k);
+        if (T.split_stamps && il < T.cpu_picks.size()) std::printf(" | CPU picks %.2f, expert groups %.2f per token", T.cpu_picks[il] / T.steps, T.cpu_groups[il] / T.steps);
+        std::printf("\n");
+      }
       }
     }
   }

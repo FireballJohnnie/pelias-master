@@ -860,9 +860,13 @@ struct GpuEngine::Impl {
   // and rounding (as v20); (2) down rows in blocks, each block computing every group's rows and then summing them per token in
   // pick-slot order (the old combine's order and arithmetic, fused: no separate combine job). The pool is held hot for the
   // whole step by the doorbell thread, so no worker sleeps between layers.
-  void cold_experts_fast(const Qwen35MoeLayer& l, int64_t n, const float* xsrc, float* ydst) {
+  // v39 (author 01:57): tlp / il (the doorbell thread only, --timeline): stage[0] input rounding + grouping, stage[1] the
+  // gate/up phase (silu fused in), stage[3] the down phase (combine fused in), wall time; busy[1] / busy[3] item time over all
+  // threads; wake = the first item's start after the job opened; per-layer picks and groups.
+  void cold_experts_fast(const Qwen35MoeLayer& l, int64_t n, const float* xsrc, float* ydst, EngineTimeline* tlp = nullptr, std::uint32_t il = 0) {
     const int64_t e = s.n_embd, ff = s.n_ff_exp;
     const int64_t np = static_cast<int64_t>(cold.size());
+    const Clock::time_point tq = Clock::now();
     std::fill(need.begin(), need.begin() + n, std::uint8_t{0});
     for (const ColdPick& c : cold) need[z(c.t)] = 1;
     for (int64_t t = 0; t < n; ++t)
@@ -934,7 +938,50 @@ struct GpuEngine::Impl {
         }
       }
     };
-    pool->run2(ng * 2 * ub, up_fn, db, down_fn);
+    if (!tlp) {
+      pool->run2(ng * 2 * ub, up_fn, db, down_fn);
+      return;
+    }
+    // stamped run: the same items, each timed; the phase-1 end is the time the last up item finished
+    const int64_t n1 = ng * 2 * ub;
+    std::atomic<std::int64_t> b1{0}, b2{0}, first{-1}, end1{0};
+    std::atomic<int64_t> left1{n1};
+    const Clock::time_point t0 = Clock::now();
+    auto tns = [&](Clock::time_point t) { return std::chrono::duration_cast<std::chrono::nanoseconds>(t - t0).count(); };
+    const std::function<void(int64_t)> up_t = [&](int64_t u) {
+      const Clock::time_point a = Clock::now();
+      std::int64_t none = -1;
+      first.compare_exchange_strong(none, tns(a), std::memory_order_relaxed);
+      up_fn(u);
+      const Clock::time_point b = Clock::now();
+      b1.fetch_add(tns(b) - tns(a), std::memory_order_relaxed);
+      if (left1.fetch_sub(1, std::memory_order_acq_rel) == 1) end1.store(tns(b), std::memory_order_relaxed);
+    };
+    const std::function<void(int64_t)> down_t = [&](int64_t u) {
+      const Clock::time_point a = Clock::now();
+      down_fn(u);
+      b2.fetch_add(tns(Clock::now()) - tns(a), std::memory_order_relaxed);
+    };
+    const double tround = std::chrono::duration<double>(t0 - tq).count();
+    pool->run2(n1, up_t, db, down_t);
+    const double wall = std::chrono::duration<double>(Clock::now() - t0).count();
+    const double p1 = static_cast<double>(end1.load()) * 1e-9;
+    tlp->split_stamps = true;
+    tlp->stage[0] += tround;
+    tlp->stage[1] += p1;
+    tlp->stage[3] += wall - p1;
+    tlp->busy[1] += static_cast<double>(b1.load()) * 1e-9;
+    tlp->busy[3] += static_cast<double>(b2.load()) * 1e-9;
+    if (first.load() >= 0) {
+      tlp->wake += static_cast<double>(first.load()) * 1e-9;
+      ++tlp->wake_n;
+    }
+    for (const ColdPick& c : cold)
+      for (const WeightView* v : {&l.gate_exps, &l.up_exps, &l.down_exps}) tlp->cold_bytes += static_cast<double>(exp_rows(*v, c.e).rb) * static_cast<double>(v == &l.down_exps ? e : ff);
+    if (il < tlp->cpu_picks.size()) {
+      tlp->cpu_picks[il] += static_cast<double>(np);
+      tlp->cpu_groups[il] += static_cast<double>(ng);
+    }
   }
 
   Status moe_block(const Qwen35MoeLayer& l, Layer& D, int64_t n, EngineStats& es) {
@@ -1074,7 +1121,7 @@ struct GpuEngine::Impl {
           }
           const Clock::time_point tc = Clock::now();
           if (cold.empty()) std::fill(yd, yd + n * e, 0.0f);
-          else if (split && !o.split_slow) cold_experts_fast(w->layers[il], n, xn_m, yd);
+          else if (split && !o.split_slow) cold_experts_fast(w->layers[il], n, xn_m, yd, tlp, il);
           else cold_experts_io(w->layers[il], n, xn_m, yd, tlp);
           const double ct_l = since(tc);
           es.cold_seconds += ct_l;
@@ -2090,7 +2137,7 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
         }
       }
       I.tline.threads = I.pool->threads();
-      for (std::vector<double>* v : {&I.tline.gpu_dense, &I.tline.gpu_hot, &I.tline.gpu_idle, &I.tline.cpu_wait, &I.tline.cpu_cold}) v->assign(s.n_layer, 0.0);
+      for (std::vector<double>* v : {&I.tline.gpu_dense, &I.tline.gpu_hot, &I.tline.gpu_idle, &I.tline.cpu_wait, &I.tline.cpu_cold, &I.tline.cpu_picks, &I.tline.cpu_groups}) v->assign(s.n_layer, 0.0);
       Impl* ip = &I;
       I.bell_th = std::thread([ip] { ip->bell_loop(); });
     }
