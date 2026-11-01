@@ -385,6 +385,7 @@ struct GpuEngine::Impl {
   std::vector<kern::ActQ8x32> actx, acth;
   std::vector<float> gbuf, ubuf, dbuf;
   std::atomic<std::uint64_t> down2_n{0}, down2_bad{0};  // v40 --cpu-check
+  std::atomic<std::uint64_t> gu2_n{0}, gu2_bad{0}, round_n{0}, round_bad{0};  // v45 --cpu-check
   std::vector<ColdPick> cold;
   std::vector<std::uint8_t> need;
   // v20: cold picks grouped by expert (up to 4 tokens each) and each group's gate / up blocks still to finish
@@ -805,8 +806,7 @@ struct GpuEngine::Impl {
     // alone); and the silu + rounding of a group done by the thread that finishes its last gate / up block (one thread
     // hand-off less per layer). Outputs stay per pick (gbuf / ubuf / dbuf at the pick's index), so the combine below is
     // unchanged and deterministic.
-    constexpr int64_t kRowsDown = 128, kGroup = 4;
-    const int64_t kRowsUp = std::max<int64_t>(8, o.cpu_up_rows);
+    constexpr int64_t kRowsUp = 64, kRowsDown = 128, kGroup = 4;
     grp.clear();
     {
       ord.resize(z(np));
@@ -835,7 +835,6 @@ struct GpuEngine::Impl {
       }
       float o4[kGroup];
       for (int64_t r = r0; r < r1; ++r) {
-        if (o.cpu_prefetch && r + 2 < r1) prefetch_row(R.base + static_cast<std::uint64_t>(r + 2) * R.rb, R.rb);
         kern::dot_row_q8(R.t, R.base + static_cast<std::uint64_t>(r) * R.rb, e, nullptr, acts, gp.m, o4);
         for (int j = 0; j < gp.m; ++j) outs[j][r] = o4[j];
       }
@@ -898,8 +897,20 @@ struct GpuEngine::Impl {
     std::fill(need.begin(), need.begin() + n, std::uint8_t{0});
     for (const ColdPick& c : cold) need[z(c.t)] = 1;
     for (int64_t t = 0; t < n; ++t)
-      if (need[z(t)]) kern::act_q8x32_quantize(xsrc + t * e, e, actx[z(t)]);
-    constexpr int64_t kRowsUp = 64, kRowsDown = 128, kGroup = 4;
+      if (need[z(t)]) {
+        kern::act_q8x32_quantize(xsrc + t * e, e, actx[z(t)]);
+        if (o.cpu_check) {  // v45: the AVX2 rounding against the scalar one, bit for bit (q, scales, rounded values)
+          kern::ActQ8x32 rf;
+          kern::act_q8x32_quantize_ref(xsrc + t * e, e, rf);
+          const kern::ActQ8x32& av = actx[z(t)];
+          const bool same = rf.q == av.q && rf.sum16 == av.sum16 && std::memcmp(rf.s.data(), av.s.data(), rf.s.size() * sizeof(float)) == 0 &&
+                            std::memcmp(rf.x.data(), av.x.data(), rf.x.size() * sizeof(float)) == 0;
+          round_n.fetch_add(1, std::memory_order_relaxed);
+          if (!same) round_bad.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
+    constexpr int64_t kRowsDown = 128, kGroup = 4;
+    const int64_t kRowsUp = std::max<int64_t>(8, o.cpu_up_rows);  // v45: the split path (v40 put this in cold_experts_io by mistake)
     grp.clear();
     ord.resize(z(np));
     for (int64_t p = 0; p < np; ++p) ord[z(p)] = static_cast<int>(p);
@@ -913,9 +924,13 @@ struct GpuEngine::Impl {
     }
     const int64_t ng = static_cast<int64_t>(grp.size());
     const int64_t ub = (ff + kRowsUp - 1) / kRowsUp, db = (e + kRowsDown - 1) / kRowsDown;
-    for (int64_t gi = 0; gi < ng; ++gi) grp_left[z(gi)].store(static_cast<int>(2 * ub), std::memory_order_relaxed);
+    // v45 (Fable review): --cpu-gu2 on one-token steps computes gate row r and up row r in one call (same x, same grids;
+    // each row's arithmetic as dot_row: bit for bit); a group then has ub items instead of 2 ub
+    const bool gu2 = o.cpu_gu2 && n == 1;
+    const int64_t per = gu2 ? ub : 2 * ub;
+    for (int64_t gi = 0; gi < ng; ++gi) grp_left[z(gi)].store(static_cast<int>(per), std::memory_order_relaxed);
     const std::function<void(int64_t)> up_fn = [&](int64_t u) {
-      const int64_t gi = u / (2 * ub), rem = u % (2 * ub), proj = rem / ub, r0 = (rem % ub) * kRowsUp, r1 = std::min(ff, r0 + kRowsUp);
+      const int64_t gi = u / per, rem = u % per, proj = gu2 ? 0 : rem / ub, r0 = (gu2 ? rem : rem % ub) * kRowsUp, r1 = std::min(ff, r0 + kRowsUp);
       const PickGroup& gp = grp[z(gi)];
       const ExpRows R = exp_rows(proj == 0 ? l.gate_exps : l.up_exps, gp.e);
       const kern::ActQ8x32* acts[kGroup] = {};
@@ -925,9 +940,45 @@ struct GpuEngine::Impl {
         outs[j] = (proj == 0 ? gbuf.data() : ubuf.data()) + static_cast<int64_t>(gp.p[j]) * ff;
       }
       float o4[kGroup];
-      for (int64_t r = r0; r < r1; ++r) {
-        kern::dot_row_q8(R.t, R.base + static_cast<std::uint64_t>(r) * R.rb, e, nullptr, acts, gp.m, o4);
-        for (int j = 0; j < gp.m; ++j) outs[j][r] = o4[j];
+      if (gu2) {
+        const ExpRows U = exp_rows(l.up_exps, gp.e);
+        const bool pair_ok = gp.m == 1 && U.t == R.t && !kern::dot_q8_has_int_path(R.t);
+        float* uo = ubuf.data() + static_cast<int64_t>(gp.p[0]) * ff;
+        for (int64_t r = r0; r < r1; ++r) {
+          const std::uint8_t* gr = R.base + static_cast<std::uint64_t>(r) * R.rb;
+          const std::uint8_t* ur = U.base + static_cast<std::uint64_t>(r) * U.rb;
+          if (o.cpu_prefetch && r + 2 < r1) {
+            prefetch_row(gr + 2 * R.rb, R.rb);
+            prefetch_row(ur + 2 * U.rb, U.rb);
+          }
+          if (pair_ok) {
+            float o2[2];
+            kern::dot_rows2_f32(R.t, gr, ur, e, acts[0]->x.data(), o2);
+            if (o.cpu_check) {
+              float c0[kGroup], c1[kGroup];
+              kern::dot_row_q8(R.t, gr, e, nullptr, acts, 1, c0);
+              kern::dot_row_q8(U.t, ur, e, nullptr, acts, 1, c1);
+              if (std::memcmp(&c0[0], &o2[0], sizeof(float)) != 0 || std::memcmp(&c1[0], &o2[1], sizeof(float)) != 0)
+                gu2_bad.fetch_add(1, std::memory_order_relaxed);
+              gu2_n.fetch_add(2, std::memory_order_relaxed);
+            }
+            outs[0][r] = o2[0];
+            uo[r] = o2[1];
+          } else {
+            const kern::ActQ8x32* au[kGroup] = {};
+            for (int j = 0; j < gp.m; ++j) au[j] = acts[j];
+            kern::dot_row_q8(R.t, gr, e, nullptr, acts, gp.m, o4);
+            for (int j = 0; j < gp.m; ++j) outs[j][r] = o4[j];
+            kern::dot_row_q8(U.t, ur, e, nullptr, au, gp.m, o4);
+            for (int j = 0; j < gp.m; ++j) ubuf[z(static_cast<int64_t>(gp.p[j]) * ff + r)] = o4[j];
+          }
+        }
+      } else {
+        for (int64_t r = r0; r < r1; ++r) {
+          if (o.cpu_prefetch && r + 2 < r1) prefetch_row(R.base + static_cast<std::uint64_t>(r + 2) * R.rb, R.rb);
+          kern::dot_row_q8(R.t, R.base + static_cast<std::uint64_t>(r) * R.rb, e, nullptr, acts, gp.m, o4);
+          for (int j = 0; j < gp.m; ++j) outs[j][r] = o4[j];
+        }
       }
       if (grp_left[z(gi)].fetch_sub(1, std::memory_order_acq_rel) == 1)
         for (int j = 0; j < gp.m; ++j) {
@@ -991,16 +1042,17 @@ struct GpuEngine::Impl {
       }
     };
     if (!tlp) {
-      pool->run2(ng * 2 * ub, up_fn, db, down_fn);
+      pool->run2(ng * per, up_fn, db, down_fn);
       return;
     }
     // stamped run: the same items, each timed; the phase-1 end is the time the last up item finished
-    const int64_t n1 = ng * 2 * ub;
+    const int64_t n1 = ng * per;
     std::atomic<std::int64_t> b1{0}, b2{0}, first{-1}, end1{0};
     std::atomic<int64_t> left1{n1};
     const Clock::time_point t0 = Clock::now();
     auto tns = [&](Clock::time_point t) { return std::chrono::duration_cast<std::chrono::nanoseconds>(t - t0).count(); };
-    std::atomic<std::int64_t> tu[32] = {}, td[32] = {};
+    std::atomic<std::int64_t> tu[32] = {}, td[32] = {}, fd[32];
+    for (std::atomic<std::int64_t>& q3 : fd) q3.store(-1, std::memory_order_relaxed);
     const std::function<void(int64_t)> up_t = [&](int64_t u) {
       const Clock::time_point a = Clock::now();
       std::int64_t none = -1;
@@ -1013,6 +1065,10 @@ struct GpuEngine::Impl {
     };
     const std::function<void(int64_t)> down_t = [&](int64_t u) {
       const Clock::time_point a = Clock::now();
+      {
+        std::int64_t none = -1;
+        fd[z(pool_tid())].compare_exchange_strong(none, tns(a), std::memory_order_relaxed);
+      }
       down_fn(u);
       const std::int64_t dt = tns(Clock::now()) - tns(a);
       b2.fetch_add(dt, std::memory_order_relaxed);
@@ -1028,6 +1084,21 @@ struct GpuEngine::Impl {
       tlp->thr_dn[q2] += static_cast<double>(td[q2].load()) * 1e-9;
     }
     tlp->thr_n = std::max(tlp->thr_n, std::min(32, pool_tid_count()));
+    {  // v45: each thread's first down item after the gate/up phase ended (end1): the hand-over between the phases
+      const std::int64_t e1 = end1.load();
+      for (int q2 = 0; q2 < 32; ++q2) {
+        const std::int64_t f2 = fd[q2].load();
+        if (f2 < 0) continue;
+        const double lag = static_cast<double>(f2 - e1) * 1e-9;
+        tlp->lag_sum += lag;
+        tlp->lag_max = std::max(tlp->lag_max, lag);
+        ++tlp->lag_n;
+      }
+    }
+    tlp->gu2_rows = gu2_n.load();
+    tlp->gu2_mismatch = gu2_bad.load();
+    tlp->round_n = round_n.load();
+    tlp->round_mismatch = round_bad.load();
     tlp->down2_rows = down2_n.load();
     tlp->down2_mismatch = down2_bad.load();
     tlp->stage[0] += tround;

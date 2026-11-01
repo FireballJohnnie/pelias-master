@@ -73,6 +73,8 @@ struct ActQ8x32 {
 };
 // From unrounded values, with act_round_q8_256x8's rule (scale amax / 127, 1 when amax is 0; q = clamp(nearbyint(x / s))).
 void act_q8x32_quantize(const float* x, std::int64_t k, ActQ8x32& a);
+// v45: act_q8x32_quantize takes an AVX2 form when the CPU has it (bit for bit with this one); the scalar form, for checks.
+void act_q8x32_quantize_ref(const float* x, std::int64_t k, ActQ8x32& a);
 // From values already rounded that way (the forward pass rounds before the product): the scale is recovered as max |x| /
 // 127 and q = nearbyint(x / s) (exactly the integers; the scale to within one rounding).
 void act_q8x32_from_rounded(const float* xr, std::int64_t k, ActQ8x32& a);

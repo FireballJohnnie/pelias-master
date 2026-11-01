@@ -970,6 +970,10 @@ PELIAS_TARGET_AVX2 void deq_q7_zt(const std::uint8_t* p, float* y) {  // d, 8 le
 // Q4_TG / Q4_TG2 without planes: each value s_j * grid[tag][code] (the same fp32 product as the dequantizer, here taken
 // from the four grids scaled once per 32-block) is fused into its lane's multiply-add, in value order, so the sums equal
 // the buffered path's bit for bit.
+// v45 (Fable review 03:3x): q::q8_z_scale lives in another file (a call per 32 values, no LTO); the same two operations in the
+// same order, inline here: (d * lv) / 63, bit for bit.
+inline float z_scale_local(float d, int lv) { return (d * static_cast<float>(lv)) / 63.0f; }
+
 PELIAS_TARGET_AVX2 void fused_q4_tg_seg(const std::uint8_t* p, int version, const float* const* xs, int nt, __m256 (*acc)[4]) {
   const float d = h2f(p);
   std::uint64_t packed = 0;
@@ -982,7 +986,7 @@ PELIAS_TARGET_AVX2 void fused_q4_tg_seg(const std::uint8_t* p, int version, cons
   }
   const __m128i m4 = _mm_set1_epi8(0x0F);
   for (int j = 0; j < 8; ++j) {
-    const __m256 sv = _mm256_set1_ps(q::q8_z_scale(d, static_cast<int>((packed >> (6 * j)) & 63u)));
+    const __m256 sv = _mm256_set1_ps(z_scale_local(d, static_cast<int>((packed >> (6 * j)) & 63u)));
     const std::uint8_t tags = p[8 + j];
     // the block's 32 codes in value order (value 2i: low nibble of byte i, value 2i + 1: high nibble)
     const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + 16 + 16 * j));
@@ -1013,8 +1017,8 @@ PELIAS_TARGET_AVX2 void fused_q4_tg_seg2(const std::uint8_t* p0, const std::uint
   }
   const __m128i m4 = _mm_set1_epi8(0x0F);
   for (int j = 0; j < 8; ++j) {
-    const __m256 sv0 = _mm256_set1_ps(q::q8_z_scale(d0, static_cast<int>((pk0 >> (6 * j)) & 63u)));
-    const __m256 sv1 = _mm256_set1_ps(q::q8_z_scale(d1, static_cast<int>((pk1 >> (6 * j)) & 63u)));
+    const __m256 sv0 = _mm256_set1_ps(z_scale_local(d0, static_cast<int>((pk0 >> (6 * j)) & 63u)));
+    const __m256 sv1 = _mm256_set1_ps(z_scale_local(d1, static_cast<int>((pk1 >> (6 * j)) & 63u)));
     const std::uint8_t tg0 = p0[8 + j], tg1 = p1[8 + j];
     const __m128i v0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p0 + 16 + 16 * j));
     const __m128i v1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p1 + 16 + 16 * j));
@@ -1508,7 +1512,58 @@ void act_block(const float* x, ActQ8x32& a, std::int64_t b, float scale) {  // q
 
 }  // namespace
 
+#if defined(PELIAS_KERN_X86)
+namespace {
+// v45 (Fable review: the CPU's input rounding is scalar nearbyint, 0.33 ms per token on the critical path): the same block in
+// AVX2. amax by max (order-free), the same scalar scale and 1 / scale, the same IEEE multiply per value, round to nearest even
+// (= nearbyint in the default rounding mode), the same clamp to +/-127, the same integer sums, x = scale * q: bit for bit.
+PELIAS_TARGET_AVX2 void act_q8x32_quantize_avx2(const float* x, std::int64_t k, ActQ8x32& a) {
+  const __m256 sign = _mm256_set1_ps(-0.0f), lo = _mm256_set1_ps(-127.0f), hi = _mm256_set1_ps(127.0f);
+  for (std::int64_t b = 0; b < k / 32; ++b) {
+    const float* xb = x + 32 * b;
+    __m256 v[4], m = _mm256_setzero_ps();
+    for (int r = 0; r < 4; ++r) {
+      v[r] = _mm256_loadu_ps(xb + 8 * r);
+      m = _mm256_max_ps(m, _mm256_andnot_ps(sign, v[r]));
+    }
+    alignas(32) float mm[8];
+    _mm256_store_ps(mm, m);
+    float amax = 0.0f;
+    for (int j = 0; j < 8; ++j) amax = std::max(amax, mm[j]);
+    const float scale = amax > 0.0f ? amax / 127.0f : 1.0f;
+    const float inv = 1.0f / scale;
+    a.s[static_cast<std::size_t>(b)] = scale;
+    const __m256 iv = _mm256_set1_ps(inv), sv = _mm256_set1_ps(scale);
+    alignas(32) std::int32_t qi[32];
+    for (int r = 0; r < 4; ++r) {
+      const __m256 q = _mm256_min_ps(hi, _mm256_max_ps(lo, _mm256_round_ps(_mm256_mul_ps(v[r], iv), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC)));
+      _mm256_store_si256(reinterpret_cast<__m256i*>(qi + 8 * r), _mm256_cvttps_epi32(q));
+      _mm256_storeu_ps(a.x.data() + 32 * b + 8 * r, _mm256_mul_ps(sv, q));
+    }
+    std::int32_t s0 = 0, s1 = 0;
+    for (int j = 0; j < 32; ++j) {
+      a.q[static_cast<std::size_t>(32 * b + j)] = static_cast<std::int8_t>(qi[j]);
+      (j < 16 ? s0 : s1) += qi[j];
+    }
+    a.sum16[static_cast<std::size_t>(2 * b)] = s0;
+    a.sum16[static_cast<std::size_t>(2 * b + 1)] = s1;
+  }
+}
+}  // namespace
+#endif
+
 void act_q8x32_quantize(const float* x, std::int64_t k, ActQ8x32& a) {
+#if defined(PELIAS_KERN_X86)
+  if (active_isa() == Isa::avx2) {
+    act_fill(a, k);
+    act_q8x32_quantize_avx2(x, k, a);
+    return;
+  }
+#endif
+  act_q8x32_quantize_ref(x, k, a);
+}
+
+void act_q8x32_quantize_ref(const float* x, std::int64_t k, ActQ8x32& a) {
   act_fill(a, k);
   for (std::int64_t b = 0; b < k / 32; ++b) {
     float amax = 0.0f;

@@ -2339,7 +2339,7 @@ int cmd_engine_check(const Args& a) {
                  "                           [--no-doorbell] [--timeline-ops] [--split-ref] [--bank-selftest MIXES] [--probe-pos P]\n"
                  "                           [--router-tie BAND] [--cold-on-gpu] [--trace OUT.tsv] [--reader-v25] [--reader-cache K] [--fold-shared]\n"
                  "                           [--batch-identical] [--graph] [--prefetch] [--plane-tail N] [--cpu-light] [--reader-rpw 1|2]\n"
-                 "                           [--pin-gap-kib K] [--pin-huge-ok] [--cpu-up-rows N] [--cpu-down2] [--cpu-prefetch] [--cpu-check] [--host-wait auto|spin|yield|block] [--pin-cpus 0,2,4,...] [--pin-host N] [--ref-threads N] [--no-cpu-light] [--split-slow] [--preload-light]\n");
+                 "                           [--pin-gap-kib K] [--pin-huge-ok] [--cpu-up-rows N] [--cpu-down2] [--cpu-gu2] [--cpu-prefetch] [--cpu-check] [--host-wait auto|spin|yield|block] [--pin-cpus 0,2,4,...] [--pin-host N] [--ref-threads N] [--no-cpu-light] [--split-slow] [--preload-light]\n");
     return 1;
   }
   auto num = [&](const char* k, std::uint64_t d, std::uint64_t lo, std::uint64_t hi, std::uint64_t& out) {
@@ -2464,6 +2464,7 @@ int cmd_engine_check(const Args& a) {
   }
   eo.cpu_down2 = a.has("cpu-down2");
   eo.cpu_prefetch = a.has("cpu-prefetch");
+  eo.cpu_gu2 = a.has("cpu-gu2");
   eo.cpu_check = a.has("cpu-check");
   if (a.has("pin-cpus")) {  // v43: comma list; the first is the doorbell thread, the rest the pool workers in order
     std::string lst = a.get("pin-cpus");
@@ -2701,6 +2702,15 @@ int cmd_engine_check(const Args& a) {
         }
         std::printf("\n  timeline (v40): gate/up per thread %.2f .. %.2f ms, down %.2f .. %.2f ms per token\n", umin, umax, dmin, dmax);
       }
+      if (T.lag_n > 0)
+        std::printf("  timeline (v45): first down item after gate/up ends: mean %.1f us, max %.1f us (%llu thread-layers)\n", 1e6 * T.lag_sum / static_cast<double>(T.lag_n),
+                    1e6 * T.lag_max, static_cast<unsigned long long>(T.lag_n));
+      if (T.gu2_rows > 0)
+        std::printf("  check (v45): paired gate/up vs one-row path: %llu rows compared, %llu differ (bit for bit)\n", static_cast<unsigned long long>(T.gu2_rows),
+                    static_cast<unsigned long long>(T.gu2_mismatch));
+      if (T.round_n > 0)
+        std::printf("  check (v45): AVX2 input rounding vs scalar: %llu vectors compared, %llu differ (bit for bit)\n", static_cast<unsigned long long>(T.round_n),
+                    static_cast<unsigned long long>(T.round_mismatch));
       if (T.down2_rows > 0)
         std::printf("  check (v40): two-row down vs one-row path: %llu rows compared, %llu differ (bit for bit)\n", static_cast<unsigned long long>(T.down2_rows),
                     static_cast<unsigned long long>(T.down2_mismatch));
