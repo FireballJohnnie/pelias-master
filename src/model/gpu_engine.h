@@ -124,6 +124,10 @@ struct EngineOptions {
   bool cpu_down2 = false;
   bool cpu_prefetch = false;
   bool cpu_check = false;  // compare the two-row down against the one-row path, row by row (bit for bit); counts mismatches
+  // v43: pin the CPU threads: pin_pool[0] = the doorbell thread (it works as the pool's first thread), pin_pool[1..] = the
+  // pool workers in order, pin_host = the thread that drives the engine (-1: leave it). Empty: no pinning (as before).
+  std::vector<int> pin_pool;
+  int pin_host = -1;
   // v28b: the split's CPU side through v20's per-stage jobs (the pool sleeping between them) instead of the one-dispatch path
   // with the pool held hot; for comparison
   bool split_slow = false;

@@ -70,10 +70,18 @@ Status gfail(const std::string& what) { return Status::fail(Code::internal, what
 // CPU is not held busy while the GPU runs a layer (the author's heat concern, 2026-10-31).
 class Pool {
  public:
-  explicit Pool(int threads) {
+  // v43: cpus[i] (when given) binds worker i to that logical CPU before it starts
+  explicit Pool(int threads, const std::vector<int>& cpus = {}) {
     const int workers = std::max(0, threads - 1);
-    for (int i = 0; i < workers; ++i) th_.emplace_back([this] { loop(); });
+    for (int i = 0; i < workers; ++i) {
+      const int cpu = i < static_cast<int>(cpus.size()) ? cpus[static_cast<std::size_t>(i)] : -1;
+      th_.emplace_back([this, cpu] {
+        if (cpu >= 0) pinned_.fetch_add(hal::pin_this_thread(cpu) ? 1 : 0, std::memory_order_relaxed);
+        loop();
+      });
+    }
   }
+  [[nodiscard]] int pinned() const { return pinned_.load(std::memory_order_relaxed); }
   ~Pool() {
     {
       std::lock_guard<std::mutex> lk(mu_);
@@ -231,6 +239,7 @@ class Pool {
   std::atomic<int64_t> next_{0};
   std::atomic<int> active_{0};
   std::atomic<std::uint64_t> gen_{0};
+  std::atomic<int> pinned_{0};
   std::atomic<bool> stop_{false};
 };
 
@@ -406,6 +415,7 @@ struct GpuEngine::Impl {
   float *wsel_m = nullptr, *xn_m = nullptr, *yc_m = nullptr, *yc_md = nullptr;  // host addresses; yc_md: the cold sum's device address
   unsigned gen = 0;
   std::thread bell_th;
+  bool pin_bell_ok = false, pin_host_ok = false;  // v43
   std::mutex bmu;
   std::condition_variable bcv;
   bool bstop = false, bjob = false, bbusy = false;
@@ -1915,7 +1925,14 @@ std::string GpuEngine::summary() const {
                 I.s.n_layer * I.s.n_expert, static_cast<double>(I.cache_bytes) / 1e9, I.pool ? I.pool->threads() : 0, I.o.max_ctx, I.o.max_batch,
                 I.bell ? "doorbell" : "device sync per layer", static_cast<double>(I.o.router_tie), I.reader_note.c_str(), I.o.batch_identical ? "on" : "off",
                 I.graph_note.c_str(), I.pf_ok ? "on" : "off", I.split_note.c_str());
-  return b;
+  std::string r = b;
+  if (!I.o.pin_pool.empty() || I.o.pin_host >= 0) {  // v43
+    char c[256];
+    std::snprintf(c, sizeof c, "; pinned: %d of %zu workers, doorbell %s, host %s", I.pool ? I.pool->pinned() : 0, I.o.pin_pool.empty() ? std::size_t{0} : I.o.pin_pool.size() - 1,
+                  I.o.pin_pool.empty() ? "not asked" : I.pin_bell_ok ? "ok" : "failed (or not started yet)", I.o.pin_host < 0 ? "not asked" : I.pin_host_ok ? "ok" : "failed");
+    r += c;
+  }
+  return r;
 }
 
 Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, const EngineOptions& o) {
@@ -2138,7 +2155,12 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
   if (o.cold_on_gpu) I.setup_reader();  // v24
   // the host side of the cold path
   const int threads = o.cpu_threads > 0 ? o.cpu_threads : static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
-  I.pool = std::make_unique<Pool>(threads);
+  {  // v43: workers take pin_pool[1..]; the doorbell thread takes pin_pool[0] when it starts; the driving thread pin_host
+    std::vector<int> wk;
+    for (std::size_t q2 = 1; q2 < o.pin_pool.size(); ++q2) wk.push_back(o.pin_pool[q2]);
+    I.pool = std::make_unique<Pool>(threads, wk);
+    if (o.pin_host >= 0) I.pin_host_ok = hal::pin_this_thread(o.pin_host);
+  }
   const int64_t mb = o.max_batch, maxp = mb * nu;
   I.xn_h.assign(z(mb * e), 0.0f);
   I.ycold_h.assign(z(mb * e), 0.0f);
@@ -2192,7 +2214,10 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
       I.tline.threads = I.pool->threads();
       for (std::vector<double>* v : {&I.tline.gpu_dense, &I.tline.gpu_hot, &I.tline.gpu_idle, &I.tline.cpu_wait, &I.tline.cpu_cold, &I.tline.cpu_picks, &I.tline.cpu_groups}) v->assign(s.n_layer, 0.0);
       Impl* ip = &I;
-      I.bell_th = std::thread([ip] { ip->bell_loop(); });
+      I.bell_th = std::thread([ip] {
+        if (!ip->o.pin_pool.empty()) ip->pin_bell_ok = hal::pin_this_thread(ip->o.pin_pool[0]);
+        ip->bell_loop();
+      });
     }
   }
   if (I.lmask_d) {  // v28: the split runs through the doorbell's CPU side

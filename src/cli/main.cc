@@ -2339,7 +2339,7 @@ int cmd_engine_check(const Args& a) {
                  "                           [--no-doorbell] [--timeline-ops] [--split-ref] [--bank-selftest MIXES] [--probe-pos P]\n"
                  "                           [--router-tie BAND] [--cold-on-gpu] [--trace OUT.tsv] [--reader-v25] [--reader-cache K] [--fold-shared]\n"
                  "                           [--batch-identical] [--graph] [--prefetch] [--plane-tail N] [--cpu-light] [--reader-rpw 1|2]\n"
-                 "                           [--pin-gap-kib K] [--pin-huge-ok] [--cpu-up-rows N] [--cpu-down2] [--cpu-prefetch] [--cpu-check] [--host-wait auto|spin|yield|block] [--ref-threads N] [--no-cpu-light] [--split-slow] [--preload-light]\n");
+                 "                           [--pin-gap-kib K] [--pin-huge-ok] [--cpu-up-rows N] [--cpu-down2] [--cpu-prefetch] [--cpu-check] [--host-wait auto|spin|yield|block] [--pin-cpus 0,2,4,...] [--pin-host N] [--ref-threads N] [--no-cpu-light] [--split-slow] [--preload-light]\n");
     return 1;
   }
   auto num = [&](const char* k, std::uint64_t d, std::uint64_t lo, std::uint64_t hi, std::uint64_t& out) {
@@ -2465,6 +2465,30 @@ int cmd_engine_check(const Args& a) {
   eo.cpu_down2 = a.has("cpu-down2");
   eo.cpu_prefetch = a.has("cpu-prefetch");
   eo.cpu_check = a.has("cpu-check");
+  if (a.has("pin-cpus")) {  // v43: comma list; the first is the doorbell thread, the rest the pool workers in order
+    std::string lst = a.get("pin-cpus");
+    std::size_t at = 0;
+    while (at <= lst.size()) {
+      const std::size_t comma = lst.find(',', at);
+      const std::string one = lst.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
+      const Result<std::uint64_t> c1 = io::parse_whole(one, 1023);
+      if (!c1.ok()) {
+        std::fprintf(stderr, "pelias: --pin-cpus takes logical CPU numbers separated by commas\n");
+        return 1;
+      }
+      eo.pin_pool.push_back(static_cast<int>(c1.value));
+      if (comma == std::string::npos) break;
+      at = comma + 1;
+    }
+  }
+  if (a.has("pin-host")) {
+    const Result<std::uint64_t> h1 = io::parse_whole(a.get("pin-host"), 1023);
+    if (!h1.ok()) {
+      std::fprintf(stderr, "pelias: --pin-host takes one logical CPU number\n");
+      return 1;
+    }
+    eo.pin_host = static_cast<int>(h1.value);
+  }
 
   // v25 trace: a new file (nothing is overwritten); the reader's steps, per layer
   const std::string trace_path = a.get("trace");
