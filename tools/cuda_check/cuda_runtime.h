@@ -20,6 +20,7 @@
 #define __constant__ __attribute__((constant))
 #define __forceinline__ __inline__ __attribute__((always_inline))
 #define __launch_bounds__(...) __attribute__((launch_bounds(__VA_ARGS__)))
+#define __grid_constant__  // nvcc: the kernel argument read in place (CUDA 11.7+); clang 18 has no such attribute: ignored here
 #ifndef CUDA_VERSION
 #define CUDA_VERSION 12080
 #endif

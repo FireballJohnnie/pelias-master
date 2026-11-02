@@ -1228,21 +1228,16 @@ __global__ void __launch_bounds__(256) k_rx_probe(const std::uint8_t* __restrict
 //  C every block: the R3 expert stage (rx_body, k_rx's task loop)
 //  D every thread: the combine (md::rd3_combine_one) into y and the residual x = (x + a) + y
 // A grid barrier between phases. The values and their order are the separate kernels', so the bits are theirs.
-template <bool kMT, int NJ, bool kStat = false>
-__global__ void __launch_bounds__(256) k_moe_half(const MoeHalfArgs A, int sbytes) {
-  namespace cg = cooperative_groups;
-  cg::grid_group grid = cg::this_grid();
-  __shared__ double s_sh[33];
-  __shared__ float s_rsh[33];
-  __shared__ float s_inv;
-  __shared__ float s_bv[8];
-  __shared__ int s_bi[8];
-  float* stg = s_lut;  // the dynamic shared memory: staging (A), the router's arrays (B), the LUT + warp buffers (C)
+// v55f2 (author 06:17: the v55f fused kernel spilled 152 B at 128 registers while k_rx alone is 108 with none): phases A
+// and B run once per layer and carry the heaviest state (the rounding with the bit planes, the router, the warp grouping's
+// expert pointers). As separate, non-inlined functions their registers and any spill stay in that setup code, and the
+// expert loop (phase C) keeps its own allocation. The kernel's argument is a __grid_constant__, so the functions read it
+// in place (no copy). Same code, same order: the bits are unchanged.
+#define PG_NOINL __attribute__((noinline))
+template <int NJ>
+__device__ PG_NOINL void mh_phase_a(const MoeHalfArgs& A, float* stg, double* s_sh) {
   const int H = A.H, n = A.n, nsub = H / 32;
   const int tid = static_cast<int>(threadIdx.x);
-  const bool phs = A.ph != nullptr && blockIdx.x == 0 && threadIdx.x == 0;  // v55b: phase stamps
-  if (phs) A.ph[0] = gtimer_s();
-  // ---- A
   for (int t = 0; t < n; ++t) {
     const float* xt = A.x + static_cast<long long>(t) * H;
     const float* at = A.a + static_cast<long long>(t) * H;
@@ -1274,21 +1269,41 @@ __global__ void __launch_bounds__(256) k_moe_half(const MoeHalfArgs A, int sbyte
       else md::gemv_row<NJ>(A.wsh, static_cast<std::uint64_t>(H) * 4u, 0, stg, nsub, n, A.gsh, 1);
     }
   }
+}
+// block 0 only (every thread of it: the router and the plan synchronise the block)
+__device__ PG_NOINL void mh_phase_b(const MoeHalfArgs& A, float* stg, float* s_rsh, float* s_inv, float* s_bv, int* s_bi) {
+  const int n = A.n, tid = static_cast<int>(threadIdx.x);
+  const md::RouterSmem S{stg, stg + md::kRouterMaxExperts, reinterpret_cast<unsigned char*>(stg + 2 * md::kRouterMaxExperts), s_rsh, s_inv, s_bv, s_bi};
+  for (int t = 0; t < n; ++t) {
+    md::router_row(A.logits + static_cast<long long>(t) * A.ne, A.ne, A.nu, A.wscale, A.sel + t * A.nu, A.wsel + t * A.nu, A.band, S);
+    __syncthreads();
+  }
+  if (A.wsh && tid < n) A.gsh[tid] = md::sigmoid_d(A.gsh[tid]);  // deltanet_gates(gsh, ...) with one head: beta = sigmoid(beta)
+  if (tid < 32) md::rd3_group_one<true>(A.tab, A.wsh ? A.shx : nullptr, A.sel, n, A.nu, A.cache, A.F, A.grp, A.gsrc, A.gfill, nullptr);  // v55e: one warp
+  __syncthreads();
+  rx_plan_body(A.grp, A.gsrc, A.gfill, n, A.nu, A.H, A.F, A.xq, A.xs, A.xsum, A.gu, A.hq, A.hs, A.hsum, A.yd, static_cast<std::uint8_t*>(A.plan),
+               A.max_picks, A.load_mode, A.xb, A.hb);
+}
+template <bool kMT, int NJ, bool kStat = false>
+__global__ void __launch_bounds__(256) k_moe_half(const __grid_constant__ MoeHalfArgs A, int sbytes) {
+  namespace cg = cooperative_groups;
+  cg::grid_group grid = cg::this_grid();
+  __shared__ double s_sh[33];
+  __shared__ float s_rsh[33];
+  __shared__ float s_inv;
+  __shared__ float s_bv[8];
+  __shared__ int s_bi[8];
+  float* stg = s_lut;  // the dynamic shared memory: staging (A), the router's arrays (B), the LUT + warp buffers (C)
+  const int H = A.H, n = A.n;
+  const int tid = static_cast<int>(threadIdx.x);
+  const bool phs = A.ph != nullptr && blockIdx.x == 0 && threadIdx.x == 0;  // v55b: phase stamps
+  if (phs) A.ph[0] = gtimer_s();
+  // ---- A
+  mh_phase_a<NJ>(A, stg, s_sh);
   grid.sync();
   if (phs) A.ph[1] = gtimer_s();
   // ---- B
-  if (blockIdx.x == 0) {
-    const md::RouterSmem S{stg, stg + md::kRouterMaxExperts, reinterpret_cast<unsigned char*>(stg + 2 * md::kRouterMaxExperts), s_rsh, &s_inv, s_bv, s_bi};
-    for (int t = 0; t < n; ++t) {
-      md::router_row(A.logits + static_cast<long long>(t) * A.ne, A.ne, A.nu, A.wscale, A.sel + t * A.nu, A.wsel + t * A.nu, A.band, S);
-      __syncthreads();
-    }
-    if (A.wsh && tid < n) A.gsh[tid] = md::sigmoid_d(A.gsh[tid]);  // deltanet_gates(gsh, ...) with one head: beta = sigmoid(beta)
-    if (tid < 32) md::rd3_group_one<true>(A.tab, A.wsh ? A.shx : nullptr, A.sel, n, A.nu, A.cache, A.F, A.grp, A.gsrc, A.gfill, nullptr);  // v55e: one warp
-    __syncthreads();
-    rx_plan_body(A.grp, A.gsrc, A.gfill, n, A.nu, H, A.F, A.xq, A.xs, A.xsum, A.gu, A.hq, A.hs, A.hsum, A.yd, static_cast<std::uint8_t*>(A.plan),
-                 A.max_picks, A.load_mode, A.xb, A.hb);
-  }
+  if (blockIdx.x == 0) mh_phase_b(A, stg, s_rsh, &s_inv, s_bv, s_bi);
   grid.sync();
   if (phs) A.ph[2] = gtimer_s();
   // ---- C
