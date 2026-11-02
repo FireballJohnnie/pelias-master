@@ -2652,12 +2652,9 @@ int cmd_engine_check(const Args& a) {
   }
   eo.cache_pools = !a.has("no-cache-pools");  // v51 (temporary switch)
   eo.fast_f32 = !a.has("no-fast-f32");        // v52 (temporary switch)
-  eo.lean_dense = a.has("lean-dense");        // v55e (temporary switch; off by default since v55e2)
   eo.dn_half = !a.has("no-dn-half");  // v55g (L3); v57: on by default again, --no-dn-half off (temporary, A/B)
   eo.dn_half_mt = a.has("dn-half-mt");  // v57 (temporary, A/B)
-  eo.l2_prefetch = a.has("l2pf") && !a.has("no-l2pf");  // v56; v56b: off by default, --l2pf on (temporary, A/B)
   eo.dn_smem = !a.has("no-dn-smem");  // v56b (temporary, A/B)
-  eo.dn_mlp2 = a.has("dn-mlp2");  // v56c; v57: opt-in (temporary, A/B)
   eo.rx_pipe = !a.has("no-rx-pipe");  // v57 (temporary, A/B)
   eo.rx_sact = !a.has("no-rx-sact");  // v57 (temporary, A/B)
   eo.fused_moe = !a.has("no-fused-moe");      // v52 (temporary switch)

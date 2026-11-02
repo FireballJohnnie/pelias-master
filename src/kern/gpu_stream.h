@@ -92,8 +92,6 @@ class StreamPlan {
   unsigned long long epoch_ = 0;  // runs so far: the counters are never reset, run e waits for e x the stage's tasks
   int grid_ = 0;                  // blocks of the cooperative launch (occupancy x SMs)
   bool mt_ = false;               // v47: a job has 2-4 tokens: the kernel that loads each row's weights once for all of them
-  int only_ = -1;                 // v55d: every job one format (Q8_0 or Q6_K) and one token: run_unstaged uses that format's lean kernel
-  int grid_lean_ = 0;             // its blocks (its own occupancy x SMs)
   int fmt1_ = -1;                 // v55g: every job's one format (one token), whatever the lean switch
   std::uint64_t off_jobs_ = 0, off_stage_ = 0, off_grp_ = 0, off_dep_ = 0, off_gtasks_ = 0, off_done_ = 0, off_gdone_ = 0;
 };
@@ -157,7 +155,6 @@ struct MoeHalfArgs {
   // 0 warp cycles waiting for a group, 1 cycles running tasks, 2 tasks, 3 the warps' loop spans, 4 warps, 5 staged tasks,
   // 6 filling tasks, 7 cycles of staged tasks, 8 + f cycles of format f (DJob fmt 0..10, 11 other), 20 + f tasks of format f
   unsigned long long* st = nullptr;
-  int l2pf = 0;  // v56: each warp prefetches its expert-stage rows into L2 before running its tasks (EngineOptions::l2_prefetch)
   int pipe = 0;  // v57: the expert stage's copy pipeline (each warp's next task's rows by cp.async while it computes; needs load_mode 1 or 2)
   int sact = 0;  // v57: with pipe, each block keeps the gate / up inputs in shared memory (their jobs read them there)
 };
@@ -204,13 +201,13 @@ struct DnHalfArgs {
   int n = 1;                       // v56: tokens (1-4; rows of H / ch / nv x ds at their strides; the plans' jobs carry n tokens)
   float* ckpt = nullptr;           // v56: verify steps: the state after each token t < n - 1 (k_dn_rec_reg_ck's layout), or null
   float* msave = nullptr;          // v56: with ckpt: the batch's conv inputs (n x ch) copied, as deltanet_block's mixed_save
-  int l2pf = 1;                    // v56: the next stage's Q8_0 rows prefetched into L2 during stages 0 and 2 (0: off, the A/B)
   int smact = 1;                   // v56b: one token, Q8_0, rot_in 0: every block keeps the inputs in shared memory (0: v56's stages)
-  int mlp2 = 1;                    // v56c: with smact, Q8_0 tasks two at a time per warp (both tasks' loads in flight first; 0: one at a time)
   unsigned long long* ph = nullptr;  // v56: null, or 5 GPU-clock stamps by block 0 (start, after stages 0, 1, 2, end)
 };
 // whether dn_half takes these shapes and pointers (ds 128, F32 beta / alpha on the fast path's terms, one-token direct plans)
 bool dn_half_ok(const DnHalfArgs& args);
+// v58: whether the fused kernels (moe_half, dn_half) are built for this H (4096 only with -DPELIAS_ALL_WIDTHS)
+bool fused_width_ok(int H);
 bool dn_half(const DnHalfArgs& args, Stream s = nullptr);
 // v55b: the expert stage holds one Q4_TG2 grid in shared memory (8 KB instead of 24 KB, so more blocks fit per SM): the grid
 // of the bits every Q4_TG2 job of the engine reads (4: stored or 4 / 5 planes; 3 or 2: the plane slider's base grid). Set
@@ -218,8 +215,6 @@ bool dn_half(const DnHalfArgs& args, Stream s = nullptr);
 bool rx_set_grid_bits(int bits);
 // v55b: the kernels' resource use for the log (registers, local memory, blocks per SM), one line per kernel
 void stream_kernel_report();
-// v55e (temporary switch, --no-lean-dense): v55d's lean one-format dense kernels on (default) or off; set before plans are built
-void set_lean_dense(bool on);
 // v55f: the expert stage's per-warp staging buffer, sized to the largest block any staged matrix has (rx_stage_block_bytes of
 // each staged expert matrix's type at the slider's bits); set before plans and launches; default: Q8_0's 272
 int rx_stage_block_bytes(std::uint32_t type, int plane_bits);

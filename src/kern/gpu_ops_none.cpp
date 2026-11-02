@@ -161,11 +161,11 @@ bool rx_type_ok(std::uint32_t, std::int64_t) { return false; }
 std::uint64_t rx_scratch_bytes(int) { return 0; }
 bool moe_half(const MoeHalfArgs&, Stream) { return false; }
 bool dn_half_ok(const DnHalfArgs&) { return false; }
+bool fused_width_ok(int) { return false; }
 bool dn_half(const DnHalfArgs&, Stream) { return false; }
 const void* StreamPlan::jobs_dev() const { return nullptr; }
 bool rx_set_grid_bits(int) { return false; }
 void stream_kernel_report() {}
-void set_lean_dense(bool) {}
 int rx_stage_block_bytes(std::uint32_t, int) { return 272; }
 void rx_set_stage_bytes(int) {}
 bool moe_r3(const ExpertPtr*, const ExpertPtr*, const std::int32_t*, const float*, const float*, int, const std::int8_t*, const float*, const int*,

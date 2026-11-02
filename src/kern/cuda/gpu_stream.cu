@@ -74,7 +74,6 @@ __constant__ float c_grid3[4][16];  // v54: the 3-bit and 2-bit base grids (tg2p
 __constant__ float c_grid2[4][16];
 __constant__ int c_rx_bits;
 int g_stage_bytes = 16 * 272 + 32;  // v55f: a warp's staging buffer: 16 blocks of the largest staged format + 32 (rx_set_stage_bytes)
-bool g_lean_dense = false;  // v55e experiment switch (--lean-dense since v55e3): v55d's lean one-format dense kernels; off (v55e2: +1.1 ms per token, MEASURED); removed once understood  // v55b: the one grid the expert stage loads (4, 3 or 2; 0 = 4)
 __device__ __forceinline__ unsigned long long gtimer_s() {  // v55b: the GPU's global nanosecond clock (as gpu_ops.cu's gtimer)
   unsigned long long t;
   asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
@@ -1172,35 +1171,6 @@ __device__ __forceinline__ void rx_rows_staged(const DJob& J, long long t, std::
   }
   __syncwarp();  // the buffer is reused by the warp's next task
 }
-// v56 (v55f3 counters MEASURED: the expert stage reads ~0.46 GB per token in 5.58 ms, ~80 GB/s, at 8 warps per SM): every
-// warp first issues L2 prefetches for the rows of all its tasks of the layer (VRAM rows, cache slots, and host-RAM rows
-// over PCIe alike), then runs the tasks, which then find their rows in L2; the stage becomes bound by the bytes, not by
-// each task's memory latency. Data and arithmetic unchanged.
-__device__ __forceinline__ void rx_prefetch_rows(const std::uint8_t* b, long long n, int lane) {
-  const long long lines = (n + 127) / 128;
-  for (long long c = lane; c < lines; c += 32) asm volatile("prefetch.global.L2 [%0];" ::"l"(b + 128 * c));
-}
-__device__ __forceinline__ void rx_prefetch_tasks(const DJob* __restrict__ jobs, int njobs, long long t0, long long end, long long step) {
-  const int lane = static_cast<int>(threadIdx.x & 31);
-  int j = 0;
-  for (long long t = t0; t < end; t += step) {
-    while (j + 1 < njobs && jobs[j + 1].task0 <= t) ++j;
-    const DJob& J = jobs[j];
-    if (J.fmt == kEpi) continue;
-    const int rpw = 32 / J.lpr, nB = J.K / 256;
-    const int r0 = static_cast<int>((t - J.task0) * rpw);
-    const int nr = J.n - r0 < rpw ? J.n - r0 : rpw;
-    if (nr <= 0) continue;
-    if (J.fmt == kQ4TG2P || J.fmt == kQ5KP) {
-      const long long pfx = static_cast<long long>(plane_prefix(J.fmt == kQ4TG2P ? g_q4_tg2p : g_q5_kp,
-                                                                static_cast<std::uint64_t>(nB) * (J.fmt == kQ4TG2P ? 144u : 176u), J.pb));
-      for (int rr = 0; rr < nr; ++rr) rx_prefetch_rows(J.w + (r0 + rr) * J.rs, pfx, lane);
-    } else {
-      const long long rowb = static_cast<long long>(nB) * rx_blk(J.fmt);
-      rx_prefetch_rows(J.w + static_cast<long long>(r0) * rowb, nr * rowb, lane);
-    }
-  }
-}
 // v57: task t's rows of job J as rx_rows_staged stages them, issued as cp.async into buf (planes: each row's prefix at
 // buf + rr x pf, every row 16-byte aligned; others: the task's one range, phase kept)
 __device__ __forceinline__ void rxp_issue(const DJob& J, long long t, std::uint8_t* buf, int lane) {
@@ -1294,7 +1264,7 @@ __device__ __forceinline__ void rxp_compute(const DJob& J, long long t, std::uin
 // tasks, tasks, the loop's span; per format (J.fmt 0..10) the cycles and tasks; staged and filling tasks (st layout:
 // gpu_stream.h kRxStatN)
 template <bool kMT, int ONLY = kOnlyRx, bool kStat = false>
-__device__ __forceinline__ void rx_body(const std::uint8_t* __restrict__ plan, int maxp, int sbytes, unsigned long long* st = nullptr, int l2pf = 0,
+__device__ __forceinline__ void rx_body(const std::uint8_t* __restrict__ plan, int maxp, int sbytes, unsigned long long* st = nullptr,
                                         int pipe = 0) {
   // v57: with pipe, each warp has two buffers of sbytes (the copy pipeline); otherwise one (v46a-2)
   std::uint8_t* sbuf = reinterpret_cast<std::uint8_t*>(s_lut) + kLutRxBytes + static_cast<long long>(threadIdx.x / 32) * sbytes * (pipe ? 2 : 1);
@@ -1313,7 +1283,6 @@ __device__ __forceinline__ void rx_body(const std::uint8_t* __restrict__ plan, i
   int j = 0;
   long long c_wait = 0, c_work = 0, c_beg = 0, ntk = 0;
   if constexpr (kStat) c_beg = clock64();
-  if (l2pf) rx_prefetch_tasks(jobs, njobs, w0, end, warps);  // v56
   if (pipe) {  // v57: the copy pipeline (two buffers per warp; the next task's rows in flight while this one computes)
     int jn = 0;
     int cur = 0;
@@ -1433,13 +1402,6 @@ __global__ void __launch_bounds__(256) k_rx(const std::uint8_t* __restrict__ pla
   lut_setup_rx();
   rx_body<kMT>(plan, maxp, sbytes);
 }
-// v55e diagnosis (temporary, never launched): the expert stage compiled for one format, so the kernel report and the ptxas
-// listing give each format path's registers and stack (the stage's kernel needs the largest of them)
-template <int F>
-__global__ void __launch_bounds__(256) k_rx_probe(const std::uint8_t* __restrict__ plan, int maxp, int sbytes) {
-  lut_setup_rx();
-  rx_body<false, F>(plan, maxp, sbytes);
-}
 
 // v52 (token kernel 3a): the MoE half of a layer, one cooperative launch (moe_half in gpu_stream.h). Phases:
 //  A every block: x + a normalized per row into its shared-memory staging (reads only; block 0 also writes xn and the
@@ -1454,6 +1416,16 @@ __global__ void __launch_bounds__(256) k_rx_probe(const std::uint8_t* __restrict
 // expert loop (phase C) keeps its own allocation. The kernel's argument is a __grid_constant__, so the functions read it
 // in place (no copy). Same code, same order: the bits are unchanged.
 #define PG_NOINL __noinline__  // v56: the CUDA keyword (nvcc with MSVC as the host compiler too)
+// v58 (bloat audit): the fused kernels for H = 4096 (NJ 4) only with -DPELIAS_ALL_WIDTHS; H <= 1024 (NJ 1, the GPU tests'
+// models) and H = 2048 (NJ 2, Qwen3.5-35B-A3B) are always built. A width not built: fused_width_ok() says no, the engine
+// keeps the separate kernels
+#ifdef PELIAS_ALL_WIDTHS
+#define PG_NJ4(x) (x)
+constexpr bool kNj4Built = true;
+#else
+#define PG_NJ4(x) nullptr
+constexpr bool kNj4Built = false;
+#endif
 template <int NJ>
 __device__ PG_NOINL void mh_phase_a(const MoeHalfArgs& A, float* stg, double* s_sh) {
   const int H = A.H, n = A.n, nsub = H / 32;
@@ -1507,55 +1479,6 @@ __device__ PG_NOINL void mh_phase_b(const MoeHalfArgs& A, float* stg, float* s_r
   rx_plan_body(A.grp, A.gsrc, A.gfill, n, A.nu, A.H, A.F, A.xq, A.xs, A.xsum, A.gu, A.hq, A.hs, A.hsum, A.yd, static_cast<std::uint8_t*>(A.plan),
                A.max_picks, A.load_mode, A.xb, A.hb);
 }
-// v56: while block 0 runs phase B (picks, grouping, plan: ~22 us per layer, v55f3 MEASURED 0.887 ms per token), the other
-// blocks find the same picks (md::router_row on the logits phase A wrote, into their own shared arrays; only addresses come
-// of it) and prefetch the picked experts' rows into L2: bank experts from VRAM, misses from host RAM over PCIe (the plane
-// prefix at the slider's bits), cached experts from their slot; the expert stage then finds them in L2. Data unchanged.
-__device__ __forceinline__ void pf_lines(const std::uint8_t* b, std::uint64_t rows, std::uint64_t stride, std::uint64_t bytes, long long g, long long G) {
-  if (!b || rows == 0 || bytes == 0) return;
-  const std::uint64_t lr = (bytes + 127) / 128, tot = rows * lr;
-  for (std::uint64_t L = static_cast<std::uint64_t>(g); L < tot; L += static_cast<std::uint64_t>(G)) {
-    const std::uint64_t r = L / lr, c = L - r * lr;
-    asm volatile("prefetch.global.L2 [%0];" ::"l"(b + r * stride + 128 * c));
-  }
-}
-__device__ PG_NOINL void mh_prefetch_picks(const MoeHalfArgs& A, float* stg, float* s_rsh, float* s_inv, float* s_bv, int* s_bi, std::int32_t* s_psel,
-                                           float* s_pw) {
-  const int n = A.n, nu = A.nu;
-  const md::RouterSmem S{stg, stg + md::kRouterMaxExperts, reinterpret_cast<unsigned char*>(stg + 2 * md::kRouterMaxExperts), s_rsh, s_inv, s_bv, s_bi};
-  for (int t = 0; t < n; ++t) {
-    md::router_row(A.logits + static_cast<long long>(t) * A.ne, A.ne, nu, A.wscale, s_psel + t * nu, s_pw + t * nu, A.band, S);
-    __syncthreads();
-  }
-  const long long G = static_cast<long long>(gridDim.x - 1) * blockDim.x, g = static_cast<long long>(blockIdx.x - 1) * blockDim.x + threadIdx.x;
-  const ReaderCache& c = A.cache;
-  const std::uint64_t Fr = static_cast<std::uint64_t>(A.F), Hr = static_cast<std::uint64_t>(A.H);
-  for (int pi = 0; pi < n * nu; ++pi) {
-    const int e = s_psel[pi];
-    if (e < 0 || e >= A.ne) continue;
-    const ExpertPtr X = A.tab[e];
-    auto pl = [](std::uint32_t t) { return t == g_q4_tg2p || t == g_q5_kp; };
-    const int want = (pl(X.type[0]) || pl(X.type[1]) || pl(X.type[2])) ? c.plane_bits : 4;
-    if (!X.vram && c.K > 0) {  // cached: the slot (its rows packed back to back); a miss: the host rows below
-      int k0 = 0, k1 = 0;
-      std::uint64_t pslot = 0, poff = 0;
-      md::rc_pool(c, e, &k0, &k1, &pslot, &poff);
-      int hit = -1;
-      for (int k = k0; k < k1 && hit < 0; ++k)
-        if (c.tag[k] == e) hit = k;
-      if (hit >= 0) {
-        pf_lines(c.base + poff + static_cast<std::uint64_t>(hit - k0) * pslot, 1, 0, pslot, g, G);
-        continue;
-      }
-    }
-    for (int m = 0; m < 3; ++m)
-      pf_lines(X.w[m], m < 2 ? Fr : Hr, X.rb[m], plane_prefix(X.type[m], X.rb[m], want), g, G);
-  }
-  if (A.wsh && A.shx) {  // the shared expert (VRAM)
-    const ExpertPtr X = *A.shx;
-    for (int m = 0; m < 3; ++m) pf_lines(X.w[m], m < 2 ? Fr : Hr, X.rb[m], X.rb[m], g, G);
-  }
-}
 // v55f3 (author 06:41, the v55f2 listing): without a bound the compiler squeezed the one-token kernel to 128 registers for
 // 2 blocks per SM and spilled 168 B in the kernel body (the expert loop; the out-of-line phases A / B: 0 spill), while
 // it gave the counting copy of the same code 173 registers, 1 block, 0 spill. Measured so far: 1 block with no spill
@@ -1570,8 +1493,6 @@ __global__ void __launch_bounds__(256, 1) k_moe_half(const __grid_constant__ Moe
   __shared__ float s_inv;
   __shared__ float s_bv[8];
   __shared__ int s_bi[8];
-  __shared__ std::int32_t s_psel[32];  // v56: the picks as the prefetching blocks find them (n x nu <= 32)
-  __shared__ float s_pw[32];
   float* stg = s_lut;  // the dynamic shared memory: staging (A), the router's arrays (B), the LUT + warp buffers (C)
   const int H = A.H, n = A.n;
   const int tid = static_cast<int>(threadIdx.x);
@@ -1581,9 +1502,8 @@ __global__ void __launch_bounds__(256, 1) k_moe_half(const __grid_constant__ Moe
   mh_phase_a<NJ>(A, stg, s_sh);
   grid.sync();
   if (phs) A.ph[1] = gtimer_s();
-  // ---- B (v56: the other blocks prefetch the picks' rows meanwhile)
+  // ---- B
   if (blockIdx.x == 0) mh_phase_b(A, stg, s_rsh, &s_inv, s_bv, s_bi);
-  else if (A.l2pf && gridDim.x > 1) mh_prefetch_picks(A, stg, s_rsh, &s_inv, s_bv, s_bi, s_psel, s_pw);
   grid.sync();
   if (phs) A.ph[2] = gtimer_s();
   // ---- C
@@ -1615,7 +1535,7 @@ __global__ void __launch_bounds__(256, 1) k_moe_half(const __grid_constant__ Moe
     s_rx_xq0 = nullptr;
   }
   __syncthreads();
-  rx_body<kMT, kOnlyRx, kStat>(static_cast<const std::uint8_t*>(A.plan), A.max_picks, sbytes, A.st, A.l2pf, A.pipe);
+  rx_body<kMT, kOnlyRx, kStat>(static_cast<const std::uint8_t*>(A.plan), A.max_picks, sbytes, A.st, A.pipe);
   grid.sync();
   if (phs) A.ph[3] = gtimer_s();
   // ---- D
@@ -1851,32 +1771,11 @@ bool StreamPlan::build(const StreamJob* jobs, int njobs, const int* stage_end, i
   if (occ < 1) return sfail("StreamPlan::build: the staged kernel does not fit on an SM");
   grid_ = sms * occ;
   epoch_ = 0;
-  // v55d: a one-token plan whose jobs are all Q8_0 (or all Q6_K) runs the kernel compiled for that format alone
-  only_ = -1;
-  grid_lean_ = 0;
   fmt1_ = -1;
   if (!dj.empty()) {  // v55g: the one format, for a fused launch (L3) whatever the lean switch (v56: several-token plans too)
     bool one = true;
     for (const DJob& D : dj) one = one && D.fmt == dj[0].fmt;
     if (one) fmt1_ = dj[0].fmt;
-  }
-  if (g_lean_dense && !mt_ && !dj.empty()) {
-    const int f0 = dj[0].fmt;
-    bool same = f0 == kQ8_0 || f0 == kQ6K;
-    for (const DJob& D : dj) same = same && D.fmt == f0;
-    if (same) {
-      const void* fn = f0 == kQ8_0 ? reinterpret_cast<const void*>(k_stream<false, kQ8_0>) : reinterpret_cast<const void*>(k_stream<false, kQ6K>);
-      int occl = 0;
-      if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occl, fn, 256, kLutBytes) == cudaSuccess && occl >= 1) {
-        only_ = f0;
-        // v55e: no more blocks than the plan's tasks fill (8 warps a block): v55d launched every resident block (5 x 46
-        // for Q8_0) even for a matrix of a few hundred tasks (v55d A/B: 1.2-1.3 ms per token slower than g55b, MEASURED;
-        // the lean kernels are the suspect, --no-lean-dense the control)
-        const long long need = (ntasks_ + 7) / 8;
-        grid_lean_ = static_cast<int>(std::min<long long>(static_cast<long long>(sms) * occl, need < 1 ? 1 : need));
-      }
-      (void)cudaGetLastError();
-    }
   }
   return true;
 }
@@ -1928,8 +1827,6 @@ bool StreamPlan::run_unstaged(Stream s) {
   if (!dev_) return sfail("StreamPlan::run_unstaged: not built");
   const DJob* jobs = reinterpret_cast<const DJob*>(static_cast<std::uint8_t*>(dev_) + off_jobs_);
   if (mt_) k_stream<true><<<static_cast<unsigned>(grid_), 256, kLutBytes, sst(s)>>>(jobs, njobs_, ntasks_);
-  else if (only_ == kQ8_0) k_stream<false, kQ8_0><<<static_cast<unsigned>(grid_lean_), 256, kLutBytes, sst(s)>>>(jobs, njobs_, ntasks_);  // v55d
-  else if (only_ == kQ6K) k_stream<false, kQ6K><<<static_cast<unsigned>(grid_lean_), 256, kLutBytes, sst(s)>>>(jobs, njobs_, ntasks_);
   else k_stream<false><<<static_cast<unsigned>(grid_), 256, kLutBytes, sst(s)>>>(jobs, njobs_, ntasks_);
   return sck(cudaGetLastError(), "stream: launch");
 }
@@ -2030,10 +1927,11 @@ bool moe_half(const MoeHalfArgs& A, Stream s) {
   const int nj = nsub <= 32 ? 1 : nsub / 32;
   void* fn = nullptr;
   if (stat) fn = nj == 1 ? reinterpret_cast<void*>(k_moe_half<false, 1, true>) : nj == 2 ? reinterpret_cast<void*>(k_moe_half<false, 2, true>)
-                                                                                        : reinterpret_cast<void*>(k_moe_half<false, 4, true>);
+                                                                                        : PG_NJ4(reinterpret_cast<void*>(k_moe_half<false, 4, true>));
   else if (nj == 1) fn = mt ? reinterpret_cast<void*>(k_moe_half<true, 1>) : reinterpret_cast<void*>(k_moe_half<false, 1>);
   else if (nj == 2) fn = mt ? reinterpret_cast<void*>(k_moe_half<true, 2>) : reinterpret_cast<void*>(k_moe_half<false, 2>);
-  else fn = mt ? reinterpret_cast<void*>(k_moe_half<true, 4>) : reinterpret_cast<void*>(k_moe_half<false, 4>);
+  else fn = mt ? PG_NJ4(reinterpret_cast<void*>(k_moe_half<true, 4>)) : PG_NJ4(reinterpret_cast<void*>(k_moe_half<false, 4>));
+  if (!fn) return sfail("moe_half: this width (H 4096) is not built (-DPELIAS_ALL_WIDTHS)");  // v58
   static int grids[2][3][3][2][3] = {};  // v57: [pipe, + shared inputs]
   static int gsm[2][3][3][2][3] = {};    // v57: the shared memory each grid was sized and opted in for
   const int gi0 = mt ? 1 : 0, gi1 = nj == 1 ? 0 : (nj == 2 ? 1 : 2), gi4 = A.pipe ? (A.sact ? 2 : 1) : 0;
@@ -2275,24 +2173,6 @@ __device__ PG_NOINL void dn_stage2_gate(const DnHalfArgs& A, int hv, float* sm, 
   __syncthreads();  // the shared arrays are reused by the next unit
 }
 
-// v56: a warp's tasks of a Q8_0 plan prefetched into L2 (the rows a task reads are contiguous: rpw rows of nB 272-byte
-// blocks); issued while an earlier stage runs, so the stage that reads them finds them in L2. Data unchanged.
-__device__ PG_NOINL void l2_prefetch_q8(const DJob* __restrict__ jobs, int njobs, long long t0, long long t_end, long long step, int maxn) {  // v56: out of line (kernel-body registers)
-  const int lane = static_cast<int>(threadIdx.x & 31);
-  int hint = 0, k = 0;
-  for (long long t = t0; t < t_end && k < maxn; t += step, ++k) {
-    const DJob& J = jobs[find_job(jobs, njobs, t, &hint)];
-    if (J.fmt != kQ8_0) continue;
-    const int rpw = 32 / J.lpr, nB = J.K / 256;
-    const long long r0 = (t - J.task0) * rpw;
-    const int rows = static_cast<int>(min(static_cast<long long>(rpw), static_cast<long long>(J.n) - r0));
-    if (rows <= 0) continue;
-    const std::uint8_t* b = J.w + r0 * nB * 272;
-    const int lines = (rows * nB * 272 + 127) / 128;
-    for (int c = lane; c < lines; c += 32) asm volatile("prefetch.global.L2 [%0];" ::"l"(b + 128 * c));
-  }
-}
-
 // v56 (ptxas v56a: the kernel body spilled 12-20 B with both stream loops inlined): a stream stage's task loop on its own
 template <int ONLY, bool kMT>
 __device__ PG_NOINL void dn_stream(const DJob* __restrict__ jobs, int nj, long long nt) {
@@ -2350,77 +2230,6 @@ __device__ PG_NOINL void dn_stage1_ba_sm(const DnHalfArgs& A, const float* xs) {
       const float xv = add(A.alpha[h], A.dt[h]);
       const float sp = xv > 20.0f ? xv : logf(add(1.0f, expf(xv)));
       A.alpha[h] = mul(sp, A.ssm_a[h]);
-    }
-  }
-}
-// a one-token plan's tasks with the activations from shared memory (run_task's one-token arithmetic, M = 4).
-// v56c (author 12:57 "do it"): Q8_0 tasks two at a time per warp: both tasks' weight loads (8 x 16 B per lane each, and
-// the scales) are issued before either is computed, so each warp keeps twice the bytes in flight (L3 runs 2 blocks of 8
-// warps per SM, against the 6 blocks of the 503 GB/s lean GEMV). Each task's sums are lane_part's Q8_0 branch, operation
-// for operation (the same loads, dp4a order and d x scale x P), so the bits are the same.
-struct DnQ8Lane {
-  int4 q[8];
-  uint2 dd;
-};
-__device__ __forceinline__ void dn_q8_load(const DJob& J, int r, int part, DnQ8Lane& L) {
-  const int B = part >> 1, half = part & 1, nB = J.K / 256;
-  const std::uint8_t* bp = J.w + (static_cast<long long>(r) * nB + B) * 272;
-  L.dd = *reinterpret_cast<const uint2*>(bp + 256 + half * 8);
-#pragma unroll
-  for (int jj = 0; jj < 4; ++jj) {
-    L.q[2 * jj] = ldw(true, bp + half * 128 + 32 * jj);
-    L.q[2 * jj + 1] = ldw(true, bp + half * 128 + 32 * jj + 16);
-  }
-}
-__device__ __forceinline__ float dn_q8_dot(int part, const DnQ8Lane& L, const std::int8_t* xq, const float* xs) {
-  const int B = part >> 1, half = part & 1, jg0 = B * 8 + half * 4;
-  float acc = 0.f;
-#pragma unroll
-  for (int jj = 0; jj < 4; ++jj) {
-    const int jg = jg0 + jj;
-    const int4 qa = L.q[2 * jj], qb = L.q[2 * jj + 1];
-    const std::uint32_t dw = (jj < 2 ? L.dd.x : L.dd.y) >> (16 * (jj & 1));
-    const float d = __half2float(__ushort_as_half(static_cast<unsigned short>(dw & 0xffffu)));
-    int xj[8];
-    ld_x8<4>(xq, jg, xj);
-    int P = 0;
-    P = __dp4a(qa.x, xj[0], P);
-    P = __dp4a(qa.y, xj[1], P);
-    P = __dp4a(qa.z, xj[2], P);
-    P = __dp4a(qa.w, xj[3], P);
-    P = __dp4a(qb.x, xj[4], P);
-    P = __dp4a(qb.y, xj[5], P);
-    P = __dp4a(qb.z, xj[6], P);
-    P = __dp4a(qb.w, xj[7], P);
-    acc += d * ldxs<4>(xs + jg) * static_cast<float>(P);
-  }
-  return acc;
-}
-// v57 (ptxas v57: with both forms in one function it spilled 176 B in the hot loop): the two-at-a-time form on its own,
-// opt-in (--dn-mlp2); the default one-at-a-time form is v56b's (0 spill; ~415 / ~467 GB/s MEASURED)
-__device__ PG_NOINL void dn_stream_sm_q8x2(const DnHalfArgs& A, const DJob* __restrict__ jobs, int nj, long long nt, const std::int8_t* sq,
-                                           const float* ssc) {
-  const long long warps = static_cast<long long>(gridDim.x) * (blockDim.x / 32);
-  const int lane = static_cast<int>(threadIdx.x & 31);
-  int hint = 0;
-  for (long long t = static_cast<long long>(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32; t < nt; t += 2 * warps) {
-    const long long t2 = t + warps;
-    const bool two = t2 < nt;
-    const DJob& J1 = jobs[find_job(jobs, nj, t, &hint)];
-    const DJob& J2 = jobs[find_job(jobs, nj, two ? t2 : t, &hint)];
-    const int r1 = static_cast<int>((t - J1.task0) * (32 / J1.lpr)) + lane / J1.lpr, p1 = lane % J1.lpr;
-    const int r2 = two ? static_cast<int>((t2 - J2.task0) * (32 / J2.lpr)) + lane / J2.lpr : 0, p2 = lane % J2.lpr;
-    const bool ok1 = r1 < J1.n, ok2 = two && r2 < J2.n;
-    DnQ8Lane L1, L2;
-    if (ok1) dn_q8_load(J1, r1, p1, L1);
-    if (ok2) dn_q8_load(J2, r2, p2, L2);
-    float a1 = ok1 ? dn_q8_dot(p1, L1, sq + (J1.xq - A.q), ssc + (J1.xs - A.scale)) : 0.f;
-    for (int o = J1.lpr / 2; o > 0; o >>= 1) a1 += __shfl_xor_sync(0xffffffffu, a1, o);
-    if (ok1 && p1 == 0) J1.y[r1] = a1;
-    if (two) {
-      float a2 = ok2 ? dn_q8_dot(p2, L2, sq + (J2.xq - A.q), ssc + (J2.xs - A.scale)) : 0.f;
-      for (int o = J2.lpr / 2; o > 0; o >>= 1) a2 += __shfl_xor_sync(0xffffffffu, a2, o);
-      if (ok2 && p2 == 0) J2.y[r2] = a2;
     }
   }
 }
@@ -2521,8 +2330,6 @@ __global__ void __launch_bounds__(256, 2) k_dn_half(const __grid_constant__ DnHa
   __shared__ int s_last;
   if constexpr (ONLY < 0) lut_setup();
   float* sm = s_lut + (ONLY < 0 ? 2048 : 0);  // past the LUT: the beta / alpha staging, then the units' q / k / v
-  const long long warps = static_cast<long long>(gridDim.x) * (blockDim.x / 32);
-  const long long w0 = static_cast<long long>(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32;
   const bool phs = A.ph != nullptr && blockIdx.x == 0 && threadIdx.x == 0;
   if (phs) A.ph[0] = gtimer_s();
   // v56b: one token, Q8_0, no rotation: the inputs in shared memory (dn_stage0_sm); otherwise v56's stages
@@ -2548,12 +2355,10 @@ __global__ void __launch_bounds__(256, 2) k_dn_half(const __grid_constant__ DnHa
     if (phs) A.ph[1] = gtimer_s();
     // ---- 1
     if (static_cast<int>(blockIdx.x) < (2 * A.nv + 7) / 8) dn_stage1_ba_sm<NJ>(A, sm);
-    if (ONLY == kQ8_0 && A.mlp2) dn_stream_sm_q8x2(A, j1, nj1, nt1, sq, ssc);
-    else dn_stream_sm<ONLY>(A, j1, nj1, nt1, sq, ssc, ssum);
+    dn_stream_sm<ONLY>(A, j1, nj1, nt1, sq, ssc, ssum);
   } else {
-  // ---- 0 (block 0); the others prefetch their first stage-1 tasks
+  // ---- 0 (block 0)
   if (blockIdx.x == 0) dn_stage0(A, s_sh);
-  else if (A.l2pf) l2_prefetch_q8(j1, nj1, w0, nt1, warps, 4);
   grid.sync();
   if (phs) A.ph[1] = gtimer_s();
   // ---- 1
@@ -2562,8 +2367,7 @@ __global__ void __launch_bounds__(256, 2) k_dn_half(const __grid_constant__ DnHa
   }
   grid.sync();
   if (phs) A.ph[2] = gtimer_s();
-  // ---- 2; every warp first prefetches its stage-3 tasks
-  if (A.l2pf) l2_prefetch_q8(j2, nj2, w0, nt2, warps, 64);
+  // ---- 2
   const int nu = A.nv * (A.ds / kDnRows);
   for (int u = static_cast<int>(blockIdx.x); u < nu; u += static_cast<int>(gridDim.x)) {
     dn_stage2_unit(A, u, sm, s_sh);
@@ -2577,15 +2381,17 @@ __global__ void __launch_bounds__(256, 2) k_dn_half(const __grid_constant__ DnHa
     dn_stream_sm_mt<ONLY>(A, j2, nj2, nt2, sq, ssc, ssum);
   } else if (smact) {
     dn_load_act(A, sq, ssc, ssum, A.nv * A.ds);
-    if (ONLY == kQ8_0 && A.mlp2) dn_stream_sm_q8x2(A, j2, nj2, nt2, sq, ssc);
-    else dn_stream_sm<ONLY>(A, j2, nj2, nt2, sq, ssc, ssum);
+    dn_stream_sm<ONLY>(A, j2, nj2, nt2, sq, ssc, ssum);
   } else {
     dn_stream<ONLY, kMT>(j2, nj2, nt2);
   }
   if (phs) A.ph[4] = gtimer_s();  // block 0's end of stage 3
 }
 
+bool fused_width_ok(int H) { return H <= 2048 || kNj4Built; }  // v58
+
 bool dn_half_ok(const DnHalfArgs& A) {
+  if (!fused_width_ok(A.H)) return false;  // v58
   const int nsub = A.H / 32;
   if (!A.x || !A.norm_w || !A.xn || !A.xr || !A.q || !A.scale || !A.sum || !A.p_in || !A.p_out || !A.wb || !A.wa || !A.beta || !A.alpha || !A.dt ||
       !A.ssm_a || !A.mixed || !A.zg || !A.tail || !A.new_tail || !A.conv_w || !A.state || !A.core || !A.gn_w || !A.hcnt)
@@ -2607,13 +2413,14 @@ bool dn_half(const DnHalfArgs& A, Stream s) {
   const bool lean = A.p_in->fmt1() == kQ8_0 && A.p_out->fmt1() == kQ8_0;  // the dense half's Q8_0 decode alone (v55d's lean kernel)
   const bool mt = A.n > 1;
   static void* const fns[2][2][3] = {
-      {{reinterpret_cast<void*>(k_dn_half<-1, 1, false>), reinterpret_cast<void*>(k_dn_half<-1, 2, false>), reinterpret_cast<void*>(k_dn_half<-1, 4, false>)},
-       {reinterpret_cast<void*>(k_dn_half<-1, 1, true>), reinterpret_cast<void*>(k_dn_half<-1, 2, true>), reinterpret_cast<void*>(k_dn_half<-1, 4, true>)}},
+      {{reinterpret_cast<void*>(k_dn_half<-1, 1, false>), reinterpret_cast<void*>(k_dn_half<-1, 2, false>), PG_NJ4(reinterpret_cast<void*>(k_dn_half<-1, 4, false>))},
+       {reinterpret_cast<void*>(k_dn_half<-1, 1, true>), reinterpret_cast<void*>(k_dn_half<-1, 2, true>), PG_NJ4(reinterpret_cast<void*>(k_dn_half<-1, 4, true>))}},
       {{reinterpret_cast<void*>(k_dn_half<kQ8_0, 1, false>), reinterpret_cast<void*>(k_dn_half<kQ8_0, 2, false>),
-        reinterpret_cast<void*>(k_dn_half<kQ8_0, 4, false>)},
+        PG_NJ4(reinterpret_cast<void*>(k_dn_half<kQ8_0, 4, false>))},
        {reinterpret_cast<void*>(k_dn_half<kQ8_0, 1, true>), reinterpret_cast<void*>(k_dn_half<kQ8_0, 2, true>),
-        reinterpret_cast<void*>(k_dn_half<kQ8_0, 4, true>)}}};
+        PG_NJ4(reinterpret_cast<void*>(k_dn_half<kQ8_0, 4, true>))}}};
   void* fn = fns[lean ? 1 : 0][mt ? 1 : 0][ji];
+  if (!fn) return sfail("dn_half: this width (H 4096) is not built (-DPELIAS_ALL_WIDTHS)");  // v58
   // the largest shared memory any token count of the kernel uses (one opt-in and one grid per kernel); v56b: the one-token
   // kernel also holds the inputs (q, scale, sum of the larger of H and nv x ds) after the staging
   const int dmax = std::max(A.H, A.nv * A.ds);
@@ -2651,7 +2458,6 @@ bool dn_half(const DnHalfArgs& A, Stream s) {
              "dn_half: cooperative launch");
 }
 
-void set_lean_dense(bool on) { g_lean_dense = on; }  // v55e (temporary switch)
 
 // v55f: a warp task stages 16 blocks of 256 values whatever the matrix shape (rows x blocks per row = 4096 / K x K / 256), so
 // the buffer is 16 x the largest block a staged matrix has, as staged (a plane matrix: its prefix at the slider's bits)
@@ -2679,28 +2485,18 @@ void stream_kernel_report() {  // v55b: registers, local memory and blocks per S
   };
   const int sb = g_stage_bytes;  // v55f
   const int sm_moe = std::max(4 * 64 * md::kGvPad * 4, std::max(2 * md::kRouterMaxExperts * 4 + md::kRouterMaxExperts, kLutRxBytes + 8 * sb));
-  const K ks[] = {{reinterpret_cast<const void*>(k_moe_half<false, 1>), "k_moe_half<1 token>", sm_moe},
-                  {reinterpret_cast<const void*>(k_moe_half<true, 1>), "k_moe_half<2-4 tokens>", sm_moe},
+  const K ks[] = {{reinterpret_cast<const void*>(k_moe_half<false, 2>), "k_moe_half<1 token>", sm_moe},  // v58: the H 2048 instances (were H <= 1024)
+                  {reinterpret_cast<const void*>(k_moe_half<true, 2>), "k_moe_half<2-4 tokens>", sm_moe},
                   {reinterpret_cast<const void*>(k_moe_half<false, 2, true>), "k_moe_half<1, counting>", sm_moe},
                   {reinterpret_cast<const void*>(k_rx<false>), "k_rx<1 token>", kLutRxBytes + 8 * sb},
                   {reinterpret_cast<const void*>(k_rx<true>), "k_rx<2-4 tokens>", kLutRxBytes + 8 * sb},
                   {reinterpret_cast<const void*>(k_stream<false>), "k_stream<1 token>", kLutBytes},
                   {reinterpret_cast<const void*>(k_stream<true>), "k_stream<2-4 tokens>", kLutBytes},
-                  {reinterpret_cast<const void*>(k_stream<false, kQ8_0>), "k_stream<Q8_0 only>", kLutBytes},
-                  {reinterpret_cast<const void*>(k_stream<false, kQ6K>), "k_stream<Q6_K only>", kLutBytes},
                   {reinterpret_cast<const void*>(k_staged<false>), "k_staged<1 token>", kLutBytes},
                   {reinterpret_cast<const void*>(k_dn_half<kQ8_0, 2, false>), "k_dn_half<Q8_0, 1 token>", 4 * 64 * md::kGvPad * 4},
                   {reinterpret_cast<const void*>(k_dn_half<kQ8_0, 2, true>), "k_dn_half<Q8_0, 2-4>", 4 * 64 * md::kGvPad * 4},
                   {reinterpret_cast<const void*>(k_dn_half<-1, 2, false>), "k_dn_half<every format>", kLutBytes + 4 * 64 * md::kGvPad * 4},
-                  // v55e diagnosis (temporary): the planner, and the expert stage compiled for each one format
-                  {reinterpret_cast<const void*>(k_rx_plan), "k_rx_plan", 0},
-                  {reinterpret_cast<const void*>(k_rx_probe<kQ4TG2P>), "k_rx<Q4_TG2 planes only>", kLutRxBytes + 8 * sb},
-                  {reinterpret_cast<const void*>(k_rx_probe<kQ4TG2>), "k_rx<Q4_TG2 only>", kLutRxBytes + 8 * sb},
-                  {reinterpret_cast<const void*>(k_rx_probe<kQ5KP>), "k_rx<Q5_K planes only>", kLutRxBytes + 8 * sb},
-                  {reinterpret_cast<const void*>(k_rx_probe<kQ5K>), "k_rx<Q5_K only>", kLutRxBytes + 8 * sb},
-                  {reinterpret_cast<const void*>(k_rx_probe<kQ4K>), "k_rx<Q4_K only>", kLutRxBytes + 8 * sb},
-                  {reinterpret_cast<const void*>(k_rx_probe<kQ6KS>), "k_rx<Q6_K only>", kLutRxBytes + 8 * sb},
-                  {reinterpret_cast<const void*>(k_rx_probe<kQ8_0>), "k_rx<Q8_0 only>", kLutRxBytes + 8 * sb}};
+                  {reinterpret_cast<const void*>(k_rx_plan), "k_rx_plan", 0}};  // v58: the per-format probes removed (bloat audit)
   for (const K& k : ks) {
     cudaFuncAttributes a{};
     int occ = 0;

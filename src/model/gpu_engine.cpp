@@ -993,10 +993,8 @@ struct GpuEngine::Impl {
     A.gn_w = D.ssm_norm;
     A.qscale = 1.0f / std::sqrt(static_cast<float>(ds));  // as deltanet_recurrent_reg computes it
     A.hcnt = dn_hcnt;
-    A.l2pf = o.l2_prefetch ? 1 : 0;
     A.n = static_cast<int>(n);
     A.smact = o.dn_smem && A.rot_in == 0 ? 1 : 0;  // v56b; v57b: the several-token kernel too
-    A.mlp2 = o.dn_mlp2 ? 1 : 0;  // v56c
     const bool ck = ckpt_mode && n > 1;  // v56: a verify step keeps every prefix's state (k_dn_rec_reg_ck) and the batch's conv inputs
     A.ckpt = ck ? D.ckpt : nullptr;
     A.msave = ck ? D.mixed_save : nullptr;
@@ -1638,7 +1636,7 @@ struct GpuEngine::Impl {
   bool fused_ok(const Layer& D, int64_t n, bool probe_row) const {
     const int64_t e = s.n_embd;
     auto k_ok = [](int64_t k) { return k == 256 || k == 512 || k == 1024 || k == 2048 || k == 4096; };
-    return o.fused_moe && k_ok(e) && k_ok(s.n_ff_exp) && s.n_expert <= 1024 && s.n_expert_used <= 8 && rx_ok && fold_ok && !split_ok && !pf_ok && o.plane_tail == 0 && !halves_now && !rlg_d && !cur_ops && !trc_src_d &&
+    return o.fused_moe && k_ok(e) && g::fused_width_ok(static_cast<int>(e)) && k_ok(s.n_ff_exp) && s.n_expert <= 1024 && s.n_expert_used <= 8 && rx_ok && fold_ok && !split_ok && !pf_ok && o.plane_tail == 0 && !halves_now && !rlg_d && !cur_ops && !trc_src_d &&
            !trc_sel_d && !probe_row && n >= 1 && n <= 4 && D.gate_inp.v && !D.gate_inp.v->rot32 &&
            D.gate_inp.dtype == static_cast<std::uint32_t>(quant::Type::f32) && D.gate_inp.drb == static_cast<std::uint64_t>(e) * sizeof(float) &&
            D.gate_inp_sh && D.post_norm && (reinterpret_cast<std::uintptr_t>(D.gate_inp.d) & 15u) == 0 &&
@@ -1685,7 +1683,6 @@ struct GpuEngine::Impl {
     A.load_mode = o.rx_load;
     A.y = y;
     A.ph = ph_d && il < s.n_layer ? ph_d + static_cast<int64_t>(il) * 5 : nullptr;  // v55b (v58: not the MTP row)
-    A.l2pf = o.l2_prefetch ? 1 : 0;  // v56
     A.pipe = o.rx_pipe && o.rx_load > 0 ? 1 : 0;  // v57
     A.sact = o.rx_sact ? 1 : 0;  // v57
     A.st = rst_d;                                                 // v55e3
@@ -2791,7 +2788,6 @@ std::string GpuEngine::summary() const {
 
 Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, const EngineOptions& o) {
   g::set_fast_f32(o.fast_f32);  // v52
-  g::set_lean_dense(o.lean_dense);  // v55e
   using R = Result<std::unique_ptr<GpuEngine>>;
   if (!g::available()) return R::fail(Status::fail(Code::no_device, std::string("engine: ") + g::last_error()));
   if (s.family != Family::qwen35moe || s.dense) return R::fail(Status::fail(Code::unsupported, "engine: qwen35moe only in this first cut"));
