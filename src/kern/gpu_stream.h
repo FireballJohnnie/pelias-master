@@ -78,6 +78,10 @@ class StreamPlan {
   int jobs() const { return njobs_; }
   long long tasks() const { return ntasks_; }
   std::uint64_t bytes() const { return bytes_; }  // weight bytes one run reads
+  // v55g (L3): the device job table (for a fused launch that runs this plan's tasks as one of its stages) and the one format
+  // every job has (one-token plans only; -1: mixed formats or several tokens)
+  const void* jobs_dev() const;
+  int fmt1() const { return fmt1_; }
 
  private:
   void* dev_ = nullptr;           // device copy: job table, stage ends (in tasks), groups, counters
@@ -89,6 +93,7 @@ class StreamPlan {
   bool mt_ = false;               // v47: a job has 2-4 tokens: the kernel that loads each row's weights once for all of them
   int only_ = -1;                 // v55d: every job one format (Q8_0 or Q6_K) and one token: run_unstaged uses that format's lean kernel
   int grid_lean_ = 0;             // its blocks (its own occupancy x SMs)
+  int fmt1_ = -1;                 // v55g: every job's one format (one token), whatever the lean switch
   std::uint64_t off_jobs_ = 0, off_stage_ = 0, off_grp_ = 0, off_dep_ = 0, off_gtasks_ = 0, off_done_ = 0, off_gdone_ = 0;
 };
 
@@ -154,6 +159,48 @@ struct MoeHalfArgs {
 };
 constexpr int kRxStatN = 32;
 bool moe_half(const MoeHalfArgs& args, Stream s = nullptr);
+// v55g (L3, the author's order 03:13; game plan "Lowering the launches per token"): the dense half of a DeltaNet layer for
+// one token in one cooperative launch, the same operations and order as the separate kernels it replaces, so the same bits:
+// (0) attn rms_norm + the 8-bit rounding (k_rms_norm_q8x32's arithmetic; block 0); (1) the qkv + gate R3 tasks (the
+// direct plan, outputs in place) and the beta / alpha F32 rows with their gates (k_dn_beta_alpha_gates' sums); (2) per
+// (value head, 64 state rows): the conv of the head's q / k / v channels + the conv tail, the l2 norms of q and k, the
+// recurrence (k_dn_rec_reg's per-row arithmetic), and the gated norm + rounding of a head by the unit that finishes it
+// last; (3) the ssm_out R3 tasks. Three grid barriers instead of eleven launches. Activations made inside the launch are
+// read with L1-bypassing loads.
+struct DnHalfArgs {
+  const float* x = nullptr;        // H the residual stream (read)
+  const float* norm_w = nullptr;   // H attn norm weight
+  float eps = 0.0f;                // rms eps (the attn norm, the l2 norms, the gated norm)
+  int H = 0, rot_in = 0, rot_out = 0;
+  float* xn = nullptr;             // H normalized row (written: later readers)
+  float* xr = nullptr;             // rounded floats (as act_q8x32; H, then nv x ds)
+  std::int8_t* q = nullptr;        // the R3 plans' int8 inputs, scales, sums (stage 0 for p_in, stage 2 for p_out)
+  float* scale = nullptr;
+  int* sum = nullptr;
+  const StreamPlan* p_in = nullptr;   // qkv + gate, direct (outputs mixed and zg)
+  const StreamPlan* p_out = nullptr;  // ssm_out, direct (output y)
+  const float* wb = nullptr;       // nv x H beta (F32, rows rbb bytes, 16-byte aligned)
+  const float* wa = nullptr;       // nv x H alpha
+  std::uint64_t rbb = 0, rba = 0;
+  float* beta = nullptr;           // nv (out: sigmoid)
+  float* alpha = nullptr;          // nv (out: softplus(alpha + dt) x a)
+  const float* dt = nullptr;
+  const float* ssm_a = nullptr;
+  int nk = 0, nv = 0, ds = 0, ch = 0, taps = 0;
+  const float* mixed = nullptr;    // ch (stage 1's qkv output)
+  const float* zg = nullptr;       // nv x ds (stage 1's gate output)
+  const float* tail = nullptr;     // (taps - 1) x ch
+  float* new_tail = nullptr;       // (taps - 1) x ch
+  const float* conv_w = nullptr;   // ch x taps
+  float* state = nullptr;          // nv x ds x ds
+  float* core = nullptr;           // nv x ds (out: after the gated norm)
+  const float* gn_w = nullptr;     // ds gated norm weight
+  float qscale = 0.0f;             // 1 / sqrt(ds) as the host computes it
+  unsigned* hcnt = nullptr;        // nv counters, zero between launches (the last unit of a head resets its own)
+};
+// whether dn_half takes these shapes and pointers (ds 128, F32 beta / alpha on the fast path's terms, one-token direct plans)
+bool dn_half_ok(const DnHalfArgs& args);
+bool dn_half(const DnHalfArgs& args, Stream s = nullptr);
 // v55b: the expert stage holds one Q4_TG2 grid in shared memory (8 KB instead of 24 KB, so more blocks fit per SM): the grid
 // of the bits every Q4_TG2 job of the engine reads (4: stored or 4 / 5 planes; 3 or 2: the plane slider's base grid). Set
 // once at engine setup; before any expert-stage launch.

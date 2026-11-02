@@ -1810,15 +1810,20 @@ __global__ void __launch_bounds__(64) k_dn_beta_alpha_gates(const float* __restr
     alpha[id] = mul(sp, a[h]);
   }
 }
+// the fused form only where both products would take k_gemv_f32 (matmul's fast F32 path), so the sums are the same
+bool deltanet_ba_fast(std::uint32_t type_b, const void* wb, std::uint64_t rbb, std::uint32_t type_a, const void* wa, std::uint64_t rba, std::int64_t nv,
+                      std::int64_t k, const float* x, std::int64_t n_tok, std::int64_t ldx) {
+  const int nsub = static_cast<int>(k / 32);
+  return g_fast_f32 && type_b == g_f32 && type_a == g_f32 && n_tok >= 1 && n_tok <= 4 && k % 32 == 0 &&
+         (nsub == 8 || nsub == 16 || nsub == 32 || nsub == 64 || nsub == 128) && n_tok * nsub * kGvPad * 4 <= 48 * 1024 && rbb % 16 == 0 &&
+         rba % 16 == 0 && ldx % 4 == 0 && (reinterpret_cast<std::uintptr_t>(wb) & 15u) == 0 && (reinterpret_cast<std::uintptr_t>(wa) & 15u) == 0 &&
+         (reinterpret_cast<std::uintptr_t>(x) & 15u) == 0 && nv > 0;
+}
 bool deltanet_beta_alpha_gates(std::uint32_t type_b, const void* wb, std::uint64_t rbb, std::uint32_t type_a, const void* wa, std::uint64_t rba,
                                std::int64_t nv, std::int64_t k, const float* x, std::int64_t n_tok, std::int64_t ldx, float* beta, float* alpha,
                                const float* dt, const float* a, Stream s) {
   const int nsub = static_cast<int>(k / 32);
-  // the fused form only where both products would take k_gemv_f32 (matmul's fast F32 path), so the sums are the same
-  if (!(g_fast_f32 && type_b == g_f32 && type_a == g_f32 && n_tok >= 1 && n_tok <= 4 && k % 32 == 0 &&
-        (nsub == 8 || nsub == 16 || nsub == 32 || nsub == 64 || nsub == 128) && n_tok * nsub * kGvPad * 4 <= 48 * 1024 && rbb % 16 == 0 &&
-        rba % 16 == 0 && ldx % 4 == 0 && (reinterpret_cast<std::uintptr_t>(wb) & 15u) == 0 && (reinterpret_cast<std::uintptr_t>(wa) & 15u) == 0 &&
-        (reinterpret_cast<std::uintptr_t>(x) & 15u) == 0 && nv > 0 && beta && alpha && dt && a))
+  if (!deltanet_ba_fast(type_b, wb, rbb, type_a, wa, rba, nv, k, x, n_tok, ldx) || !beta || !alpha || !dt || !a)
     return false;  // not a failure: the caller runs the separate products and gates
   const std::size_t sm = static_cast<std::size_t>(n_tok) * nsub * kGvPad * sizeof(float);
   const float* fb = static_cast<const float*>(wb);

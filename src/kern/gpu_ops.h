@@ -133,6 +133,9 @@ bool deltanet_conv(const float* mixed, const float* tail, const float* w, std::i
                    float* conv, float* new_tail, Stream s = nullptr);
 // in place: beta = sigmoid(beta); alpha = softplus(alpha + dt[h]) * a[h]  (n rows of nv)
 bool deltanet_gates(float* beta, float* alpha, const float* dt, const float* a, std::int64_t n, std::int64_t nv, Stream s = nullptr);
+// v55g (L3): whether deltanet_beta_alpha_gates takes these (both products on k_gemv_f32's fast F32 path, so the same sums)
+bool deltanet_ba_fast(std::uint32_t type_b, const void* wb, std::uint64_t rbb, std::uint32_t type_a, const void* wa, std::uint64_t rba, std::int64_t nv,
+                      std::int64_t k, const float* x, std::int64_t n_tok, std::int64_t ldx);
 // v55g (L2): beta = Wb x, alpha = Wa x (F32, nv rows, k inputs, n_tok 1-4) and the gates in one launch, with the same sums as
 // matmul's F32 path; false (not an error, nothing launched) where that path would not apply: run them separately then
 bool deltanet_beta_alpha_gates(std::uint32_t type_b, const void* wb, std::uint64_t rbb, std::uint32_t type_a, const void* wa, std::uint64_t rba,

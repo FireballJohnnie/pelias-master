@@ -353,6 +353,8 @@ struct GpuEngine::Impl {
   int* sum = nullptr;
   float *qg = nullptr, *att = nullptr, *ascr = nullptr;
   float *mixed = nullptr, *zg = nullptr, *beta = nullptr, *alpha = nullptr, *conv = nullptr, *core = nullptr;
+  unsigned* dn_hcnt = nullptr;  // v55g (L3): per value head, the dense half's units that finished it (zero between launches)
+  std::uint64_t dn_half_runs = 0;
   float *logits_r = nullptr, *wsel = nullptr, *gs = nullptr, *us = nullptr, *sh = nullptr, *gsh = nullptr, *galpha = nullptr, *zero2 = nullptr;
   float* yc = nullptr;  // the cold sum, copied up
   std::int32_t* sel = nullptr;
@@ -907,6 +909,67 @@ struct GpuEngine::Impl {
     if (!opstamp(4) || !opstamp(5)) return gfail("engine: stamp");
     if (Status ps = prod(D.wo, att, n, y); !ps) return ps;
     return opstamp(6) ? Status::good() : gfail("engine: stamp");
+  }
+
+  // v55g (L3): a DeltaNet layer's dense half for one token in one cooperative launch (attn norm + rounding, qkv + gate,
+  // beta / alpha + gates, conv + tail, l2 norms, recurrence, gated norm + rounding, ssm_out), the same bits as the separate
+  // launches; *took false (nothing run) where it does not apply, and the caller runs the attn norm and deltanet_block
+  Status dn_half_layer(Layer& D, bool* took) {
+    *took = false;
+    const int64_t ch = s.conv_channels(), ds = s.ssm_d_state, nk = s.ssm_n_group, nv = s.ssm_dt_rank, taps = s.ssm_d_conv, e = s.n_embd;
+    if (!o.dn_half || !dn_hcnt || halves_now || !D.wqkv.r3 || !D.wgate.r3 || !D.ssm_out.r3 || D.wqkv.k != e || D.wgate.k != e || D.ssm_out.k != nv * ds ||
+        D.wqkv.v->rot32 != D.wgate.v->rot32 || D.wbeta.v->rot32 || D.walpha.v->rot32 || D.wbeta.k != e || D.walpha.k != e || D.wbeta.n_out != nv ||
+        D.walpha.n_out != nv || !is_float_type(D.wbeta.v->type) || !is_float_type(D.walpha.v->type) ||
+        !g::deltanet_ba_fast(D.wbeta.dtype, D.wbeta.d, D.wbeta.drb, D.walpha.dtype, D.walpha.d, D.walpha.drb, nv, e, xn, 1, e))
+      return Status::good();
+    R3Group* G1 = nullptr;
+    R3Group* G2 = nullptr;
+    if (Status st = r3_group({{&D.wqkv, mixed}, {&D.wgate, zg}}, 1, 0x200, &G1); !st) return st;
+    if (Status st = r3_group({{&D.ssm_out, y}}, 1, 0x200, &G2); !st) return st;
+    if (G1->yo.size() != 2 || G1->yo[0] != mixed || G1->yo[1] != zg || G2->yo.size() != 1 || G2->yo[0] != y) return Status::good();
+    g::DnHalfArgs A;
+    A.x = x;
+    A.norm_w = D.attn_norm;
+    A.eps = s.rms_eps;
+    A.H = static_cast<int>(e);
+    A.rot_in = D.wqkv.v->rot32 ? 1 : 0;
+    A.rot_out = D.ssm_out.v->rot32 ? 1 : 0;
+    A.xn = xn;
+    A.xr = xr;
+    A.q = q;
+    A.scale = scale;
+    A.sum = sum;
+    A.p_in = G1->plan.get();
+    A.p_out = G2->plan.get();
+    A.wb = static_cast<const float*>(D.wbeta.d);
+    A.wa = static_cast<const float*>(D.walpha.d);
+    A.rbb = D.wbeta.drb;
+    A.rba = D.walpha.drb;
+    A.beta = beta;
+    A.alpha = alpha;
+    A.dt = D.ssm_dt;
+    A.ssm_a = D.ssm_a;
+    A.nk = static_cast<int>(nk);
+    A.nv = static_cast<int>(nv);
+    A.ds = static_cast<int>(ds);
+    A.ch = static_cast<int>(ch);
+    A.taps = static_cast<int>(taps);
+    A.mixed = mixed;
+    A.zg = zg;
+    A.tail = D.tail[D.cur];
+    A.new_tail = D.tail[1 - D.cur];
+    A.conv_w = D.conv1d;
+    A.state = D.state;
+    A.core = core;
+    A.gn_w = D.ssm_norm;
+    A.qscale = 1.0f / std::sqrt(static_cast<float>(ds));  // as deltanet_recurrent_reg computes it
+    A.hcnt = dn_hcnt;
+    if (!g::dn_half_ok(A)) return Status::good();
+    if (!g::dn_half(A)) return Status::fail(Code::internal, std::string("engine: dense half (L3): ") + g::stream_last_error());
+    D.cur = 1 - D.cur;
+    ++dn_half_runs;
+    *took = true;
+    return Status::good();
   }
 
   Status deltanet_block(Layer& D, int64_t n) {
@@ -2464,7 +2527,8 @@ std::string GpuEngine::moe_phase_report() const {  // v55b
   return r;
 }
 std::string GpuEngine::graph_report() const {
-  return p_->graph_note + "; captures " + std::to_string(p_->graph_captures) + ", replays " + std::to_string(p_->graph_replays);
+  return p_->graph_note + "; captures " + std::to_string(p_->graph_captures) + ", replays " + std::to_string(p_->graph_replays) +
+         "; DeltaNet dense halves in one launch (L3, v55g) " + std::to_string(p_->dn_half_runs);
 }
 bool GpuEngine::router_margins(std::vector<float>* m, std::vector<std::uint8_t>* have) const {
   if (!p_->rlg_h) return false;
@@ -2681,6 +2745,7 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
       {reinterpret_cast<void**>(&I.mixed), np * z(ch) * 4},     {reinterpret_cast<void**>(&I.zg), np * z(di) * 4},
       {reinterpret_cast<void**>(&I.beta), np * z(nv) * 4},      {reinterpret_cast<void**>(&I.alpha), np * z(nv) * 4},
       {reinterpret_cast<void**>(&I.conv), np * z(ch) * 4},      {reinterpret_cast<void**>(&I.core), np * z(di) * 4},
+      {reinterpret_cast<void**>(&I.dn_hcnt), z(nv > 0 ? nv : 1) * 4},
       {reinterpret_cast<void**>(&I.logits_r), np * z(ne) * 4},  {reinterpret_cast<void**>(&I.sel), np * z(nu) * 4},
       {reinterpret_cast<void**>(&I.wsel), np * z(nu) * 4},      {reinterpret_cast<void**>(&I.gs), np * z(ffs) * 4},
       {reinterpret_cast<void**>(&I.us), np * z(ffs) * 4},       {reinterpret_cast<void**>(&I.sh), np * z(e) * 4},
@@ -3128,10 +3193,14 @@ Status GpuEngine::Impl::run(const std::int32_t* tokens, int n, float* logits, bo
     const Qwen35MoeLayer& l = wt.layers[il];
     Layer& D = I.L[il];
     I.cur_ops = (I.ops_d && (bl || rd) && n == 1) ? I.ops_d + z(EngineTimeline::kOps) * il : nullptr;
+    bool dnh = false;  // v55g (L3): the DeltaNet dense half in one launch (one token, no per-op stamps)
+    if (l.recurrent && n == 1 && !I.cur_ops && !(st = I.dn_half_layer(D, &dnh))) return st;
+    if (!dnh) {
     if (!I.opstamp(0)) return gfail("engine: stamp");
     if (!g::rms_norm(I.x, D.attn_norm, I.xn, e, 1, e, e, n, s.rms_eps)) return gfail("engine: attn norm");
     if (!I.opstamp(1)) return gfail("engine: stamp");
     if (!(st = l.recurrent ? I.deltanet_block(D, n) : I.attention_block(D, n, I.pos))) return st;
+    }
     const bool probe_row = I.probe_pos >= I.pos && I.probe_pos < I.pos + n && I.probe_bd;
     if (probe_row && !g::dcopy(I.probe_bd + static_cast<int64_t>(il) * e, I.y + (I.probe_pos - I.pos) * e, z(e) * sizeof(float))) return gfail("engine: probe copy");
     const bool fused = rd && I.fused_ok(D, n, probe_row);  // v52: residual + MoE half + residual in one launch

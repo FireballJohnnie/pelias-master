@@ -51,6 +51,7 @@ struct EngineOptions {
   bool fast_f32 = true;
   // v55e: v55d's lean one-format dense kernels (--lean-dense, temporary; off since v55e2 measured +1.1 ms per token); same bits
   bool lean_dense = false;
+  bool dn_half = true;  // v55g (L3): a DeltaNet layer's dense half for one token in one launch (temporary switch --no-dn-half for the A/B)
   // v52: the MoE half of each layer (residual, post norm, rounding, router, shared gate, picks, grouping, plan, R3 expert
   // stage, combine, residual) in one cooperative launch (g::moe_half); same bits (--no-fused-moe, temporary)
   bool fused_moe = true;

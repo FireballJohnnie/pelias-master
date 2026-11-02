@@ -683,7 +683,8 @@ __device__ __forceinline__ int find_job(const DJob* __restrict__ jobs, int njobs
   return lo;
 }
 
-template <bool kMT, int ONLY = -1>
+// v55g: MA 1 reads the activations with L1-bypassing loads (inputs written earlier in the same launch: L3's stages)
+template <bool kMT, int ONLY = -1, int MA = 0>
 __device__ __forceinline__ void run_task(const DJob* __restrict__ jobs, int njobs, long long t, int* hint) {
   const DJob& J = jobs[find_job(jobs, njobs, t, hint)];
   const int lane = static_cast<int>(threadIdx.x & 31), rpw = 32 / J.lpr;
@@ -710,7 +711,7 @@ __device__ __forceinline__ void run_task(const DJob* __restrict__ jobs, int njob
   // v26: each token's arithmetic is the one-token path's (lane_part on that token's inputs), so a row of a several-token
   // job equals the same token alone bit for bit
   for (int tk = 0; tk < J.ntok; ++tk) {
-    float acc = r < J.n ? lane_part<0, ONLY>(J, r, part, J.xq + tk * J.xqs, J.xs + tk * J.xss, J.xsum + tk * J.xss, J.ntok == 1) : 0.f;
+    float acc = r < J.n ? lane_part<MA, ONLY>(J, r, part, J.xq + tk * J.xqs, J.xs + tk * J.xss, J.xsum + tk * J.xss, J.ntok == 1) : 0.f;
     for (int o = J.lpr / 2; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
     if (r < J.n && part == 0) J.y[tk * J.ys + r] = acc;
   }
@@ -1550,6 +1551,12 @@ bool StreamPlan::build(const StreamJob* jobs, int njobs, const int* stage_end, i
   // v55d: a one-token plan whose jobs are all Q8_0 (or all Q6_K) runs the kernel compiled for that format alone
   only_ = -1;
   grid_lean_ = 0;
+  fmt1_ = -1;
+  if (!mt_ && !dj.empty()) {  // v55g: the one format, for a fused launch (L3) whatever the lean switch
+    bool one = true;
+    for (const DJob& D : dj) one = one && D.fmt == dj[0].fmt;
+    if (one) fmt1_ = dj[0].fmt;
+  }
   if (g_lean_dense && !mt_ && !dj.empty()) {
     const int f0 = dj[0].fmt;
     bool same = f0 == kQ8_0 || f0 == kQ6K;
@@ -1611,6 +1618,8 @@ bool StreamPlan::run_reset(Stream s) {
   return sck(cudaLaunchCooperativeKernel(reinterpret_cast<void*>(mt_ ? k_staged<true> : k_staged<false>), dim3(static_cast<unsigned>(grid_)), dim3(256), args, kLutBytes, sst(s)),
              "stream: cooperative launch (reset)");
 }
+
+const void* StreamPlan::jobs_dev() const { return dev_ ? static_cast<const std::uint8_t*>(dev_) + off_jobs_ : nullptr; }
 
 bool StreamPlan::run_unstaged(Stream s) {
   if (!dev_) return sfail("StreamPlan::run_unstaged: not built");
@@ -1741,6 +1750,243 @@ bool moe_half(const MoeHalfArgs& A, Stream s) {
              "moe_half: cooperative launch");
 }
 
+// ------------------------------------------------------------------------------------------------ v55g (L3): the dense half
+// of a DeltaNet layer for one token in one cooperative launch (DnHalfArgs in gpu_stream.h)
+constexpr int kDnRows = 64;  // state rows per unit (256 threads, ds / 32 = 4 threads a row as k_dn_rec_reg)
+
+// (0) block 0: k_rms_norm_q8x32 for one row (the same partial order and block_sum_d as k_rms_norm, then each thread whole
+// 32-value blocks rounded with md::round32, the loops of k_act_q8x32)
+__device__ PG_NOINL void dn_stage0(const DnHalfArgs& A, double* sh) {
+  const float* xs = A.x;
+  const int n = A.H;
+  double part = 0.0;
+  for (int i = static_cast<int>(threadIdx.x); i < n; i += static_cast<int>(blockDim.x)) part += static_cast<double>(mul(xs[i], xs[i]));
+  const double ssum = md::block_sum_d(part, sh);
+  const float mean = static_cast<float>(ssum / static_cast<double>(n));
+  const float rs = quo(1.0f, sqrtf(add(mean, A.eps)));
+  const float norm = 1.0f / sqrtf(32.0f);
+  for (int b = static_cast<int>(threadIdx.x); b < n / 32; b += static_cast<int>(blockDim.x)) {
+    float v[32];
+#pragma unroll
+    for (int i = 0; i < 32; ++i) {
+      const int c = 32 * b + i;
+      v[i] = mul(mul(xs[c], rs), A.norm_w[c]);
+      A.xn[c] = v[i];
+    }
+    md::round32<false>(v, 0, b, n, 1, A.rot_in, norm, A.xr, n, A.q, A.scale, A.sum);
+  }
+}
+
+// (1b) blocks 0 .. 2 nv / 8 - 1: one warp per beta / alpha row (md::gemv_row on the staged normalized row, k_gemv_f32's sums),
+// then that row's gate by lane 0 (k_dn_beta_alpha_gates' expressions)
+template <int NJ>
+__device__ PG_NOINL void dn_stage1_ba(const DnHalfArgs& A, float* xs) {
+  const int nsub = A.H / 32, warp = static_cast<int>(threadIdx.x >> 5), lane = static_cast<int>(threadIdx.x & 31);
+  md::gemv_stage(A.xn, 1, nsub, A.H, xs);
+  __syncthreads();
+  const int r = static_cast<int>(blockIdx.x) * 8 + warp;
+  if (r < 2 * A.nv) {
+    const int h = r % A.nv;
+    if (r < A.nv) {
+      md::gemv_row<NJ>(A.wb, A.rbb, h, xs, nsub, 1, A.beta, A.nv);
+      if (lane == 0) A.beta[h] = md::sigmoid_d(A.beta[h]);
+    } else {
+      md::gemv_row<NJ>(A.wa, A.rba, h, xs, nsub, 1, A.alpha, A.nv);
+      if (lane == 0) {
+        const float xv = add(A.alpha[h], A.dt[h]);
+        const float sp = xv > 20.0f ? xv : logf(add(1.0f, expf(xv)));
+        A.alpha[h] = mul(sp, A.ssm_a[h]);
+      }
+    }
+  }
+}
+
+// one channel of k_dn_conv for one token (silu of the taps' sum; earlier positions from the tail), and its k_dn_tail entries
+__device__ __forceinline__ float dn_conv1(const DnHalfArgs& A, int c, bool wtail) {
+  const int T = A.taps;
+  float s = 0.0f;
+  for (int kk = 0; kk < T; ++kk) {
+    const int src = kk - (T - 1);
+    const float xv = src >= 0 ? ld_cgf(A.mixed + c) : A.tail[(T - 1 + src) * A.ch + c];
+    s = add(s, mul(xv, A.conv_w[c * T + kk]));
+  }
+  if (wtail)
+    for (int r = 0; r < T - 1; ++r) {
+      const int src = 1 - (T - 1) + r;
+      A.new_tail[r * A.ch + c] = src >= 0 ? ld_cgf(A.mixed + src * A.ch + c) : A.tail[(T - 1 + src) * A.ch + c];
+    }
+  return md::silu_d(s);
+}
+
+// (2) unit u = (value head hv, rows part x 64 .. + 63)
+__device__ PG_NOINL void dn_stage2_unit(const DnHalfArgs& A, int u, float* sm, double* sh, int* s_last) {
+  const int ds = A.ds, nk = A.nk, upH = ds / kDnRows;
+  const int hv = u / upH, part = u - hv * upH, hk = hv % nk;
+  const int tid = static_cast<int>(threadIdx.x);
+  float* qv = sm;
+  float* kv = sm + ds;
+  float* vv = sm + 2 * ds;
+  // the conv of the head's q and k channels (the unit with hv < nk and part 0 also writes their tail) and of its 64 v rows
+  if (tid < 2 * ds) {
+    const int i = tid < ds ? tid : tid - ds;
+    const int c = (tid < ds ? 0 : nk * ds) + hk * ds + i;
+    const float v = dn_conv1(A, c, hv < nk && part == 0);
+    (tid < ds ? qv : kv)[i] = v;
+  }
+  if (tid < kDnRows) vv[tid] = dn_conv1(A, 2 * nk * ds + hv * ds + part * kDnRows + tid, true);
+  __syncthreads();
+  // the l2 norms of q and k (k_rms_norm with l2, 256 threads a segment)
+  md::rms_norm_seg([qv](std::int64_t i) { return qv[i]; }, [qv](std::int64_t i, float v) { qv[i] = v; }, nullptr, ds, A.eps, 1, sh);
+  md::rms_norm_seg([kv](std::int64_t i) { return kv[i]; }, [kv](std::int64_t i, float v) { kv[i] = v; }, nullptr, ds, A.eps, 1, sh);
+  __syncthreads();
+  // the recurrence: k_dn_rec_reg's per-row arithmetic (thread l of a row owns columns c * tpr + l)
+  {
+    const int tpr = ds / 32, l = tid % tpr;
+    const int jr = tid / tpr, j = part * kDnRows + jr;
+    float* grow = A.state + (static_cast<long long>(hv) * ds + j) * ds;
+    float M[32];
+#pragma unroll
+    for (int c = 0; c < 32; ++c) M[c] = grow[c * tpr + l];
+    const float decay = expf(ld_cgf(A.alpha + hv)), b = ld_cgf(A.beta + hv);
+    float sum = 0.0f;
+#pragma unroll
+    for (int c = 0; c < 32; ++c) {
+      M[c] *= decay;
+      sum += M[c] * kv[c * tpr + l];
+    }
+    for (int o = tpr / 2; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o, tpr);
+    const float delta = (vv[jr] - sum) * b;
+    float out = 0.0f;
+#pragma unroll
+    for (int c = 0; c < 32; ++c) {
+      M[c] += kv[c * tpr + l] * delta;
+      out += M[c] * qv[c * tpr + l];
+    }
+    for (int o = tpr / 2; o > 0; o >>= 1) out += __shfl_xor_sync(0xffffffffu, out, o, tpr);
+    if (l == 0) A.core[hv * ds + j] = out * A.qscale;
+#pragma unroll
+    for (int c = 0; c < 32; ++c) grow[c * tpr + l] = M[c];
+  }
+  // the unit that finishes the head last: k_gated_norm on it (128 values, one per thread: the same partials; the extra
+  // warps add exact zeros), then its 32-value blocks rounded for ssm_out (md::round32, as k_act_q8x32)
+  __threadfence();  // every thread's core and state writes ordered before the head's count (then the block barrier)
+  __syncthreads();
+  if (tid == 0) {
+    __threadfence();
+    *s_last = atomicAdd(A.hcnt + hv, 1u) == static_cast<unsigned>(upH - 1);
+  }
+  __syncthreads();
+  if (*s_last) {
+    __threadfence();
+    double pt = 0.0;
+    float o = 0.0f;
+    if (tid < ds) {
+      o = ld_cgf(A.core + hv * ds + tid);
+      pt = static_cast<double>(mul(o, o));
+    }
+    const double ssum = md::block_sum_d(pt, sh);
+    const float mean = static_cast<float>(ssum / static_cast<double>(ds));
+    const float scl = quo(1.0f, sqrtf(add(mean, A.eps)));
+    if (tid < ds) {
+      const float g = mul(mul(mul(o, scl), A.gn_w[tid]), md::silu_d(ld_cgf(A.zg + hv * ds + tid)));
+      qv[tid] = g;
+      A.core[hv * ds + tid] = g;
+    }
+    __syncthreads();
+    if (tid < ds / 32) {
+      float v[32];
+#pragma unroll
+      for (int i = 0; i < 32; ++i) v[i] = qv[32 * tid + i];
+      const int n = A.nv * ds;
+      md::round32<false>(v, 0, hv * (ds / 32) + tid, n, 1, A.rot_out, 1.0f / sqrtf(32.0f), A.xr, n, A.q, A.scale, A.sum);
+    }
+    if (tid == 0) A.hcnt[hv] = 0u;  // every unit of this head has arrived in this launch
+  }
+  __syncthreads();  // the shared arrays are reused by the next unit
+}
+
+template <int ONLY, int NJ>
+__global__ void __launch_bounds__(256) k_dn_half(const __grid_constant__ DnHalfArgs A, const DJob* __restrict__ j1, int nj1, long long nt1,
+                                                 const DJob* __restrict__ j2, int nj2, long long nt2) {
+  namespace cg = cooperative_groups;
+  cg::grid_group grid = cg::this_grid();
+  __shared__ double s_sh[33];
+  __shared__ int s_last;
+  if constexpr (ONLY < 0) lut_setup();
+  float* sm = s_lut + (ONLY < 0 ? 2048 : 0);  // past the LUT: the beta / alpha staging, then the units' q / k / v
+  const long long warps = static_cast<long long>(gridDim.x) * (blockDim.x / 32);
+  const long long w0 = static_cast<long long>(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32;
+  // ---- 0
+  if (blockIdx.x == 0) dn_stage0(A, s_sh);
+  grid.sync();
+  // ---- 1
+  if (static_cast<int>(blockIdx.x) < (2 * A.nv + 7) / 8) dn_stage1_ba<NJ>(A, sm);
+  {
+    int hint = 0;
+    for (long long t = w0; t < nt1; t += warps) run_task<false, ONLY, 1>(j1, nj1, t, &hint);
+  }
+  grid.sync();
+  // ---- 2
+  const int nu = A.nv * (A.ds / kDnRows);
+  for (int u = static_cast<int>(blockIdx.x); u < nu; u += static_cast<int>(gridDim.x)) dn_stage2_unit(A, u, sm, s_sh, &s_last);
+  grid.sync();
+  // ---- 3
+  {
+    int hint = 0;
+    for (long long t = w0; t < nt2; t += warps) run_task<false, ONLY, 1>(j2, nj2, t, &hint);
+  }
+}
+
+bool dn_half_ok(const DnHalfArgs& A) {
+  const int nsub = A.H / 32;
+  if (!A.x || !A.norm_w || !A.xn || !A.xr || !A.q || !A.scale || !A.sum || !A.p_in || !A.p_out || !A.wb || !A.wa || !A.beta || !A.alpha || !A.dt ||
+      !A.ssm_a || !A.mixed || !A.zg || !A.tail || !A.new_tail || !A.conv_w || !A.state || !A.core || !A.gn_w || !A.hcnt)
+    return false;
+  if (A.H % 32 != 0 || !(nsub == 8 || nsub == 16 || nsub == 32 || nsub == 64 || nsub == 128) || A.ds != 128 || A.nk <= 0 || A.nv <= 0 ||
+      A.nv % A.nk != 0 || A.taps < 1 || A.ch < (2 * A.nk + A.nv) * A.ds)
+    return false;
+  if (A.rbb % 16 != 0 || A.rba % 16 != 0 || (reinterpret_cast<std::uintptr_t>(A.wb) & 15u) || (reinterpret_cast<std::uintptr_t>(A.wa) & 15u) ||
+      (reinterpret_cast<std::uintptr_t>(A.xn) & 15u) || reinterpret_cast<std::uintptr_t>(A.q) % 16 != 0)
+    return false;
+  const int f1 = A.p_in->fmt1(), f2 = A.p_out->fmt1();
+  return f1 >= 0 && f2 >= 0 && A.p_in->jobs_dev() && A.p_out->jobs_dev();  // one-token plans
+}
+
+bool dn_half(const DnHalfArgs& A, Stream s) {
+  if (!dn_half_ok(A)) return sfail("dn_half: shapes or pointers it does not take");
+  if (!grid_ready()) return false;
+  const int nsub = A.H / 32, nj = nsub <= 32 ? 1 : nsub / 32;
+  const bool lean = A.p_in->fmt1() == kQ8_0 && A.p_out->fmt1() == kQ8_0;  // the dense half's Q8_0 decode alone (v55d's lean kernel)
+  void* fn = nullptr;
+  if (lean) fn = nj == 1 ? reinterpret_cast<void*>(k_dn_half<kQ8_0, 1>) : nj == 2 ? reinterpret_cast<void*>(k_dn_half<kQ8_0, 2>) : reinterpret_cast<void*>(k_dn_half<kQ8_0, 4>);
+  else fn = nj == 1 ? reinterpret_cast<void*>(k_dn_half<-1, 1>) : nj == 2 ? reinterpret_cast<void*>(k_dn_half<-1, 2>) : reinterpret_cast<void*>(k_dn_half<-1, 4>);
+  const int smem = (lean ? 0 : kLutBytes) + std::max(nsub * md::kGvPad * 4, (2 * A.ds + kDnRows) * 4);
+  static int grids[2][3] = {};
+  int& grid = grids[lean ? 1 : 0][nj == 1 ? 0 : (nj == 2 ? 1 : 2)];
+  if (!grid) {
+    int dev = 0, sms = 0, occ = 0, coop = 0;
+    if (!sck(cudaGetDevice(&dev), "cudaGetDevice") || !sck(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev), "SM count") ||
+        !sck(cudaDeviceGetAttribute(&coop, cudaDevAttrCooperativeLaunch, dev), "cooperative launch attribute") ||
+        !sck(cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem), "dn_half: shared memory opt-in") ||
+        !sck(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, fn, 256, static_cast<std::size_t>(smem)), "occupancy (dn half)"))
+      return false;
+    if (!coop) return sfail("dn_half: the device has no cooperative launch");
+    if (occ < 1) return sfail("dn_half: the kernel does not fit on an SM");
+    if (sms * occ < (2 * A.nv + 7) / 8) return sfail("dn_half: fewer blocks than the beta / alpha rows need");
+    grid = sms * occ;
+    std::fprintf(stderr, "dn_half (L3): %s decode, H %d: grid %d (%d SMs x %d blocks), shared memory %d B\n", lean ? "Q8_0" : "every format", A.H, grid, sms,
+                 occ, smem);
+  }
+  DnHalfArgs a = A;
+  const DJob* j1 = static_cast<const DJob*>(A.p_in->jobs_dev());
+  const DJob* j2 = static_cast<const DJob*>(A.p_out->jobs_dev());
+  int nj1 = A.p_in->jobs(), nj2 = A.p_out->jobs();
+  long long nt1 = A.p_in->tasks(), nt2 = A.p_out->tasks();
+  void* args[] = {&a, &j1, &nj1, &nt1, &j2, &nj2, &nt2};
+  return sck(cudaLaunchCooperativeKernel(fn, dim3(static_cast<unsigned>(grid)), dim3(256), args, static_cast<std::size_t>(smem), sst(s)),
+             "dn_half: cooperative launch");
+}
+
 void set_lean_dense(bool on) { g_lean_dense = on; }  // v55e (temporary switch)
 
 // v55f: a warp task stages 16 blocks of 256 values whatever the matrix shape (rows x blocks per row = 4096 / K x K / 256), so
@@ -1779,6 +2025,8 @@ void stream_kernel_report() {  // v55b: registers, local memory and blocks per S
                   {reinterpret_cast<const void*>(k_stream<false, kQ8_0>), "k_stream<Q8_0 only>", kLutBytes},
                   {reinterpret_cast<const void*>(k_stream<false, kQ6K>), "k_stream<Q6_K only>", kLutBytes},
                   {reinterpret_cast<const void*>(k_staged<false>), "k_staged<1 token>", kLutBytes},
+                  {reinterpret_cast<const void*>(k_dn_half<kQ8_0, 2>), "k_dn_half<Q8_0> (L3)", 64 * md::kGvPad * 4},
+                  {reinterpret_cast<const void*>(k_dn_half<-1, 2>), "k_dn_half<every format>", kLutBytes + 64 * md::kGvPad * 4},
                   // v55e diagnosis (temporary): the planner, and the expert stage compiled for each one format
                   {reinterpret_cast<const void*>(k_rx_plan), "k_rx_plan", 0},
                   {reinterpret_cast<const void*>(k_rx_probe<kQ4TG2P>), "k_rx<Q4_TG2 planes only>", kLutRxBytes + 8 * sb},

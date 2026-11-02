@@ -108,6 +108,10 @@ bool attention(const float*, std::int64_t, std::int64_t, const float*, const flo
 }
 bool deltanet_conv(const float*, const float*, const float*, std::int64_t, std::int64_t, std::int64_t, float*, float*, Stream) { return false; }
 bool deltanet_gates(float*, float*, const float*, const float*, std::int64_t, std::int64_t, Stream) { return false; }
+bool deltanet_ba_fast(std::uint32_t, const void*, std::uint64_t, std::uint32_t, const void*, std::uint64_t, std::int64_t, std::int64_t, const float*, std::int64_t,
+                      std::int64_t) {
+  return false;
+}
 bool deltanet_beta_alpha_gates(std::uint32_t, const void*, std::uint64_t, std::uint32_t, const void*, std::uint64_t, std::int64_t, std::int64_t, const float*,
                                std::int64_t, std::int64_t, float*, float*, const float*, const float*, Stream) {
   return false;
@@ -155,6 +159,9 @@ bool StreamPlan::run_reset(Stream) { return false; }
 bool rx_type_ok(std::uint32_t, std::int64_t) { return false; }
 std::uint64_t rx_scratch_bytes(int) { return 0; }
 bool moe_half(const MoeHalfArgs&, Stream) { return false; }
+bool dn_half_ok(const DnHalfArgs&) { return false; }
+bool dn_half(const DnHalfArgs&, Stream) { return false; }
+const void* StreamPlan::jobs_dev() const { return nullptr; }
 bool rx_set_grid_bits(int) { return false; }
 void stream_kernel_report() {}
 void set_lean_dense(bool) {}
