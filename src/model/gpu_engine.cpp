@@ -917,9 +917,16 @@ struct GpuEngine::Impl {
     } else if (!(st = prod(D.wqkv, xn, n, mixed)) || !(st = prod(D.wgate, xn, n, zg))) {
       return st;
     }
-    if (!(st = prod(D.wbeta, xn, n, beta)) || !(st = prod(D.walpha, xn, n, alpha))) return st;
+    // v55g (L2): beta, alpha and the gates in one launch where both products take the F32 fast path (the same sums)
+    const bool ba = !D.wbeta.v->rot32 && !D.walpha.v->rot32 && D.wbeta.k == D.walpha.k && D.wbeta.n_out == nv && D.walpha.n_out == nv &&
+                    is_float_type(D.wbeta.v->type) && is_float_type(D.walpha.v->type) &&
+                    g::deltanet_beta_alpha_gates(D.wbeta.dtype, D.wbeta.d, D.wbeta.drb, D.walpha.dtype, D.walpha.d, D.walpha.drb, nv, D.wbeta.k, xn, n,
+                                                 D.wbeta.k, beta, alpha, D.ssm_dt, D.ssm_a);
+    if (!ba) {
+      if (!(st = prod(D.wbeta, xn, n, beta)) || !(st = prod(D.walpha, xn, n, alpha))) return st;
+    }
     if (!opstamp(2)) return gfail("engine: stamp");
-    if (!g::deltanet_gates(beta, alpha, D.ssm_dt, D.ssm_a, n, nv)) return gfail("engine: deltanet gates");
+    if (!ba && !g::deltanet_gates(beta, alpha, D.ssm_dt, D.ssm_a, n, nv)) return gfail("engine: deltanet gates");
     const bool ck = ckpt_mode && n > 1;
     if (ck && !g::dcopy(D.mixed_save, mixed, z(n * ch) * sizeof(float))) return gfail("engine: verify inputs");
     if (!g::deltanet_conv(mixed, D.tail[D.cur], D.conv1d, n, ch, taps, conv, D.tail[1 - D.cur])) return gfail("engine: deltanet conv");
@@ -1578,8 +1585,10 @@ struct GpuEngine::Impl {
     A.y = y;
     A.ph = ph_d ? ph_d + static_cast<int64_t>(il) * 5 : nullptr;  // v55b
     A.st = rst_d;                                                 // v55e3
-    A.xb = rxb;                                                   // v55f
-    A.hb = rhb;
+    // v55f / v55f2: the bit planes only feed planed experts' 1-bit route; with no planes (--plane-bits 0) nothing reads
+    // them, so they are not built (v55f2 S0 +0.33 ms vs g55e3, MEASURED)
+    A.xb = o.plane_bits > 0 ? rxb : nullptr;
+    A.hb = o.plane_bits > 0 ? rhb : nullptr;
     if (!g::moe_half(A)) return Status::fail(Code::internal, std::string("engine: fused MoE half: ") + g::stream_last_error());
     return Status::good();
   }

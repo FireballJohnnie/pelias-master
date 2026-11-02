@@ -133,6 +133,11 @@ bool deltanet_conv(const float* mixed, const float* tail, const float* w, std::i
                    float* conv, float* new_tail, Stream s = nullptr);
 // in place: beta = sigmoid(beta); alpha = softplus(alpha + dt[h]) * a[h]  (n rows of nv)
 bool deltanet_gates(float* beta, float* alpha, const float* dt, const float* a, std::int64_t n, std::int64_t nv, Stream s = nullptr);
+// v55g (L2): beta = Wb x, alpha = Wa x (F32, nv rows, k inputs, n_tok 1-4) and the gates in one launch, with the same sums as
+// matmul's F32 path; false (not an error, nothing launched) where that path would not apply: run them separately then
+bool deltanet_beta_alpha_gates(std::uint32_t type_b, const void* wb, std::uint64_t rbb, std::uint32_t type_a, const void* wa, std::uint64_t rba,
+                               std::int64_t nv, std::int64_t k, const float* x, std::int64_t n_tok, std::int64_t ldx, float* beta, float* alpha,
+                               const float* dt, const float* a, Stream s = nullptr);
 // the recurrence over n tokens, one value head per block (value head h reads key head h % nk); state carried in and out;
 // q at conv row + hk * ds, k at + nk * ds + hk * ds, v at + 2 * nk * ds + h * ds (already L2-normed q, k); core: n rows of
 // nv * ds, value head h at h * ds, each value times 1 / sqrt(ds)

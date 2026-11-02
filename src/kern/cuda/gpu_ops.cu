@@ -1784,6 +1784,52 @@ bool deltanet_conv(const float* mixed, const float* tail, const float* w, std::i
   return true;
 }
 
+// v55g (L2, the author's order 03:13: products that share an input in one launch): a DeltaNet layer's beta and alpha
+// products (F32, nv rows each, the same input) and the gates in one launch: block h computes head h's beta row (warp 0)
+// and alpha row (warp 1) with k_gemv_f32's sums (md::gemv_row on the same staged input, so the same bits as the two
+// separate products), then the gates of that head for each token as k_dn_gates. Three launches per layer become one.
+template <int NJ>
+__global__ void __launch_bounds__(64) k_dn_beta_alpha_gates(const float* __restrict__ wb, std::uint64_t rbb, const float* __restrict__ wa,
+                                                            std::uint64_t rba, std::int64_t nv, std::int64_t k, const float* __restrict__ x, int n_tok,
+                                                            std::int64_t ldx, float* beta, float* alpha, const float* __restrict__ dt,
+                                                            const float* __restrict__ a) {
+  extern __shared__ float4 s_gv4[];
+  float* xs = reinterpret_cast<float*>(s_gv4);
+  const int nsub = static_cast<int>(k / 32);
+  md::gemv_stage(x, n_tok, nsub, ldx, xs);
+  __syncthreads();
+  const std::int64_t h = blockIdx.x;
+  if (threadIdx.x < 32) md::gemv_row<NJ>(wb, rbb, h, xs, nsub, n_tok, beta, nv);
+  else md::gemv_row<NJ>(wa, rba, h, xs, nsub, n_tok, alpha, nv);
+  __syncthreads();
+  for (int t = static_cast<int>(threadIdx.x); t < n_tok; t += static_cast<int>(blockDim.x)) {
+    const std::int64_t id = t * nv + h;
+    beta[id] = sigmoid_d(beta[id]);
+    const float xv = add(alpha[id], dt[h]);
+    const float sp = xv > 20.0f ? xv : logf(add(1.0f, expf(xv)));
+    alpha[id] = mul(sp, a[h]);
+  }
+}
+bool deltanet_beta_alpha_gates(std::uint32_t type_b, const void* wb, std::uint64_t rbb, std::uint32_t type_a, const void* wa, std::uint64_t rba,
+                               std::int64_t nv, std::int64_t k, const float* x, std::int64_t n_tok, std::int64_t ldx, float* beta, float* alpha,
+                               const float* dt, const float* a, Stream s) {
+  const int nsub = static_cast<int>(k / 32);
+  // the fused form only where both products would take k_gemv_f32 (matmul's fast F32 path), so the sums are the same
+  if (!(g_fast_f32 && type_b == g_f32 && type_a == g_f32 && n_tok >= 1 && n_tok <= 4 && k % 32 == 0 &&
+        (nsub == 8 || nsub == 16 || nsub == 32 || nsub == 64 || nsub == 128) && n_tok * nsub * kGvPad * 4 <= 48 * 1024 && rbb % 16 == 0 &&
+        rba % 16 == 0 && ldx % 4 == 0 && (reinterpret_cast<std::uintptr_t>(wb) & 15u) == 0 && (reinterpret_cast<std::uintptr_t>(wa) & 15u) == 0 &&
+        (reinterpret_cast<std::uintptr_t>(x) & 15u) == 0 && nv > 0 && beta && alpha && dt && a))
+    return false;  // not a failure: the caller runs the separate products and gates
+  const std::size_t sm = static_cast<std::size_t>(n_tok) * nsub * kGvPad * sizeof(float);
+  const float* fb = static_cast<const float*>(wb);
+  const float* fa = static_cast<const float*>(wa);
+  const unsigned nb = static_cast<unsigned>(nv);
+  if (nsub <= 32) k_dn_beta_alpha_gates<1><<<nb, 64, sm, st(s)>>>(fb, rbb, fa, rba, nv, k, x, static_cast<int>(n_tok), ldx, beta, alpha, dt, a);
+  else if (nsub == 64) k_dn_beta_alpha_gates<2><<<nb, 64, sm, st(s)>>>(fb, rbb, fa, rba, nv, k, x, static_cast<int>(n_tok), ldx, beta, alpha, dt, a);
+  else k_dn_beta_alpha_gates<4><<<nb, 64, sm, st(s)>>>(fb, rbb, fa, rba, nv, k, x, static_cast<int>(n_tok), ldx, beta, alpha, dt, a);
+  return launched("deltanet beta / alpha / gates");
+}
+
 bool deltanet_gates(float* beta, float* alpha, const float* dt, const float* a, std::int64_t n, std::int64_t nv, Stream s) {
   if (nv <= 0 || !beta || !alpha || !dt || !a) return fail("deltanet_gates: bad pointer");
   if (n <= 0) return true;

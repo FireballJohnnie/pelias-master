@@ -108,6 +108,10 @@ bool attention(const float*, std::int64_t, std::int64_t, const float*, const flo
 }
 bool deltanet_conv(const float*, const float*, const float*, std::int64_t, std::int64_t, std::int64_t, float*, float*, Stream) { return false; }
 bool deltanet_gates(float*, float*, const float*, const float*, std::int64_t, std::int64_t, Stream) { return false; }
+bool deltanet_beta_alpha_gates(std::uint32_t, const void*, std::uint64_t, std::uint32_t, const void*, std::uint64_t, std::int64_t, std::int64_t, const float*,
+                               std::int64_t, std::int64_t, float*, float*, const float*, const float*, Stream) {
+  return false;
+}
 bool deltanet_recurrent(const float*, std::int64_t, const float*, const float*, float*, std::int64_t, std::int64_t, std::int64_t, std::int64_t,
                         float*, Stream) {
   return false;
