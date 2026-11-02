@@ -861,30 +861,13 @@ __device__ __forceinline__ void rx_plan_body(const int* __restrict__ grp, const 
   __syncthreads();
   if (s_err == 0)
     for (int i = static_cast<int>(threadIdx.x); i < nj; i += static_cast<int>(blockDim.x)) {
-      // v55f, pipelined (author: no warp idles while work exists): gate / up of expert s, then silu x up and down of expert
-      // s - 1, so a down starts one expert behind its gate / up instead of after every expert's gate / up (v55e3: 20 % of
-      // the warps' time waited for a group). Order: GU0 | GU1 EP0 DN0 | GU2 EP1 DN1 | ... | EP(U-1) DN(U-1). A job waits only
-      // for jobs before it, so the lowest unfinished task can always run. Same jobs, same outputs; only the order moves.
-      const long long t4 = 2 * nt_gu + 1 + nt_dn;  // one expert's tasks
-      int kind, u;
-      long long task0;
-      if (i < 2) {
-        kind = i;
-        u = 0;
-        task0 = i * nt_gu;
-      } else if (i < 2 + 4 * (U - 1)) {
-        const int sx = 1 + (i - 2) / 4, r = (i - 2) % 4;
-        const long long base = 2 * nt_gu + static_cast<long long>(sx - 1) * t4;
-        kind = r < 2 ? r : (r == 2 ? 3 : 2);  // 0 gate, 1 up, 2 down, 3 silu x up
-        u = r < 2 ? sx : sx - 1;
-        task0 = r == 0 ? base : r == 1 ? base + nt_gu : r == 2 ? base + 2 * nt_gu : base + 2 * nt_gu + 1;
-      } else {
-        const int r = i - (2 + 4 * (U - 1));
-        const long long base = 2 * nt_gu + static_cast<long long>(U - 1) * t4;
-        kind = r == 0 ? 3 : 2;
-        u = U - 1;
-        task0 = r == 0 ? base : base + 1;
-      }
+      // jobs: gate u, up u for every u (2U), then silu x up per u (U), then down per u (U). (v55f tried a pipelined order,
+      // GU s | EP s-1 | DN s-1: prefill 120.9 -> 83.7 tok/s and decode +0.7 ms at GP5 (MEASURED, v55f): with tasks dealt
+      // to warps in table order, each expert's 256 down tasks land on warps that then wait for its silu step instead of
+      // working; reverted to this order, measured since v46a)
+      const int kind = i < 2 * U ? (i & 1) : (i < 3 * U ? 3 : 2);  // 0 gate, 1 up, 2 down, 3 silu x up
+      const int u = i < 2 * U ? (i >> 1) : (i < 3 * U ? i - 2 * U : i - 3 * U);
+      const long long task0 = i < 2 * U ? i * nt_gu : (i < 3 * U ? 2 * U * nt_gu + (i - 2 * U) : 2 * U * nt_gu + U + (i - 3 * U) * nt_dn);
       const int* G = grp + 1 + 6 * u;
       const int cnt = G[1];
       DJob J{};
