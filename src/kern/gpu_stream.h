@@ -140,8 +140,15 @@ struct MoeHalfArgs {
   void* plan = nullptr;
   int max_picks = 0, load_mode = 0;
   float* y = nullptr;              // n x H the MoE output (as moe_r3's y)
+  unsigned long long* ph = nullptr;  // v55b: null, or 5 GPU-clock stamps by block 0 (start, after phases A, B, C, end)
 };
 bool moe_half(const MoeHalfArgs& args, Stream s = nullptr);
+// v55b: the expert stage holds one Q4_TG2 grid in shared memory (8 KB instead of 24 KB, so more blocks fit per SM): the grid
+// of the bits every Q4_TG2 job of the engine reads (4: stored or 4 / 5 planes; 3 or 2: the plane slider's base grid). Set
+// once at engine setup; before any expert-stage launch.
+bool rx_set_grid_bits(int bits);
+// v55b: the kernels' resource use for the log (registers, local memory, blocks per SM), one line per kernel
+void stream_kernel_report();
 // v46a-2 load_mode: 0 each lane loads its own 16-byte pieces (v46a-1); 1 a warp first copies its task's rows contiguously into
 // shared memory for experts read from RAM (every 32-byte sector over PCIe once; the slot filled by the same copy); 2 the same
 // for every expert. The arithmetic is the same in all three, so the outputs are equal bit for bit.

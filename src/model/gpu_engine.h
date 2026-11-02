@@ -52,6 +52,10 @@ struct EngineOptions {
   // v52: the MoE half of each layer (residual, post norm, rounding, router, shared gate, picks, grouping, plan, R3 expert
   // stage, combine, residual) in one cooperative launch (g::moe_half); same bits (--no-fused-moe, temporary)
   bool fused_moe = true;
+  // v55b verbose GPU probe (author 03:24 "full verbose mode"): each kernel's registers / local memory / blocks per SM at open,
+  // and GPU-clock stamps inside the fused MoE half (start, after phases A, B, C, block 0's end) summed over the one-token decode
+  // steps (moe_phase_report); no extra launches, so the fused path is the one measured
+  bool verbose_gpu = false;
   // v54b sliding bit planes (endgame; author 23:14, 23:54 "a slider ... 2, 3 or 4 bit", 23:56): plane_bits 2, 3 or 4 puts
   // the RAM experts' Q4_TG2 matrices in bit planes (kern/tg2_planes.h; pinned at open, their file bytes not registered) and
   // the R3 expert stage reads every pick with that many code bits; the cache's slots hold exactly those bits, so their size
@@ -291,6 +295,8 @@ class GpuEngine {
   bool router_margins(std::vector<float>* m, std::vector<std::uint8_t>* have) const;
   // v26: the graph's state: "<note>; captures C, replays R"
   std::string graph_report() const;
+  // v55b: with EngineOptions::verbose_gpu, the fused MoE half's phases per token (ms, decode one-token steps); empty if off
+  std::string moe_phase_report() const;
   // v30: wait for the light experts' pre-load (if any); its seconds and bytes; false if none was started
   bool preload_wait(double* seconds, std::uint64_t* bytes);
   // v19 timeline (empty unless EngineOptions::timeline and the doorbell are on)

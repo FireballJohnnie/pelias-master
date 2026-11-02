@@ -68,6 +68,12 @@ struct DJob {
 __constant__ float c_grid[4][16];  // the Q4_TG2 grids (quant::q4_tg_grid(tag, 2)), uploaded once
 __constant__ float c_grid3[4][16];  // v54: the 3-bit and 2-bit base grids (tg2p_base_grid of c_grid), uploaded once
 __constant__ float c_grid2[4][16];
+__constant__ int c_rx_bits;  // v55b: the one grid the expert stage loads (4, 3 or 2; 0 = 4)
+__device__ __forceinline__ unsigned long long gtimer_s() {  // v55b: the GPU's global nanosecond clock (as gpu_ops.cu's gtimer)
+  unsigned long long t;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+  return t;
+}
 
 thread_local std::string s_err;
 bool sfail(const std::string& why) {
@@ -182,7 +188,7 @@ __device__ __forceinline__ int sx8(const int* xw, int i) {  // int8 value i of a
 
 extern __shared__ float s_lut[];  // the replicated grid: 2,048 floats (8 KB), lane L reads s_lut[L + 32 * (tag * 16 + code)]
 constexpr int kLutBytes = 2048 * 4;
-constexpr int kLutRxBytes = 3 * 2048 * 4;  // v54: the expert stage's grids: 4-bit (as kLutBytes), then the 3-bit and the 2-bit base
+constexpr int kLutRxBytes = 2048 * 4;  // v55b: the expert stage's one grid (c_rx_bits); v54 held all three (24 KB, 1 block per SM)
 // v54: the 8-code words of one lane part (half `half` of block B of the row at R) from the plane layout:
 // header, plane A, and planes B / C when J.pb asks for them (missing planes read as zero bits); returns the header
 template <int M>
@@ -231,7 +237,9 @@ __device__ __forceinline__ int4 q5p_part(const DJob& J, bool cs, const std::uint
 }
 // v54: the grid the codes are read through (the stored levels, or the 3-bit / 2-bit base) and the mask that clears the code
 // bits not read
-__device__ __forceinline__ const float* tg2_lutb(int bits) { return bits == 3 ? s_lut + 2048 : bits == 2 ? s_lut + 4096 : s_lut; }
+// v55b: one grid in shared memory: the dense kernels load the stored grid (lut_setup, they read Q4_TG2 at 4 bits), the expert
+// stage the grid of c_rx_bits (lut_setup_rx), which is every Q4_TG2 job's bits there (the engine sets it from the slider)
+__device__ __forceinline__ const float* tg2_lutb(int) { return s_lut; }
 __device__ __forceinline__ std::uint32_t tg2_mask(int bits) { return bits >= 4 ? 0xffffffffu : bits == 3 ? 0xeeeeeeeeu : 0xccccccccu; }
 
 __device__ __forceinline__ float i8f(const int* xw, int i) {  // int8 -> float by the magic number (exact for int8)
@@ -1054,11 +1062,12 @@ __device__ __forceinline__ void lut_setup() {
   for (int i = static_cast<int>(threadIdx.x); i < 2048; i += static_cast<int>(blockDim.x)) s_lut[i] = c_grid[(i >> 9) & 3][(i >> 5) & 15];
   __syncthreads();
 }
-// v54: the expert stage's three grids (kLutRxBytes): stored levels, 3-bit base, 2-bit base, each replicated as lut_setup's
+// v55b: the expert stage's one grid (kLutRxBytes): stored levels, or the 3-bit / 2-bit base, replicated as lut_setup's
 __device__ __forceinline__ void lut_setup_rx() {
-  for (int i = static_cast<int>(threadIdx.x); i < 6144; i += static_cast<int>(blockDim.x)) {
-    const int k = i & 2047, tg = (k >> 9) & 3, c = (k >> 5) & 15;
-    s_lut[i] = i < 2048 ? c_grid[tg][c] : i < 4096 ? c_grid3[tg][c] : c_grid2[tg][c];
+  const int b = c_rx_bits;
+  for (int i = static_cast<int>(threadIdx.x); i < 2048; i += static_cast<int>(blockDim.x)) {
+    const int tg = (i >> 9) & 3, c = (i >> 5) & 15;
+    s_lut[i] = b == 3 ? c_grid3[tg][c] : b == 2 ? c_grid2[tg][c] : c_grid[tg][c];
   }
   __syncthreads();
 }
@@ -1498,6 +1507,8 @@ __global__ void __launch_bounds__(256) k_moe_half(const MoeHalfArgs A, int sbyte
   float* stg = s_lut;  // the dynamic shared memory: staging (A), the router's arrays (B), the LUT + warp buffers (C)
   const int H = A.H, n = A.n, nsub = H / 32;
   const int tid = static_cast<int>(threadIdx.x);
+  const bool phs = A.ph != nullptr && blockIdx.x == 0 && threadIdx.x == 0;  // v55b: phase stamps
+  if (phs) A.ph[0] = gtimer_s();
   // ---- A
   for (int t = 0; t < n; ++t) {
     const float* xt = A.x + static_cast<long long>(t) * H;
@@ -1530,6 +1541,7 @@ __global__ void __launch_bounds__(256) k_moe_half(const MoeHalfArgs A, int sbyte
     }
   }
   grid.sync();
+  if (phs) A.ph[1] = gtimer_s();
   // ---- B
   if (blockIdx.x == 0) {
     const md::RouterSmem S{stg, stg + md::kRouterMaxExperts, reinterpret_cast<unsigned char*>(stg + 2 * md::kRouterMaxExperts), s_rsh, &s_inv, s_bv, s_bi};
@@ -1544,10 +1556,12 @@ __global__ void __launch_bounds__(256) k_moe_half(const MoeHalfArgs A, int sbyte
                  A.max_picks, A.load_mode);
   }
   grid.sync();
+  if (phs) A.ph[2] = gtimer_s();
   // ---- C
   lut_setup_rx();
   rx_body<kMT>(static_cast<const std::uint8_t*>(A.plan), A.max_picks, sbytes);
   grid.sync();
+  if (phs) A.ph[3] = gtimer_s();
   // ---- D
   const long long tot = static_cast<long long>(n) * H, step = static_cast<long long>(gridDim.x) * blockDim.x;
   for (long long id = static_cast<long long>(blockIdx.x) * blockDim.x + tid; id < tot; id += step) {
@@ -1557,6 +1571,7 @@ __global__ void __launch_bounds__(256) k_moe_half(const MoeHalfArgs A, int sbyte
     A.y[id] = yv;
     A.x[id] = add(x1, yv);  // k_add_rows of the MoE output
   }
+  if (phs) A.ph[4] = gtimer_s();  // block 0's end of D
 }
 
 bool grid_ready() {
@@ -1947,5 +1962,38 @@ bool moe_half(const MoeHalfArgs& A, Stream s) {
   return sck(cudaLaunchCooperativeKernel(fn, dim3(static_cast<unsigned>(grid)), dim3(256), args, static_cast<std::size_t>(smem), sst(s)),
              "moe_half: cooperative launch");
 }
+
+bool rx_set_grid_bits(int bits) {  // v55b
+  const int b = bits == 3 || bits == 2 ? bits : 4;
+  return sck(cudaMemcpyToSymbol(c_rx_bits, &b, sizeof b), "stream: expert stage grid bits");
+}
+
+void stream_kernel_report() {  // v55b: registers, local memory and blocks per SM at the shared memory each kernel is launched with
+  struct K {
+    const void* f;
+    const char* name;
+    int smem;
+  };
+  const int sb = 16 * 272 + 32;
+  const int sm_moe = std::max(4 * 64 * md::kGvPad * 4, std::max(2 * md::kRouterMaxExperts * 4 + md::kRouterMaxExperts, kLutRxBytes + 8 * sb));
+  const K ks[] = {{reinterpret_cast<const void*>(k_moe_half<false, 1>), "k_moe_half<1 token>", sm_moe},
+                  {reinterpret_cast<const void*>(k_moe_half<true, 1>), "k_moe_half<2-4 tokens>", sm_moe},
+                  {reinterpret_cast<const void*>(k_rx<false>), "k_rx<1 token>", kLutRxBytes + 8 * sb},
+                  {reinterpret_cast<const void*>(k_rx<true>), "k_rx<2-4 tokens>", kLutRxBytes + 8 * sb},
+                  {reinterpret_cast<const void*>(k_stream<false>), "k_stream<1 token>", kLutBytes},
+                  {reinterpret_cast<const void*>(k_stream<true>), "k_stream<2-4 tokens>", kLutBytes},
+                  {reinterpret_cast<const void*>(k_staged<false>), "k_staged<1 token>", kLutBytes}};
+  for (const K& k : ks) {
+    cudaFuncAttributes a{};
+    int occ = 0;
+    if (cudaFuncGetAttributes(&a, k.f) != cudaSuccess) continue;
+    (void)cudaFuncSetAttribute(k.f, cudaFuncAttributeMaxDynamicSharedMemorySize, k.smem);
+    (void)cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, k.f, 256, static_cast<std::size_t>(k.smem));
+    std::fprintf(stderr, "kernel %-24s registers %3d, local %4zu B, static shared %5zu B, dynamic shared %6d B: %d blocks of 256 per SM\n", k.name, a.numRegs,
+                 a.localSizeBytes, a.sharedSizeBytes, k.smem, occ);
+  }
+  (void)cudaGetLastError();
+}
+
 
 }  // namespace pelias::kern::gpu

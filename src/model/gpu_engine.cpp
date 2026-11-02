@@ -401,6 +401,9 @@ struct GpuEngine::Impl {
   void* rxplan = nullptr;
   int rx_maxp = 0;
   bool rx_ok = false;
+  unsigned long long *ph_h = nullptr, *ph_d = nullptr;  // v55b: n_layer x 5 phase stamps of the fused MoE half (verbose_gpu)
+  double ph_sum[4] = {0, 0, 0, 0};
+  std::uint64_t ph_steps = 0, ph_layers = 0;
   std::string rx_note = "off";
   g::ExpertPtr *trc_src_h = nullptr, *trc_src_d = nullptr, *trc_fill_h = nullptr, *trc_fill_d = nullptr;
   // v25 trace: pinned mapped, per layer 6 reader stamps, the picks (kReaderMax x nu) and the group count
@@ -1571,6 +1574,7 @@ struct GpuEngine::Impl {
     A.max_picks = rx_maxp;
     A.load_mode = o.rx_load;
     A.y = y;
+    A.ph = ph_d ? ph_d + static_cast<int64_t>(il) * 5 : nullptr;  // v55b
     if (!g::moe_half(A)) return Status::fail(Code::internal, std::string("engine: fused MoE half: ") + g::stream_last_error());
     return Status::good();
   }
@@ -2173,6 +2177,18 @@ struct GpuEngine::Impl {
           dev_bytes += z(P * Fx) + z(P * Fx / 32) * 8 + pb;
           rx_ok = true;
           rx_note = "on (gate / up, silu x up, down of every pick in one R3 launch per layer)";
+          // v55b: the stage's one grid in shared memory: the slider's bits for every Q4_TG2 job (planes), else the stored grid
+          if (!g::rx_set_grid_bits(o.plane_bits > 0 ? std::min(o.plane_bits, 4) : 4)) {
+            rx_ok = false;
+            rx_note = std::string("off (grid bits: ") + g::stream_last_error() + ")";
+          }
+          if (rx_ok && o.verbose_gpu) {
+            g::stream_kernel_report();
+            void* phd = nullptr;
+            ph_h = static_cast<unsigned long long*>(g::host_alloc_mapped(static_cast<std::size_t>(s.n_layer) * 5 * sizeof(unsigned long long), &phd));
+            ph_d = static_cast<unsigned long long*>(phd);
+            if (!ph_h || !ph_d) ph_h = ph_d = nullptr;
+          }
         } else {
           rx_note = "off (device memory)";
         }
@@ -2276,6 +2292,7 @@ GpuEngine::~GpuEngine() {
   g::dfree(p_->cache_meta);
   g::host_free(p_->trc_hv);
   g::host_free(p_->planes_h);  // v54
+  g::host_free(p_->ph_h);  // v55b
   g::host_free(p_->rlg_h);  // v49
   g::dfree(p_->probe_bd);
   g::dfree(p_->probe_ld);
@@ -2363,6 +2380,18 @@ bool GpuEngine::probe_get_ops(std::vector<float>* block_out, std::vector<float>*
   if (router_logits) *router_logits = I.probe_lh;
   if (moe_out) *moe_out = I.probe_mh;
   return true;
+}
+std::string GpuEngine::moe_phase_report() const {  // v55b
+  const Impl& I = *p_;
+  if (!I.ph_h || I.ph_steps == 0) return "";
+  const double st = static_cast<double>(I.ph_steps);
+  char b[400];
+  std::snprintf(b, sizeof b,
+                "fused MoE half, ms per token over %llu decode steps (%.1f layers per step; GPU clock, block 0): A norm + router + shared gate %.3f, "
+                "B picks + grouping + plan (block 0) %.3f, C expert stage %.3f, D combine + residual %.3f; total %.3f",
+                static_cast<unsigned long long>(I.ph_steps), static_cast<double>(I.ph_layers) / st, I.ph_sum[0] / st, I.ph_sum[1] / st, I.ph_sum[2] / st,
+                I.ph_sum[3] / st, (I.ph_sum[0] + I.ph_sum[1] + I.ph_sum[2] + I.ph_sum[3]) / st);
+  return b;
 }
 std::string GpuEngine::graph_report() const {
   return p_->graph_note + "; captures " + std::to_string(p_->graph_captures) + ", replays " + std::to_string(p_->graph_replays);
@@ -3154,6 +3183,18 @@ Status GpuEngine::Impl::run(const std::int32_t* tokens, int n, float* logits, bo
   if (rd) {  // v25: every pick of a reader step runs on the GPU
     es.hot_picks += static_cast<std::uint64_t>(n) * s.n_expert_used;
     if (I.trc_ts_h) I.trace_step(n, since(t0));
+    if (I.ph_h && n == 1 && !I.in_prompt) {  // v55b: the fused MoE half's phases of this decode step (layers that ran it fill stamp 0)
+      bool any = false;
+      for (std::uint32_t il = 0; il < s.n_layer; ++il) {
+        unsigned long long* pq = I.ph_h + static_cast<int64_t>(il) * 5;
+        if (pq[0] == 0 || pq[4] < pq[0]) continue;
+        for (int k = 0; k < 4; ++k) I.ph_sum[k] += static_cast<double>(pq[k + 1] - pq[k]) * 1e-6;
+        ++I.ph_layers;
+        pq[0] = 0;
+        any = true;
+      }
+      if (any) ++I.ph_steps;
+    }
     if (I.rlg_h) {  // v49: this step's router margins, per token and layer (8th - 9th logit, 1st - 2nd)
       const int64_t ne2 = s.n_expert, nu2 = s.n_expert_used, nl = s.n_layer;
       std::vector<float> row(z(ne2));
