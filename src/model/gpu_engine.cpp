@@ -299,6 +299,9 @@ struct Layer {
   DevW wq, wk, wv, wo, wqkv, wgate, wbeta, walpha, ssm_out, gate_inp, gate_sh, up_sh, down_sh;
   const float *attn_norm = nullptr, *post_norm = nullptr, *q_norm = nullptr, *k_norm = nullptr, *conv1d = nullptr, *ssm_dt = nullptr,
               *ssm_a = nullptr, *ssm_norm = nullptr, *gate_inp_sh = nullptr;
+  // v58b: an F32 copy of the router for the fused launch when the file stores it otherwise (the MTP block's; 0: gate_inp
+  // is F32 itself)
+  const float* router_f32 = nullptr;
   // the bank: typed stacks per projection (each with its expert map), and which experts it holds
   std::vector<g::PromptWeights> bg, bu, bd;
   std::vector<std::uint8_t> hot;  // n_expert flags
@@ -472,6 +475,8 @@ struct GpuEngine::Impl {
   // tables (expert table, shared expert, cache, planes) then have n_layer + 1 rows
   bool mtp_rd = false;
   std::uint64_t mtp_fused_steps = 0, mtp_old_steps = 0;
+  std::string mtp_why;          // v58b: why the first MTP step that took the old path did
+  std::string mtp_router_note;  // v58b: the MTP router's stored type, and whether an F32 copy was made
   std::uint32_t nlr() const { return s.n_layer + (mtp_rd ? 1u : 0u); }
   const Qwen35MoeLayer& WL(std::uint32_t il) const { return il < s.n_layer ? w->layers[il] : w->mtp.layer; }
   Layer& LL(std::uint32_t il) { return il < s.n_layer ? L[il] : M; }
@@ -1615,15 +1620,38 @@ struct GpuEngine::Impl {
   // v52: whether this layer's MoE half can run as one launch (g::moe_half): the R3 expert stage with the shared expert folded
   // in, an F32 router, the shared-memory picks; none of the side outputs the separate kernels feed (router margins, op
   // stamps, traces, probes, the CPU split, the plane tail, prefetch, the halves)
-  bool fused_ok(const Layer& D, int64_t n, bool probe_row) const {
+  // v58b: the first condition that keeps a layer's MoE half off the fused launch, or nullptr when it can run there (v58
+  // MEASURED: the MTP block's took the old path on every step; this names why)
+  const char* fused_why(const Layer& D, int64_t n, bool probe_row) const {
     const int64_t e = s.n_embd;
     auto k_ok = [](int64_t k) { return k == 256 || k == 512 || k == 1024 || k == 2048 || k == 4096; };
-    return o.fused_moe && k_ok(e) && g::fused_width_ok(static_cast<int>(e)) && k_ok(s.n_ff_exp) && s.n_expert <= 1024 && s.n_expert_used <= 8 && rx_ok && fold_ok && !split_ok && !pf_ok && o.plane_tail == 0 && !rlg_d && !cur_ops && !trc_src_d &&
-           !trc_sel_d && !probe_row && n >= 1 && n <= 4 && D.gate_inp.v && !D.gate_inp.v->rot32 &&
-           D.gate_inp.dtype == static_cast<std::uint32_t>(quant::Type::f32) && D.gate_inp.drb == static_cast<std::uint64_t>(e) * sizeof(float) &&
-           D.gate_inp_sh && D.post_norm && (reinterpret_cast<std::uintptr_t>(D.gate_inp.d) & 15u) == 0 &&
-           (reinterpret_cast<std::uintptr_t>(D.gate_inp_sh) & 15u) == 0 && g::router_fast_for(s.n_expert, o.router_tie);
+    if (!o.fused_moe) return "--no-fused-moe";
+    if (!k_ok(e) || !g::fused_width_ok(static_cast<int>(e)) || !k_ok(s.n_ff_exp)) return "a width the fused kernels are not built for";
+    if (s.n_expert > 1024 || s.n_expert_used > 8) return "more than 1024 experts or 8 picks";
+    if (!rx_ok) return "the R3 expert stage is off";
+    if (!fold_ok) return "the shared expert is not folded";
+    if (split_ok || pf_ok || o.plane_tail != 0) return "the CPU split, prefetch or the plane tail";
+    if (rlg_d || cur_ops || trc_src_d || trc_sel_d || probe_row) return "a side output (router margins, op stamps, trace, probe)";
+    if (n < 1 || n > 4) return "a step of more than 4 tokens";
+    const float* wr = router_of(D);
+    if (!wr) return "the router is not F32 (and has no F32 copy)";
+    if (!D.gate_inp_sh) return "no shared-expert gate";
+    if (!D.post_norm) return "no post-attention norm";
+    if ((reinterpret_cast<std::uintptr_t>(wr) & 15u) != 0 || (reinterpret_cast<std::uintptr_t>(D.gate_inp_sh) & 15u) != 0) return "router rows not 16-byte aligned";
+    if (!g::router_fast_for(s.n_expert, o.router_tie)) return "the fast router does not take this expert count / tie band";
+    return nullptr;
   }
+  // the router rows the fused launch reads: gate_inp itself when stored as plain F32 rows, else the layer's F32 copy
+  const float* router_of(const Layer& D) const {
+    if (D.router_f32) return D.router_f32;
+    const int64_t e = s.n_embd;
+    if (D.gate_inp.v && !D.gate_inp.v->rot32 && D.gate_inp.dtype == static_cast<std::uint32_t>(quant::Type::f32) &&
+        D.gate_inp.drb == static_cast<std::uint64_t>(e) * sizeof(float))
+      return static_cast<const float*>(D.gate_inp.d);
+    return nullptr;
+  }
+  bool fused_ok(const Layer& D, int64_t n, bool probe_row) const { return fused_why(D, n, probe_row) == nullptr; }
+
   // v52: x += y (the block's output, in y), then the MoE half, then x += y, in one launch
   Status moe_half_fused(Layer& D, int64_t n, std::uint32_t il) {
     g::MoeHalfArgs A;
@@ -1641,7 +1669,7 @@ struct GpuEngine::Impl {
     A.xq = q;
     A.xs = scale;
     A.xsum = sum;
-    A.wr = static_cast<const float*>(D.gate_inp.d);
+    A.wr = router_of(D);  // v58b
     A.logits = logits_r;
     A.wsh = D.gate_inp_sh;
     A.gsh = gsh;
@@ -2460,6 +2488,7 @@ GpuEngine::~GpuEngine() {
   for (Layer& D : p_->L)
     for (DevW* d : {&D.wq, &D.wk, &D.wv, &D.wo, &D.wqkv, &D.wgate, &D.wbeta, &D.walpha, &D.ssm_out, &D.gate_inp, &D.gate_sh, &D.up_sh, &D.down_sh}) rel(*d);
   for (DevW* d : {&p_->M.wq, &p_->M.wk, &p_->M.wv, &p_->M.wo, &p_->M.gate_inp, &p_->M.gate_sh, &p_->M.up_sh, &p_->M.down_sh, &p_->eh, &p_->out}) rel(*d);
+  if (p_->M.router_f32) g::dfree(const_cast<float*>(p_->M.router_f32));  // v58b: the MTP router's F32 copy (device memory)
   if (p_->head.r3 && p_->head.sw.w != p_->out.sw.w) rel(p_->head);
   g::dfree(p_->act_mem);
   g::dfree(p_->dense_mem);
@@ -2595,9 +2624,12 @@ std::string GpuEngine::mtp_path_report() const {
   const Impl& I = *p_;
   if (!I.has_mtp) return {};
   char b[200];
-  std::snprintf(b, sizeof b, "MTP block MoE half (v58): %s; %llu steps on the fused launch, %llu on the old path", I.mtp_rd && I.rx_ok ? "on the fused launch (reader row n_layer)" : "old path",
+  std::snprintf(b, sizeof b, "MTP block MoE half (v58): %s; %llu steps on the fused launch, %llu on the old path", I.mtp_rd && I.rx_ok ? "set up on the fused launch (reader row n_layer)" : "old path",
                 static_cast<unsigned long long>(I.mtp_fused_steps), static_cast<unsigned long long>(I.mtp_old_steps));
-  return b;
+  std::string r = b;
+  if (!I.mtp_why.empty()) r += std::string("; first old-path step: ") + I.mtp_why;  // v58b
+  if (!I.mtp_router_note.empty()) r += "; " + I.mtp_router_note;
+  return r;
 }
 
 std::string GpuEngine::graph_report() const {
@@ -2925,6 +2957,25 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
   // v58: the MTP block's MoE half on the reader (its row n_layer: planes / file mapping and its own cache slots, no bank)
   I.mtp_rd = o.mtp && o.mtp_fused && w.mtp.present && o.cold_on_gpu && o.r3_experts && o.rx_load >= 1 && o.fused_moe &&
              !o.cpu_light && !o.prefetch && o.plane_tail == 0;
+  if (I.mtp_rd) {  // v58b: the fused launch reads the router as F32 rows; the MTP block's may be stored otherwise
+    const WeightView& rv = w.mtp.layer.gate_inp;
+    I.mtp_router_note = std::string("MTP router stored as ") + quant::type_info(rv.type).name + (rv.rot32 ? " (rotated)" : "");
+    if (!I.router_of(I.M) && rv.present() && !rv.rot32) {
+      std::vector<float> rf(z(ne) * z(e));
+      bool ok = true;
+      for (int64_t r = 0; r < ne && ok; ++r)
+        ok = quant::dequantize_row(static_cast<quant::Type>(rv.type), rv.data + static_cast<std::uint64_t>(r) * rv.row_bytes, rf.data() + z(r) * z(e), e).ok();
+      void* rd = ok ? g::dalloc(rf.size() * sizeof(float)) : nullptr;
+      if (rd && g::to_device(rd, rf.data(), rf.size() * sizeof(float))) {
+        I.M.router_f32 = static_cast<const float*>(rd);
+        I.dev_bytes += rf.size() * sizeof(float);
+        left = left > rf.size() * sizeof(float) ? left - rf.size() * sizeof(float) : 0;
+        I.mtp_router_note += ", an F32 copy made for the fused launch (decoded from the stored rows; draft picks only: verify still decides every token)";
+      } else {
+        I.mtp_router_note += ", no F32 copy (dequantize or device memory)";
+      }
+    }
+  }
   if (o.mtp && o.mtp_bank != 0 && !I.mtp_rd) {  // the MTP block's fixed arena, for promotion
     const Qwen35MoeLayer& ml = w.mtp.layer;
     std::uint64_t eb = 0;
@@ -3548,6 +3599,10 @@ Status GpuEngine::mtp_step(const std::int32_t* tokens, const float* h_prev, int 
     if (!(st = I.moe_half_fused(D, n, s.n_layer))) return st;
     ++I.mtp_fused_steps;
   } else {
+    if (I.mtp_rd && I.mtp_why.empty()) {
+      const char* why = I.fused_why(D, n, false);
+      I.mtp_why = why ? why : "?";
+    }
     if (!g::add_rows(I.x, e, I.y, e, nullptr, e, n)) return gfail("engine: MTP residual");
     if (!g::rms_norm(I.x, D.post_norm, I.xn, e, 1, e, e, n, s.rms_eps)) return gfail("engine: MTP post norm");
     if (!(st = I.moe_block(w.mtp.layer, D, n, es))) return st;
