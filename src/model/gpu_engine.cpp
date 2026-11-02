@@ -427,6 +427,7 @@ struct GpuEngine::Impl {
   std::unique_ptr<std::atomic<int>[]> grp_left;
   // verify / keep (stage 3)
   bool ckpt_mode = false;
+  bool in_prompt = false;   // v48b: a step of a split prompt (its products of 2-4 tokens go through R3, as option B's)
   bool no_head = false;      // v48: a prompt step whose logits nobody reads (an inner step of a split prompt): skip the head
   int last_n = 0;            // tokens of the last verify batch (0: none pending)
   std::int64_t verify_pos0 = 0;
@@ -2479,9 +2480,11 @@ Status GpuEngine::step(const std::int32_t* tokens, int n, float* logits, bool la
     const bool last = c0 + m == n;
     EngineStats es;
     I.no_head = last_only && !last;
+    I.in_prompt = true;
     const Status st = I.run(tokens + c0, m, last_only ? logits : logits + static_cast<std::int64_t>(c0) * nvoc, last_only, &es,
                             hidden_out ? hidden_out + static_cast<std::int64_t>(c0) * e : nullptr);
     I.no_head = false;
+    I.in_prompt = false;
     if (!st) return st;
     sum.seconds += es.seconds;
     sum.cold_seconds += es.cold_seconds;
@@ -2538,7 +2541,7 @@ Status GpuEngine::Impl::run(const std::int32_t* tokens, int n, float* logits, bo
   const bool rd = I.reader && n <= Impl::kReaderMax;  // v24: the reader's steps use no doorbell
   const bool bl = I.bell && !rd;
   const bool cl = rd && I.split_ok;  // v28: a reader step whose light picks the CPU computes
-  I.bi_now = rd && I.o.batch_identical;  // v26 option B
+  I.bi_now = rd && (I.o.batch_identical || I.in_prompt);  // v26 option B; v48b: the GPU prompt's steps too (MEASURED v48: 99.0 vs 49.9 tok/s)
   struct BiReset {
     bool& f;
     ~BiReset() { f = false; }
@@ -2637,7 +2640,7 @@ Status GpuEngine::Impl::run(const std::int32_t* tokens, int n, float* logits, bo
         parity = I.L[il].cur;
         break;
       }
-    const std::tuple<int, int, int, int> key{n, parity, I.ckpt_mode && n > 1 ? 1 : 0, (I.ops_d && n == 1) ? 1 : 0};
+    const std::tuple<int, int, int, int> key{n, parity, I.ckpt_mode && n > 1 ? 1 : (I.bi_now && n > 1 ? 2 : 0), (I.ops_d && n == 1) ? 1 : 0};  // v48b: R3 (bi) and batched steps of the same size are different graphs
     auto flip = [&]() {
       for (std::uint32_t il = 0; il < s.n_layer; ++il)
         if (wt.layers[il].recurrent) I.L[il].cur = 1 - I.L[il].cur;
