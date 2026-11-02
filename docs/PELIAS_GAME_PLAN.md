@@ -49,6 +49,7 @@ What the v46a-2 options say (MEASURED): contiguous staging only where the bytes 
 - **MTP** through the same program (1-4 tokens). **Native Windows** build of the same code.
 - **Build rule:** the token kernel is the final architecture from its first commit; an op not yet moved inside splits the program at that point (a launch boundary), so every commit runs end to end and each moved op removes a boundary. Measured each run: launches per token, ms per token, the gate.
 - **Expected (DERIVED, model49):** 7.5-8.6 ms (116-134 tok/s) before MTP; with MTP 139-184 tok/s at 85-90 % efficiency.
+- **Point predictions on record (2026-11-01 19:13):** author: 112.3 tok/s without MTP, 157.4 with MTP. Claude (ESTIMATE): 108.7 without MTP, 141.3 with MTP.
 
 **Next step, proposed 18:5x (author 18:47 "plan out the next step with these considerations"; waiting on the go):**
 - **v46a-2 (build + run, ~2-3 h code, ~6 min run):** inside the R3 expert stage each warp first copies its task's rows contiguously (the reader's staging: 32 lanes x 16 bytes, every 32-byte sector once) into shared memory and, on a miss, into its slot; R3's math then reads shared memory. Switch `--rx-load lane|miss|all`: lane = today, miss = staged for experts read from RAM, all = staged for every expert (tests the VRAM side too). Results bit for bit equal to RX (same arithmetic); a top-1 dump compare proves it. Prediction (DERIVED, model48): miss 15.5-17.5 ms, all 13.5-16.5 ms; trace fit of the RAM side back near 20 GB/s.
