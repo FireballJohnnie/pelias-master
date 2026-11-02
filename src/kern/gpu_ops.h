@@ -201,9 +201,18 @@ struct ReaderCache {
   int* tag = nullptr;            // K
   unsigned* use = nullptr;       // K
   unsigned* stamp = nullptr;     // 1
-  std::uint8_t* base = nullptr;  // K x slot_bytes
+  std::uint8_t* base = nullptr;  // K x slot_bytes (np 0), or the pools back to back
   std::uint64_t slot_bytes = 0;
   int K = 0;
+  // v51 size pools (np > 0): pool p holds slots pk0[p] .. pk0[p + 1] - 1 of pbytes[p] each, starting pboff[p] bytes after
+  // base; an expert is cached only in the pool pool_of[e] names (-1: not cached). Slots then fit the expert's real size
+  // instead of the file's largest expert (replay52c: misses x0.896 in the same VRAM, DERIVED). np 0: one pool, as v26.
+  static constexpr int kMaxPools = 8;
+  int np = 0;
+  int pk0[kMaxPools + 1] = {};
+  std::uint64_t pbytes[kMaxPools] = {};
+  std::uint64_t pboff[kMaxPools] = {};
+  const signed char* pool_of = nullptr;  // n_expert (device), this layer's
 };
 // tab: n_expert entries (device); sel / wsel: tokens x n_used picks and weights (device, as router_topk); xr: tokens x H
 // rounded inputs; gu: scratch tokens x n_used x 2F; h: scratch tokens x n_used x F; y: tokens x H, overwritten with the

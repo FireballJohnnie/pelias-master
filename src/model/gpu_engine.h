@@ -42,6 +42,11 @@ struct EngineOptions {
   // (every layer's first expert, then every layer's second, ...) until the budget or max_hot_per_layer is reached. Empty:
   // no bank, every routed expert runs on the CPU.
   std::vector<std::vector<int>> hot_order;
+  // v51: per layer, each expert's pick count from the routes file (empty: none); sizes the cache's size pools
+  std::vector<std::vector<std::uint64_t>> hot_count;
+  // v51: reader cache slots in pools by real expert size (default) instead of slots of the file's largest expert
+  // (--no-cache-pools, temporary). Same bytes; replay52c: misses x0.896 (DERIVED)
+  bool cache_pools = true;
   int max_hot_per_layer = 256;
   int cpu_threads = 0;  // workers for the cold experts (0: hardware threads)
   // GP3-14 stage 3 (MTP drafting): the largest verify batch (1 + drafts); 0 = no rollback buffers. Needs the DeltaNet
@@ -131,7 +136,7 @@ struct EngineOptions {
   bool prompt_r3 = true;
   // v50: the GPU prompt's R3 products take int16-level inputs as two int8 halves (hi + lo / 256, one load of the weights);
   // decode steps unchanged. MEASURED v49e: the int8 prompt's state cost W2's decode rows +65 % KL (--no-prompt-halves, temporary)
-  bool prompt_halves = true;
+  bool prompt_halves = false;  // v51: parked (author 21:50 "screw stage 1"), unrun; --prompt-halves turns it on
   // v28: gate / up rows per warp in the reader v3 kernels (1 or 2; 2 = v26's shape)
   int reader_rows_per_warp = 2;
   // v28: pinned ranges are merged across gaps smaller than this (bytes; v27 used 8 MiB; 0 = exact ranges, one per matrix
@@ -289,6 +294,7 @@ Status engine_generate_greedy_mtp(GpuEngine& eng, const Qwen35MoeSpec& s, const 
 
 // The hot order from a routing record (pelias kld --route-dump, PELROUT1): per layer, experts by pick count, most picked
 // first (ties: lower index); experts never picked come last in index order.
-Result<std::vector<std::vector<int>>> hot_order_from_routes(const std::string& path, std::uint32_t n_layer, std::uint32_t n_expert);
+Result<std::vector<std::vector<int>>> hot_order_from_routes(const std::string& path, std::uint32_t n_layer, std::uint32_t n_expert,
+                                                            std::vector<std::vector<std::uint64_t>>* counts = nullptr);
 
 }  // namespace pelias::model

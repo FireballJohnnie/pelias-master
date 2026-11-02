@@ -1360,6 +1360,28 @@ bool moe_reader(const ExpertPtr* tab, const std::int32_t* sel, const float* wsel
 }
 
 // ------------------------------------------------------------------------------------------------ v26 reader v3
+// v51: the slot range of the pool expert e is cached in, its slot size and the pool's byte offset (np 0: one pool, v26)
+__device__ __forceinline__ void rc_pool(const ReaderCache& c, int e, int* k0, int* k1, std::uint64_t* sb, std::uint64_t* boff) {
+  if (c.np <= 0) {
+    *k0 = 0;
+    *k1 = c.K;
+    *sb = c.slot_bytes;
+    *boff = 0;
+    return;
+  }
+  const int p = c.pool_of ? static_cast<int>(c.pool_of[e]) : -1;
+  if (p < 0 || p >= c.np) {
+    *k0 = 0;
+    *k1 = 0;
+    *sb = 0;
+    *boff = 0;
+    return;
+  }
+  *k0 = c.pk0[p];
+  *k1 = c.pk0[p + 1];
+  *sb = c.pbytes[p];
+  *boff = c.pboff[p];
+}
 // one thread: group the routed picks by expert (first appearance), then the shared expert as one more group over every
 // token; per group the source (bank / cache slot / file) and, on a cache miss, the slot its rows are written into
 __global__ void k_rd3_group(const ExpertPtr* __restrict__ tab, const ExpertPtr* __restrict__ shx, const std::int32_t* __restrict__ sel, int tokens,
@@ -1379,9 +1401,11 @@ __global__ void k_rd3_group(const ExpertPtr* __restrict__ tab, const ExpertPtr* 
       grp[2 + 6 * u] = 0;
       ExpertPtr src = tab[e], fill;
       if (c.K > 0 && !src.vram) {
-        int hit = -1, victim = -1;
+        int hit = -1, victim = -1, k0 = 0, k1 = 0;
+        std::uint64_t pslot = 0, poff = 0;
+        rc_pool(c, e, &k0, &k1, &pslot, &poff);
         unsigned best = 0xffffffffu;
-        for (int k = 0; k < c.K; ++k) {
+        for (int k = k0; k < k1; ++k) {
           if (c.tag[k] == e) hit = k;
           if (c.use[k] != stamp && c.use[k] < best) {
             best = c.use[k];
@@ -1390,7 +1414,7 @@ __global__ void k_rd3_group(const ExpertPtr* __restrict__ tab, const ExpertPtr* 
         }
         const int slot = hit >= 0 ? hit : victim;
         if (slot >= 0) {
-          std::uint8_t* sb = c.base + static_cast<std::uint64_t>(slot) * c.slot_bytes;
+          std::uint8_t* sb = c.base + poff + static_cast<std::uint64_t>(slot - k0) * pslot;
           ExpertPtr at = src;
           at.w[0] = sb;
           at.w[1] = sb + src.rb[0] * static_cast<std::uint64_t>(F);
@@ -2137,7 +2161,10 @@ __global__ void k_pf_assign(const ExpertPtr* __restrict__ tab, const std::int32_
     const int e = sel_pred[pi];
     if (tab[e].vram) continue;
     bool have = false;
-    for (int k = 0; k < c.K && !have; ++k)
+    int k0 = 0, k1 = 0;
+    std::uint64_t pslot = 0, poff = 0;
+    rc_pool(c, e, &k0, &k1, &pslot, &poff);  // v51
+    for (int k = k0; k < k1 && !have; ++k)
       if (c.tag[k] == e) {
         have = true;
         c.use[k] = next;
@@ -2145,12 +2172,12 @@ __global__ void k_pf_assign(const ExpertPtr* __restrict__ tab, const std::int32_
     if (have) continue;
     int victim = -1;
     unsigned best = 0xffffffffu;
-    for (int k = 0; k < c.K; ++k)
+    for (int k = k0; k < k1; ++k)
       if (c.use[k] != next && c.use[k] < best) {
         best = c.use[k];
         victim = k;
       }
-    if (victim < 0) break;
+    if (victim < 0) continue;  // v51: this expert's pool is full for the coming step (others may still fit theirs)
     c.tag[victim] = e;
     c.use[victim] = next;
     job[1 + 2 * nj] = e;
@@ -2164,7 +2191,10 @@ __global__ void k_pf_copy(const ExpertPtr* __restrict__ tab, const int* __restri
   const int it = static_cast<int>(blockIdx.y);
   if (it >= job[0]) return;
   const ExpertPtr& X = tab[job[1 + 2 * it]];
-  std::uint8_t* sb = c.base + static_cast<std::uint64_t>(job[2 + 2 * it]) * c.slot_bytes;
+  int k0 = 0, k1 = 0;
+  std::uint64_t pslot = 0, poff = 0;
+  rc_pool(c, job[1 + 2 * it], &k0, &k1, &pslot, &poff);  // v51
+  std::uint8_t* sb = c.base + poff + static_cast<std::uint64_t>(job[2 + 2 * it] - k0) * pslot;
   const std::uint64_t len[3] = {X.rb[0] * static_cast<std::uint64_t>(F), X.rb[1] * static_cast<std::uint64_t>(F), X.rb[2] * static_cast<std::uint64_t>(H)};
   std::uint64_t off = 0;
   const std::uint64_t tid = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x, nth = static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
