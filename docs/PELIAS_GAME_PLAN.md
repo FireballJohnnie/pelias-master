@@ -4,6 +4,8 @@ Written 2026-10-27 at 13:5x, at the author's request. Every step has enough deta
 
 Copyright (c) 2026 John Lipka and the Pelias contributors
 
+**CURRENT STATE (restart point; rewritten before every run; last 2026-11-02 05:33 EST).** Head 043b0de (v55e3). Engine path: R3 + fused MoE half + sliding bit planes (slider 2-5; planes stay, author 04:03). **R3 register fix DONE (v55e2, MEASURED):** k_moe_half<1 token> 128 registers, 2 blocks per SM; k_rx 128; dense 106; gates = v55 bit for bit. Speed best: P3 14.10-14.12 ms (70.9 tok/s), P5 15.00-15.07, S0 15.71-15.78 (g55e2, lean dense off). Lean one-format dense kernels: +1.1 ms per token, OFF by default since v55e3 (--lean-dense). Open question (author 05:26 "something is getting pulled through the cpu to bottleneck this"): the expert stage did not speed up at 2 blocks per SM; misses are read from host RAM over PCIe inside the stage (DERIVED 0.74-2.8 ms per token from step 2 miss bytes). **Running: v55e3 probe** (block_v55e3.sh; console ENGINE/chain55e3_20261102_0531.out; counting expert stage: RAM vs VRAM task cycles, wait vs work; rx-load miss vs lane speed). Next after its result: the fix it points to; then the author's order (L2 + L3, P1, PAUSE before P4, P4, bloat audit, MTP); multi-token kernels to tensor cores with the 8-token prefill.
+
 **What this file is:**
 - The single list of what happens next, in order.
 - Status: what is settled (with results), what is retired, what is open.
