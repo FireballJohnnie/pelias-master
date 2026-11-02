@@ -298,6 +298,7 @@ int cmd_device(const Args& a) {
     std::printf("NVML: unavailable (%s)\n", d.nvml_note.c_str());
   const hal::Ceiling c = hal::ceiling_from_device(d);
   if (c.bytes) std::printf("VRAM ceiling: %s (basis %s %s minus margin %s; standing rule 3)\n", plan::format_bytes(c.bytes).c_str(), c.basis, plan::format_bytes(c.basis_free).c_str(), plan::format_bytes(c.margin).c_str());
+  if (const std::string cm = hal::cpu_core_map(); !cm.empty()) std::printf("CPU cores (logical CPUs per physical core; v58, for --pin-host / --pin-cpus):\n%s", cm.c_str());
   return d.available ? 0 : 4;
 }
 
@@ -2431,11 +2432,11 @@ int cmd_engine_check(const Args& a) {
   if (path.empty()) {
     std::fprintf(stderr,
                  "usage: pelias engine-check --model FILE [--routes ROUTES.bin] [--prefill 64] [--decode 32] [--ctx 4096] [--batch 64] [--threads N]\n"
-                 "                           [--budget-gb G] [--hot-max N] [--mtp-draft K] [--fast-cpu] [--no-cpu] [--float-ref]\n"
+                 "                           [--budget-gb G] [--hot-max N (default 40)] [--mtp-draft K] [--fast-cpu] [--no-cpu] [--float-ref]\n"
                  "                           [--text FILE [--skip-tokens N]] [--timeline] [--dump-top OUT.tsv] [--dump-router OUT.tsv] [--dump-draft OUT.tsv] [--dump-split [--split-sizes 2,3,4] [--split-step]]\n"
                  "                           [--no-doorbell] [--timeline-ops] [--split-ref] [--bank-selftest MIXES] [--probe-pos P]\n"
-                 "                           [--router-tie BAND] [--cold-on-gpu] [--trace OUT.tsv] [--reader-cache K] [--fold-shared]\n"
-                 "                           [--batch-identical] [--graph] [--prefetch] [--plane-tail N] [--cpu-light] [--reader-rpw 1|2] [--r3-experts] [--rx-load lane|miss|all] [--prompt-batched] [--prompt-halves] [--cpu-prompt] [--no-cache-pools] [--no-fast-f32] [--lean-dense] [--dn-half] [--l2pf] [--no-dn-smem] [--dn-mlp2] [--no-rx-pipe] [--no-rx-sact] [--no-fused-moe] [--plane-bits 2|3|4|5] [--auto-vram [--cache-share F]] [--verbose-gpu]\n"
+                 "                           [--router-tie BAND (default 0.01)] [--no-cold-on-gpu] [--trace OUT.tsv] [--reader-cache K] [--no-fold-shared]\n"
+                 "                           [--batch-identical] [--no-graph] [--prefetch] [--plane-tail N] [--cpu-light] [--reader-rpw 1|2] [--no-r3-experts] [--rx-load lane|miss (default)|all] [--prompt-batched] [--cpu-prompt] [--no-cache-pools] [--no-fast-f32] [--dn-half] [--no-dn-smem] [--no-rx-pipe] [--no-rx-sact] [--no-fused-moe] [--no-mtp-fused] [--plane-bits 2|3|4|5] [--no-auto-vram] [--cache-share F] [--verbose-gpu]\n"
                  "                           [--pin-gap-kib K] [--pin-huge-ok] [--cpu-up-rows N] [--cpu-down2] [--cpu-gu2] [--cpu-tile] [--spin-pause] [--cpu-prefetch] [--cpu-check] [--host-wait auto|spin|yield|block] [--pin-cpus 0,2,4,...] [--pin-host N] [--ref-threads N] [--no-cpu-light] [--split-slow] [--preload-light]\n");
     return 1;
   }

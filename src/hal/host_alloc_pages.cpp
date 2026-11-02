@@ -9,6 +9,9 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <string>
+#include <utility>
+#include <vector>
 
 #if defined(__linux__)
 #include <fcntl.h>
@@ -64,6 +67,53 @@ bool pin_this_thread(int cpu) {
   (void)cpu;
   return false;
 #endif
+}
+
+std::string cpu_core_map() {
+  std::string out;
+#if defined(_WIN32)
+  DWORD len = 0;
+  (void)GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
+  if (len == 0) return out;
+  std::string buf(static_cast<std::size_t>(len), '\0');
+  auto* base = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buf.data());
+  if (!GetLogicalProcessorInformationEx(RelationProcessorCore, base, &len)) return out;
+  int core = 0;
+  for (DWORD off = 0; off < len;) {
+    const auto* p = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buf.data() + off);
+    if (p->Relationship == RelationProcessorCore) {
+      out += "core " + std::to_string(core++) + ":";
+      for (WORD gi = 0; gi < p->Processor.GroupCount; ++gi) {
+        const GROUP_AFFINITY& ga = p->Processor.GroupMask[gi];
+        for (int b = 0; b < 64; ++b)
+          if ((ga.Mask >> b) & 1u) out += " " + std::to_string(64 * static_cast<int>(ga.Group) + b);
+      }
+      out += p->Processor.Flags == LTP_PC_SMT ? " (SMT)\n" : "\n";
+    }
+    if (p->Size == 0) break;
+    off += p->Size;
+  }
+#elif defined(__linux__)
+  std::vector<std::pair<std::string, std::string>> cores;  // (package:core, cpus)
+  for (int c = 0; c < 1024; ++c) {
+    std::ifstream fc("/sys/devices/system/cpu/cpu" + std::to_string(c) + "/topology/core_id");
+    if (!fc) break;
+    std::string id, pk;
+    fc >> id;
+    std::ifstream fp("/sys/devices/system/cpu/cpu" + std::to_string(c) + "/topology/physical_package_id");
+    if (fp) fp >> pk;
+    const std::string key = pk + ":" + id;
+    bool found = false;
+    for (auto& kv : cores)
+      if (kv.first == key) {
+        kv.second += " " + std::to_string(c);
+        found = true;
+      }
+    if (!found) cores.emplace_back(key, std::to_string(c));
+  }
+  for (std::size_t i = 0; i < cores.size(); ++i) out += "core " + std::to_string(i) + ": " + cores[i].second + "\n";
+#endif
+  return out;
 }
 
 void* huge_arena_from_file(const char* path, unsigned long long offset, std::size_t bytes, bool* direct_used, std::string* why) {

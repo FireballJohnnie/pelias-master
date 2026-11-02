@@ -23,6 +23,10 @@ bool advise_huge_pages(void* p, std::size_t bytes);
 // this file because it is one of the two places allowed OS headers (BC6). v58: Windows SetThreadAffinityMask (CPUs 0-63);
 // other systems: nothing, returns false.
 bool pin_this_thread(int cpu);
+// v58 (author 15:09-15:11: Windows sees each core's threads): one line per physical core, "core N: CPUs a b" (Windows:
+// GetLogicalProcessorInformationEx; Linux: /sys/devices/system/cpu/cpu*/topology/core_id, as the kernel reports it, which
+// under WSL may not be the real pairing); empty if unknown. For choosing --pin-host / --pin-cpus.
+std::string cpu_core_map();
 
 // v46 arena probe (author 19:34 "probe it"; the author's WSL RAM dossiers, workaround 3A): an anonymous mapping of `bytes`
 // (a multiple of 2 MB), asked for 2 MB pages, filled from the file with direct reads (O_DIRECT: the page cache is skipped,
