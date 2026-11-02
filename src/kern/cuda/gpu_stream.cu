@@ -2387,39 +2387,41 @@ __device__ __forceinline__ float dn_q8_dot(int part, const DnQ8Lane& L, const st
   }
   return acc;
 }
+// v57 (ptxas v57: with both forms in one function it spilled 176 B in the hot loop): the two-at-a-time form on its own,
+// opt-in (--dn-mlp2); the default one-at-a-time form is v56b's (0 spill; ~415 / ~467 GB/s MEASURED)
+__device__ PG_NOINL void dn_stream_sm_q8x2(const DnHalfArgs& A, const DJob* __restrict__ jobs, int nj, long long nt, const std::int8_t* sq,
+                                           const float* ssc) {
+  const long long warps = static_cast<long long>(gridDim.x) * (blockDim.x / 32);
+  const int lane = static_cast<int>(threadIdx.x & 31);
+  int hint = 0;
+  for (long long t = static_cast<long long>(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32; t < nt; t += 2 * warps) {
+    const long long t2 = t + warps;
+    const bool two = t2 < nt;
+    const DJob& J1 = jobs[find_job(jobs, nj, t, &hint)];
+    const DJob& J2 = jobs[find_job(jobs, nj, two ? t2 : t, &hint)];
+    const int r1 = static_cast<int>((t - J1.task0) * (32 / J1.lpr)) + lane / J1.lpr, p1 = lane % J1.lpr;
+    const int r2 = two ? static_cast<int>((t2 - J2.task0) * (32 / J2.lpr)) + lane / J2.lpr : 0, p2 = lane % J2.lpr;
+    const bool ok1 = r1 < J1.n, ok2 = two && r2 < J2.n;
+    DnQ8Lane L1, L2;
+    if (ok1) dn_q8_load(J1, r1, p1, L1);
+    if (ok2) dn_q8_load(J2, r2, p2, L2);
+    float a1 = ok1 ? dn_q8_dot(p1, L1, sq + (J1.xq - A.q), ssc + (J1.xs - A.scale)) : 0.f;
+    for (int o = J1.lpr / 2; o > 0; o >>= 1) a1 += __shfl_xor_sync(0xffffffffu, a1, o);
+    if (ok1 && p1 == 0) J1.y[r1] = a1;
+    if (two) {
+      float a2 = ok2 ? dn_q8_dot(p2, L2, sq + (J2.xq - A.q), ssc + (J2.xs - A.scale)) : 0.f;
+      for (int o = J2.lpr / 2; o > 0; o >>= 1) a2 += __shfl_xor_sync(0xffffffffu, a2, o);
+      if (ok2 && p2 == 0) J2.y[r2] = a2;
+    }
+  }
+}
 template <int ONLY>
 __device__ PG_NOINL void dn_stream_sm(const DnHalfArgs& A, const DJob* __restrict__ jobs, int nj, long long nt, const std::int8_t* sq, const float* ssc,
                                       const int* ssum) {
   const long long warps = static_cast<long long>(gridDim.x) * (blockDim.x / 32);
   const int lane = static_cast<int>(threadIdx.x & 31);
   int hint = 0;
-  long long t = static_cast<long long>(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32;
-  if constexpr (ONLY == kQ8_0) {
-    if (A.mlp2) {
-      for (; t < nt; t += 2 * warps) {
-        const long long t2 = t + warps;
-        const bool two = t2 < nt;
-        const DJob& J1 = jobs[find_job(jobs, nj, t, &hint)];
-        const DJob& J2 = jobs[find_job(jobs, nj, two ? t2 : t, &hint)];
-        const int r1 = static_cast<int>((t - J1.task0) * (32 / J1.lpr)) + lane / J1.lpr, p1 = lane % J1.lpr;
-        const int r2 = two ? static_cast<int>((t2 - J2.task0) * (32 / J2.lpr)) + lane / J2.lpr : 0, p2 = lane % J2.lpr;
-        const bool ok1 = r1 < J1.n, ok2 = two && r2 < J2.n;
-        DnQ8Lane L1, L2;
-        if (ok1) dn_q8_load(J1, r1, p1, L1);
-        if (ok2) dn_q8_load(J2, r2, p2, L2);
-        float a1 = ok1 ? dn_q8_dot(p1, L1, sq + (J1.xq - A.q), ssc + (J1.xs - A.scale)) : 0.f;
-        for (int o = J1.lpr / 2; o > 0; o >>= 1) a1 += __shfl_xor_sync(0xffffffffu, a1, o);
-        if (ok1 && p1 == 0) J1.y[r1] = a1;
-        if (two) {
-          float a2 = ok2 ? dn_q8_dot(p2, L2, sq + (J2.xq - A.q), ssc + (J2.xs - A.scale)) : 0.f;
-          for (int o = J2.lpr / 2; o > 0; o >>= 1) a2 += __shfl_xor_sync(0xffffffffu, a2, o);
-          if (ok2 && p2 == 0) J2.y[r2] = a2;
-        }
-      }
-      return;
-    }
-  }
-  for (; t < nt; t += warps) {
+  for (long long t = static_cast<long long>(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32; t < nt; t += warps) {
     const DJob& J = jobs[find_job(jobs, nj, t, &hint)];
     const int rpw = 32 / J.lpr;
     const int r = static_cast<int>((t - J.task0) * rpw) + lane / J.lpr, part = lane % J.lpr;
@@ -2474,7 +2476,8 @@ __global__ void __launch_bounds__(256, 2) k_dn_half(const __grid_constant__ DnHa
     if (phs) A.ph[1] = gtimer_s();
     // ---- 1
     if (static_cast<int>(blockIdx.x) < (2 * A.nv + 7) / 8) dn_stage1_ba_sm<NJ>(A, sm);
-    dn_stream_sm<ONLY>(A, j1, nj1, nt1, sq, ssc, ssum);
+    if (ONLY == kQ8_0 && A.mlp2) dn_stream_sm_q8x2(A, j1, nj1, nt1, sq, ssc);
+    else dn_stream_sm<ONLY>(A, j1, nj1, nt1, sq, ssc, ssum);
   } else {
   // ---- 0 (block 0); the others prefetch their first stage-1 tasks
   if (blockIdx.x == 0) dn_stage0(A, s_sh);
@@ -2499,7 +2502,8 @@ __global__ void __launch_bounds__(256, 2) k_dn_half(const __grid_constant__ DnHa
   // ---- 3
   if (smact) {
     dn_load_act(A, sq, ssc, ssum);
-    dn_stream_sm<ONLY>(A, j2, nj2, nt2, sq, ssc, ssum);
+    if (ONLY == kQ8_0 && A.mlp2) dn_stream_sm_q8x2(A, j2, nj2, nt2, sq, ssc);
+    else dn_stream_sm<ONLY>(A, j2, nj2, nt2, sq, ssc, ssum);
   } else {
     dn_stream<ONLY, kMT>(j2, nj2, nt2);
   }

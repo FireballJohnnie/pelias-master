@@ -2434,7 +2434,7 @@ int cmd_engine_check(const Args& a) {
                  "                           [--text FILE [--skip-tokens N]] [--timeline] [--dump-top OUT.tsv] [--dump-router OUT.tsv] [--dump-draft OUT.tsv] [--dump-split [--split-sizes 2,3,4] [--split-step]]\n"
                  "                           [--no-doorbell] [--timeline-ops] [--split-ref] [--bank-selftest MIXES] [--probe-pos P]\n"
                  "                           [--router-tie BAND] [--cold-on-gpu] [--trace OUT.tsv] [--reader-v25] [--reader-cache K] [--fold-shared]\n"
-                 "                           [--batch-identical] [--graph] [--prefetch] [--plane-tail N] [--cpu-light] [--reader-rpw 1|2] [--r3-experts] [--rx-load lane|miss|all] [--prompt-batched] [--prompt-halves] [--cpu-prompt] [--no-cache-pools] [--no-fast-f32] [--lean-dense] [--dn-half] [--l2pf] [--no-dn-smem] [--no-dn-mlp2] [--no-rx-pipe] [--no-rx-sact] [--no-fused-moe] [--plane-bits 2|3|4|5] [--auto-vram [--cache-share F]] [--verbose-gpu]\n"
+                 "                           [--batch-identical] [--graph] [--prefetch] [--plane-tail N] [--cpu-light] [--reader-rpw 1|2] [--r3-experts] [--rx-load lane|miss|all] [--prompt-batched] [--prompt-halves] [--cpu-prompt] [--no-cache-pools] [--no-fast-f32] [--lean-dense] [--dn-half] [--l2pf] [--no-dn-smem] [--dn-mlp2] [--no-rx-pipe] [--no-rx-sact] [--no-fused-moe] [--plane-bits 2|3|4|5] [--auto-vram [--cache-share F]] [--verbose-gpu]\n"
                  "                           [--pin-gap-kib K] [--pin-huge-ok] [--cpu-up-rows N] [--cpu-down2] [--cpu-gu2] [--cpu-tile] [--spin-pause] [--cpu-prefetch] [--cpu-check] [--host-wait auto|spin|yield|block] [--pin-cpus 0,2,4,...] [--pin-host N] [--ref-threads N] [--no-cpu-light] [--split-slow] [--preload-light]\n");
     return 1;
   }
@@ -2656,7 +2656,7 @@ int cmd_engine_check(const Args& a) {
   eo.dn_half_mt = a.has("dn-half-mt");  // v57 (temporary, A/B)
   eo.l2_prefetch = a.has("l2pf") && !a.has("no-l2pf");  // v56; v56b: off by default, --l2pf on (temporary, A/B)
   eo.dn_smem = !a.has("no-dn-smem");  // v56b (temporary, A/B)
-  eo.dn_mlp2 = !a.has("no-dn-mlp2");  // v56c (temporary, A/B)
+  eo.dn_mlp2 = a.has("dn-mlp2");  // v56c; v57: opt-in (temporary, A/B)
   eo.rx_pipe = !a.has("no-rx-pipe");  // v57 (temporary, A/B)
   eo.rx_sact = !a.has("no-rx-sact");  // v57 (temporary, A/B)
   eo.fused_moe = !a.has("no-fused-moe");      // v52 (temporary switch)
