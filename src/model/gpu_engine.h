@@ -119,6 +119,10 @@ struct EngineOptions {
   // v46a-2: how the stage loads expert rows: 0 each lane its own 16-byte pieces (v46a-1), 1 a warp copies its task's rows
   // contiguously into shared memory first for experts read from RAM, 2 the same for every expert (outputs equal in all three)
   int rx_load = 0;
+  // v48 (author 20:13: the CPU only at 0 cost): with the expert reader on, step() runs a prompt of more than 4 tokens as
+  // steps of up to 4 on the GPU-only path (reader / R3), so no expert pick of the prompt goes to the CPU; false = the
+  // prompt's batches take the bank + CPU cold path as before (--cpu-prompt)
+  bool gpu_prompt = true;
   // v28: gate / up rows per warp in the reader v3 kernels (1 or 2; 2 = v26's shape)
   int reader_rows_per_warp = 2;
   // v28: pinned ranges are merged across gaps smaller than this (bytes; v27 used 8 MiB; 0 = exact ranges, one per matrix

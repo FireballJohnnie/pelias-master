@@ -427,6 +427,7 @@ struct GpuEngine::Impl {
   std::unique_ptr<std::atomic<int>[]> grp_left;
   // verify / keep (stage 3)
   bool ckpt_mode = false;
+  bool no_head = false;      // v48: a prompt step whose logits nobody reads (an inner step of a split prompt): skip the head
   int last_n = 0;            // tokens of the last verify batch (0: none pending)
   std::int64_t verify_pos0 = 0;
   // the MTP block (stage 3)
@@ -2115,6 +2116,7 @@ std::string GpuEngine::summary() const {
                 I.bell ? "doorbell" : "device sync per layer", static_cast<double>(I.o.router_tie), I.reader_note.c_str(), I.o.batch_identical ? "on" : "off",
                 I.graph_note.c_str(), I.pf_ok ? "on" : "off", I.split_note.c_str());
   std::string r = b;
+  if (I.reader) r += I.o.gpu_prompt ? "; prompt on the GPU in steps of 1-4 tokens" : "; prompt batches on the bank + CPU cold path";  // v48
   if (I.o.r3_experts) r += "; R3 expert stage " + I.rx_note + (I.o.rx_load == 2 ? ", rows staged for every expert" : I.o.rx_load == 1 ? ", rows staged for experts read from RAM" : ", lane loads");  // v46a-1 / v46a-2
   if (!I.o.pin_pool.empty() || I.o.pin_host >= 0) {  // v43
     char c[256];
@@ -2466,7 +2468,30 @@ Status GpuEngine::step(const std::int32_t* tokens, int n, float* logits, bool la
   Impl& I = *p_;
   I.ckpt_mode = false;
   I.last_n = 0;
-  return I.run(tokens, n, logits, last_only, stats, hidden_out);
+  if (!(I.reader && I.o.gpu_prompt && n > Impl::kReaderMax)) return I.run(tokens, n, logits, last_only, stats, hidden_out);
+  // v48: the prompt as steps of up to kReaderMax tokens on the GPU-only path; each step's rows land where the one batch
+  // would have put them (logits row c0 + r, hidden row c0 + r); with last_only only the final step runs the head
+  if (n > I.o.max_batch || !tokens || !logits) return Status::fail(Code::invalid_argument, "engine: 1 .. max_batch tokens and an output");
+  const std::int64_t nvoc = I.s.n_vocab, e = I.s.n_embd;
+  EngineStats sum;
+  for (int c0 = 0; c0 < n; c0 += Impl::kReaderMax) {
+    const int m = std::min(Impl::kReaderMax, n - c0);
+    const bool last = c0 + m == n;
+    EngineStats es;
+    I.no_head = last_only && !last;
+    const Status st = I.run(tokens + c0, m, last_only ? logits : logits + static_cast<std::int64_t>(c0) * nvoc, last_only, &es,
+                            hidden_out ? hidden_out + static_cast<std::int64_t>(c0) * e : nullptr);
+    I.no_head = false;
+    if (!st) return st;
+    sum.seconds += es.seconds;
+    sum.cold_seconds += es.cold_seconds;
+    sum.wait_seconds += es.wait_seconds;
+    sum.hot_picks += es.hot_picks;
+    sum.cold_picks += es.cold_picks;
+    sum.cold_bytes += es.cold_bytes;
+  }
+  if (stats) *stats = sum;
+  return {};
 }
 
 Status GpuEngine::verify(const std::int32_t* tokens, int n, float* logits, float* hidden_out, EngineStats* stats) {
@@ -2666,7 +2691,7 @@ Status GpuEngine::Impl::run(const std::int32_t* tokens, int n, float* logits, bo
   const bool ops_this = I.cur_ops != nullptr;
   I.cur_ops = nullptr;
   const int64_t nvoc = s.n_vocab;
-  const int r_begin = last_only ? n - 1 : 0;
+  const int r_begin = I.no_head ? n : last_only ? n - 1 : 0;  // v48: no_head runs no row through the head
   for (int r0 = hidden_out ? 0 : r_begin; r0 < n; r0 += Impl::kOutRows) {
     const int m = std::min(Impl::kOutRows, n - r0);
     if (!g::rms_norm(I.x + static_cast<int64_t>(r0) * e, I.out_norm, I.xn, e, 1, e, e, m, s.rms_eps)) return gfail("engine: output norm");
