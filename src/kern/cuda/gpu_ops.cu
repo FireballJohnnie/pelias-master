@@ -190,7 +190,10 @@ __global__ void k_gather(std::uint32_t type, const std::uint8_t* __restrict__ w,
 
 // ------------------------------------------------------------------------------------------------ activations
 
-// one thread per 32-value block: the same loops as quant::hadamard32 and model::act_round_q8_256x8
+// one thread per 32-value block: the same loops as quant::hadamard32 and model::act_round_q8_256x8. v50 kHalves: also the
+// leftover x - sc q rounded at sc / 256 (clamped to +-127) as rows rows .. 2 rows - 1 of q / scale / sum: hi + lo / 256 is an
+// int16-level input (the R3 kernels run hi and lo as two rows on one load of the weights; their outputs add)
+template <bool kHalves>
 __global__ void k_act_q8x32(const float* __restrict__ x, std::int64_t n, std::int64_t rows, std::int64_t ldx, int rot, float norm,
                             float* xr, std::int64_t ldr, std::int8_t* __restrict__ q, float* __restrict__ scale, int* __restrict__ sum) {
   const std::int64_t nb = n / 32;
@@ -219,9 +222,21 @@ __global__ void k_act_q8x32(const float* __restrict__ x, std::int64_t n, std::in
     xr[t * ldr + 32 * b + j] = mul(sc, qv);
     if (q) q[t * n + 32 * b + j] = static_cast<std::int8_t>(qv);
     s += static_cast<int>(qv);
+    if constexpr (kHalves) v[j] = sub(v[j], mul(sc, qv));  // the leftover, rounded below at sc / 256
   }
   if (scale) scale[t * nb + b] = sc;
   if (sum) sum[t * nb + b] = s;
+  if constexpr (kHalves) {
+    const float sl = quo(sc, 256.0f), il = quo(1.0f, sl);
+    int s2 = 0;
+    for (int j = 0; j < 32; ++j) {
+      const float qv = fminf(127.0f, fmaxf(-127.0f, rintf(mul(v[j], il))));
+      q[(t + rows) * n + 32 * b + j] = static_cast<std::int8_t>(qv);
+      s2 += static_cast<int>(qv);
+    }
+    scale[(t + rows) * nb + b] = sl;
+    sum[(t + rows) * nb + b] = s2;
+  }
 }
 
 // ------------------------------------------------------------------------------------------------ elementwise
@@ -1820,8 +1835,17 @@ bool act_q8x32(const float* x, std::int64_t n, std::int64_t rows, std::int64_t l
   if (n <= 0 || n % 32 != 0 || ldx < n || ldr < n || !x || !xr) return fail("act_q8x32: the row length must be whole 32-blocks");
   if (rows <= 0) return true;
   const float norm = 1.0f / std::sqrt(32.0f);  // as quant::hadamard32 computes it
-  k_act_q8x32<<<blocks_for(rows * (n / 32), 128), 128, 0, st(s)>>>(x, n, rows, ldx, rot32 ? 1 : 0, norm, xr, ldr, q, scale, sum);
+  k_act_q8x32<false><<<blocks_for(rows * (n / 32), 128), 128, 0, st(s)>>>(x, n, rows, ldx, rot32 ? 1 : 0, norm, xr, ldr, q, scale, sum);
   return launched("act_q8x32");
+}
+
+bool act_q8x32_halves(const float* x, std::int64_t n, std::int64_t rows, std::int64_t ldx, bool rot32, float* xr, std::int64_t ldr, std::int8_t* q,
+                      float* scale, int* sum, Stream s) {
+  if (n <= 0 || n % 32 != 0 || ldx < n || ldr < n || !x || !xr || !q || !scale || !sum) return fail("act_q8x32_halves: bad shape or a null output");
+  if (rows <= 0) return true;
+  const float norm = 1.0f / std::sqrt(32.0f);
+  k_act_q8x32<true><<<blocks_for(rows * (n / 32), 128), 128, 0, st(s)>>>(x, n, rows, ldx, rot32 ? 1 : 0, norm, xr, ldr, q, scale, sum);
+  return launched("act_q8x32_halves");
 }
 
 bool rms_norm_q8x32(const float* x, const float* w, std::int64_t n, std::int64_t ldx, std::int64_t rows, float eps, bool rot32, float* y,

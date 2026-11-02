@@ -2434,7 +2434,7 @@ int cmd_engine_check(const Args& a) {
                  "                           [--text FILE [--skip-tokens N]] [--timeline] [--dump-top OUT.tsv] [--dump-router OUT.tsv] [--dump-draft OUT.tsv] [--dump-split [--split-sizes 2,3,4] [--split-step]]\n"
                  "                           [--no-doorbell] [--timeline-ops] [--split-ref] [--bank-selftest MIXES] [--probe-pos P]\n"
                  "                           [--router-tie BAND] [--cold-on-gpu] [--trace OUT.tsv] [--reader-v25] [--reader-cache K] [--fold-shared]\n"
-                 "                           [--batch-identical] [--graph] [--prefetch] [--plane-tail N] [--cpu-light] [--reader-rpw 1|2] [--r3-experts] [--rx-load lane|miss|all] [--gpu-prompt [--prompt-batched]] [--cpu-prompt]\n"
+                 "                           [--batch-identical] [--graph] [--prefetch] [--plane-tail N] [--cpu-light] [--reader-rpw 1|2] [--r3-experts] [--rx-load lane|miss|all] [--prompt-batched] [--no-prompt-halves] [--cpu-prompt]\n"
                  "                           [--pin-gap-kib K] [--pin-huge-ok] [--cpu-up-rows N] [--cpu-down2] [--cpu-gu2] [--cpu-tile] [--spin-pause] [--cpu-prefetch] [--cpu-check] [--host-wait auto|spin|yield|block] [--pin-cpus 0,2,4,...] [--pin-host N] [--ref-threads N] [--no-cpu-light] [--split-slow] [--preload-light]\n");
     return 1;
   }
@@ -2521,7 +2521,8 @@ int cmd_engine_check(const Args& a) {
   eo.fold_shared = a.has("fold-shared");
   eo.r3_experts = a.has("r3-experts");  // v46a-1
   eo.gpu_prompt = !a.has("cpu-prompt");  // v49e: the GPU prompt by default (fix forward); --cpu-prompt / --prompt-batched are temporary diagnosis switches
-  eo.prompt_r3 = !a.has("prompt-batched");                       // v49d: the GPU prompt's steps on the batched kernels
+  eo.prompt_r3 = !a.has("prompt-batched");
+  eo.prompt_halves = !a.has("no-prompt-halves");  // v50 (temporary switch)                       // v49d: the GPU prompt's steps on the batched kernels
   if (a.has("rx-load")) {  // v46a-2
     const std::string rxl = a.get("rx-load");
     if (rxl == "lane") eo.rx_load = 0;

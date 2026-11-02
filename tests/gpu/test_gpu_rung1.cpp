@@ -274,6 +274,58 @@ TEST(rung1_act_q8x32_equals_the_reference_rounding) {
   }
 }
 
+// v50: act_q8x32_halves: rows 0 .. rows - 1 bit for bit act_q8x32's (int8, scales, sums, rounded floats); rows rows .. 2 rows - 1
+// the leftover at scale / 256 with consistent sums; hi + lo / 256 within half a fine step of the (rotated) input except where
+// the leftover hit the +-127 clamp; error vs the input about 1/256 of int8's
+TEST(rung1_act_q8x32_halves) {
+  if (!gpu_or_skip()) return;
+  const std::int64_t n = 2048, rows = 3;
+  std::vector<float> x = wave(n * rows, 77u, 4.0f);
+  for (const bool rot : {false, true}) {
+    const std::size_t nb = static_cast<std::size_t>(rows * n / 32);
+    Dev<float> dx(x), dr1(x.size()), dr2(x.size()), ds1(nb), ds2(2 * nb);
+    Dev<std::int8_t> dq1(x.size()), dq2(2 * x.size());
+    Dev<int> dm1(nb), dm2(2 * nb);
+    CHECK(g::act_q8x32(dx.p, n, rows, n, rot, dr1.p, n, dq1.p, ds1.p, dm1.p));
+    CHECK(g::act_q8x32_halves(dx.p, n, rows, n, rot, dr2.p, n, dq2.p, ds2.p, dm2.p));
+    CHECK(g::sync());
+    const std::vector<std::int8_t> q1 = dq1.get(), q2 = dq2.get();
+    const std::vector<float> s1 = ds1.get(), s2 = ds2.get(), r1 = dr1.get(), r2 = dr2.get();
+    const std::vector<int> m1 = dm1.get(), m2 = dm2.get();
+    bool hi_eq = bits_equal(r1, r2);
+    for (std::size_t i = 0; i < q1.size(); ++i) hi_eq = hi_eq && q1[i] == q2[i];
+    for (std::size_t b = 0; b < nb; ++b) hi_eq = hi_eq && s1[b] == s2[b] && m1[b] == m2[b];
+    CHECK(hi_eq);
+    std::vector<float> ref = x;
+    if (rot)
+      for (std::int64_t t = 0; t < rows; ++t) q::hadamard32(ref.data() + t * n, n);
+    bool sums = true, within = true;
+    double e8 = 0.0, e16 = 0.0, den = 0.0;
+    int clamped = 0;
+    for (std::size_t b = 0; b < nb; ++b) {
+      int sl = 0;
+      for (int i = 0; i < 32; ++i) {
+        const std::size_t k = 32 * b + static_cast<std::size_t>(i);
+        const int lo = q2[q1.size() + k];
+        sl += lo;
+        const double hv = static_cast<double>(s2[b]) * q2[k], fine = static_cast<double>(s2[nb + b]);
+        const double v = hv + fine * lo, xv = ref[k];
+        if (lo == 127 || lo == -127) ++clamped;
+        else within = within && std::fabs(v - xv) <= 0.5 * fine * (1.0 + 1e-3) + 4e-7 * std::fabs(xv) + 1e-30;  // + float rounding of the leftover
+        e8 += (hv - xv) * (hv - xv);
+        e16 += (v - xv) * (v - xv);
+        den += xv * xv;
+      }
+      sums = sums && sl == m2[nb + b];
+    }
+    CHECK(sums);
+    CHECK(within);
+    CHECK(e16 * 1000.0 < e8);
+    std::printf("    %s: hi rows bit for bit act_q8x32's; lo sums consistent; hi + lo / 256 rel error %.3e vs int8 %.3e (%d values at the lo clamp)\n",
+                rot ? "rotated" : "plain", std::sqrt(e16 / den), std::sqrt(e8 / den), clamped);
+  }
+}
+
 // the fused norm + rounding (rms_norm_q8x32) equals rms_norm then act_q8x32 bit for bit: normalized floats, rounded
 // floats, int8 values, scales, sums; with and without the weight, plain and rotated, rows of 512 / 2048 / 4096 (a row
 // longer than 256 blocks of 32 is not needed by the model; 4096 = 128 blocks). Both paths timed (information only).

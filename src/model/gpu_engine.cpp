@@ -681,6 +681,7 @@ struct GpuEngine::Impl {
     std::vector<int64_t> off;  // each job's output offset in r3y
   };
   std::map<std::pair<const DevW*, int>, R3Group> r3plans;  // v26: per group and token count
+  bool halves_now = false;  // v50: this step's R3 products take int16-level inputs as two int8 halves (the GPU prompt's steps)
   bool bi_now = false;  // v26 option B: this step's products of 2-4 tokens go through R3 (set by run())
   // v26 CUDA graph
   g::Stream stm = nullptr;
@@ -707,7 +708,38 @@ struct GpuEngine::Impl {
   Status prod_r3(std::initializer_list<std::pair<const DevW*, float*>> jobs, const float* xin, int64_t n = 1) {
     const DevW& W0 = *jobs.begin()->first;
     if (n < 1 || n > kReaderMax) return Status::fail(Code::internal, "engine: R3 takes 1-4 tokens");
-    R3Group& G = r3plans[{&W0, static_cast<int>(n)}];
+    if (halves_now) {  // v50: per 2 tokens, the hi rows then the lo rows (4 rows, one load of the weights), outputs added
+      for (int64_t c0 = 0; c0 < n; c0 += 2) {
+        const int64_t m = std::min<int64_t>(2, n - c0);
+        R3Group* G = nullptr;
+        if (Status st = r3_group(jobs, 2 * m, 0x100, &G); !st) return st;
+        if (!g::act_q8x32_halves(xin + c0 * W0.k, W0.k, m, W0.k, W0.v->rot32, xr, W0.k, q, scale, sum)) return gfail("engine: halves rounding for R3");
+        if (!(o.graph ? G->plan->run_reset() : G->plan->run())) return Status::fail(Code::internal, std::string("engine: R3 run: ") + g::stream_last_error());
+        std::size_t i = 0;
+        for (const auto& [W, yo] : jobs) {
+          const float* yr = r3y + G->off[i++];
+          float* yd = yo + c0 * W->n_out;
+          if (!g::dcopy(yd, yr, z(m * W->n_out) * sizeof(float)) || !g::add_rows(yd, W->n_out, yr + m * W->n_out, W->n_out, nullptr, W->n_out, m))
+            return gfail("engine: R3 halves output");
+        }
+      }
+      return Status::good();
+    }
+    R3Group* Gp = nullptr;
+    if (Status st = r3_group(jobs, n, 0, &Gp); !st) return st;
+    R3Group& G = *Gp;
+    if (!g::act_q8x32(xin, W0.k, n, W0.k, W0.v->rot32, xr, W0.k, q, scale, sum)) return gfail("engine: rounding for R3");
+    if (!(o.graph ? G.plan->run_reset() : G.plan->run())) return Status::fail(Code::internal, std::string("engine: R3 run: ") + g::stream_last_error());
+    std::size_t i = 0;
+    for (const auto& [W, yo] : jobs)
+      if (!g::dcopy(yo, r3y + G.off[i++], z(n * W->n_out) * sizeof(float))) return gfail("engine: R3 output");
+    return Status::good();
+  }
+  // v26 / v50: the R3 plan of a group for `rows` input rows (tag separates the halves' plans from plain ones of the same size)
+  Status r3_group(std::initializer_list<std::pair<const DevW*, float*>> jobs, int64_t n, int tag, R3Group** gout) {
+    const DevW& W0 = *jobs.begin()->first;
+    R3Group& G = r3plans[{&W0, static_cast<int>(n) | tag}];
+    *gout = &G;
     if (!G.plan) {
       std::vector<g::StreamJob> js;
       int64_t at = 0;
@@ -734,11 +766,6 @@ struct GpuEngine::Impl {
       if (!G.plan->build(js.data(), static_cast<int>(js.size()), stage_end, 1, 0))
         return Status::fail(Code::internal, std::string("engine: R3 plan: ") + g::stream_last_error());
     }
-    if (!g::act_q8x32(xin, W0.k, n, W0.k, W0.v->rot32, xr, W0.k, q, scale, sum)) return gfail("engine: rounding for R3");
-    if (!(o.graph ? G.plan->run_reset() : G.plan->run())) return Status::fail(Code::internal, std::string("engine: R3 run: ") + g::stream_last_error());
-    std::size_t i = 0;
-    for (const auto& [W, yo] : jobs)
-      if (!g::dcopy(yo, r3y + G.off[i++], z(n * W->n_out) * sizeof(float))) return gfail("engine: R3 output");
     return Status::good();
   }
 
@@ -2562,10 +2589,12 @@ Status GpuEngine::Impl::run(const std::int32_t* tokens, int n, float* logits, bo
   const bool bl = I.bell && !rd;
   const bool cl = rd && I.split_ok;  // v28: a reader step whose light picks the CPU computes
   I.bi_now = rd && (I.o.batch_identical || (I.in_prompt && I.o.prompt_r3));  // v26 option B; v48b: the GPU prompt's steps too (MEASURED v48: 99.0 vs 49.9 tok/s)
+  I.halves_now = I.bi_now && I.in_prompt && I.o.prompt_halves;  // v50
   struct BiReset {
     bool& f;
     ~BiReset() { f = false; }
   } bi_reset{I.bi_now};
+  BiReset halves_reset{I.halves_now};  // v50: only this step's products
   if (bl || cl) {  // the CPU side starts waiting for this step's rings
     if (cl) {  // v28: the generation the reader steps' rings carry (device-resident, so a graph replay rings this step's)
       *I.gen_hp = g0;

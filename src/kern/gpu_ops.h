@@ -56,6 +56,10 @@ bool gather_rows(std::uint32_t type, const void* w, std::uint64_t row_bytes, std
 // value for value model::act_round_q8_256x8. rot32: Walsh-Hadamard per 32 first (a weight stored rotated), norm =
 // 1 / sqrt(32) as quant::hadamard32 computes it on the host. Writes the rounded floats to xr (may equal x) and, when q is
 // not null, the int8 values, the scale and the integer sum per 32 (the R3 kernel's inputs).
+// v50: as act_q8x32, plus the leftover of each row rounded at scale / 256 written as rows rows .. 2 rows - 1 of q / scale /
+// sum (q, scale, sum hold 2 rows); hi + lo / 256 is an int16-level input
+bool act_q8x32_halves(const float* x, std::int64_t n, std::int64_t rows, std::int64_t ldx, bool rot32, float* xr, std::int64_t ldr, std::int8_t* q,
+                      float* scale, int* sum, Stream s = nullptr);
 bool act_q8x32(const float* x, std::int64_t n, std::int64_t rows, std::int64_t ldx, bool rot32, float* xr, std::int64_t ldr,
                std::int8_t* q, float* scale, int* sum, Stream s = nullptr);
 

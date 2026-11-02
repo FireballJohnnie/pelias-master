@@ -129,6 +129,9 @@ struct EngineOptions {
   bool gpu_prompt = true;  // v49e (author 21:09-21:13): the GPU prompt stays the default and is fixed forward; --cpu-prompt (temporary, for the diagnosis)
   // v49d: the GPU prompt's steps on R3 (true, v48b) or on the batched kernels (false, v48's plain path; --prompt-batched)
   bool prompt_r3 = true;
+  // v50: the GPU prompt's R3 products take int16-level inputs as two int8 halves (hi + lo / 256, one load of the weights);
+  // decode steps unchanged. MEASURED v49e: the int8 prompt's state cost W2's decode rows +65 % KL (--no-prompt-halves, temporary)
+  bool prompt_halves = true;
   // v28: gate / up rows per warp in the reader v3 kernels (1 or 2; 2 = v26's shape)
   int reader_rows_per_warp = 2;
   // v28: pinned ranges are merged across gaps smaller than this (bytes; v27 used 8 MiB; 0 = exact ranges, one per matrix
