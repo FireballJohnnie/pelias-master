@@ -74,6 +74,12 @@ Status gfail(const std::string& what) { return Status::fail(Code::internal, what
 // atomic counter and the calling thread works too. Between jobs a worker spins briefly (kSpin checks, about tens of
 // microseconds: the cold path runs several jobs back to back per layer) and then sleeps on a condition variable, so the
 // CPU is not held busy while the GPU runs a layer (the author's heat concern, 2026-10-31).
+// v57 (Windows build check wincheck57b): MSVC warns (C4324, an error under warnings-as-errors) that the cache-line-aligned
+// counters below pad the struct, which is their purpose
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
 class Pool {
  public:
   // v43: cpus[i] (when given) binds worker i to that logical CPU before it starts
@@ -260,6 +266,9 @@ class Pool {
   alignas(64) std::atomic<int> pinned_{0};
   std::atomic<bool> stop_{false};
 };
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 
 // a bump allocator over one device block
 struct Arena {
