@@ -51,7 +51,7 @@ struct EngineOptions {
   bool fast_f32 = true;
   // v55e: v55d's lean one-format dense kernels (--lean-dense, temporary; off since v55e2 measured +1.1 ms per token); same bits
   bool lean_dense = false;
-  bool dn_half = false;  // v55g (L3): a DeltaNet layer's dense half in one launch; v56b: off by default (v56 MEASURED +4.6 ms), --dn-half for the A/B
+  bool dn_half = true;  // v55g (L3): a DeltaNet layer's dense half in one launch; v57: on again (v56b MEASURED: L3 3.36 ms per token vs 7.41, -0.25 ms vs g55f3); --no-dn-half
   bool l2_prefetch = false;  // v56: L2 prefetch inside the fused launches; v56b: off by default (v56 MEASURED +0.5 ms, no gain), --l2pf for the A/B
   bool dn_smem = true;  // v56b: inside L3, each block normalizes and rounds the inputs itself into shared memory (no stage-0 barrier; tasks read shared); --no-dn-smem
   bool dn_mlp2 = true;  // v56c: inside L3 (shared inputs), Q8_0 tasks two at a time per warp; --no-dn-mlp2
