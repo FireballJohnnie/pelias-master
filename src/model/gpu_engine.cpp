@@ -283,6 +283,7 @@ struct DevW {
   std::uint64_t drb = 0;     // its row bytes
   bool r3 = false;           // sw holds this weight for R3 (one-token steps)
   g::StreamWeights sw;
+  bool lean = false;         // v55: only R3's copy is held (no raw copy, no int8 tables); every product of it must run on R3
 };
 
 struct Layer {
@@ -497,6 +498,7 @@ struct GpuEngine::Impl {
   }
   static bool int8_ok(std::uint32_t type, int64_t n_out, int64_t k) { return g::prompt_type_ok(type, k) && n_out % 128 == 0; }
   bool use_r3 = false;  // EngineOptions::r3
+  const WeightView* lean_w = nullptr;  // v55: a weight held only in R3's copy (the output head when every head product runs on R3)
   // R3 holds the matrix and the batched kernels read that same copy
   static bool r3_shared(std::uint32_t t) {
     return t == static_cast<std::uint32_t>(quant::Type::q8_0) || t == static_cast<std::uint32_t>(quant::Type::q4_k) ||
@@ -508,6 +510,7 @@ struct GpuEngine::Impl {
   std::size_t dense_bytes(const WeightView& v) const {
     if (!v.present()) return 0;
     const int64_t n_out = static_cast<int64_t>(v.ne[1]), k = static_cast<int64_t>(v.ne[0]);
+    if (&v == lean_w && r3_takes(v)) return 256;  // v55: R3's copy only (counted by put_dense from stream_upload)
     std::size_t b = r3_takes(v) && r3_shared(v.type) ? 256 : al(view_bytes(v)) + 256;
     if (int8_ok(v.type, n_out, k)) b += al(g::prompt_table_bytes(v.type, n_out, k)) + 256;
     return b;
@@ -536,6 +539,10 @@ struct GpuEngine::Impl {
       dw.r3 = true;
       dev_bytes += dw.sw.bytes;
       dense_bytes_total += dw.sw.bytes;
+      if (&v == lean_w) {  // v55: no raw copy and no int8 tables; prod() refuses any product of it that is not on R3
+        dw.lean = true;
+        return Status::good();
+      }
       if (r3_shared(v.type)) {  // the batched kernels read R3's copy
         d = dw.sw.w;
         if (v.type == static_cast<std::uint32_t>(quant::Type::q8_0)) {
@@ -736,6 +743,7 @@ struct GpuEngine::Impl {
       return Status::good();
     }
     if (W.r3 && (n == 1 || (bi_now && n <= kReaderMax))) return prod_r3({{&W, yout}}, xin, n);
+    if (W.lean) return Status::fail(Code::internal, "engine: " + v.name + " is held only in R3's copy (v55) and this product of " + std::to_string(n) + " rows is not on R3");
     if (!g::act_q8x32(xin, W.k, n, W.k, v.rot32, xr, W.k, q, scale, sum)) return gfail("engine: rounding for " + v.name);
     if (W.int8) {
       if (!g::act_digits(scale, sum, n, W.k, dig) || !g::prompt_gemm(W.pw, W.n_out, q, scale, dig, n, yout)) return gfail("engine: int8 product " + v.name);
@@ -749,7 +757,14 @@ struct GpuEngine::Impl {
   struct R3Group {
     std::unique_ptr<g::StreamPlan> plan;
     std::vector<int64_t> off;  // each job's output offset in r3y
+    std::vector<float*> yo;    // v55: direct plans: the outputs the plan writes (a call with other outputs takes the scratch plan)
   };
+  // v55 (L1): a product's outputs go straight to where they belong when the call's outputs are the plan's (no scratch + copy),
+  // and a one-stage group with no waits runs as a plain launch (no counter reset, no cooperative launch); same tasks, same sums
+  std::uint64_t r3_direct_runs = 0, r3_copy_runs = 0;
+  std::string r3_direct_note() const {
+    return use_r3 ? "; R3 products: outputs written in place, one-stage groups as plain launches (v55)" : "";
+  }
   std::map<std::pair<const DevW*, int>, R3Group> r3plans;  // v26: per group and token count
   bool halves_now = false;  // v50: this step's R3 products take int16-level inputs as two int8 halves (the GPU prompt's steps)
   bool bi_now = false;  // v26 option B: this step's products of 2-4 tokens go through R3 (set by run())
@@ -795,14 +810,31 @@ struct GpuEngine::Impl {
       }
       return Status::good();
     }
+    // v55: the direct plan (built with this call's outputs) when the outputs match; otherwise the scratch plan and copies
+    R3Group* Dp = nullptr;
+    if (Status st = r3_group(jobs, n, 0x200, &Dp); !st) return st;
+    bool same = Dp->yo.size() == jobs.size();
+    {
+      std::size_t i = 0;
+      for (const auto& [W, yo] : jobs) {
+        (void)W;
+        same = same && Dp->yo[i++] == yo;
+      }
+    }
+    if (!g::act_q8x32(xin, W0.k, n, W0.k, W0.v->rot32, xr, W0.k, q, scale, sum)) return gfail("engine: rounding for R3");
+    if (same) {
+      if (!Dp->plan->run_unstaged()) return Status::fail(Code::internal, std::string("engine: R3 run: ") + g::stream_last_error());
+      ++r3_direct_runs;
+      return Status::good();
+    }
     R3Group* Gp = nullptr;
     if (Status st = r3_group(jobs, n, 0, &Gp); !st) return st;
     R3Group& G = *Gp;
-    if (!g::act_q8x32(xin, W0.k, n, W0.k, W0.v->rot32, xr, W0.k, q, scale, sum)) return gfail("engine: rounding for R3");
-    if (!(o.graph ? G.plan->run_reset() : G.plan->run())) return Status::fail(Code::internal, std::string("engine: R3 run: ") + g::stream_last_error());
+    if (!G.plan->run_unstaged()) return Status::fail(Code::internal, std::string("engine: R3 run: ") + g::stream_last_error());
     std::size_t i = 0;
     for (const auto& [W, yo] : jobs)
       if (!g::dcopy(yo, r3y + G.off[i++], z(n * W->n_out) * sizeof(float))) return gfail("engine: R3 output");
+    ++r3_copy_runs;
     return Status::good();
   }
   // v26 / v50: the R3 plan of a group for `rows` input rows (tag separates the halves' plans from plain ones of the same size)
@@ -814,15 +846,19 @@ struct GpuEngine::Impl {
       std::vector<g::StreamJob> js;
       int64_t at = 0;
       for (const auto& [W, yo] : jobs) {
-        (void)yo;
         if (!W->r3 || W->k != W0.k || W->v->rot32 != W0.v->rot32) return Status::fail(Code::internal, "engine: an R3 group with unlike inputs");
         g::StreamJob j;
         j.w = &W->sw;
         j.xq = q;
         j.xs = scale;
         j.xsum = sum;
-        if (static_cast<std::size_t>(at + n * W->n_out) > r3y_floats) return Status::fail(Code::internal, "engine: R3 scratch too small");
-        j.y = r3y + at;
+        if (tag & 0x200) {  // v55: a direct plan writes the call's outputs
+          j.y = yo;
+          G.yo.push_back(yo);
+        } else {
+          if (static_cast<std::size_t>(at + n * W->n_out) > r3y_floats) return Status::fail(Code::internal, "engine: R3 scratch too small");
+          j.y = r3y + at;
+        }
         j.ntok = static_cast<int>(n);  // v26: rows of n tokens back to back (stride n_out)
         j.xq_stride = W0.k;
         j.xs_stride = W0.k / 32;
@@ -2481,6 +2517,8 @@ std::string GpuEngine::summary() const {
   if (I.o.r3_experts) r += "; R3 expert stage " + I.rx_note + (I.o.rx_load == 2 ? ", rows staged for every expert" : I.o.rx_load == 1 ? ", rows staged for experts read from RAM" : ", lane loads");  // v46a-1 / v46a-2
   r += I.planes_note;  // v54
   r += I.probe_note;   // v54b
+  if (I.out.lean) r += "; output head held once (R3's copy; no raw copy or int8 tables)";  // v55
+  r += I.r3_direct_note();  // v55
   if (I.o.fused_moe && I.rx_ok && I.fold_ok) r += "; MoE half fused (one launch per layer where no side output needs the separate kernels)";  // v52
   if (!I.o.pin_pool.empty() || I.o.pin_host >= 0) {  // v43
     char c[256];
@@ -2518,6 +2556,10 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
   I.kv_w = hd * nkv;
   I.has_mtp = o.mtp;
   I.use_r3 = o.r3;
+  // v55 (author 02:36-02:41, build audit A): with planes on, every product of the output head runs on R3 (one-token steps,
+  // the GPU prompt's steps of 1-4 tokens on R3, no MTP block, no verify batches off R3), so the head's raw copy and its int8
+  // tables (~0.48 GB for this model's Q6_K head) are not loaded; the VRAM probe gives that room to the experts
+  if (o.r3 && o.plane_bits > 0 && !o.mtp && (o.max_verify <= 1 || o.batch_identical) && o.gpu_prompt && o.prompt_r3) I.lean_w = &w.output;
   if (o.mtp && !w.mtp.present) return R::fail(Status::fail(Code::unsupported, "engine: this file has no MTP block"));
   if (o.max_verify > 1 && !(ds >= 32 && ds <= 1024 && (ds & (ds - 1)) == 0))
     return R::fail(Status::fail(Code::unsupported, "engine: verify batches need the DeltaNet d_state a power of two (the checkpointing recurrence)"));
