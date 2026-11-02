@@ -14,6 +14,7 @@
 
 #include "kern/gpu_decode.h"
 #include "kern/gpu_ops.h"
+#include "kern/tg2_planes.h"
 
 namespace pelias::kern::gpu::md {
 
@@ -318,19 +319,34 @@ __device__ __forceinline__ void rd3_group_one(const ExpertPtr* __restrict__ tab,
       grp[1 + 6 * u] = e;
       grp[2 + 6 * u] = 0;
       ExpertPtr src = tab[e], fill;
+      // v54: the code bits the group's plane matrices are read with: the base (plane_bits) only if every pick of the group
+      // is among its token's plane_picks lowest-ranked; else all 4
+      // (each pick then uses its own bits: v54 per-pick, so a pick computes the same in a verify batch as alone)
+      int want = 4;
+      if (c.plane_bits < 4 && c.plane_picks > 0 && (src.type[0] == g_q4_tg2p || src.type[1] == g_q4_tg2p || src.type[2] == g_q4_tg2p)) {
+        bool low = true;
+        for (int pj = pi; pj < picks; ++pj)
+          if (sel[pj] == e && pj % nu < nu - c.plane_picks) low = false;
+        if (low) want = c.plane_bits;
+      }
+      // the read bits, and the rule (base bits, base picks) the planner gives each pick by its rank
+      src.pbits = static_cast<std::uint32_t>(want) | (static_cast<std::uint32_t>(c.plane_bits & 0xff) << 8) | (static_cast<std::uint32_t>(c.plane_picks & 0xff) << 16);
       if (c.K > 0 && !src.vram) {
-        int hit = -1, victim = -1, k0 = 0, k1 = 0;
+        int hit = -1, stale = -1, victim = -1, k0 = 0, k1 = 0;
         std::uint64_t pslot = 0, poff = 0;
         rc_pool(c, e, &k0, &k1, &pslot, &poff);
         unsigned best = 0xffffffffu;
         for (int k = k0; k < k1; ++k) {
-          if (c.tag[k] == e) hit = k;
+          if (c.tag[k] == e) {
+            if (!c.sbits || c.sbits[k] >= want) hit = k;
+            else stale = k;  // v54: holds fewer bits than wanted: refilled in place
+          }
           if (c.use[k] != stamp && c.use[k] < best) {
             best = c.use[k];
             victim = k;
           }
         }
-        const int slot = hit >= 0 ? hit : victim;
+        const int slot = hit >= 0 ? hit : stale >= 0 ? stale : victim;
         if (slot >= 0) {
           std::uint8_t* sb = c.base + poff + static_cast<std::uint64_t>(slot - k0) * pslot;
           ExpertPtr at = src;
@@ -344,6 +360,8 @@ __device__ __forceinline__ void rd3_group_one(const ExpertPtr* __restrict__ tab,
           } else {
             c.tag[slot] = e;
             fill = at;
+            fill.pbits = slot == stale && c.sbits ? c.sbits[slot] : 0u;  // v54: a promotion keeps what the slot holds
+            if (c.sbits) c.sbits[slot] = static_cast<unsigned char>(want);
           }
         }
       }

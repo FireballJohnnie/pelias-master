@@ -20,6 +20,7 @@
 #include "kern/cuda/moe_dev.cuh"
 #include "kern/gpu_decode.h"
 #include "kern/gpu_stream.h"
+#include "kern/tg2_planes.h"
 #include "quant/block_types.h"
 #include "quant/quant_cpu.h"
 
@@ -35,7 +36,7 @@ namespace {
 
 // v46a-1: kQ6KS Q6_K as stored (210-byte blocks, 2-byte aligned: the expert stage reads the file's / bank's bytes); kEpi
 // the expert stage's silu(g) x u rounding (not a matrix: one warp task per expert group)
-enum Fmt : int { kQ7ZT = 0, kQ4TG2 = 1, kQ5K = 2, kQ6K = 3, kQ8_0 = 4, kQ4K = 5, kIQ4XS = 6, kQ6KS = 7, kEpi = 8 };
+enum Fmt : int { kQ7ZT = 0, kQ4TG2 = 1, kQ5K = 2, kQ6K = 3, kQ8_0 = 4, kQ4K = 5, kIQ4XS = 6, kQ6KS = 7, kEpi = 8, kQ4TG2P = 9 };  // v54 kQ4TG2P: Q4_TG2 in bit planes (kern/tg2_planes.h)
 
 struct DJob {
   int fmt, n, K, lpr;      // format, rows, inputs, lanes per row (K / 128)
@@ -58,9 +59,15 @@ struct DJob {
   float* hs;
   int* hsum;
   int stg;                  // v46a-2: 1 = the warp stages its task's rows contiguously in shared memory first (lane_part M = 3)
+  int pb;                   // v54 kQ4TG2P: the code bits read (2-4)
+  int ph;                   // v54 kQ4TG2P staged: the bits the cache slot (w + fd) already holds; only the planes above them
+                            // come from w (RAM), the rest from the slot (a promotion: A -> A+B -> A+B+C in place)
+  int tb[4];                // v54 kQ4TG2P: each token's (pick's) code bits (pb = the most of them: read once, used per token)
 };
 
 __constant__ float c_grid[4][16];  // the Q4_TG2 grids (quant::q4_tg_grid(tag, 2)), uploaded once
+__constant__ float c_grid3[4][16];  // v54: the 3-bit and 2-bit base grids (tg2p_base_grid of c_grid), uploaded once
+__constant__ float c_grid2[4][16];
 
 thread_local std::string s_err;
 bool sfail(const std::string& why) {
@@ -175,6 +182,33 @@ __device__ __forceinline__ int sx8(const int* xw, int i) {  // int8 value i of a
 
 extern __shared__ float s_lut[];  // the replicated grid: 2,048 floats (8 KB), lane L reads s_lut[L + 32 * (tag * 16 + code)]
 constexpr int kLutBytes = 2048 * 4;
+constexpr int kLutRxBytes = 3 * 2048 * 4;  // v54: the expert stage's grids: 4-bit (as kLutBytes), then the 3-bit and the 2-bit base
+// v54: the 8-code words of one lane part (half `half` of block B of the row at W + (rbw - B) x 144) from the plane layout:
+// header, plane A, and planes B / C when J.pb asks for them (missing planes read as zero bits); returns the header
+template <int M>
+__device__ __forceinline__ int4 tg2p_words(const DJob& J, bool cs, const std::uint8_t* W, long long rbw, int B, int half, int nB, std::uint32_t* cw) {
+  const std::uint8_t* R = W + (rbw - B) * 144;
+  const int4 hd = ldwf<M>(J, cs, R + 16 * B, half == 0);
+  const int4 a0 = ldwf<M>(J, cs, R + 16 * nB + 64 * B + 32 * half, true), a1 = ldwf<M>(J, cs, R + 16 * nB + 64 * B + 32 * half + 16, true);
+  int4 b4 = make_int4(0, 0, 0, 0), c4 = make_int4(0, 0, 0, 0);
+  if (J.pb >= 3) b4 = ldwf<M>(J, cs, R + 80 * nB + 32 * B + 16 * half, true);
+  if (J.pb >= 4) c4 = ldwf<M>(J, cs, R + 112 * nB + 32 * B + 16 * half, true);
+  const std::uint32_t aw[8] = {static_cast<std::uint32_t>(a0.x), static_cast<std::uint32_t>(a0.y), static_cast<std::uint32_t>(a0.z),
+                               static_cast<std::uint32_t>(a0.w), static_cast<std::uint32_t>(a1.x), static_cast<std::uint32_t>(a1.y),
+                               static_cast<std::uint32_t>(a1.z), static_cast<std::uint32_t>(a1.w)};
+  const std::uint32_t bw[4] = {static_cast<std::uint32_t>(b4.x), static_cast<std::uint32_t>(b4.y), static_cast<std::uint32_t>(b4.z), static_cast<std::uint32_t>(b4.w)};
+  const std::uint32_t cv[4] = {static_cast<std::uint32_t>(c4.x), static_cast<std::uint32_t>(c4.y), static_cast<std::uint32_t>(c4.z), static_cast<std::uint32_t>(c4.w)};
+#pragma unroll
+  for (int jj = 0; jj < 4; ++jj)
+#pragma unroll
+    for (int g = 0; g < 4; ++g)
+      cw[jj * 4 + g] = tg2p_codes8((aw[2 * jj + (g >> 1)] >> (16 * (g & 1))) & 0xffffu, (bw[jj] >> (8 * g)) & 0xffu, (cv[jj] >> (8 * g)) & 0xffu);
+  return hd;
+}
+// v54: a pick's code bits: the grid its codes are read through (the stored levels, or the 3-bit / 2-bit base) and the mask
+// that clears the bits it does not use (a group reads the most bits any of its picks wants; each pick uses its own)
+__device__ __forceinline__ const float* tg2_lutb(int bits) { return bits == 3 ? s_lut + 2048 : bits == 2 ? s_lut + 4096 : s_lut; }
+__device__ __forceinline__ std::uint32_t tg2_mask(int bits) { return bits >= 4 ? 0xffffffffu : bits == 3 ? 0xeeeeeeeeu : 0xccccccccu; }
 
 __device__ __forceinline__ float i8f(const int* xw, int i) {  // int8 -> float by the magic number (exact for int8)
   const unsigned b = (static_cast<unsigned>(xw[i >> 2]) >> (8 * (i & 3))) & 0xffu;
@@ -196,7 +230,7 @@ __device__ __forceinline__ int iq4_levels(std::uint32_t v) {
 // dense instantiation, M = 0, is the code as measured: no fill, no stored Q6_K branch, __ldg inputs)
 template <int M>
 __device__ float lane_part(const DJob& J, int r, int part, const std::int8_t* xq, const float* xs, const int* xsum, bool cs,
-                           const std::uint8_t* wb = nullptr, long long rb0 = 0) {
+                           const std::uint8_t* wb = nullptr, long long rb0 = 0, int tk = 0) {
   const int B = part >> 1, half = part & 1, nB = J.K / 256;
   const long long rb = static_cast<long long>(r) * nB + B;
   // v46a-2: with M = 3 the rows come from the warp's staged copy (wb holds block rb0 onwards); else from J.w as before
@@ -258,18 +292,28 @@ __device__ float lane_part(const DJob& J, int r, int part, const std::int8_t* xq
       const float s = (d * static_cast<float>((h >> (16 + 6 * j)) & 63u)) / 63.f;
       acc += s * ldxs<M>(xs + jg) * static_cast<float>(P);
     }
-  } else if (J.fmt == kQ4TG2) {
-    const std::uint8_t* bp = W + rbw * 144;
-    const int4 hd = ldwf<M>(J, cs, bp, half == 0);
-    int4 c[4];
+  } else if (J.fmt == kQ4TG2 || J.fmt == kQ4TG2P) {  // v54: stored, or in bit planes (the same codes when all 4 bits are read)
+    int4 hd;
+    std::uint32_t cw[16];
+    if (J.fmt == kQ4TG2P) {
+      hd = tg2p_words<M>(J, cs, W, rbw, B, half, nB, cw);
+    } else {
+      const std::uint8_t* bp = W + rbw * 144;
+      hd = ldwf<M>(J, cs, bp, half == 0);
+      int4 c[4];
 #pragma unroll
-    for (int i = 0; i < 4; ++i) c[i] = ldwf<M>(J, cs, bp + 16 + half * 64 + 16 * i, true);
-    const std::uint32_t cw[16] = {static_cast<std::uint32_t>(c[0].x), static_cast<std::uint32_t>(c[0].y), static_cast<std::uint32_t>(c[0].z),
-                                  static_cast<std::uint32_t>(c[0].w), static_cast<std::uint32_t>(c[1].x), static_cast<std::uint32_t>(c[1].y),
-                                  static_cast<std::uint32_t>(c[1].z), static_cast<std::uint32_t>(c[1].w), static_cast<std::uint32_t>(c[2].x),
-                                  static_cast<std::uint32_t>(c[2].y), static_cast<std::uint32_t>(c[2].z), static_cast<std::uint32_t>(c[2].w),
-                                  static_cast<std::uint32_t>(c[3].x), static_cast<std::uint32_t>(c[3].y), static_cast<std::uint32_t>(c[3].z),
-                                  static_cast<std::uint32_t>(c[3].w)};
+      for (int i = 0; i < 4; ++i) c[i] = ldwf<M>(J, cs, bp + 16 + half * 64 + 16 * i, true);
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        cw[4 * i] = static_cast<std::uint32_t>(c[i].x);
+        cw[4 * i + 1] = static_cast<std::uint32_t>(c[i].y);
+        cw[4 * i + 2] = static_cast<std::uint32_t>(c[i].z);
+        cw[4 * i + 3] = static_cast<std::uint32_t>(c[i].w);
+      }
+    }
+    const int tbits = J.fmt == kQ4TG2P ? J.tb[tk] : 4;  // v54: this pick's bits
+    const std::uint32_t mk = tg2_mask(tbits);
+    const float* lut0 = tg2_lutb(tbits);
     const std::uint32_t h0 = static_cast<std::uint32_t>(hd.x), h1 = static_cast<std::uint32_t>(hd.y);
     const std::uint64_t lv = (static_cast<std::uint64_t>(h0 >> 16)) | (static_cast<std::uint64_t>(h1) << 16);  // 6 level bytes at 2..7
     const float d = __half2float(__ushort_as_half(static_cast<unsigned short>(h0 & 0xffffu)));
@@ -283,8 +327,8 @@ __device__ float lane_part(const DJob& J, int r, int part, const std::int8_t* xq
 #pragma unroll
       for (int g = 0; g < 4; ++g) {
         const unsigned tg = (tb >> (2 * g)) & 3u;
-        const std::uint32_t word = cw[jj * 4 + g];  // 8 codes = values 32 jj + 8 g .. + 7 of the part
-        const float* lr = s_lut + (threadIdx.x & 31) + 32 * 16 * tg;
+        const std::uint32_t word = cw[jj * 4 + g] & mk;  // 8 codes = values 32 jj + 8 g .. + 7 of the part
+        const float* lr = lut0 + (threadIdx.x & 31) + 32 * 16 * tg;
 #pragma unroll
         for (int k = 0; k < 8; ++k) {
           const float wv = lr[32 * ((word >> (4 * k)) & 15u)];
@@ -549,18 +593,33 @@ __device__ __forceinline__ void lane_part_n(const DJob& J, int r, int part, cons
         acc[t] += s * ldxs<M>(xs[t] + jg) * static_cast<float>(P);
       }
     }
-  } else if (J.fmt == kQ4TG2) {
-    const std::uint8_t* bp = W + rbw * 144;
-    const int4 hd = ldwf<M>(J, cs, bp, half == 0);
-    int4 c[4];
+  } else if (J.fmt == kQ4TG2 || J.fmt == kQ4TG2P) {  // v54: stored, or in bit planes (the same codes when all 4 bits are read)
+    int4 hd;
+    std::uint32_t cw[16];
+    if (J.fmt == kQ4TG2P) {
+      hd = tg2p_words<M>(J, cs, W, rbw, B, half, nB, cw);
+    } else {
+      const std::uint8_t* bp = W + rbw * 144;
+      hd = ldwf<M>(J, cs, bp, half == 0);
+      int4 c[4];
 #pragma unroll
-    for (int i = 0; i < 4; ++i) c[i] = ldwf<M>(J, cs, bp + 16 + half * 64 + 16 * i, true);
-    const std::uint32_t cw[16] = {static_cast<std::uint32_t>(c[0].x), static_cast<std::uint32_t>(c[0].y), static_cast<std::uint32_t>(c[0].z),
-                                  static_cast<std::uint32_t>(c[0].w), static_cast<std::uint32_t>(c[1].x), static_cast<std::uint32_t>(c[1].y),
-                                  static_cast<std::uint32_t>(c[1].z), static_cast<std::uint32_t>(c[1].w), static_cast<std::uint32_t>(c[2].x),
-                                  static_cast<std::uint32_t>(c[2].y), static_cast<std::uint32_t>(c[2].z), static_cast<std::uint32_t>(c[2].w),
-                                  static_cast<std::uint32_t>(c[3].x), static_cast<std::uint32_t>(c[3].y), static_cast<std::uint32_t>(c[3].z),
-                                  static_cast<std::uint32_t>(c[3].w)};
+      for (int i = 0; i < 4; ++i) c[i] = ldwf<M>(J, cs, bp + 16 + half * 64 + 16 * i, true);
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        cw[4 * i] = static_cast<std::uint32_t>(c[i].x);
+        cw[4 * i + 1] = static_cast<std::uint32_t>(c[i].y);
+        cw[4 * i + 2] = static_cast<std::uint32_t>(c[i].z);
+        cw[4 * i + 3] = static_cast<std::uint32_t>(c[i].w);
+      }
+    }
+    std::uint32_t mkt[NT];  // v54: each pick's bits
+    const float* lutt[NT];
+#pragma unroll
+    for (int t = 0; t < NT; ++t) {
+      const int tbits = J.fmt == kQ4TG2P ? J.tb[t] : 4;
+      mkt[t] = tg2_mask(tbits);
+      lutt[t] = tg2_lutb(tbits);
+    }
     const std::uint32_t h0 = static_cast<std::uint32_t>(hd.x), h1 = static_cast<std::uint32_t>(hd.y);
     const std::uint64_t lv = (static_cast<std::uint64_t>(h0 >> 16)) | (static_cast<std::uint64_t>(h1) << 16);  // 6 level bytes at 2..7
     const float d = __half2float(__ushort_as_half(static_cast<unsigned short>(h0 & 0xffffu)));
@@ -588,8 +647,8 @@ __device__ __forceinline__ void lane_part_n(const DJob& J, int r, int part, cons
 #pragma unroll
         for (int g = 0; g < 4; ++g) {
           const unsigned tg = (tb >> (2 * g)) & 3u;
-          const std::uint32_t word = cw[jj * 4 + g];  // 8 codes = values 32 jj + 8 g .. + 7 of the part
-          const float* lr = s_lut + (threadIdx.x & 31) + 32 * 16 * tg;
+          const std::uint32_t word = cw[jj * 4 + g] & mkt[t];  // 8 codes = values 32 jj + 8 g .. + 7 of the part
+          const float* lr = lutt[t] + (threadIdx.x & 31) + 32 * 16 * tg;
 #pragma unroll
           for (int k = 0; k < 8; ++k) {
             const float wv = lr[32 * ((word >> (4 * k)) & 15u)];
@@ -935,6 +994,14 @@ __device__ __forceinline__ void lut_setup() {
   for (int i = static_cast<int>(threadIdx.x); i < 2048; i += static_cast<int>(blockDim.x)) s_lut[i] = c_grid[(i >> 9) & 3][(i >> 5) & 15];
   __syncthreads();
 }
+// v54: the expert stage's three grids (kLutRxBytes): stored levels, 3-bit base, 2-bit base, each replicated as lut_setup's
+__device__ __forceinline__ void lut_setup_rx() {
+  for (int i = static_cast<int>(threadIdx.x); i < 6144; i += static_cast<int>(blockDim.x)) {
+    const int k = i & 2047, tg = (k >> 9) & 3, c = (k >> 5) & 15;
+    s_lut[i] = i < 2048 ? c_grid[tg][c] : i < 4096 ? c_grid3[tg][c] : c_grid2[tg][c];
+  }
+  __syncthreads();
+}
 
 __device__ __forceinline__ unsigned long long ld_acquire_u64(const unsigned long long* p) {
   unsigned long long v;
@@ -1009,6 +1076,7 @@ __global__ void __launch_bounds__(256) k_staged(const DJob* __restrict__ jobs, i
 __host__ __device__ inline int rx_fmt(std::uint32_t t) {
   switch (t) {
     case g_q4_tg2: return kQ4TG2;
+    case g_q4_tg2p: return kQ4TG2P;
     case g_q5_k: return kQ5K;
     case g_q4_k: return kQ4K;
     case g_q6_k: return kQ6KS;
@@ -1090,6 +1158,16 @@ __device__ __forceinline__ void rx_plan_body(const int* __restrict__ grp, const 
         const ExpertPtr& X = gsrc[u];
         const ExpertPtr& FL = gfill[u];
         J.fmt = rx_fmt(X.type[kind]);
+        // v54: X.pbits = the bits the group reads (low byte), the base bits and the base picks (bytes 1, 2): each pick's own
+        // bits from its rank (pk % nu; the router's order), as the grouping decided the group's
+        {
+          const int want = static_cast<int>(X.pbits & 0xffu), bb = static_cast<int>((X.pbits >> 8) & 0xffu), bp = static_cast<int>((X.pbits >> 16) & 0xffu);
+          J.pb = want >= 2 && want <= 4 ? want : 4;
+          for (int c = 0; c < 4; ++c) {
+            const int pk = c < cnt ? G[2 + c] : 0;
+            J.tb[c] = bb >= 2 && bb < 4 && bp > 0 && pk < routed && pk % nu >= nu - bp ? bb : 4;
+          }
+        }
         if (J.fmt < 0) s_err = 2;  // every writer stores 2; read after the barrier
         J.n = kind < 2 ? F : H;
         J.K = kind < 2 ? H : F;
@@ -1098,6 +1176,19 @@ __device__ __forceinline__ void rx_plan_body(const int* __restrict__ grp, const 
         J.w = X.w[kind];
         J.fd = FL.w[kind] ? static_cast<long long>(FL.w[kind] - X.w[kind]) : 0;
         J.stg = load_mode == 2 || (load_mode == 1 && !X.vram);  // v46a-2: all experts, or those read from RAM
+        // v54 promotion (the slot holds FL.pbits bits of this expert, fewer than wanted): a plane matrix reads the slot's planes
+        // from the slot and only the planes above them from RAM (staged; the slot and the source on the same 16-byte phase);
+        // a matrix that is not in planes is already whole in the slot: read from there, nothing refilled
+        J.ph = 0;
+        if (FL.w[kind] && (FL.pbits & 0xffu) > 0) {
+          if (J.fmt == kQ4TG2P) {
+            if (J.stg && (J.fd & 15) == 0 && (FL.pbits & 0xffu) < static_cast<std::uint32_t>(J.pb)) J.ph = static_cast<int>(FL.pbits & 0xffu);
+          } else {
+            J.w = FL.w[kind];
+            J.fd = 0;
+            J.stg = 0;
+          }
+        }
         if (kind < 2) {
           J.xq = xq;
           J.xs = xs;
@@ -1201,7 +1292,8 @@ __device__ __forceinline__ void rx_rows(const DJob& J, long long t) {
     const float* xs = J.xs + xo * J.xss;
     const int* xsum = J.xsum + xo * J.xss;
     float acc = 0.f;
-    if (r < J.n) acc = (M == 2 && tk == 0) ? lane_part<2>(J, r, part, xq, xs, xsum, J.ntok == 1) : lane_part<1>(J, r, part, xq, xs, xsum, J.ntok == 1);
+    if (r < J.n)
+      acc = (M == 2 && tk == 0) ? lane_part<2>(J, r, part, xq, xs, xsum, J.ntok == 1, nullptr, 0, tk) : lane_part<1>(J, r, part, xq, xs, xsum, J.ntok == 1, nullptr, 0, tk);
     for (int o = J.lpr / 2; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
     if (r < J.n && part == 0) J.y[J.ypk[tk] * J.ys + r] = acc;
   }
@@ -1249,7 +1341,31 @@ __device__ __forceinline__ void rx_rows_staged(const DJob& J, long long t, std::
   const int nr = J.n - r0 < rpw ? J.n - r0 : rpw;
   const long long rowb = static_cast<long long>(nB) * rx_blk(J.fmt);
   const std::uint8_t* src = J.w + static_cast<long long>(r0) * rowb;
-  const std::uint8_t* wb = rx_stage(src, nr * rowb, sbuf, J.fd ? const_cast<std::uint8_t*>(src) + J.fd : nullptr, lane);
+  const std::uint8_t* wb;
+  if (J.fmt == kQ4TG2P && J.pb < 4) {  // v54: each row's first J.pb bits only (2-bit 80 nB, 3-bit 112 nB of 144 nB bytes)
+    const long long pf = static_cast<long long>(tg2p_prefix(static_cast<std::uint64_t>(nB), J.pb)), ph = J.ph ? static_cast<long long>(tg2p_prefix(static_cast<std::uint64_t>(nB), J.ph)) : 0;
+    wb = nullptr;
+    for (int rr = 0; rr < nr; ++rr) {
+      const std::uint8_t* s0 = src + rr * rowb;
+      std::uint8_t* f0 = J.fd ? const_cast<std::uint8_t*>(s0) + J.fd : nullptr;
+      // a promotion (J.ph): the planes the slot holds come from the slot (VRAM), only the planes above them from RAM
+      const std::uint8_t* d0 = ph ? rx_stage(f0, ph, sbuf + rr * rowb, nullptr, lane) : nullptr;
+      const std::uint8_t* d1 = rx_stage(s0 + ph, pf - ph, sbuf + rr * rowb + ph, f0 ? f0 + ph : nullptr, lane);
+      if (rr == 0) wb = ph ? d0 : d1 - ph;
+    }
+  } else if (J.fmt == kQ4TG2P && J.ph) {  // v54: a promotion to all 4 bits: the slot's planes, then the rest from RAM
+    const long long ph = static_cast<long long>(tg2p_prefix(static_cast<std::uint64_t>(nB), J.ph));
+    wb = nullptr;
+    for (int rr = 0; rr < nr; ++rr) {
+      const std::uint8_t* s0 = src + rr * rowb;
+      std::uint8_t* f0 = const_cast<std::uint8_t*>(s0) + J.fd;
+      const std::uint8_t* d0 = rx_stage(f0, ph, sbuf + rr * rowb, nullptr, lane);
+      rx_stage(s0 + ph, rowb - ph, sbuf + rr * rowb + ph, f0 + ph, lane);
+      if (rr == 0) wb = d0;
+    }
+  } else {
+    wb = rx_stage(src, nr * rowb, sbuf, J.fd ? const_cast<std::uint8_t*>(src) + J.fd : nullptr, lane);
+  }
   if constexpr (kMT) {  // v47: the group's picks (2-4) on one load of the rows (fill, if any, by that one load)
     if (J.ntok > 1) {
       const std::int8_t* xq[4];
@@ -1274,7 +1390,7 @@ __device__ __forceinline__ void rx_rows_staged(const DJob& J, long long t, std::
   for (int tk = 0; tk < J.ntok; ++tk) {
     const long long xo = J.tokx[tk];
     float acc = 0.f;
-    if (r < J.n) acc = lane_part<3>(J, r, part, J.xq + xo * J.xqs, J.xs + xo * J.xss, J.xsum + xo * J.xss, false, wb, static_cast<long long>(r0) * nB);
+    if (r < J.n) acc = lane_part<3>(J, r, part, J.xq + xo * J.xqs, J.xs + xo * J.xss, J.xsum + xo * J.xss, false, wb, static_cast<long long>(r0) * nB, tk);
     for (int o = J.lpr / 2; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
     if (r < J.n && part == 0) J.y[J.ypk[tk] * J.ys + r] = acc;
   }
@@ -1287,7 +1403,7 @@ __device__ __forceinline__ void rx_rows_staged(const DJob& J, long long t, std::
 // v52: the task loop (after lut_setup) for k_rx and the fused MoE half
 template <bool kMT>
 __device__ __forceinline__ void rx_body(const std::uint8_t* __restrict__ plan, int maxp, int sbytes) {
-  std::uint8_t* sbuf = reinterpret_cast<std::uint8_t*>(s_lut) + kLutBytes + static_cast<long long>(threadIdx.x / 32) * sbytes;  // v46a-2
+  std::uint8_t* sbuf = reinterpret_cast<std::uint8_t*>(s_lut) + kLutRxBytes + static_cast<long long>(threadIdx.x / 32) * sbytes;  // v46a-2, v54
   const RxLayout Lo = rx_layout(maxp);
   const auto* hd = reinterpret_cast<const RxHdr*>(plan);
   const auto* jobs = reinterpret_cast<const DJob*>(plan + Lo.jobs);
@@ -1325,7 +1441,7 @@ __device__ __forceinline__ void rx_body(const std::uint8_t* __restrict__ plan, i
 }
 template <bool kMT>
 __global__ void __launch_bounds__(256) k_rx(const std::uint8_t* __restrict__ plan, int maxp, int sbytes) {
-  lut_setup();
+  lut_setup_rx();
   rx_body<kMT>(plan, maxp, sbytes);
 }
 
@@ -1395,7 +1511,7 @@ __global__ void __launch_bounds__(256) k_moe_half(const MoeHalfArgs A, int sbyte
   }
   grid.sync();
   // ---- C
-  lut_setup();
+  lut_setup_rx();
   rx_body<kMT>(static_cast<const std::uint8_t*>(A.plan), A.max_picks, sbytes);
   grid.sync();
   // ---- D
@@ -1416,6 +1532,14 @@ bool grid_ready() {
   for (int t = 0; t < 4; ++t)
     for (int i = 0; i < 16; ++i) g[t][i] = quant::q4_tg_grid(t, 2)[i];
   if (!sck(cudaMemcpyToSymbol(c_grid, g, sizeof g), "stream: grid upload")) return false;
+  float g3[4][16], g2[4][16];  // v54: the base grids of the bit planes
+  for (int t = 0; t < 4; ++t) {
+    tg2p_base_grid(g[t], 3, g3[t]);
+    tg2p_base_grid(g[t], 2, g2[t]);
+  }
+  if (!sck(cudaMemcpyToSymbol(c_grid3, g3, sizeof g3), "stream: grid upload (3-bit base)") ||
+      !sck(cudaMemcpyToSymbol(c_grid2, g2, sizeof g2), "stream: grid upload (2-bit base)"))
+    return false;
   ready = true;
   return true;
 }
@@ -1699,7 +1823,7 @@ bool moe_r3(const ExpertPtr* tab, const ExpertPtr* shx, const std::int32_t* sel,
   // v46a-2: the staging buffer per warp: one task's 16 blocks of the largest format (Q8_0 repacked, 272 bytes) + the 16-byte
   // phase, 8 warps per block: 8 KB grid + 34.3 KB (under the 48 KB a launch gets without opting in)
   const int sbytes = load_mode ? 16 * 272 + 32 : 0;
-  const int smem = kLutBytes + 8 * sbytes;
+  const int smem = kLutRxBytes + 8 * sbytes;  // v54: 24 KB of grids + the warps' buffers (59 KB: opted in past 48 KB)
   static int grids[2][3] = {{0, 0, 0}, {0, 0, 0}};
   const bool mt = tokens > 1;  // v47: steps of 2-4 tokens run the kernel that loads each row once for all of a group's picks
   int& grid = grids[mt ? 1 : 0][load_mode];
@@ -1707,6 +1831,8 @@ bool moe_r3(const ExpertPtr* tab, const ExpertPtr* shx, const std::int32_t* sel,
     int dev = 0, sms = 0, occ = 0, coop = 0;
     if (!sck(cudaGetDevice(&dev), "cudaGetDevice") || !sck(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev), "SM count") ||
         !sck(cudaDeviceGetAttribute(&coop, cudaDevAttrCooperativeLaunch, dev), "cooperative launch attribute") ||
+        !sck(cudaFuncSetAttribute(reinterpret_cast<const void*>(mt ? k_rx<true> : k_rx<false>), cudaFuncAttributeMaxDynamicSharedMemorySize, smem),
+             "expert stage: shared memory opt-in") ||
         !sck(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, mt ? k_rx<true> : k_rx<false>, 256, smem), "occupancy (expert stage)"))
       return false;
     if (!coop) return sfail("moe_r3: the device has no cooperative launch");
@@ -1755,7 +1881,7 @@ bool moe_half(const MoeHalfArgs& A, Stream s) {
   if (!grid_ready()) return false;
   const int sbytes = A.load_mode ? 16 * 272 + 32 : 0;
   // dynamic shared memory: the largest of the phases' uses (at most 4 x 128 x 144 B staging = 72 KB: opt in past 48 KB)
-  const int sm_stage = 4 * nsub * md::kGvPad * 4, sm_router = 2 * md::kRouterMaxExperts * 4 + md::kRouterMaxExperts, sm_rx = kLutBytes + 8 * sbytes;
+  const int sm_stage = 4 * nsub * md::kGvPad * 4, sm_router = 2 * md::kRouterMaxExperts * 4 + md::kRouterMaxExperts, sm_rx = kLutRxBytes + 8 * sbytes;
   const int smem = std::max(sm_stage, std::max(sm_router, sm_rx));
   const bool mt = A.n > 1;
   const int nj = nsub <= 32 ? 1 : nsub / 32;
@@ -1776,6 +1902,7 @@ bool moe_half(const MoeHalfArgs& A, Stream s) {
     if (occ < 1) return sfail("moe_half: the kernel does not fit on an SM");
     grid = sms * occ;
     int occ_rx = 0;  // v52 diagnosis: the separate expert stage's blocks per SM at its own shared memory, for comparison
+    (void)cudaFuncSetAttribute(reinterpret_cast<const void*>(mt ? k_rx<true> : k_rx<false>), cudaFuncAttributeMaxDynamicSharedMemorySize, sm_rx);
     (void)cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ_rx, mt ? k_rx<true> : k_rx<false>, 256, static_cast<std::size_t>(sm_rx));
     std::fprintf(stderr, "moe_half: %s tokens, H %d: grid %d (%d SMs x %d blocks), shared memory %d B; k_rx alone %d blocks per SM\n", mt ? "2-4" : "1",
                  A.H, grid, sms, occ, smem, occ_rx);

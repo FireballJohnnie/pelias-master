@@ -11,6 +11,7 @@
 
 #include "gpu_test_rows.h"
 #include "kern/gpu_decode.h"
+#include "kern/tg2_planes.h"
 #include "pelias_test.h"
 #include "quant/block_types.h"
 #include "quant/quant_cpu.h"
@@ -107,4 +108,89 @@ TEST(gpu_decoder_q8_0_r3_layout_equals_q8_0) {
     same += std::memcmp(a, b2, sizeof a) == 0 ? 1 : 0;
   }
   CHECK(same == k / 32);
+}
+
+// v54: Q4_TG2 bit planes (kern/tg2_planes.h). The spreads exhaustively; rows planed and back: 4 bits give the stored row
+// exactly, 3 / 2 bits the stored row with the low code bits zero; the 8-code words the GPU builds from the plane words
+// (the R3 stage's reads) equal the stored nibble words; the base grids are the means of the levels sharing the top bits.
+TEST(tg2_planes_layout_and_reads) {
+  bool sp = true;
+  for (std::uint32_t a = 0; a < 65536u; ++a) {
+    std::uint32_t r = 0;
+    for (int k = 0; k < 8; ++k) r |= ((a >> (2 * k)) & 3u) << (4 * k);
+    sp = sp && g::tg2p_spread2(a) == r;
+  }
+  for (std::uint32_t b = 0; b < 256u; ++b) {
+    std::uint32_t r = 0;
+    for (int k = 0; k < 8; ++k) r |= ((b >> k) & 1u) << (4 * k);
+    sp = sp && g::tg2p_spread1(b) == r;
+  }
+  CHECK(sp);
+  std::uint32_t seed = 12345u;
+  auto rnd = [&]() {
+    seed = seed * 1664525u + 1013904223u;
+    return static_cast<std::uint8_t>(seed >> 24);
+  };
+  int rows = 0;
+  bool round = true, masked = true, words = true;
+  for (const int nB : {1, 2, 8}) {
+    for (int rep = 0; rep < 20; ++rep, ++rows) {
+      std::vector<std::uint8_t> row(static_cast<std::size_t>(144 * nB)), pl(row.size()), back(row.size());
+      for (auto& x : row) x = rnd();
+      g::tg2p_plane_row(row.data(), pl.data(), nB);
+      g::tg2p_unplane_row(pl.data(), back.data(), nB, 4);
+      round = round && back == row;
+      for (const int bits : {2, 3}) {
+        g::tg2p_unplane_row(pl.data(), back.data(), nB, bits);
+        const std::uint8_t keep = bits == 3 ? 0xEE : 0xCC;  // both nibbles of a byte, low bits cleared
+        bool m = true;
+        for (int b = 0; b < nB; ++b) {
+          m = m && std::memcmp(back.data() + 144 * b, row.data() + 144 * b, 16) == 0;
+          for (int i = 16; i < 144; ++i) m = m && back[static_cast<std::size_t>(144 * b + i)] == (row[static_cast<std::size_t>(144 * b + i)] & keep);
+        }
+        masked = masked && m;
+      }
+      // the GPU's reads: per block B, half h, sub-block jj, group g: plane words as little-endian 32-bit loads
+      auto u32 = [&](std::size_t off) {
+        std::uint32_t v;
+        std::memcpy(&v, pl.data() + off, 4);
+        return v;
+      };
+      for (int b = 0; b < nB; ++b)
+        for (int h = 0; h < 2; ++h)
+          for (int jj = 0; jj < 4; ++jj)
+            for (int gq = 0; gq < 4; ++gq) {
+              const std::size_t ab = static_cast<std::size_t>(16 * nB + 64 * b + 32 * h), bb = static_cast<std::size_t>(80 * nB + 32 * b + 16 * h),
+                                cb = static_cast<std::size_t>(112 * nB + 32 * b + 16 * h);
+              const std::uint32_t a16 = (u32(ab + 4 * static_cast<std::size_t>(2 * jj + (gq >> 1))) >> (16 * (gq & 1))) & 0xffffu;
+              const std::uint32_t b8 = (u32(bb + 4 * static_cast<std::size_t>(jj)) >> (8 * gq)) & 0xffu;
+              const std::uint32_t c8 = (u32(cb + 4 * static_cast<std::size_t>(jj)) >> (8 * gq)) & 0xffu;
+              std::uint32_t want;
+              std::memcpy(&want, row.data() + 144 * b + 16 + 64 * h + 4 * (4 * jj + gq), 4);
+              words = words && g::tg2p_codes8(a16, b8, c8) == want;
+              words = words && g::tg2p_codes8(a16, b8, 0) == (want & 0xEEEEEEEEu) && g::tg2p_codes8(a16, 0, 0) == (want & 0xCCCCCCCCu);
+            }
+    }
+  }
+  CHECK(round);
+  CHECK(masked);
+  CHECK(words);
+  bool grids = true;
+  for (int t = 0; t < 4; ++t) {
+    const float* lv = q::q4_tg_grid(t, 2);
+    float o2[16], o3[16], o4[16];
+    g::tg2p_base_grid(lv, 2, o2);
+    g::tg2p_base_grid(lv, 3, o3);
+    g::tg2p_base_grid(lv, 4, o4);
+    for (int c = 0; c < 16; ++c) {
+      const int q2 = c & ~3, q3 = c & ~1;
+      grids = grids && o4[c] == lv[c];
+      grids = grids && o3[c] == static_cast<float>((static_cast<double>(lv[q3]) + lv[q3 + 1]) / 2.0);
+      grids = grids && o2[c] == static_cast<float>((static_cast<double>(lv[q2]) + lv[q2 + 1] + lv[q2 + 2] + lv[q2 + 3]) / 4.0);
+    }
+  }
+  CHECK(grids);
+  std::printf("    spreads exhaustive %s; %d rows (1 / 2 / 8 blocks): 4 bits round trip %s, 3 / 2 bits = stored with low bits zero %s; "
+              "GPU word reads %s; base grids %s\n",
+              sp ? "ok" : "WRONG", rows, round ? "exact" : "WRONG", masked ? "yes" : "NO", words ? "= stored words" : "WRONG", grids ? "ok" : "WRONG");
 }

@@ -570,6 +570,103 @@ TEST(rung4_engine_fused_moe_half) {
               eq ? "bit for bit" : "DIFFER", noted ? "names the fused path" : "MISSING the fused note");
 }
 
+// v54: the sliding bit planes (kern/tg2_planes.h) in the R3 expert stage. 4 bits through the planes = the stored layout bit
+// for bit; a 2- or 3-bit base changes the logits (finite), is the same one token at a time and in verify batches of 4, and
+// does not depend on the cache (1 or 4 slots: slots promoted in place A -> A+B+C with only the missing planes read) or on
+// how rows are loaded (lanes / staged)
+TEST(rung4_engine_bit_planes) {
+  if (!g::available()) return;
+  Small sm;
+  small_model(sm);
+  CHECK(sm.ok);
+  if (!sm.ok) return;
+  const m::Qwen35MoeSpec& s = sm.spec;
+  const int nv = static_cast<int>(s.n_vocab), npre = 12, ndec = 12;
+  const std::size_t row = static_cast<std::size_t>(nv);
+  std::vector<std::int32_t> tok(static_cast<std::size_t>(npre + ndec));
+  for (std::size_t i = 0; i < tok.size(); ++i) tok[i] = static_cast<std::int32_t>((i * 29 + 5) % 1000);
+  struct Cfg {
+    bool planes;
+    int bits, picks, cache, load;
+  };
+  auto run = [&](const Cfg& c, std::string* summ) {
+    m::EngineOptions eo;
+    eo.max_ctx = 128;
+    eo.max_batch = 16;
+    eo.max_verify = 4;
+    eo.cpu_threads = 4;
+    eo.cold_on_gpu = true;
+    eo.hot_order.assign(s.n_layer, {});
+    for (auto& v : eo.hot_order)
+      for (int e = 0; e < static_cast<int>(s.n_expert); ++e) v.push_back(e);
+    eo.max_hot_per_layer = 2;
+    eo.reader_cache = c.cache;
+    eo.fold_shared = true;
+    eo.batch_identical = true;
+    eo.graph = true;
+    eo.r3_experts = true;
+    eo.rx_load = c.load;
+    eo.router_tie = 0.01f;
+    eo.bit_planes = c.planes;
+    eo.base_bits = c.bits;
+    eo.base_picks = c.picks;
+    std::vector<float> o;
+    auto f = m::GpuEngine::open(s, sm.w, eo);
+    CHECK(f.ok());
+    if (!f.ok()) {
+      std::printf("    bit planes: open failed: %s\n", f.status.text().c_str());
+      return o;
+    }
+    m::GpuEngine& E = *f.value;
+    o.assign(static_cast<std::size_t>(npre + 2 * ndec) * row, 0.0f);
+    bool ok = E.reset().ok() && E.step(tok.data(), npre, o.data(), false).ok();
+    for (int i = 0; i < ndec; ++i) ok = ok && E.step(tok.data() + npre + i, 1, o.data() + static_cast<std::size_t>(npre + i) * row, false).ok();
+    std::vector<float> pre(static_cast<std::size_t>(npre) * row);
+    ok = ok && E.reset().ok() && E.step(tok.data(), npre, pre.data(), false).ok();
+    std::vector<float> bh(4 * static_cast<std::size_t>(s.n_embd));
+    for (int b = 0; b < ndec / 4; ++b) {
+      ok = ok && E.verify(tok.data() + npre + 4 * b, 4, o.data() + static_cast<std::size_t>(npre + ndec + 4 * b) * row, bh.data()).ok();
+      ok = ok && E.keep(4).ok();
+    }
+    CHECK(ok);
+    if (summ) *summ = E.summary();
+    return o;
+  };
+  auto same = [](const std::vector<float>& a, const std::vector<float>& b) {
+    return !a.empty() && a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
+  };
+  auto finite = [](const std::vector<float>& a) {
+    for (const float x : a)
+      if (!std::isfinite(x)) return false;
+    return !a.empty();
+  };
+  // one-token decode rows vs the verify rows of the same tokens
+  auto one_vs_ver = [&](const std::vector<float>& a) {
+    return !a.empty() && std::memcmp(a.data() + static_cast<std::size_t>(npre) * row, a.data() + static_cast<std::size_t>(npre + ndec) * row,
+                                     static_cast<std::size_t>(ndec) * row * sizeof(float)) == 0;
+  };
+  std::string summ;
+  const std::vector<float> base = run({false, 4, 0, 3, 1}, nullptr);
+  const std::vector<float> p4 = run({true, 4, 0, 3, 1}, &summ);
+  const bool full_eq = same(base, p4);
+  CHECK(full_eq);
+  CHECK(summ.find("bit planes:") != std::string::npos);
+  const std::vector<float> p2 = run({true, 2, 2, 3, 1}, nullptr), p3 = run({true, 3, 2, 3, 1}, nullptr);
+  const bool lossy = !same(p2, base) && !same(p3, base) && !same(p2, p3) && finite(p2) && finite(p3);
+  CHECK(lossy);
+  const bool det = one_vs_ver(p2) && one_vs_ver(p3);
+  CHECK(det);
+  // rank 1 of 2 on the base: slots move between 2 bits and 4 (promotions); the cache size and the load mode change nothing
+  const std::vector<float> q1 = run({true, 2, 1, 1, 1}, nullptr), q4 = run({true, 2, 1, 4, 1}, nullptr), q0 = run({true, 2, 1, 1, 0}, nullptr);
+  const bool cache_free = same(q1, q4) && same(q1, q0) && !same(q1, base) && !same(q1, p2) && one_vs_ver(q1);
+  CHECK(cache_free);
+  std::printf("    bit planes: 4 bits = stored layout %s; 2 / 3-bit base on both picks changes the logits %s, one token = verify batches %s; "
+              "base on the lower pick: cache 1 = cache 4 = lane loads %s\n",
+              full_eq ? "bit for bit" : "DIFFER", lossy ? "(finite)" : "NOT AS EXPECTED", det ? "bit for bit" : "DIFFER",
+              cache_free ? "bit for bit" : "DIFFER");
+  std::printf("      %s\n", summ.c_str());
+}
+
 TEST(rung4_engine_verify_and_keep) {
   if (!g::available()) return;
   Small sm;

@@ -196,6 +196,8 @@ struct ExpertPtr {
   std::uint32_t type[3] = {0, 0, 0};
   std::uint64_t rb[3] = {0, 0, 0};
   std::uint32_t vram = 0;  // v26: 1 if w points at VRAM (the bank, the shared expert): never cached
+  std::uint32_t pbits = 0;  // v54, a grouping's output: low byte the code bits its plane matrices (g_q4_tg2p) are read with (2-4; 0 = 4),
+                            // byte 1 the base bits, byte 2 the base picks (each pick's own bits by rank); in gfill: the bits the slot held
 };
 // v26 reader cache (per layer K slots of slot_bytes in VRAM; a slot holds one file expert's gate, up and down rows back to
 // back, as stored): tag (expert, -1 empty) and last-use stamp per slot, and the layer's call counter. The grouping kernel
@@ -217,6 +219,12 @@ struct ReaderCache {
   std::uint64_t pbytes[kMaxPools] = {};
   std::uint64_t pboff[kMaxPools] = {};
   const signed char* pool_of = nullptr;  // n_expert (device), this layer's
+  // v54 sliding bit planes (kern/tg2_planes.h; author 23:14): each token's plane_picks lowest-ranked routed picks read their
+  // plane matrices with plane_bits code bits (2 or 3); every other pick reads all 4. sbits (K, device): the bits a slot holds
+  // (0 empty); a slot serves a pick that wants no more bits than it holds; one that wants more is refilled in place.
+  int plane_bits = 4;
+  int plane_picks = 0;
+  unsigned char* sbits = nullptr;
 };
 // tab: n_expert entries (device); sel / wsel: tokens x n_used picks and weights (device, as router_topk); xr: tokens x H
 // rounded inputs; gu: scratch tokens x n_used x 2F; h: scratch tokens x n_used x F; y: tokens x H, overwritten with the

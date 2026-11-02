@@ -22,6 +22,7 @@
 
 #include "hal/host_alloc_pages.h"
 #include "kern/cpu_dot.h"
+#include "kern/tg2_planes.h"
 #include "kern/gpu_ops.h"
 #include "kern/gpu_decode.h"
 #include "kern/gpu_decode.h"
@@ -360,6 +361,9 @@ struct GpuEngine::Impl {
   bool reader = false;
   std::string reader_note = "off";
   std::vector<void*> reg_bases;          // v27: the registered ranges of the model file's mapping (host)
+  void* planes_h = nullptr;              // v54: the RAM experts' Q4_TG2 matrices in bit planes (pinned, mapped)
+  std::uint64_t planes_b = 0;
+  std::string planes_note;
   g::ExpertPtr* rtab = nullptr;          // n_layer x n_expert entries (device)
   float *rgu = nullptr, *rh = nullptr;   // scratch: kReaderMax x nu x 2F, kReaderMax x nu x F
   float* ryd = nullptr;                  // v25 scratch: kReaderMax x nu x H (each pick's down row)
@@ -1639,15 +1643,70 @@ struct GpuEngine::Impl {
         light_b += b;
       }
     }
+    // v54: the bit planes: every Q4_TG2 matrix of an expert outside the bank (and not the CPU's) copied row by row into the
+    // plane layout, in pinned mapped memory; those matrices' file bytes are then not registered
+    std::vector<std::uint64_t> poff;  // per (layer, matrix, expert): offset in planes_h + 1 (0: not in planes)
+    void* planes_dev = nullptr;
+    if (o.bit_planes) {
+      poff.assign(z(static_cast<int64_t>(s.n_layer) * 3 * ne), 0);
+      std::uint64_t tot = 0;
+      struct PJob {
+        const std::uint8_t* src;
+        std::uint64_t off, rb, rows;
+      };
+      std::vector<PJob> jobs;
+      for (std::uint32_t il = 0; il < s.n_layer; ++il) {
+        const WeightView* vv[3] = {&w->layers[il].gate_exps, &w->layers[il].up_exps, &w->layers[il].down_exps};
+        for (int pj = 0; pj < 3; ++pj)
+          for (int64_t ex = 0; ex < ne; ++ex) {
+            if (L[il].hot[z(ex)] || L[il].light[z(ex)]) continue;
+            const ExpRows r = exp_rows(*vv[pj], static_cast<int>(ex));
+            if (r.t != quant::Type::q4_tg2 || r.rb % 144 != 0) continue;
+            const std::uint64_t rows = static_cast<std::uint64_t>(vv[pj]->ne[1]), b = r.rb * rows;
+            poff[z((static_cast<int64_t>(il) * 3 + pj) * ne + ex)] = tot + 1;
+            jobs.push_back({r.base, tot, r.rb, rows});
+            tot += (b + 255) / 256 * 256;  // each matrix 256-byte aligned
+          }
+      }
+      if (tot > 0) {
+        const Clock::time_point tp = Clock::now();
+        planes_h = g::host_alloc_mapped(static_cast<std::size_t>(tot), &planes_dev);
+        if (!planes_h || !planes_dev) {
+          reader_note = "off (pinned memory for the bit planes: " + std::to_string(tot >> 20) + " MiB)";
+          planes_h = nullptr;
+          return;
+        }
+        planes_b = tot;
+        auto* ph = static_cast<std::uint8_t*>(planes_h);
+        const unsigned nt = std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
+        std::atomic<std::size_t> next{0};
+        std::vector<std::thread> th;
+        for (unsigned t = 0; t < nt; ++t)
+          th.emplace_back([&]() {
+            for (std::size_t i = next.fetch_add(1); i < jobs.size(); i = next.fetch_add(1)) {
+              const PJob& J = jobs[i];
+              const int nB = static_cast<int>(J.rb / 144);
+              for (std::uint64_t rr = 0; rr < J.rows; ++rr) kern::gpu::tg2p_plane_row(J.src + rr * J.rb, ph + J.off + rr * J.rb, nB);
+            }
+          });
+        for (auto& t : th) t.join();
+        char pb[200];
+        std::snprintf(pb, sizeof pb, "; bit planes: %zu Q4_TG2 matrices, %.2f GB pinned, built in %.2f s; base %d bits for the %d lowest-ranked picks",
+                      jobs.size(), static_cast<double>(tot) / 1e9, since(tp), o.base_bits, o.base_picks);
+        planes_note = pb;
+      }
+    }
     // v27: pin only the experts the bank does not hold (the GPU reads the bank's from VRAM): their matrices as page-aligned
     // ranges, merged where the gap between them is under o.pin_gap (v27: 8 MiB; fewer, larger registrations); each range's
-    // device address. v28: not the light experts either when the split is on.
+    // device address. v28: not the light experts either when the split is on. v54: not the matrices held in bit planes.
     const std::uintptr_t pg = 4096;
     std::vector<std::pair<std::uintptr_t, std::uintptr_t>> want;
     for (std::uint32_t il = 0; il < s.n_layer; ++il)
       for (const WeightView* v : {&w->layers[il].gate_exps, &w->layers[il].up_exps, &w->layers[il].down_exps})
         for (int64_t ex = 0; ex < ne; ++ex) {
           if (L[il].hot[z(ex)] || L[il].light[z(ex)]) continue;
+          const int pjv = v == &w->layers[il].gate_exps ? 0 : v == &w->layers[il].up_exps ? 1 : 2;
+          if (!poff.empty() && poff[z((static_cast<int64_t>(il) * 3 + pjv) * ne + ex)]) continue;
           const ExpRows r = exp_rows(*v, static_cast<int>(ex));
           const auto a = reinterpret_cast<std::uintptr_t>(r.base);
           want.emplace_back(a & ~(pg - 1), (a + static_cast<std::uintptr_t>(r.rb * v->ne[1]) + pg - 1) & ~(pg - 1));
@@ -1701,6 +1760,10 @@ struct GpuEngine::Impl {
           X.type[pj] = static_cast<std::uint32_t>(r.t);
           X.rb[pj] = r.rb;
           if (bank) X.vram = 1;
+          if (!bank && !poff.empty() && poff[z((static_cast<int64_t>(il) * 3 + pj) * ne + ex)]) {  // v54: from the bit planes
+            X.w[pj] = static_cast<const std::uint8_t*>(planes_dev) + (poff[z((static_cast<int64_t>(il) * 3 + pj) * ne + ex)] - 1);
+            X.type[pj] = kern::gpu::g_q4_tg2p;
+          }
         }
       }
     }
@@ -1918,7 +1981,8 @@ struct GpuEngine::Impl {
         }
       }
       const bool use_pools = o.cache_pools && pools_ok;
-      const std::size_t meta_b = nl * (static_cast<std::size_t>(K) * 8 + 16) + (use_pools ? nl * z(ne) : 0);
+      const std::size_t meta_b0 = nl * (static_cast<std::size_t>(K) * 8 + 16) + (use_pools ? nl * z(ne) : 0);
+      const std::size_t meta_b = meta_b0 + (o.bit_planes ? nl * static_cast<std::size_t>(K) : 0);  // v54: the bits each slot holds
       cache_mem = g::dalloc(cache_reserved);
       cache_meta = g::dalloc(meta_b);
       if (cache_mem && cache_meta) {
@@ -1938,6 +2002,11 @@ struct GpuEngine::Impl {
             c.base = static_cast<std::uint8_t*>(cache_mem) + il * budget;
             c.slot_bytes = cslot;
             if (use_pools) c.pool_of = reinterpret_cast<const signed char*>(mb + nl * (static_cast<std::size_t>(K) * 8 + 16)) + il * z(ne);
+            if (o.bit_planes) {  // v54
+              c.sbits = mb + meta_b0 + il * static_cast<std::size_t>(K);
+              c.plane_bits = o.base_bits;
+              c.plane_picks = o.base_picks;
+            }
             kmin = std::min(kmin, c.K);
             kall += c.K;
             rcache.push_back(c);
@@ -2095,6 +2164,7 @@ GpuEngine::~GpuEngine() {
   g::dfree(p_->cache_mem);
   g::dfree(p_->cache_meta);
   g::host_free(p_->trc_hv);
+  g::host_free(p_->planes_h);  // v54
   g::host_free(p_->rlg_h);  // v49
   g::dfree(p_->probe_bd);
   g::dfree(p_->probe_ld);
@@ -2334,6 +2404,7 @@ std::string GpuEngine::summary() const {
   std::string r = b;
   if (I.reader) r += I.o.gpu_prompt ? "; prompt on the GPU in steps of 1-4 tokens" : "; prompt batches on the bank + CPU cold path";  // v48
   if (I.o.r3_experts) r += "; R3 expert stage " + I.rx_note + (I.o.rx_load == 2 ? ", rows staged for every expert" : I.o.rx_load == 1 ? ", rows staged for experts read from RAM" : ", lane loads");  // v46a-1 / v46a-2
+  r += I.planes_note;  // v54
   if (I.o.fused_moe && I.rx_ok && I.fold_ok) r += "; MoE half fused (one launch per layer where no side output needs the separate kernels)";  // v52
   if (!I.o.pin_pool.empty() || I.o.pin_host >= 0) {  // v43
     char c[256];
@@ -2562,7 +2633,18 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
       if (!st) return R::fail(st);
     }
   }
+  if (o.bit_planes || o.base_bits != 4 || o.base_picks != 0) {  // v54: only the R3 expert stage reads the planes
+    if (!o.bit_planes) return R::fail(Status::fail(Code::invalid_argument, "engine: --base-bits / --base-picks need --bit-planes"));
+    if (o.base_bits < 2 || o.base_bits > 4 || o.base_picks < 0 || o.base_picks > static_cast<int>(s.n_expert_used))
+      return R::fail(Status::fail(Code::invalid_argument, "engine: --base-bits 2, 3 or 4; --base-picks 0 .. n_expert_used"));
+    if (!o.cold_on_gpu || !o.r3_experts || o.prefetch || o.cpu_light || o.plane_tail != 0 || (o.base_bits < 4 && o.base_picks > 0 && o.reader_cache <= 0))
+      return R::fail(Status::fail(Code::invalid_argument,
+                                  "engine: --bit-planes needs the R3 expert stage (--cold-on-gpu --r3-experts), no --prefetch, --cpu-light or "
+                                  "--plane-tail, and a reader cache for a base below 4 bits"));
+  }
   if (o.cold_on_gpu) I.setup_reader();  // v24
+  if (o.bit_planes && (!I.rx_ok || !I.planes_h))
+    return R::fail(Status::fail(Code::internal, "engine: the bit planes need the R3 expert stage on (" + I.rx_note + "; reader " + I.reader_note + ")"));
   // the host side of the cold path
   const int threads = o.cpu_threads > 0 ? o.cpu_threads : static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
   {  // v43: workers take pin_pool[1..]; the doorbell thread takes pin_pool[0] when it starts; the driving thread pin_host

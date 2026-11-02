@@ -52,6 +52,14 @@ struct EngineOptions {
   // v52: the MoE half of each layer (residual, post norm, rounding, router, shared gate, picks, grouping, plan, R3 expert
   // stage, combine, residual) in one cooperative launch (g::moe_half); same bits (--no-fused-moe, temporary)
   bool fused_moe = true;
+  // v54 sliding bit planes (endgame, author 23:14): the RAM experts' Q4_TG2 matrices held as bit planes (kern/tg2_planes.h,
+  // copied into pinned memory at open; the file's bytes for them are not registered), read by the R3 expert stage with
+  // base_bits code bits (2, 3 or 4) for each token's base_picks lowest-ranked picks and all 4 for the rest. 4 bits read the
+  // stored codes exactly. Needs the R3 expert stage; not with the split, prefetch or the plane test (--bit-planes,
+  // --base-bits, --base-picks; temporary flags until measured)
+  bool bit_planes = false;
+  int base_bits = 4;
+  int base_picks = 0;
   int max_hot_per_layer = 256;
   int cpu_threads = 0;  // workers for the cold experts (0: hardware threads)
   // GP3-14 stage 3 (MTP drafting): the largest verify batch (1 + drafts); 0 = no rollback buffers. Needs the DeltaNet
