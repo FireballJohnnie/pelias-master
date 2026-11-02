@@ -17,6 +17,7 @@
 #include <string>
 #include <vector>
 
+#include "os/aligned_mem.h"
 #include "../unit/gpu_test_rows.h"
 #include "kern/gpu_decode.h"
 #include "kern/gpu_ops.h"
@@ -697,7 +698,7 @@ TEST(rung1_moe_reader_against_fp64) {
   std::size_t host_b = 0;
   for (std::int64_t e = 3; e < ne; ++e)
     for (int pj = 0; pj < 3; ++pj) host_b += (M[static_cast<std::size_t>(3 * e + pj)].bytes.size() + 4095) & ~std::size_t{4095};
-  void* hm = std::aligned_alloc(4096, host_b);
+  void* hm = pelias::os::aligned_alloc_bytes(4096, host_b);
   CHECK(hm != nullptr);
   if (!hm) return;
   void* hdev = nullptr;
@@ -811,7 +812,7 @@ TEST(rung1_moe_reader_against_fp64) {
               alone_eq ? "bit for bit" : "DIFFERS");
   for (void* d : dmem) g::dfree(d);
   if (reg) g::host_unregister(hm);
-  std::free(hm);
+  pelias::os::aligned_free_bytes(hm);
 }
 
 // v26 reader v3: equal to the v24 / v25 reader bit for bit (Q4_TG2 from the per-lane grid, two rows per warp, half-warp

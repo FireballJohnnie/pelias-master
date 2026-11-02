@@ -32,6 +32,7 @@
 #endif
 #include <vector>
 
+#include "os/aligned_mem.h"
 #include "hal/device.h"
 #include "hal/host_alloc_pages.h"
 #include "hal/vram_governor.h"
@@ -497,8 +498,8 @@ int cmd_page_probe(const Args& a) {
     std::printf("  %-38s %.2f ns per access (end %llu)\n", name, sec * 1e9 / static_cast<double>(kSteps), static_cast<unsigned long long>(q % 7));
   };
   std::printf("page-probe: 65,536 lines in a random cycle, 20 M dependent loads per layout; %s at start\n", anon_huge().c_str());
-  auto* h = static_cast<std::uint8_t*>(std::aligned_alloc(kAlign, kSpan));
-  auto* s4 = static_cast<std::uint8_t*>(std::aligned_alloc(kAlign, kSpan));
+  auto* h = static_cast<std::uint8_t*>(pelias::os::aligned_alloc_bytes(kAlign, kSpan));
+  auto* s4 = static_cast<std::uint8_t*>(pelias::os::aligned_alloc_bytes(kAlign, kSpan));
   if (!h || !s4) {
     std::fprintf(stderr, "pelias page-probe: allocation failed\n");
     return 1;
@@ -512,8 +513,8 @@ int cmd_page_probe(const Args& a) {
   chase(h, 4096, "B spread, 256 MB span, 2 MB pages");
   chase(s4, 4096, "C spread, 256 MB span, 4 KB pages");
   chase(h, 64, "A again (drift check)");
-  std::free(h);
-  std::free(s4);
+  pelias::os::aligned_free_bytes(h);
+  pelias::os::aligned_free_bytes(s4);
   return 0;
 }
 
