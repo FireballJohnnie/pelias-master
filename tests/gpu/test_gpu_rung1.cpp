@@ -153,6 +153,34 @@ TEST(rung1_matmul_every_type_against_fp64) {
   std::printf("    %zu types x n_tok 1 / 3 / 9, 97 x 2048: worst relative L2 vs fp64 %.3e (tolerance %.0e)\n", types.size(), worst, kProductTol);
 }
 
+// v52: the F32 product of 1-4 tokens on k_gemv_f32 equals k_matmul's bit for bit (router 256 x 2048, a 1-row gate, 97 rows,
+// k 1024 / 2048 / 4096 including a 4096 x 4-token case past the shared-memory limit that takes the general kernel)
+TEST(rung1_gemv_f32_equals_matmul) {
+  if (!gpu_or_skip()) return;
+  int cases = 0;
+  bool same = true;
+  for (const std::int64_t n_out : {std::int64_t{256}, std::int64_t{1}, std::int64_t{97}})
+    for (const std::int64_t k : {std::int64_t{1024}, std::int64_t{2048}, std::int64_t{4096}}) {
+      const Mat m = make_mat(q::Type::f32, n_out, k, 301u + static_cast<std::uint32_t>(n_out + k));
+      Dev<std::uint8_t> dw(m.bytes);
+      for (std::int64_t n_tok = 1; n_tok <= 4; ++n_tok) {
+        const std::vector<float> x = wave(n_tok * k, 41u + static_cast<std::uint32_t>(n_tok + k), 1.0f);
+        Dev<float> dx(x), d0(static_cast<std::size_t>(n_tok * n_out)), d1(static_cast<std::size_t>(n_tok * n_out));
+        g::set_fast_f32(false);
+        CHECK(g::matmul(static_cast<std::uint32_t>(q::Type::f32), dw.p, m.rb, n_out, k, dx.p, n_tok, k, d0.p, n_out));
+        g::set_fast_f32(true);
+        CHECK(g::matmul(static_cast<std::uint32_t>(q::Type::f32), dw.p, m.rb, n_out, k, dx.p, n_tok, k, d1.p, n_out));
+        CHECK(g::sync());
+        const bool eq = bits_equal(d0.get(), d1.get());
+        if (!eq) std::printf("    n_out %lld k %lld n_tok %lld: differs\n", static_cast<long long>(n_out), static_cast<long long>(k), static_cast<long long>(n_tok));
+        same = same && eq;
+        ++cases;
+      }
+    }
+  CHECK(same);
+  std::printf("    %d cases (rows 256 / 1 / 97, k 1024 / 2048 / 4096, 1-4 tokens): k_gemv_f32 %s k_matmul bit for bit\n", cases, same ? "equals" : "DIFFERS FROM");
+}
+
 TEST(rung1_matmul_refuses_what_it_cannot_read) {
   if (!gpu_or_skip()) return;
   float dummy = 0.0f;

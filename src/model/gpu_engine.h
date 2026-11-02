@@ -47,6 +47,8 @@ struct EngineOptions {
   // v51: reader cache slots in pools by real expert size (default) instead of slots of the file's largest expert
   // (--no-cache-pools, temporary). Same bytes; replay52c: misses x0.896 (DERIVED)
   bool cache_pools = true;
+  // v52: the F32 products of 1-4 tokens (router, shared gate) on k_gemv_f32; same bits (--no-fast-f32, temporary)
+  bool fast_f32 = true;
   int max_hot_per_layer = 256;
   int cpu_threads = 0;  // workers for the cold experts (0: hardware threads)
   // GP3-14 stage 3 (MTP drafting): the largest verify batch (1 + drafts); 0 = no rollback buffers. Needs the DeltaNet

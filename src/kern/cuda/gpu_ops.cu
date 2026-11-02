@@ -139,6 +139,64 @@ __global__ void __launch_bounds__(128) k_matmul(std::uint32_t type, const std::u
   }
 }
 
+// v52 (token kernel 3a, first piece): the F32 product for 1-4 tokens (the router, the shared gate). The same sums as
+// k_matmul, in the same order (lane l: sub-blocks l, l + 32, ...; each a chain over its 32 values; then warp_sum), so the
+// same bits. What changes is only where the values come from: x staged once per block in shared memory (rows of 32 padded
+// to 36 floats: the lanes' float4 reads hit distinct banks), every weight load of the lane issued before the first sum,
+// and two rows per block so the 256 router rows spread over 128 SMs.
+constexpr int kGvPad = 36;
+template <int NJ>
+__global__ void __launch_bounds__(64) k_gemv_f32(const float* __restrict__ w, std::uint64_t rb, std::int64_t n_out, std::int64_t k,
+                                                 const float* __restrict__ x, int n_tok, std::int64_t ldx, float* __restrict__ y,
+                                                 std::int64_t ldy) {
+  extern __shared__ float4 s_gv4[];
+  float* xs = reinterpret_cast<float*>(s_gv4);
+  const int nsub = static_cast<int>(k / 32);
+  for (int idx = static_cast<int>(threadIdx.x); idx < n_tok * nsub * 8; idx += static_cast<int>(blockDim.x)) {
+    const int t = idx / (nsub * 8), rem = idx - t * nsub * 8, j = rem >> 3, q4 = rem & 7;
+    const float4 v = *reinterpret_cast<const float4*>(x + t * ldx + 32 * j + 4 * q4);
+    *reinterpret_cast<float4*>(xs + (t * nsub + j) * kGvPad + 4 * q4) = v;
+  }
+  __syncthreads();
+  const std::int64_t r = static_cast<std::int64_t>(blockIdx.x) * 2 + threadIdx.x / 32;
+  const int lane = static_cast<int>(threadIdx.x & 31);
+  if (r >= n_out) return;
+  const float4* p4 = reinterpret_cast<const float4*>(reinterpret_cast<const std::uint8_t*>(w) + static_cast<std::uint64_t>(r) * rb);
+  float4 wv[NJ][8];
+#pragma unroll
+  for (int jj = 0; jj < NJ; ++jj)
+#pragma unroll
+    for (int i4 = 0; i4 < 8; ++i4) wv[jj][i4] = p4[8 * (lane + 32 * jj) + i4];
+  float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+  for (int jj = 0; jj < NJ; ++jj) {
+    const int j = lane + 32 * jj;
+#pragma unroll
+    for (int tt = 0; tt < 4; ++tt) {
+      if (tt >= n_tok) break;
+      const float4* xr = reinterpret_cast<const float4*>(xs + (tt * nsub + j) * kGvPad);
+      float s = 0.0f;
+#pragma unroll
+      for (int i4 = 0; i4 < 8; ++i4) {
+        const float4 a = wv[jj][i4], b = xr[i4];
+        s += a.x * b.x;
+        s += a.y * b.y;
+        s += a.z * b.z;
+        s += a.w * b.w;
+      }
+      acc[tt] += s;
+    }
+  }
+#pragma unroll
+  for (int tt = 0; tt < 4; ++tt) {
+    if (tt >= n_tok) break;
+    const float v = warp_sum(acc[tt]);
+    if (lane == 0) y[tt * ldy + r] = v;
+  }
+}
+
+bool g_fast_f32 = true;  // v52 experiment switch (--no-fast-f32): removed once measured
+
 // grouped experts: blockIdx.y = expert, one warp per output row of it; the expert's slots in passes of kTT
 __global__ void __launch_bounds__(128) k_moe_matmul(std::uint32_t type, const std::uint8_t* __restrict__ w, std::uint64_t eb, std::uint64_t rb,
                                                     std::int64_t n_out, std::int64_t k, const int* __restrict__ off,
@@ -1825,9 +1883,22 @@ bool matmul(std::uint32_t type, const void* w, std::uint64_t row_bytes, std::int
   if (n_tok == 0) return true;
   Tables tb;
   if (!device_tables(&tb)) return false;
+  const int nsub = static_cast<int>(k / 32);
+  if (g_fast_f32 && type == g_f32 && n_tok <= 4 && (nsub == 32 || nsub == 64 || nsub == 128) && n_tok * nsub * kGvPad * 4 <= 48 * 1024 && row_bytes % 16 == 0 &&
+      ldx % 4 == 0 && (reinterpret_cast<std::uintptr_t>(w) & 15u) == 0 && (reinterpret_cast<std::uintptr_t>(x) & 15u) == 0) {
+    const std::size_t sm = static_cast<std::size_t>(n_tok) * nsub * kGvPad * sizeof(float);  // at most 48 KB (the default limit)
+    const float* wf = static_cast<const float*>(w);
+    const unsigned nb = blocks_for(n_out, 2);
+    if (nsub == 32) k_gemv_f32<1><<<nb, 64, sm, st(s)>>>(wf, row_bytes, n_out, k, x, static_cast<int>(n_tok), ldx, y, ldy);
+    else if (nsub == 64) k_gemv_f32<2><<<nb, 64, sm, st(s)>>>(wf, row_bytes, n_out, k, x, static_cast<int>(n_tok), ldx, y, ldy);
+    else k_gemv_f32<4><<<nb, 64, sm, st(s)>>>(wf, row_bytes, n_out, k, x, static_cast<int>(n_tok), ldx, y, ldy);
+    return launched("matmul f32");
+  }
   k_matmul<<<blocks_for(n_out, 4), 128, 0, st(s)>>>(type, static_cast<const std::uint8_t*>(w), row_bytes, n_out, k, x, n_tok, ldx, y, ldy, tb);
   return launched("matmul");
 }
+
+void set_fast_f32(bool on) { g_fast_f32 = on; }
 
 bool moe_matmul(std::uint32_t type, const void* w, std::uint64_t expert_bytes, std::uint64_t row_bytes, std::int64_t n_out, std::int64_t k,
                 int n_expert, const int* slot_off, const int* src, const int* dst, const float* x, std::int64_t ldx, float* y,

@@ -40,6 +40,8 @@ bool mem_info(std::size_t* free_bytes, std::size_t* total_bytes);
 
 // ---- products straight from GGUF storage (gemm_gguf)
 // y[t * ldy + r] = sum_i W[r][i] * x[t * ldx + i] for r < n_out, t < n_tok; W in one of the types of gpu_decode.h
+// v52 experiment switch: the F32 product of 1-4 tokens on k_gemv_f32 (default) or the general kernel; same bits either way
+void set_fast_f32(bool on);
 bool matmul(std::uint32_t type, const void* w, std::uint64_t row_bytes, std::int64_t n_out, std::int64_t k, const float* x,
             std::int64_t n_tok, std::int64_t ldx, float* y, std::int64_t ldy, Stream s = nullptr);
 // grouped experts in one launch (P-K2b; O14: unequal token counts). Expert e's matrix starts at w + e * expert_bytes. Its

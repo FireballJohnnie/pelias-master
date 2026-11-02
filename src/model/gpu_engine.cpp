@@ -2289,6 +2289,7 @@ std::string GpuEngine::summary() const {
 }
 
 Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const Qwen35MoeWeights& w, const EngineOptions& o) {
+  g::set_fast_f32(o.fast_f32);  // v52
   using R = Result<std::unique_ptr<GpuEngine>>;
   if (!g::available()) return R::fail(Status::fail(Code::no_device, std::string("engine: ") + g::last_error()));
   if (s.family != Family::qwen35moe || s.dense) return R::fail(Status::fail(Code::unsupported, "engine: qwen35moe only in this first cut"));

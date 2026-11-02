@@ -83,6 +83,7 @@ bool moe_matmul(std::uint32_t, const void*, std::uint64_t, std::uint64_t, std::i
 }
 bool gather_rows(std::uint32_t, const void*, std::uint64_t, std::int64_t, const std::int32_t*, std::int64_t, float*, Stream) { return false; }
 bool act_q8x32_halves(const float*, std::int64_t, std::int64_t, std::int64_t, bool, float*, std::int64_t, std::int8_t*, float*, int*, Stream) { return false; }
+void set_fast_f32(bool) {}
 bool act_q8x32(const float*, std::int64_t, std::int64_t, std::int64_t, bool, float*, std::int64_t, std::int8_t*, float*, int*, Stream) {
   return false;
 }
