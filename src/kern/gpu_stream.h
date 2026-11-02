@@ -159,6 +159,7 @@ struct MoeHalfArgs {
   unsigned long long* st = nullptr;
   int l2pf = 0;  // v56: each warp prefetches its expert-stage rows into L2 before running its tasks (EngineOptions::l2_prefetch)
   int pipe = 0;  // v57: the expert stage's copy pipeline (each warp's next task's rows by cp.async while it computes; needs load_mode 1 or 2)
+  int sact = 0;  // v57: with pipe, each block keeps the gate / up inputs in shared memory (their jobs read them there)
 };
 constexpr int kRxStatN = 32;
 bool moe_half(const MoeHalfArgs& args, Stream s = nullptr);

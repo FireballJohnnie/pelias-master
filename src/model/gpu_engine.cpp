@@ -1669,6 +1669,7 @@ struct GpuEngine::Impl {
     A.ph = ph_d ? ph_d + static_cast<int64_t>(il) * 5 : nullptr;  // v55b
     A.l2pf = o.l2_prefetch ? 1 : 0;  // v56
     A.pipe = o.rx_pipe && o.rx_load > 0 ? 1 : 0;  // v57
+    A.sact = o.rx_sact ? 1 : 0;  // v57
     A.st = rst_d;                                                 // v55e3
     // v55f / v55f2: the bit planes only feed planed experts' 1-bit route; with no planes (--plane-bits 0) nothing reads
     // them, so they are not built (v55f2 S0 +0.33 ms vs g55e3, MEASURED)

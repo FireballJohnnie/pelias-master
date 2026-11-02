@@ -56,6 +56,7 @@ struct EngineOptions {
   bool dn_smem = true;  // v56b: inside L3, each block normalizes and rounds the inputs itself into shared memory (no stage-0 barrier; tasks read shared); --no-dn-smem
   bool dn_mlp2 = true;  // v56c: inside L3 (shared inputs), Q8_0 tasks two at a time per warp; --no-dn-mlp2
   bool rx_pipe = true;  // v57: the expert stage's copy pipeline (cp.async of each warp's next task; needs rx_load miss / all); --no-rx-pipe
+  bool rx_sact = true;  // v57: with rx_pipe, the gate / up inputs from each block's shared copy (not one L2 read per task); --no-rx-sact
   // v52: the MoE half of each layer (residual, post norm, rounding, router, shared gate, picks, grouping, plan, R3 expert
   // stage, combine, residual) in one cooperative launch (g::moe_half); same bits (--no-fused-moe, temporary)
   bool fused_moe = true;

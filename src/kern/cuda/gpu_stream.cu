@@ -138,29 +138,30 @@ __device__ __forceinline__ std::uint32_t ld_cs1(const void* p) {
   return v;
 }
 // v56b: M = 4 reads the activations with generic loads (L3 keeps each block's copy of them in shared memory); the weights as M 0
+// v57: M = 5: the weights from the warp's staged copy (as M 3) and the activations from the block's shared copy (generic)
 template <int M>
 __device__ __forceinline__ int4 ldx4(const int4* p) {
   if constexpr (M == 0) return __ldg(p);
-  else if constexpr (M == 4) return *p;
+  else if constexpr (M == 4 || M == 5) return *p;
   else return ld_cg4(p);
 }
 template <int M>
 __device__ __forceinline__ float ldxs(const float* p) {
   if constexpr (M == 0) return __ldg(p);
-  else if constexpr (M == 4) return *p;
+  else if constexpr (M == 4 || M == 5) return *p;
   else return ld_cgf(p);
 }
 template <int M>
 __device__ __forceinline__ int ldxi(const int* p) {
   if constexpr (M == 0) return __ldg(p);
-  else if constexpr (M == 4) return *p;
+  else if constexpr (M == 4 || M == 5) return *p;
   else return ld_cgi(p);
 }
 // a weight load; with M = 2 (a cache miss being filled) and st, the 16 bytes also go to the same offset in the slot
 // v46a-2: M = 3 reads the warp's staged copy in shared memory (generic loads; the staging copy did any slot fill)
 template <int M>
 __device__ __forceinline__ int4 ldwf(const DJob& J, bool cs, const std::uint8_t* p, bool st) {
-  if constexpr (M == 3) return *reinterpret_cast<const int4*>(p);
+  if constexpr (M == 3 || M == 5) return *reinterpret_cast<const int4*>(p);
   const int4 v = ldw(cs, p);
   if constexpr (M == 2) {
     if (st) *reinterpret_cast<int4*>(const_cast<std::uint8_t*>(p) + J.fd) = v;
@@ -173,7 +174,7 @@ template <int M, int N>
 __device__ __forceinline__ void q6s_words(const DJob& J, bool cs, const std::uint8_t* p, unsigned mis, std::uint32_t* out) {
   const std::uint32_t* a = reinterpret_cast<const std::uint32_t*>(p - mis);
   std::uint32_t r[N + 1];
-  if constexpr (M == 3) {
+  if constexpr (M == 3 || M == 5) {
 #pragma unroll
     for (int i = 0; i < N; ++i) r[i] = a[i];
     r[N] = mis ? a[N] : 0u;
@@ -329,13 +330,19 @@ __device__ __forceinline__ int q6_sub(const std::uint32_t* qlw, const std::uint3
   const int c0 = static_cast<int>(static_cast<std::int8_t>(sw & 0xffu)), c1 = static_cast<int>(static_cast<std::int8_t>((sw >> 8) & 0xffu));
   return c0 * (a0 - 32 * x0) + c1 * (a1 - 32 * x1);
 }
+// v57: the block's shared copy of the expert stage's gate / up inputs (set at the start of phase C; M = 5 reads them)
+__shared__ const std::int8_t* s_rx_xq0;
+__shared__ const std::uint32_t* s_rx_xb0;
+__shared__ const float* s_rx_xs0;
+__shared__ const int* s_rx_xsum0;
+__shared__ const std::int8_t* s_rx_gxq;  // the global inputs the copy holds (the gate / up jobs' J.xq)
 template <int M, int NT, int ONLY = -1>
 __device__ __forceinline__ void lane_part_n(const DJob& J, int r, int part, const std::int8_t* const* xq, const float* const* xs, const int* const* xsum,
                                             bool cs, float* acc, const std::uint8_t* wb = nullptr, long long rb0 = 0) {
   const int B = part >> 1, half = part & 1, nB = J.K / 256;
   const long long rb = static_cast<long long>(r) * nB + B;
-  const std::uint8_t* const W = M == 3 ? wb : J.w;
-  const long long rbw = M == 3 ? rb - rb0 : rb;
+  const std::uint8_t* const W = (M == 3 || M == 5) ? wb : J.w;
+  const long long rbw = (M == 3 || M == 5) ? rb - rb0 : rb;
   const int jg0 = B * 8 + half * 4;  // first 32-block of the part in the row
 #pragma unroll
   for (int t = 0; t < NT; ++t) acc[t] = 0.f;
@@ -390,8 +397,8 @@ __device__ __forceinline__ void lane_part_n(const DJob& J, int r, int part, cons
     int4 hd;
     std::uint32_t cw[16];
     if (fm_on<ONLY>(kQ4TG2P) && J.fmt == kQ4TG2P) {  // v54b: the row at stride J.rs (or the warp's staged rows, packed at the prefix)
-      const long long r0s = M == 3 ? rb0 / nB : 0;
-      const long long stride = M == 3 ? static_cast<long long>(tg2p_prefix(static_cast<std::uint64_t>(nB), J.pb)) : J.rs;
+      const long long r0s = (M == 3 || M == 5) ? rb0 / nB : 0;
+      const long long stride = (M == 3 || M == 5) ? static_cast<long long>(tg2p_prefix(static_cast<std::uint64_t>(nB), J.pb)) : J.rs;
       hd = tg2p_words<M>(J, cs, W + (r - r0s) * stride, B, half, nB, cw);
     } else {
       const std::uint8_t* bp = W + rbw * 144;
@@ -441,8 +448,8 @@ __device__ __forceinline__ void lane_part_n(const DJob& J, int r, int part, cons
     }
   } else if (fm_on<ONLY>(kQ5KP) && J.fmt == kQ5KP) {  // v54c / v55: Q5_K in bit planes, plane words -> 4 codes a word -> dp4a
     std::uint32_t pa[8], pb[4], pc[4], pd[4];
-    const long long r0s = M == 3 ? rb0 / nB : 0;
-    const long long stride = M == 3 ? static_cast<long long>(plane_prefix(g_q5_kp, 176ull * static_cast<unsigned long long>(nB), J.pb)) : J.rs;
+    const long long r0s = (M == 3 || M == 5) ? rb0 / nB : 0;
+    const long long stride = (M == 3 || M == 5) ? static_cast<long long>(plane_prefix(g_q5_kp, 176ull * static_cast<unsigned long long>(nB), J.pb)) : J.rs;
     const int4 hd = q5p_part<M>(J, cs, W + (r - r0s) * stride, B, half, nB, pa, pb, pc, pd);
     const int kmiss = 5 - J.pb;  // code bits not read (their midpoint is added through the input sums)
     const std::uint32_t h0 = static_cast<std::uint32_t>(hd.x);
@@ -457,7 +464,8 @@ __device__ __forceinline__ void lane_part_n(const DJob& J, int r, int part, cons
       for (int t = 0; t < NT; ++t) {
         int sq = 0;
         if (J.xb) {  // v55f, the 1-bit route (author's 1-bit decoder): each plane AND + popcount against the input's bit planes
-          const int4* u4 = reinterpret_cast<const int4*>(J.xb + ((xq[t] - J.xq) >> 2) + 8 * jg);
+          const int4* u4 = M == 5 ? reinterpret_cast<const int4*>(s_rx_xb0 + ((xq[t] - s_rx_xq0) >> 2) + 8 * jg)  // v57: the block's shared copy
+                                  : reinterpret_cast<const int4*>(J.xb + ((xq[t] - J.xq) >> 2) + 8 * jg);
           const int4 v0 = ldx4<M>(u4), v1 = ldx4<M>(u4 + 1);
           const std::uint32_t u8[8] = {static_cast<std::uint32_t>(v0.x), static_cast<std::uint32_t>(v0.y), static_cast<std::uint32_t>(v0.z),
                                        static_cast<std::uint32_t>(v0.w), static_cast<std::uint32_t>(v1.x), static_cast<std::uint32_t>(v1.y),
@@ -1237,6 +1245,11 @@ __device__ __forceinline__ void rxp_compute(const DJob& J, long long t, std::uin
     wb = buf + (reinterpret_cast<std::uintptr_t>(src) & 15u);
     if (J.fd && nr > 0) rxp_fill(const_cast<std::uint8_t*>(src) + J.fd, wb, nr * rowb, lane);
   }
+  // v57: the gate / up jobs read their inputs from the block's shared copy (M = 5) when phase C made one; down from global
+  const bool sh = s_rx_xq0 != nullptr && J.xq == s_rx_gxq;
+  const std::int8_t* bq = sh ? s_rx_xq0 : J.xq;
+  const float* bs = sh ? s_rx_xs0 : J.xs;
+  const int* bm = sh ? s_rx_xsum0 : J.xsum;
   if constexpr (kMT) {
     if (J.ntok > 1) {
       const std::int8_t* xq[4];
@@ -1246,13 +1259,16 @@ __device__ __forceinline__ void rxp_compute(const DJob& J, long long t, std::uin
       for (int tk = 0; tk < 4; ++tk) {
         const int u = tk < J.ntok ? tk : 0;
         const long long xo = J.tokx[u];
-        xq[tk] = J.xq + xo * J.xqs;
-        xs[tk] = J.xs + xo * J.xss;
-        xsum[tk] = J.xsum + xo * J.xss;
+        xq[tk] = bq + xo * J.xqs;
+        xs[tk] = bs + xo * J.xss;
+        xsum[tk] = bm + xo * J.xss;
         yo[tk] = J.ypk[u] * J.ys;
       }
       float acc[4] = {0.f, 0.f, 0.f, 0.f};
-      if (r < J.n) lane_part_d<3, ONLY>(J, r, part, xq, xs, xsum, J.ntok, acc, wb, static_cast<long long>(r0) * nB);
+      if (r < J.n) {
+        if (sh) lane_part_d<5, ONLY>(J, r, part, xq, xs, xsum, J.ntok, acc, wb, static_cast<long long>(r0) * nB);
+        else lane_part_d<3, ONLY>(J, r, part, xq, xs, xsum, J.ntok, acc, wb, static_cast<long long>(r0) * nB);
+      }
       store_rows(J, r, part, acc, J.ntok, yo);
       return;
     }
@@ -1260,7 +1276,10 @@ __device__ __forceinline__ void rxp_compute(const DJob& J, long long t, std::uin
   for (int tk = 0; tk < J.ntok; ++tk) {
     const long long xo = J.tokx[tk];
     float acc = 0.f;
-    if (r < J.n) acc = lane_part<3, ONLY>(J, r, part, J.xq + xo * J.xqs, J.xs + xo * J.xss, J.xsum + xo * J.xss, false, wb, static_cast<long long>(r0) * nB);
+    if (r < J.n) {
+      if (sh) acc = lane_part<5, ONLY>(J, r, part, bq + xo * J.xqs, bs + xo * J.xss, bm + xo * J.xss, false, wb, static_cast<long long>(r0) * nB);
+      else acc = lane_part<3, ONLY>(J, r, part, bq + xo * J.xqs, bs + xo * J.xss, bm + xo * J.xss, false, wb, static_cast<long long>(r0) * nB);
+    }
     for (int o = J.lpr / 2; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
     if (r < J.n && part == 0) J.y[J.ypk[tk] * J.ys + r] = acc;
   }
@@ -1569,6 +1588,33 @@ __global__ void __launch_bounds__(256, 1) k_moe_half(const __grid_constant__ Moe
   if (phs) A.ph[2] = gtimer_s();
   // ---- C
   lut_setup_rx();
+  // v57: with the pipeline, each block copies the gate / up inputs phase A wrote (n x H int8, their scales and sums, and the
+  // 1-bit route's bit planes) into its shared memory after the warps' buffers; those jobs then read them there (M = 5)
+  if (A.pipe && A.sact) {
+    std::uint8_t* base = reinterpret_cast<std::uint8_t*>(s_lut) + kLutRxBytes + 16 * static_cast<long long>(sbytes);
+    const int nH = n * H, nb = nH / 32;
+    std::int8_t* q8 = reinterpret_cast<std::int8_t*>(base);
+    float* xs = reinterpret_cast<float*>(base + nH);
+    int* xm = reinterpret_cast<int*>(base + nH + 4 * nb);
+    std::uint32_t* xb = reinterpret_cast<std::uint32_t*>(base + nH + 8 * nb);
+    for (int i = tid; i < nH / 16; i += static_cast<int>(blockDim.x)) reinterpret_cast<int4*>(q8)[i] = ld_cg4(reinterpret_cast<const int4*>(A.xq) + i);
+    for (int i = tid; i < nb; i += static_cast<int>(blockDim.x)) {
+      xs[i] = ld_cgf(A.xs + i);
+      xm[i] = ld_cgi(A.xsum + i);
+    }
+    if (A.xb)
+      for (int i = tid; i < nH / 16; i += static_cast<int>(blockDim.x)) reinterpret_cast<int4*>(xb)[i] = ld_cg4(reinterpret_cast<const int4*>(A.xb) + i);
+    if (tid == 0) {
+      s_rx_xq0 = q8;
+      s_rx_xs0 = xs;
+      s_rx_xsum0 = xm;
+      s_rx_xb0 = xb;
+      s_rx_gxq = A.xq;
+    }
+  } else if (tid == 0) {
+    s_rx_xq0 = nullptr;
+  }
+  __syncthreads();
   rx_body<kMT, kOnlyRx, kStat>(static_cast<const std::uint8_t*>(A.plan), A.max_picks, sbytes, A.st, A.l2pf, A.pipe);
   grid.sync();
   if (phs) A.ph[3] = gtimer_s();
@@ -1973,7 +2019,8 @@ bool moe_half(const MoeHalfArgs& A, Stream s) {
   const int sbytes = A.load_mode ? g_stage_bytes : 0;  // v55f
   // dynamic shared memory: the largest of the phases' uses (at most 4 x 128 x 144 B staging = 72 KB: opt in past 48 KB)
   const int sm_stage = 4 * nsub * md::kGvPad * 4, sm_router = 2 * md::kRouterMaxExperts * 4 + md::kRouterMaxExperts,
-            sm_rx = kLutRxBytes + 8 * sbytes * (A.pipe ? 2 : 1);  // v57: two buffers per warp with the pipeline
+            sm_rx = kLutRxBytes + 8 * sbytes * (A.pipe ? 2 : 1) +  // v57: two buffers per warp with the pipeline
+                    (A.pipe && A.sact ? (A.n > 1 ? 4 : 1) * (2 * A.H + 8 * (A.H / 32)) : 0);  // and the gate / up inputs' shared copy
   const int smem = std::max(sm_stage, std::max(sm_router, sm_rx));
   const bool mt = A.n > 1;
   const bool stat = !mt && A.st != nullptr;  // v55e3 diagnosis: the counting kernel (verbose runs only)
@@ -1984,8 +2031,8 @@ bool moe_half(const MoeHalfArgs& A, Stream s) {
   else if (nj == 1) fn = mt ? reinterpret_cast<void*>(k_moe_half<true, 1>) : reinterpret_cast<void*>(k_moe_half<false, 1>);
   else if (nj == 2) fn = mt ? reinterpret_cast<void*>(k_moe_half<true, 2>) : reinterpret_cast<void*>(k_moe_half<false, 2>);
   else fn = mt ? reinterpret_cast<void*>(k_moe_half<true, 4>) : reinterpret_cast<void*>(k_moe_half<false, 4>);
-  static int grids[2][3][3][2][2] = {};  // v57: [pipe]
-  int& grid = grids[mt ? 1 : 0][nj == 1 ? 0 : (nj == 2 ? 1 : 2)][A.load_mode][stat ? 1 : 0][A.pipe ? 1 : 0];
+  static int grids[2][3][3][2][3] = {};  // v57: [pipe, + shared inputs]
+  int& grid = grids[mt ? 1 : 0][nj == 1 ? 0 : (nj == 2 ? 1 : 2)][A.load_mode][stat ? 1 : 0][A.pipe ? (A.sact ? 2 : 1) : 0];
   if (!grid) {
     int dev = 0, sms = 0, occ = 0, coop = 0;
     if (!sck(cudaGetDevice(&dev), "cudaGetDevice") || !sck(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev), "SM count") ||
