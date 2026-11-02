@@ -445,8 +445,10 @@ TEST(rung4_engine_batch_identical_and_graph) {
   const std::size_t row = static_cast<std::size_t>(nv);
   std::vector<std::int32_t> tok(static_cast<std::size_t>(npre + ndec));
   for (std::size_t i = 0; i < tok.size(); ++i) tok[i] = static_cast<std::int32_t>((i * 37 + 11) % 1000);
-  std::vector<std::vector<float>> one(3), ver(3);
-  for (int cfg = 0; cfg < 3; ++cfg) {  // 0: plain batched kernels; 1: batch-identical; 2: batch-identical + graph
+  std::vector<std::vector<float>> one(4), ver(4);
+  // 3 (v47): batch-identical + graph + the R3 expert stage with staged RAM experts: verify batches run the kernels that load
+  // each row once for every token (lane_part_n), one-token steps the one-token kernels; both must give the same logits
+  for (int cfg = 0; cfg < 4; ++cfg) {  // 0: plain batched kernels; 1: batch-identical; 2: batch-identical + graph
     m::EngineOptions eo;
     eo.max_ctx = 128;
     eo.max_batch = 16;
@@ -458,7 +460,9 @@ TEST(rung4_engine_batch_identical_and_graph) {
       for (int e = 0; e < static_cast<int>(s.n_expert); ++e) v.push_back(e);
     eo.max_hot_per_layer = 2;
     eo.batch_identical = cfg >= 1;
-    eo.graph = cfg == 2;
+    eo.graph = cfg >= 2;
+    eo.r3_experts = cfg == 3;
+    eo.rx_load = cfg == 3 ? 1 : 0;
     auto f = m::GpuEngine::open(s, sm.w, eo);
     CHECK(f.ok());
     if (!f.ok()) {
@@ -480,15 +484,20 @@ TEST(rung4_engine_batch_identical_and_graph) {
       CHECK(E.verify(tok.data() + npre + 4 * b, 4, ver[static_cast<std::size_t>(cfg)].data() + static_cast<std::size_t>(4 * b) * row, bh.data()).ok());
       CHECK(E.keep(4).ok());
     }
-    std::printf("    config %d (%s): %s\n", cfg, cfg == 0 ? "batched kernels" : cfg == 1 ? "batch-identical" : "batch-identical + graph", E.graph_report().c_str());
-    if (cfg == 2) CHECK(E.graph_report().find("replays 0") == std::string::npos);
+    std::printf("    config %d (%s): %s\n", cfg,
+                cfg == 0 ? "batched kernels" : cfg == 1 ? "batch-identical" : cfg == 2 ? "batch-identical + graph" : "+ R3 expert stage", E.graph_report().c_str());
+    if (cfg == 3) std::printf("      %s\n", E.summary().c_str());
+    if (cfg >= 2) CHECK(E.graph_report().find("replays 0") == std::string::npos);
   }
   const std::size_t nb = static_cast<std::size_t>(ndec) * row * sizeof(float);
   const bool plain_split = std::memcmp(one[0].data(), ver[0].data(), nb) != 0;
   const bool bi_eq = std::memcmp(one[1].data(), ver[1].data(), nb) == 0;
   const bool gr_eq = std::memcmp(one[2].data(), ver[2].data(), nb) == 0 && std::memcmp(one[1].data(), one[2].data(), nb) == 0;
+  const bool rx_eq = std::memcmp(one[3].data(), ver[3].data(), nb) == 0;
   CHECK(bi_eq);
   CHECK(gr_eq);
+  CHECK(rx_eq);
+  std::printf("    v47 R3 expert stage + multi-token loads: one token at a time vs verify batches of 4 %s\n", rx_eq ? "bit for bit" : "DIFFER");
   std::printf("    one token at a time vs verify batches of 4: batched kernels %s; batch-identical %s; with the graph %s (and equal to plain launches)\n",
               plain_split ? "differ (the split)" : "equal", bi_eq ? "bit for bit" : "DIFFER", gr_eq ? "bit for bit" : "DIFFER");
 }

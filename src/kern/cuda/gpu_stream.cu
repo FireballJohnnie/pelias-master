@@ -474,6 +474,418 @@ __device__ float lane_part(const DJob& J, int r, int part, const std::int8_t* xq
   return acc;
 }
 
+// v47 (THE FINAL FORM, MTP fix; author 19:30-19:46): NT tokens on one load of the weights. The row part's weights are loaded
+// (and on a miss filled) once; for each quarter, every token's eight activation words are loaded and that token's arithmetic
+// runs exactly as lane_part's (the same operations in the same order per token), so each token's result equals the one-token
+// path's bit for bit while the weights cross the bus once instead of NT times (v46a-2 MTP: verify of 2 tokens 29.8 ms vs 16.5).
+template <int M, int NT>
+__device__ __forceinline__ void lane_part_n(const DJob& J, int r, int part, const std::int8_t* const* xq, const float* const* xs, const int* const* xsum,
+                                            bool cs, float* acc, const std::uint8_t* wb = nullptr, long long rb0 = 0) {
+  const int B = part >> 1, half = part & 1, nB = J.K / 256;
+  const long long rb = static_cast<long long>(r) * nB + B;
+  const std::uint8_t* const W = M == 3 ? wb : J.w;
+  const long long rbw = M == 3 ? rb - rb0 : rb;
+  const int jg0 = B * 8 + half * 4;  // first 32-block of the part in the row
+#pragma unroll
+  for (int t = 0; t < NT; ++t) acc[t] = 0.f;
+  if (J.fmt == kQ7ZT) {
+    std::uint32_t wd[29];
+    const std::uint8_t* bp = J.w + rb * 224 + half * 112;
+#pragma unroll
+    for (int i = 0; i < 7; ++i) {
+      const int4 t = ldw(cs, bp + 16 * i);
+      wd[4 * i] = static_cast<std::uint32_t>(t.x);
+      wd[4 * i + 1] = static_cast<std::uint32_t>(t.y);
+      wd[4 * i + 2] = static_cast<std::uint32_t>(t.z);
+      wd[4 * i + 3] = static_cast<std::uint32_t>(t.w);
+    }
+    wd[28] = 0u;
+    const std::uint64_t h = J.hdr[rb];
+    const unsigned m = J.mask[rb];
+    const float d = __half2float(__ushort_as_half(static_cast<unsigned short>(h & 0xffffu)));
+#pragma unroll
+    for (int jj = 0; jj < 4; ++jj) {
+      for (int t = 0; t < NT; ++t) {
+        int xj[8];
+        {
+          const int4* x4 = reinterpret_cast<const int4*>(xq[t] + (jg0 + jj) * 32);
+          const int4 u0 = ldx4<M>(x4), u1 = ldx4<M>(x4 + 1);
+          xj[0] = u0.x;
+          xj[1] = u0.y;
+          xj[2] = u0.z;
+          xj[3] = u0.w;
+          xj[4] = u1.x;
+          xj[5] = u1.y;
+          xj[6] = u1.z;
+          xj[7] = u1.w;
+        }
+        const int j = half * 4 + jj, jg = jg0 + jj;
+        int pb = 0;
+#pragma unroll
+        for (int g = 0; g < 8; ++g) {
+          std::uint32_t packed = 0;
+#pragma unroll
+          for (int t = 0; t < 4; ++t) {
+            const int i = 32 * jj + 4 * g + t, bit = 7 * i;
+            packed |= (__funnelshift_r(wd[bit >> 5], wd[(bit >> 5) + 1], static_cast<unsigned>(bit & 31)) & 127u) << (8 * t);
+          }
+          pb = __dp4a(static_cast<int>(packed), xj[g], pb);
+        }
+        int hx = 0;
+        if ((m >> j) & 1u) {
+          const std::uint32_t H = J.hb[rb * 2 + __popc(m & ((1u << j) - 1u))];
+#pragma unroll
+          for (int g = 0; g < 8; ++g) {
+            const std::uint32_t nib = (H >> (4 * g)) & 0xfu;
+            hx = __dp4a(static_cast<int>((nib * 0x00204081u) & 0x01010101u), xj[g], hx);
+          }
+        }
+        const int P = 2 * pb - 127 * ldxi<M>(xsum[t] + jg) + hx;  // sum (2b + h - 127) x
+        const float s = (d * static_cast<float>((h >> (16 + 6 * j)) & 63u)) / 63.f;
+        acc[t] += s * ldxs<M>(xs[t] + jg) * static_cast<float>(P);
+      }
+    }
+  } else if (J.fmt == kQ4TG2) {
+    const std::uint8_t* bp = W + rbw * 144;
+    const int4 hd = ldwf<M>(J, cs, bp, half == 0);
+    int4 c[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) c[i] = ldwf<M>(J, cs, bp + 16 + half * 64 + 16 * i, true);
+    const std::uint32_t cw[16] = {static_cast<std::uint32_t>(c[0].x), static_cast<std::uint32_t>(c[0].y), static_cast<std::uint32_t>(c[0].z),
+                                  static_cast<std::uint32_t>(c[0].w), static_cast<std::uint32_t>(c[1].x), static_cast<std::uint32_t>(c[1].y),
+                                  static_cast<std::uint32_t>(c[1].z), static_cast<std::uint32_t>(c[1].w), static_cast<std::uint32_t>(c[2].x),
+                                  static_cast<std::uint32_t>(c[2].y), static_cast<std::uint32_t>(c[2].z), static_cast<std::uint32_t>(c[2].w),
+                                  static_cast<std::uint32_t>(c[3].x), static_cast<std::uint32_t>(c[3].y), static_cast<std::uint32_t>(c[3].z),
+                                  static_cast<std::uint32_t>(c[3].w)};
+    const std::uint32_t h0 = static_cast<std::uint32_t>(hd.x), h1 = static_cast<std::uint32_t>(hd.y);
+    const std::uint64_t lv = (static_cast<std::uint64_t>(h0 >> 16)) | (static_cast<std::uint64_t>(h1) << 16);  // 6 level bytes at 2..7
+    const float d = __half2float(__ushort_as_half(static_cast<unsigned short>(h0 & 0xffffu)));
+    const std::uint64_t tags =
+        static_cast<std::uint64_t>(static_cast<std::uint32_t>(hd.z)) | (static_cast<std::uint64_t>(static_cast<std::uint32_t>(hd.w)) << 32);
+#pragma unroll
+    for (int jj = 0; jj < 4; ++jj) {
+      for (int t = 0; t < NT; ++t) {
+        int xj[8];
+        {
+          const int4* x4 = reinterpret_cast<const int4*>(xq[t] + (jg0 + jj) * 32);
+          const int4 u0 = ldx4<M>(x4), u1 = ldx4<M>(x4 + 1);
+          xj[0] = u0.x;
+          xj[1] = u0.y;
+          xj[2] = u0.z;
+          xj[3] = u0.w;
+          xj[4] = u1.x;
+          xj[5] = u1.y;
+          xj[6] = u1.z;
+          xj[7] = u1.w;
+        }
+        const int j = half * 4 + jj, jg = jg0 + jj;
+        const unsigned tb = static_cast<unsigned>((tags >> (8 * j)) & 0xffu);
+        float sum = 0.f;
+#pragma unroll
+        for (int g = 0; g < 4; ++g) {
+          const unsigned tg = (tb >> (2 * g)) & 3u;
+          const std::uint32_t word = cw[jj * 4 + g];  // 8 codes = values 32 jj + 8 g .. + 7 of the part
+          const float* lr = s_lut + (threadIdx.x & 31) + 32 * 16 * tg;
+#pragma unroll
+          for (int k = 0; k < 8; ++k) {
+            const float wv = lr[32 * ((word >> (4 * k)) & 15u)];
+            sum += wv * i8f(xj, 8 * g + k);
+          }
+        }
+        const float s = (d * static_cast<float>((lv >> (6 * j)) & 63u)) / 63.f;
+        acc[t] += s * ldxs<M>(xs[t] + jg) * sum;
+      }
+    }
+  } else if (J.fmt == kQ5K) {
+    const std::uint8_t* bp = W + rbw * 176;
+    const int4 hd = ldwf<M>(J, cs, bp, half == 0);
+    const int4 qa = ldwf<M>(J, cs, bp + 16, half == 0), qb4 = ldwf<M>(J, cs, bp + 32, half == 0);
+    int4 ql[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) ql[i] = ldwf<M>(J, cs, bp + 48 + half * 64 + 16 * i, true);
+    std::uint8_t hb[4], qh[32], qlb[64];
+    memcpy(hb, &hd, 4);
+    memcpy(qh, &qa, 16);
+    memcpy(qh + 16, &qb4, 16);
+    memcpy(qlb, ql, 64);
+    const float d = __half2float(__ushort_as_half(static_cast<unsigned short>(hb[0] | (hb[1] << 8))));
+    const float dmin = __half2float(__ushort_as_half(static_cast<unsigned short>(hb[2] | (hb[3] << 8))));
+#pragma unroll
+    for (int jj = 0; jj < 4; ++jj) {
+      for (int t = 0; t < NT; ++t) {
+        int xj[8];
+        {
+          const int4* x4 = reinterpret_cast<const int4*>(xq[t] + (jg0 + jj) * 32);
+          const int4 u0 = ldx4<M>(x4), u1 = ldx4<M>(x4 + 1);
+          xj[0] = u0.x;
+          xj[1] = u0.y;
+          xj[2] = u0.z;
+          xj[3] = u0.w;
+          xj[4] = u1.x;
+          xj[5] = u1.y;
+          xj[6] = u1.z;
+          xj[7] = u1.w;
+        }
+        const int j = half * 4 + jj, jg = jg0 + jj;
+        // the 12 scale bytes sit in header words y, z, w (bytes 4..15); read by shifts, so nothing goes to local memory
+        const std::uint32_t s0 = static_cast<std::uint32_t>(hd.y), s1 = static_cast<std::uint32_t>(hd.z), s2 = static_cast<std::uint32_t>(hd.w);
+        auto qb = [&](int k) { return static_cast<int>(((k < 4 ? s0 : (k < 8 ? s1 : s2)) >> (8 * (k & 3))) & 0xffu); };
+        int sc, mn;
+        if (j < 4) {
+          sc = qb(j) & 63;
+          mn = qb(j + 4) & 63;
+        } else {
+          sc = (qb(j + 4) & 0xF) | ((qb(j - 4) >> 6) << 4);
+          mn = (qb(j + 4) >> 4) | ((qb(j) >> 6) << 4);
+        }
+        const std::uint8_t* q = qlb + 32 * (jj >> 1);
+        int sq = 0;
+#pragma unroll
+        for (int l = 0; l < 32; ++l) {
+          const int lo = (j & 1) ? (q[l] >> 4) : (q[l] & 0xF);
+          sq += (lo + (((qh[l] >> j) & 1) << 4)) * sx8(xj, l);
+        }
+        acc[t] += ldxs<M>(xs[t] + jg) *
+               (d * static_cast<float>(sc) * static_cast<float>(sq) - dmin * static_cast<float>(mn) * static_cast<float>(ldxi<M>(xsum[t] + jg)));
+      }
+    }
+  } else if (J.fmt == kQ8_0) {  // repacked per 256: qs[256] (int8) | d[8] (fp16); the half's 128 values and 4 d's
+    const std::uint8_t* bp = W + rbw * 272;
+    const uint2 dd = *reinterpret_cast<const uint2*>(bp + 256 + half * 8);
+#pragma unroll
+    for (int jj = 0; jj < 4; ++jj) {
+      const int4 qa = ldwf<M>(J, cs, bp + half * 128 + 32 * jj, false), qb = ldwf<M>(J, cs, bp + half * 128 + 32 * jj + 16, false);  // once for all tokens
+      for (int t = 0; t < NT; ++t) {
+        int xj[8];
+        {
+          const int4* x4 = reinterpret_cast<const int4*>(xq[t] + (jg0 + jj) * 32);
+          const int4 u0 = ldx4<M>(x4), u1 = ldx4<M>(x4 + 1);
+          xj[0] = u0.x;
+          xj[1] = u0.y;
+          xj[2] = u0.z;
+          xj[3] = u0.w;
+          xj[4] = u1.x;
+          xj[5] = u1.y;
+          xj[6] = u1.z;
+          xj[7] = u1.w;
+        }
+        const int jg = jg0 + jj;
+        int P = 0;
+        P = __dp4a(qa.x, xj[0], P);
+        P = __dp4a(qa.y, xj[1], P);
+        P = __dp4a(qa.z, xj[2], P);
+        P = __dp4a(qa.w, xj[3], P);
+        P = __dp4a(qb.x, xj[4], P);
+        P = __dp4a(qb.y, xj[5], P);
+        P = __dp4a(qb.z, xj[6], P);
+        P = __dp4a(qb.w, xj[7], P);
+        const std::uint32_t dw = (jj < 2 ? dd.x : dd.y) >> (16 * (jj & 1));
+        const float d = __half2float(__ushort_as_half(static_cast<unsigned short>(dw & 0xffffu)));
+        acc[t] += d * ldxs<M>(xs[t] + jg) * static_cast<float>(P);
+      }
+    }
+  } else if (J.fmt == kQ4K) {  // as stored (144 bytes): d | dmin | scales[12] | qs[128]; Q5_K without qh
+    const std::uint8_t* bp = W + rbw * 144;
+    const int4 hd = ldwf<M>(J, cs, bp, half == 0);
+    int4 ql[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) ql[i] = ldwf<M>(J, cs, bp + 16 + half * 64 + 16 * i, true);
+    const std::uint32_t qw[16] = {static_cast<std::uint32_t>(ql[0].x), static_cast<std::uint32_t>(ql[0].y), static_cast<std::uint32_t>(ql[0].z),
+                                  static_cast<std::uint32_t>(ql[0].w), static_cast<std::uint32_t>(ql[1].x), static_cast<std::uint32_t>(ql[1].y),
+                                  static_cast<std::uint32_t>(ql[1].z), static_cast<std::uint32_t>(ql[1].w), static_cast<std::uint32_t>(ql[2].x),
+                                  static_cast<std::uint32_t>(ql[2].y), static_cast<std::uint32_t>(ql[2].z), static_cast<std::uint32_t>(ql[2].w),
+                                  static_cast<std::uint32_t>(ql[3].x), static_cast<std::uint32_t>(ql[3].y), static_cast<std::uint32_t>(ql[3].z),
+                                  static_cast<std::uint32_t>(ql[3].w)};
+    const std::uint32_t h0 = static_cast<std::uint32_t>(hd.x);
+    const float d = __half2float(__ushort_as_half(static_cast<unsigned short>(h0 & 0xffffu)));
+    const float dmin = __half2float(__ushort_as_half(static_cast<unsigned short>(h0 >> 16)));
+    const std::uint32_t s0 = static_cast<std::uint32_t>(hd.y), s1 = static_cast<std::uint32_t>(hd.z), s2 = static_cast<std::uint32_t>(hd.w);
+#pragma unroll
+    for (int jj = 0; jj < 4; ++jj) {
+      for (int t = 0; t < NT; ++t) {
+        int xj[8];
+        {
+          const int4* x4 = reinterpret_cast<const int4*>(xq[t] + (jg0 + jj) * 32);
+          const int4 u0 = ldx4<M>(x4), u1 = ldx4<M>(x4 + 1);
+          xj[0] = u0.x;
+          xj[1] = u0.y;
+          xj[2] = u0.z;
+          xj[3] = u0.w;
+          xj[4] = u1.x;
+          xj[5] = u1.y;
+          xj[6] = u1.z;
+          xj[7] = u1.w;
+        }
+        const int j = half * 4 + jj, jg = jg0 + jj;
+        auto qb = [&](int k) { return static_cast<int>(((k < 4 ? s0 : (k < 8 ? s1 : s2)) >> (8 * (k & 3))) & 0xffu); };
+        int sc, mn;
+        if (j < 4) {
+          sc = qb(j) & 63;
+          mn = qb(j + 4) & 63;
+        } else {
+          sc = (qb(j + 4) & 0xF) | ((qb(j - 4) >> 6) << 4);
+          mn = (qb(j + 4) >> 4) | ((qb(j) >> 6) << 4);
+        }
+        // sub-block j: 32 nibbles of bytes 32 (jj / 2) .. +31 of the half, low nibbles for even j, high for odd
+        const int sh = 4 * (j & 1);
+        int sq = 0;
+#pragma unroll
+        for (int g = 0; g < 8; ++g) sq = __dp4a(static_cast<int>((qw[8 * (jj >> 1) + g] >> sh) & 0x0F0F0F0Fu), xj[g], sq);
+        acc[t] += ldxs<M>(xs[t] + jg) *
+               (d * static_cast<float>(sc) * static_cast<float>(sq) - dmin * static_cast<float>(mn) * static_cast<float>(ldxi<M>(xsum[t] + jg)));
+      }
+    }
+  } else if (J.fmt == kIQ4XS) {  // repacked per 256 (144 bytes): d | scales_h | scales_l[4] | 8 zero bytes | qs[128]
+    const std::uint8_t* bp = W + rbw * 144;
+    const int4 hd = ldw(cs, bp);
+    const std::uint32_t h0 = static_cast<std::uint32_t>(hd.x), sl = static_cast<std::uint32_t>(hd.y);
+    const float d = __half2float(__ushort_as_half(static_cast<unsigned short>(h0 & 0xffffu)));
+    const std::uint32_t sh = h0 >> 16;
+#pragma unroll
+    for (int jj = 0; jj < 4; ++jj) {
+      const int ib = half * 4 + jj, jg = jg0 + jj;
+      const int ls = static_cast<int>(((sl >> (4 * ib)) & 0xfu) | (((sh >> (2 * ib)) & 3u) << 4));
+      const int4 qv = ldw(cs, bp + 16 + 16 * ib);  // once for all tokens
+      const std::uint32_t qw[4] = {static_cast<std::uint32_t>(qv.x), static_cast<std::uint32_t>(qv.y), static_cast<std::uint32_t>(qv.z),
+                                   static_cast<std::uint32_t>(qv.w)};
+      for (int t = 0; t < NT; ++t) {
+        int xj[8];
+        {
+          const int4* x4 = reinterpret_cast<const int4*>(xq[t] + (jg0 + jj) * 32);
+          const int4 u0 = ldx4<M>(x4), u1 = ldx4<M>(x4 + 1);
+          xj[0] = u0.x;
+          xj[1] = u0.y;
+          xj[2] = u0.z;
+          xj[3] = u0.w;
+          xj[4] = u1.x;
+          xj[5] = u1.y;
+          xj[6] = u1.z;
+          xj[7] = u1.w;
+        }
+        int P = 0;
+#pragma unroll
+        for (int w = 0; w < 4; ++w) {
+          P = __dp4a(iq4_levels(qw[w] & 0x0F0F0F0Fu), xj[w], P);
+          P = __dp4a(iq4_levels((qw[w] >> 4) & 0x0F0F0F0Fu), xj[4 + w], P);
+        }
+        acc[t] += d * static_cast<float>(ls - 32) * ldxs<M>(xs[t] + jg) * static_cast<float>(P);
+      }
+    }
+  } else if (M != 0 && J.fmt == kQ6KS) {  // v46a-1: as stored: ql[128] | qh[64] | scales[16] | d (210 bytes, 2-byte aligned)
+    const std::uint8_t* bp = W + rbw * 210;
+    const unsigned mis = static_cast<unsigned>(reinterpret_cast<std::uintptr_t>(bp) & 3u);
+    std::uint32_t qlw[16], qhw[8], scw[2];
+    q6s_words<M, 16>(J, cs, bp + half * 64, mis, qlw);
+    q6s_words<M, 8>(J, cs, bp + 128 + half * 32, mis, qhw);
+    q6s_words<M, 2>(J, cs, bp + 192 + half * 8, mis, scw);
+    const unsigned short dh = *reinterpret_cast<const unsigned short*>(bp + 208);
+    if constexpr (M == 2) {
+      if (half == 0) *reinterpret_cast<unsigned short*>(const_cast<std::uint8_t*>(bp) + 208 + J.fd) = dh;
+    }
+    std::uint8_t ql[64], qh[32];
+    std::int8_t sc[8];
+    memcpy(ql, qlw, 64);
+    memcpy(qh, qhw, 32);
+    memcpy(sc, scw, 8);
+    const float d = __half2float(__ushort_as_half(dh));
+#pragma unroll
+    for (int p = 0; p < 4; ++p) {
+      for (int t = 0; t < NT; ++t) {
+        int xj[8];
+        {
+          const int4* x4 = reinterpret_cast<const int4*>(xq[t] + (jg0 + p) * 32);
+          const int4 u0 = ldx4<M>(x4), u1 = ldx4<M>(x4 + 1);
+          xj[0] = u0.x;
+          xj[1] = u0.y;
+          xj[2] = u0.z;
+          xj[3] = u0.w;
+          xj[4] = u1.x;
+          xj[5] = u1.y;
+          xj[6] = u1.z;
+          xj[7] = u1.w;
+        }
+        const int jg = jg0 + p;
+        int s0 = 0, s1 = 0;
+#pragma unroll
+        for (int l = 0; l < 32; ++l) {
+          int q;
+          if (p == 0) q = (ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4);
+          else if (p == 1) q = (ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4);
+          else if (p == 2) q = (ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4);
+          else q = (ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4);
+          const int v = (q - 32) * sx8(xj, l);
+          if (l < 16) s0 += v;
+          else s1 += v;
+        }
+        acc[t] += d * ldxs<M>(xs[t] + jg) * static_cast<float>(sc[2 * p] * s0 + sc[2 * p + 1] * s1);
+      }
+    }
+  } else {  // kQ6K
+    const std::uint8_t* bp = J.w + rb * 208;
+    int4 l4[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) l4[i] = ldw(cs, bp + half * 64 + 16 * i);
+    const int4 h4a = ldw(cs, bp + 128 + half * 32), h4b = ldw(cs, bp + 128 + half * 32 + 16);
+    const uint2 s2 = *reinterpret_cast<const uint2*>(bp + 192 + half * 8);
+    std::uint8_t ql[64], qh[32];
+    std::int8_t sc[8];
+    memcpy(ql, l4, 64);
+    memcpy(qh, &h4a, 16);
+    memcpy(qh + 16, &h4b, 16);
+    memcpy(sc, &s2, 8);
+    const float d = __half2float(__ushort_as_half(J.d6[rb]));
+#pragma unroll
+    for (int p = 0; p < 4; ++p) {
+      for (int t = 0; t < NT; ++t) {
+        int xj[8];
+        {
+          const int4* x4 = reinterpret_cast<const int4*>(xq[t] + (jg0 + p) * 32);
+          const int4 u0 = ldx4<M>(x4), u1 = ldx4<M>(x4 + 1);
+          xj[0] = u0.x;
+          xj[1] = u0.y;
+          xj[2] = u0.z;
+          xj[3] = u0.w;
+          xj[4] = u1.x;
+          xj[5] = u1.y;
+          xj[6] = u1.z;
+          xj[7] = u1.w;
+        }
+        const int jg = jg0 + p;
+        int s0 = 0, s1 = 0;
+#pragma unroll
+        for (int l = 0; l < 32; ++l) {
+          int q;
+          if (p == 0) q = (ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4);
+          else if (p == 1) q = (ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4);
+          else if (p == 2) q = (ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4);
+          else q = (ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4);
+          const int v = (q - 32) * sx8(xj, l);
+          if (l < 16) s0 += v;
+          else s1 += v;
+        }
+        acc[t] += d * ldxs<M>(xs[t] + jg) * static_cast<float>(sc[2 * p] * s0 + sc[2 * p + 1] * s1);
+      }
+    }
+  }
+}
+
+// v47: NT = 2, 3 or 4 tokens on one load of the weights (cs: the weights are read once, so they stream past the caches)
+template <int M>
+__device__ __forceinline__ void lane_part_d(const DJob& J, int r, int part, const std::int8_t* const* xq, const float* const* xs, const int* const* xsum, int nt,
+                                            float* acc, const std::uint8_t* wb = nullptr, long long rb0 = 0) {
+  if (nt == 2) lane_part_n<M, 2>(J, r, part, xq, xs, xsum, true, acc, wb, rb0);
+  else if (nt == 3) lane_part_n<M, 3>(J, r, part, xq, xs, xsum, true, acc, wb, rb0);
+  else lane_part_n<M, 4>(J, r, part, xq, xs, xsum, true, acc, wb, rb0);
+}
+// v47: the warp's NT accumulators reduced over the row's lanes and stored (row r, token outputs at y + ypk / tk strides)
+__device__ __forceinline__ void store_rows(const DJob& J, int r, int part, const float* acc, int nt, const long long* yoff) {
+  for (int tk = 0; tk < nt; ++tk) {
+    float a = acc[tk];
+    for (int o = J.lpr / 2; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+    if (r < J.n && part == 0) J.y[yoff[tk] + r] = a;
+  }
+}
+
 // route 2: a warp's t only grows, so the job is found by walking forward from the last one
 __device__ __forceinline__ int find_job(const DJob* __restrict__ jobs, int njobs, long long t, int* hint) {
   int lo = *hint;
@@ -482,10 +894,30 @@ __device__ __forceinline__ int find_job(const DJob* __restrict__ jobs, int njobs
   return lo;
 }
 
+template <bool kMT>
 __device__ __forceinline__ void run_task(const DJob* __restrict__ jobs, int njobs, long long t, int* hint) {
   const DJob& J = jobs[find_job(jobs, njobs, t, hint)];
   const int lane = static_cast<int>(threadIdx.x & 31), rpw = 32 / J.lpr;
   const int r = static_cast<int>((t - J.task0) * rpw) + lane / J.lpr, part = lane % J.lpr;
+  if constexpr (kMT) {  // v47: several tokens on one load of the weights (the plan's jobs have 2-4 tokens)
+    if (J.ntok > 1) {
+      const std::int8_t* xq[4];
+      const float* xs[4];
+      const int* xsum[4];
+      long long yo[4];
+      for (int tk = 0; tk < 4; ++tk) {
+        const int u = tk < J.ntok ? tk : 0;
+        xq[tk] = J.xq + u * J.xqs;
+        xs[tk] = J.xs + u * J.xss;
+        xsum[tk] = J.xsum + u * J.xss;
+        yo[tk] = u * J.ys;
+      }
+      float acc[4] = {0.f, 0.f, 0.f, 0.f};
+      if (r < J.n) lane_part_d<0>(J, r, part, xq, xs, xsum, J.ntok, acc);
+      store_rows(J, r, part, acc, J.ntok, yo);
+      return;
+    }
+  }
   // v26: each token's arithmetic is the one-token path's (lane_part on that token's inputs), so a row of a several-token
   // job equals the same token alone bit for bit
   for (int tk = 0; tk < J.ntok; ++tk) {
@@ -510,17 +942,19 @@ __device__ __forceinline__ void red_release_add(unsigned long long* p, unsigned 
 }
 
 // every job at once (r3_stream2<2, 1>)
+template <bool kMT>
 __global__ void __launch_bounds__(256) k_stream(const DJob* __restrict__ jobs, int njobs, long long t_end) {
   lut_setup();
   const long long warps = static_cast<long long>(gridDim.x) * (blockDim.x / 32);
   int hint = 0;
   for (long long t = static_cast<long long>(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32; t < t_end; t += warps)
-    run_task(jobs, njobs, t, &hint);
+    run_task<kMT>(jobs, njobs, t, &hint);
 }
 
 // the token (r3_grouped<2>): stages with a counter barrier per warp between them; inside a stage a job may wait for a
 // group's tasks (acquire) and its own tasks may signal a group (release). done[] and gdone[] are never reset: run number
 // epoch (1-based) waits for epoch x the counts.
+template <bool kMT>
 __global__ void __launch_bounds__(256) k_staged(const DJob* __restrict__ jobs, int njobs, const long long* __restrict__ stage_end, int nstages,
                                                 unsigned long long* done, const int* __restrict__ grp, const int* __restrict__ dep,
                                                 const long long* __restrict__ gtasks, unsigned long long* gdone, unsigned long long epoch) {
@@ -544,7 +978,7 @@ __global__ void __launch_bounds__(256) k_staged(const DJob* __restrict__ jobs, i
         }
         __syncwarp();
       }
-      run_task(jobs, njobs, t, &hint);
+      run_task<kMT>(jobs, njobs, t, &hint);
       const int sg = grp[j];
       if (sg >= 0) {
         __syncwarp();  // the lanes' outputs are ordered before lane 0's release
@@ -727,10 +1161,30 @@ __device__ __forceinline__ void rx_epi(const DJob& J) {
   }
 }
 // one warp task of a matrix job: each pick's inputs (tokx) and output row (ypk); the first pick fills the slot on a miss
-template <int M>
+template <int M, bool kMT>
 __device__ __forceinline__ void rx_rows(const DJob& J, long long t) {
   const int lane = static_cast<int>(threadIdx.x & 31), rpw = 32 / J.lpr;
   const int r = static_cast<int>((t - J.task0) * rpw) + lane / J.lpr, part = lane % J.lpr;
+  if constexpr (kMT) {  // v47: the group's picks (2-4) on one load of the rows (fill, if any, by that one load)
+    if (J.ntok > 1) {
+      const std::int8_t* xq[4];
+      const float* xs[4];
+      const int* xsum[4];
+      long long yo[4];
+      for (int tk = 0; tk < 4; ++tk) {
+        const int u = tk < J.ntok ? tk : 0;
+        const long long xo = J.tokx[u];
+        xq[tk] = J.xq + xo * J.xqs;
+        xs[tk] = J.xs + xo * J.xss;
+        xsum[tk] = J.xsum + xo * J.xss;
+        yo[tk] = J.ypk[u] * J.ys;
+      }
+      float acc[4] = {0.f, 0.f, 0.f, 0.f};
+      if (r < J.n) lane_part_d<M>(J, r, part, xq, xs, xsum, J.ntok, acc);
+      store_rows(J, r, part, acc, J.ntok, yo);
+      return;
+    }
+  }
   for (int tk = 0; tk < J.ntok; ++tk) {
     const long long xo = J.tokx[tk];
     const std::int8_t* xq = J.xq + xo * J.xqs;
@@ -777,6 +1231,7 @@ __device__ __forceinline__ const std::uint8_t* rx_stage(const std::uint8_t* src,
   return dst;
 }
 // v46a-2: one warp task with its rows staged first (a task's rows are consecutive: 16 blocks of 256 values in one range)
+template <bool kMT>
 __device__ __forceinline__ void rx_rows_staged(const DJob& J, long long t, std::uint8_t* sbuf) {
   const int lane = static_cast<int>(threadIdx.x & 31), rpw = 32 / J.lpr, nB = J.K / 256;
   const int r0 = static_cast<int>((t - J.task0) * rpw);
@@ -785,6 +1240,27 @@ __device__ __forceinline__ void rx_rows_staged(const DJob& J, long long t, std::
   const long long rowb = static_cast<long long>(nB) * rx_blk(J.fmt);
   const std::uint8_t* src = J.w + static_cast<long long>(r0) * rowb;
   const std::uint8_t* wb = rx_stage(src, nr * rowb, sbuf, J.fd ? const_cast<std::uint8_t*>(src) + J.fd : nullptr, lane);
+  if constexpr (kMT) {  // v47: the group's picks (2-4) on one load of the rows (fill, if any, by that one load)
+    if (J.ntok > 1) {
+      const std::int8_t* xq[4];
+      const float* xs[4];
+      const int* xsum[4];
+      long long yo[4];
+      for (int tk = 0; tk < 4; ++tk) {
+        const int u = tk < J.ntok ? tk : 0;
+        const long long xo = J.tokx[u];
+        xq[tk] = J.xq + xo * J.xqs;
+        xs[tk] = J.xs + xo * J.xss;
+        xsum[tk] = J.xsum + xo * J.xss;
+        yo[tk] = J.ypk[u] * J.ys;
+      }
+      float acc[4] = {0.f, 0.f, 0.f, 0.f};
+      if (r < J.n) lane_part_d<3>(J, r, part, xq, xs, xsum, J.ntok, acc, wb, static_cast<long long>(r0) * nB);
+      store_rows(J, r, part, acc, J.ntok, yo);
+      __syncwarp();
+      return;
+    }
+  }
   for (int tk = 0; tk < J.ntok; ++tk) {
     const long long xo = J.tokx[tk];
     float acc = 0.f;
@@ -798,6 +1274,7 @@ __device__ __forceinline__ void rx_rows_staged(const DJob& J, long long t, std::
 // then the downs); a task whose job waits for a group starts once the group's count is complete (acquire), and a task of
 // a signalling job adds 1 (release). All blocks are resident (cooperative launch), and a job waits only for groups of
 // jobs before it, so the lowest unfinished task can always run: no deadlock.
+template <bool kMT>
 __global__ void __launch_bounds__(256) k_rx(const std::uint8_t* __restrict__ plan, int maxp, int sbytes) {
   lut_setup();
   std::uint8_t* sbuf = reinterpret_cast<std::uint8_t*>(s_lut) + kLutBytes + static_cast<long long>(threadIdx.x / 32) * sbytes;  // v46a-2
@@ -826,9 +1303,9 @@ __global__ void __launch_bounds__(256) k_rx(const std::uint8_t* __restrict__ pla
     }
     const DJob& J = jobs[j];
     if (J.fmt == kEpi) rx_epi(J);
-    else if (J.stg) rx_rows_staged(J, t, sbuf);
-    else if (J.fd) rx_rows<2>(J, t);
-    else rx_rows<1>(J, t);
+    else if (J.stg) rx_rows_staged<kMT>(J, t, sbuf);
+    else if (J.fd) rx_rows<2, kMT>(J, t);
+    else rx_rows<1, kMT>(J, t);
     const int sg = sig[j];
     if (sg >= 0) {
       __syncwarp();
@@ -997,6 +1474,7 @@ bool StreamPlan::build(const StreamJob* jobs, int njobs, const int* stage_end, i
     D.xsum = J.xsum;
     D.y = J.y;
     if (J.ntok < 1 || J.ntok > 4) return sfail("StreamPlan::build: job " + std::to_string(j) + ": 1-4 tokens");
+    if (J.ntok > 1) mt_ = true;  // v47: the multi-token kernel (weights once for all tokens)
     D.ntok = J.ntok;
     D.xqs = J.xq_stride > 0 ? J.xq_stride : J.w->k;
     D.xss = J.xs_stride > 0 ? J.xs_stride : J.w->k / 32;
@@ -1043,7 +1521,7 @@ bool StreamPlan::build(const StreamJob* jobs, int njobs, const int* stage_end, i
   int dev = 0, sms = 0, occ = 0, coop = 0;
   if (!sck(cudaGetDevice(&dev), "cudaGetDevice") || !sck(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev), "SM count") ||
       !sck(cudaDeviceGetAttribute(&coop, cudaDevAttrCooperativeLaunch, dev), "cooperative launch attribute") ||
-      !sck(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, k_staged, 256, kLutBytes), "occupancy"))
+      !sck(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, mt_ ? k_staged<true> : k_staged<false>, 256, kLutBytes), "occupancy"))
     return false;
   if (!coop) return sfail("StreamPlan::build: the device has no cooperative launch");
   if (occ < 1) return sfail("StreamPlan::build: the staged kernel does not fit on an SM");
@@ -1065,7 +1543,7 @@ bool StreamPlan::run(Stream s) {
   int nj = njobs_, ns = nstages_;
   unsigned long long ep = epoch_ + 1;
   void* args[] = {&jobs, &nj, &stage_end, &ns, &done, &grp, &dep, &gtasks, &gdone, &ep};
-  if (!sck(cudaLaunchCooperativeKernel(reinterpret_cast<void*>(k_staged), dim3(static_cast<unsigned>(grid_)), dim3(256), args, kLutBytes, sst(s)),
+  if (!sck(cudaLaunchCooperativeKernel(reinterpret_cast<void*>(mt_ ? k_staged<true> : k_staged<false>), dim3(static_cast<unsigned>(grid_)), dim3(256), args, kLutBytes, sst(s)),
            "stream: cooperative launch"))
     return false;
   epoch_ = ep;
@@ -1089,14 +1567,15 @@ bool StreamPlan::run_reset(Stream s) {
   int nj = njobs_, ns = nstages_;
   unsigned long long ep = 1;
   void* args[] = {&jobs, &nj, &stage_end, &ns, &done, &grp, &dep, &gtasks, &gdone, &ep};
-  return sck(cudaLaunchCooperativeKernel(reinterpret_cast<void*>(k_staged), dim3(static_cast<unsigned>(grid_)), dim3(256), args, kLutBytes, sst(s)),
+  return sck(cudaLaunchCooperativeKernel(reinterpret_cast<void*>(mt_ ? k_staged<true> : k_staged<false>), dim3(static_cast<unsigned>(grid_)), dim3(256), args, kLutBytes, sst(s)),
              "stream: cooperative launch (reset)");
 }
 
 bool StreamPlan::run_unstaged(Stream s) {
   if (!dev_) return sfail("StreamPlan::run_unstaged: not built");
   const DJob* jobs = reinterpret_cast<const DJob*>(static_cast<std::uint8_t*>(dev_) + off_jobs_);
-  k_stream<<<static_cast<unsigned>(grid_), 256, kLutBytes, sst(s)>>>(jobs, njobs_, ntasks_);
+  if (mt_) k_stream<true><<<static_cast<unsigned>(grid_), 256, kLutBytes, sst(s)>>>(jobs, njobs_, ntasks_);
+  else k_stream<false><<<static_cast<unsigned>(grid_), 256, kLutBytes, sst(s)>>>(jobs, njobs_, ntasks_);
   return sck(cudaGetLastError(), "stream: launch");
 }
 
@@ -1126,13 +1605,14 @@ bool moe_r3(const ExpertPtr* tab, const ExpertPtr* shx, const std::int32_t* sel,
   // phase, 8 warps per block: 8 KB grid + 34.3 KB (under the 48 KB a launch gets without opting in)
   const int sbytes = load_mode ? 16 * 272 + 32 : 0;
   const int smem = kLutBytes + 8 * sbytes;
-  static int grids[3] = {0, 0, 0};
-  int& grid = grids[load_mode];
+  static int grids[2][3] = {{0, 0, 0}, {0, 0, 0}};
+  const bool mt = tokens > 1;  // v47: steps of 2-4 tokens run the kernel that loads each row once for all of a group's picks
+  int& grid = grids[mt ? 1 : 0][load_mode];
   if (!grid) {
     int dev = 0, sms = 0, occ = 0, coop = 0;
     if (!sck(cudaGetDevice(&dev), "cudaGetDevice") || !sck(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev), "SM count") ||
         !sck(cudaDeviceGetAttribute(&coop, cudaDevAttrCooperativeLaunch, dev), "cooperative launch attribute") ||
-        !sck(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, k_rx, 256, smem), "occupancy (expert stage)"))
+        !sck(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, mt ? k_rx<true> : k_rx<false>, 256, smem), "occupancy (expert stage)"))
       return false;
     if (!coop) return sfail("moe_r3: the device has no cooperative launch");
     if (occ < 1) return sfail("moe_r3: the expert stage kernel does not fit on an SM");
@@ -1149,7 +1629,7 @@ bool moe_r3(const ExpertPtr* tab, const ExpertPtr* shx, const std::int32_t* sel,
   const std::uint8_t* cp = pb;
   int mp = max_picks, sb = sbytes;
   void* args[] = {&cp, &mp, &sb};
-  if (!sck(cudaLaunchCooperativeKernel(reinterpret_cast<void*>(k_rx), dim3(static_cast<unsigned>(grid)), dim3(256), args, static_cast<std::size_t>(smem), sst(s)),
+  if (!sck(cudaLaunchCooperativeKernel(reinterpret_cast<void*>(mt ? k_rx<true> : k_rx<false>), dim3(static_cast<unsigned>(grid)), dim3(256), args, static_cast<std::size_t>(smem), sst(s)),
            "moe_r3: cooperative launch"))
     return false;
   if (ts) {

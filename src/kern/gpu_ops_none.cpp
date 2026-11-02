@@ -137,6 +137,7 @@ const char* stream_last_error() { return "built without the CUDA backend (config
 StreamPlan::~StreamPlan() {  // nothing was allocated; the fields are named so every compiler sees them used
   dev_ = nullptr;
   njobs_ = nstages_ = ngroups_ = grid_ = 0;
+  mt_ = false;
   epoch_ = 0;
   off_jobs_ = off_stage_ = off_grp_ = off_dep_ = off_gtasks_ = off_done_ = off_gdone_ = 0;
 }
