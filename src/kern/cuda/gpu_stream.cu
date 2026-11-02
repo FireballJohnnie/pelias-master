@@ -260,7 +260,12 @@ __device__ __forceinline__ int iq4_levels(std::uint32_t v) {
 
 // one lane's part (128 values = 4 sub-blocks of 32) of one row; returns the partial dot product. v46a-1: M as above (the
 // dense instantiation, M = 0, is the code as measured: no fill, no stored Q6_K branch, __ldg inputs)
-template <int M>
+// v55d: ONLY >= 0 compiles the branch of that one format (the others fold away): a lean kernel for one-type plans
+template <int ONLY>
+__device__ __forceinline__ constexpr bool fm_on(int f) {
+  return ONLY < 0 || ONLY == f;
+}
+template <int M, int ONLY = -1>
 __device__ float lane_part(const DJob& J, int r, int part, const std::int8_t* xq, const float* xs, const int* xsum, bool cs,
                            const std::uint8_t* wb = nullptr, long long rb0 = 0) {
   const int B = part >> 1, half = part & 1, nB = J.K / 256;
@@ -282,7 +287,7 @@ __device__ float lane_part(const DJob& J, int r, int part, const std::int8_t* xq
     }
   }
   float acc = 0.f;
-  if (J.fmt == kQ7ZT) {
+  if (fm_on<ONLY>(kQ7ZT) && J.fmt == kQ7ZT) {
     std::uint32_t wd[29];
     const std::uint8_t* bp = J.w + rb * 224 + half * 112;
 #pragma unroll
@@ -324,7 +329,7 @@ __device__ float lane_part(const DJob& J, int r, int part, const std::int8_t* xq
       const float s = (d * static_cast<float>((h >> (16 + 6 * j)) & 63u)) / 63.f;
       acc += s * ldxs<M>(xs + jg) * static_cast<float>(P);
     }
-  } else if (J.fmt == kQ4TG2 || J.fmt == kQ4TG2P) {  // v54: stored, or in bit planes (the same codes when all 4 bits are read)
+  } else if ((fm_on<ONLY>(kQ4TG2) || fm_on<ONLY>(kQ4TG2P)) && (J.fmt == kQ4TG2 || J.fmt == kQ4TG2P)) {  // v54: stored, or in bit planes (the same codes when all 4 bits are read)
     int4 hd;
     std::uint32_t cw[16];
     if (J.fmt == kQ4TG2P) {  // v54b: the row at stride J.rs (or the warp's staged rows, packed at the prefix)
@@ -372,10 +377,11 @@ __device__ float lane_part(const DJob& J, int r, int part, const std::int8_t* xq
       const float s = (d * static_cast<float>((lv >> (6 * j)) & 63u)) / 63.f;
       acc += s * ldxs<M>(xs + jg) * sum;
     }
-  } else if (J.fmt == kQ5K || J.fmt == kQ5KP) {  // v54c: stored, or in bit planes (the same bytes when all 5 bits are read)
+  } else if ((fm_on<ONLY>(kQ5K) || fm_on<ONLY>(kQ5KP)) && (J.fmt == kQ5K || J.fmt == kQ5KP)) {  // v54c: stored, or in bit planes (the same bytes when all 5 bits are read)
     int4 hd;
-    std::uint8_t hb[4], qh[32], qlb[64];
+    std::uint8_t hb[4];
     std::uint32_t pa[8], pb[4], pc[4], pd[4];  // v55: the plane words (kQ5KP)
+    std::uint32_t qhw[8], qlw[16];  // v55d: stored rows as words (qh bytes 0..31, the half's low nibbles), read straight into dp4a
     int kmiss = 0;  // code bits not read (their midpoint is added through the input sums)
     if (J.fmt == kQ5KP) {
       const long long r0s = M == 3 ? rb0 / nB : 0;
@@ -389,9 +395,16 @@ __device__ float lane_part(const DJob& J, int r, int part, const std::int8_t* xq
       int4 ql[4];
 #pragma unroll
       for (int i = 0; i < 4; ++i) ql[i] = ldwf<M>(J, cs, bp + 48 + half * 64 + 16 * i, true);
-      memcpy(qh, &qa, 16);
-      memcpy(qh + 16, &qb4, 16);
-      memcpy(qlb, ql, 64);
+      auto put4 = [](std::uint32_t* w, int4 v) {
+        w[0] = static_cast<std::uint32_t>(v.x);
+        w[1] = static_cast<std::uint32_t>(v.y);
+        w[2] = static_cast<std::uint32_t>(v.z);
+        w[3] = static_cast<std::uint32_t>(v.w);
+      };
+      put4(qhw, qa);
+      put4(qhw + 4, qb4);
+#pragma unroll
+      for (int i = 0; i < 4; ++i) put4(qlw + 4 * i, ql[i]);
     }
     memcpy(hb, &hd, 4);
     const float d = __half2float(__ushort_as_half(static_cast<unsigned short>(hb[0] | (hb[1] << 8))));
@@ -414,19 +427,18 @@ __device__ float lane_part(const DJob& J, int r, int part, const std::int8_t* xq
       if (J.fmt == kQ5KP) {  // v55: plane words -> 4 codes a word -> dp4a (same integer sum as the stored loop)
 #pragma unroll
         for (int g = 0; g < 8; ++g) sq = __dp4a(static_cast<int>(q5p_word(pa, pb, pc, pd, jj, g)), xw[8 * jj + g], sq);
-      } else {
-        const std::uint8_t* q = qlb + 32 * (jj >> 1);
+      } else {  // v55d: stored rows on dp4a too: 4 codes a word from the low nibbles and the high bit j (the same integer sum)
 #pragma unroll
-        for (int l = 0; l < 32; ++l) {
-          const int lo = (j & 1) ? (q[l] >> 4) : (q[l] & 0xF);
-          sq += (lo + (((qh[l] >> j) & 1) << 4)) * sx8(xw, 32 * jj + l);
+        for (int g = 0; g < 8; ++g) {
+          const std::uint32_t lo = (qlw[8 * (jj >> 1) + g] >> (4 * (j & 1))) & 0x0f0f0f0fu, hi = ((qhw[g] >> j) & 0x01010101u) << 4;
+          sq = __dp4a(static_cast<int>(lo | hi), xw[8 * jj + g], sq);
         }
       }
       const int xsi = ldxi<M>(xsum + jg);
       const float sqf = kmiss > 0 ? 0.5f * static_cast<float>(2 * sq + ((1 << kmiss) - 1) * xsi) : static_cast<float>(sq);
       acc += ldxs<M>(xs + jg) * (d * static_cast<float>(sc) * sqf - dmin * static_cast<float>(mn) * static_cast<float>(xsi));
     }
-  } else if (J.fmt == kQ8_0) {  // repacked per 256: qs[256] (int8) | d[8] (fp16); the half's 128 values and 4 d's
+  } else if (fm_on<ONLY>(kQ8_0) && J.fmt == kQ8_0) {  // repacked per 256: qs[256] (int8) | d[8] (fp16); the half's 128 values and 4 d's
     const std::uint8_t* bp = W + rbw * 272;
     const uint2 dd = *reinterpret_cast<const uint2*>(bp + 256 + half * 8);
 #pragma unroll
@@ -446,7 +458,7 @@ __device__ float lane_part(const DJob& J, int r, int part, const std::int8_t* xq
       const float d = __half2float(__ushort_as_half(static_cast<unsigned short>(dw & 0xffffu)));
       acc += d * ldxs<M>(xs + jg) * static_cast<float>(P);
     }
-  } else if (J.fmt == kQ4K) {  // as stored (144 bytes): d | dmin | scales[12] | qs[128]; Q5_K without qh
+  } else if (fm_on<ONLY>(kQ4K) && J.fmt == kQ4K) {  // as stored (144 bytes): d | dmin | scales[12] | qs[128]; Q5_K without qh
     const std::uint8_t* bp = W + rbw * 144;
     const int4 hd = ldwf<M>(J, cs, bp, half == 0);
     int4 ql[4];
@@ -482,7 +494,7 @@ __device__ float lane_part(const DJob& J, int r, int part, const std::int8_t* xq
       acc += ldxs<M>(xs + jg) *
              (d * static_cast<float>(sc) * static_cast<float>(sq) - dmin * static_cast<float>(mn) * static_cast<float>(ldxi<M>(xsum + jg)));
     }
-  } else if (J.fmt == kIQ4XS) {  // repacked per 256 (144 bytes): d | scales_h | scales_l[4] | 8 zero bytes | qs[128]
+  } else if (fm_on<ONLY>(kIQ4XS) && J.fmt == kIQ4XS) {  // repacked per 256 (144 bytes): d | scales_h | scales_l[4] | 8 zero bytes | qs[128]
     const std::uint8_t* bp = W + rbw * 144;
     const int4 hd = ldw(cs, bp);
     const std::uint32_t h0 = static_cast<std::uint32_t>(hd.x), sl = static_cast<std::uint32_t>(hd.y);
@@ -503,7 +515,7 @@ __device__ float lane_part(const DJob& J, int r, int part, const std::int8_t* xq
       }
       acc += d * static_cast<float>(ls - 32) * ldxs<M>(xs + jg) * static_cast<float>(P);
     }
-  } else if (M != 0 && J.fmt == kQ6KS) {  // v46a-1: as stored: ql[128] | qh[64] | scales[16] | d (210 bytes, 2-byte aligned)
+  } else if (M != 0 && fm_on<ONLY>(kQ6KS) && J.fmt == kQ6KS) {  // v46a-1: as stored: ql[128] | qh[64] | scales[16] | d (210 bytes, 2-byte aligned)
     const std::uint8_t* bp = W + rbw * 210;
     const unsigned mis = static_cast<unsigned>(reinterpret_cast<std::uintptr_t>(bp) & 3u);
     std::uint32_t qlw[16], qhw[8], scw[2];
@@ -537,7 +549,7 @@ __device__ float lane_part(const DJob& J, int r, int part, const std::int8_t* xq
       }
       acc += d * ldxs<M>(xs + jg) * static_cast<float>(sc[2 * p] * s0 + sc[2 * p + 1] * s1);
     }
-  } else {  // kQ6K
+  } else if (fm_on<ONLY>(kQ6K)) {  // kQ6K
     const std::uint8_t* bp = J.w + rb * 208;
     int4 l4[4];
 #pragma unroll
@@ -713,8 +725,9 @@ __device__ __forceinline__ void lane_part_n(const DJob& J, int r, int part, cons
     }
   } else if (J.fmt == kQ5K || J.fmt == kQ5KP) {  // v54c: stored, or in bit planes (the same bytes when all 5 bits are read)
     int4 hd;
-    std::uint8_t hb[4], qh[32], qlb[64];
+    std::uint8_t hb[4];
     std::uint32_t pa[8], pb[4], pc[4], pd[4];  // v55: the plane words (kQ5KP)
+    std::uint32_t qhw[8], qlw[16];  // v55d: stored rows as words (qh bytes 0..31, the half's low nibbles), read straight into dp4a
     int kmiss = 0;  // code bits not read (their midpoint is added through the input sums)
     if (J.fmt == kQ5KP) {
       const long long r0s = M == 3 ? rb0 / nB : 0;
@@ -728,9 +741,16 @@ __device__ __forceinline__ void lane_part_n(const DJob& J, int r, int part, cons
       int4 ql[4];
 #pragma unroll
       for (int i = 0; i < 4; ++i) ql[i] = ldwf<M>(J, cs, bp + 48 + half * 64 + 16 * i, true);
-      memcpy(qh, &qa, 16);
-      memcpy(qh + 16, &qb4, 16);
-      memcpy(qlb, ql, 64);
+      auto put4 = [](std::uint32_t* w, int4 v) {
+        w[0] = static_cast<std::uint32_t>(v.x);
+        w[1] = static_cast<std::uint32_t>(v.y);
+        w[2] = static_cast<std::uint32_t>(v.z);
+        w[3] = static_cast<std::uint32_t>(v.w);
+      };
+      put4(qhw, qa);
+      put4(qhw + 4, qb4);
+#pragma unroll
+      for (int i = 0; i < 4; ++i) put4(qlw + 4 * i, ql[i]);
     }
     memcpy(hb, &hd, 4);
     const float d = __half2float(__ushort_as_half(static_cast<unsigned short>(hb[0] | (hb[1] << 8))));
@@ -767,12 +787,11 @@ __device__ __forceinline__ void lane_part_n(const DJob& J, int r, int part, cons
         if (J.fmt == kQ5KP) {  // v55: plane words -> dp4a, as in rx_body
 #pragma unroll
           for (int g = 0; g < 8; ++g) sq = __dp4a(static_cast<int>(q5p_word(pa, pb, pc, pd, jj, g)), xj[g], sq);
-        } else {
-          const std::uint8_t* q = qlb + 32 * (jj >> 1);
+        } else {  // v55d: stored rows on dp4a (as lane_part)
 #pragma unroll
-          for (int l = 0; l < 32; ++l) {
-            const int lo = (j & 1) ? (q[l] >> 4) : (q[l] & 0xF);
-            sq += (lo + (((qh[l] >> j) & 1) << 4)) * sx8(xj, l);
+          for (int g = 0; g < 8; ++g) {
+            const std::uint32_t lo = (qlw[8 * (jj >> 1) + g] >> (4 * (j & 1))) & 0x0f0f0f0fu, hi = ((qhw[g] >> j) & 0x01010101u) << 4;
+            sq = __dp4a(static_cast<int>(lo | hi), xj[g], sq);
           }
         }
         const int xsi = ldxi<M>(xsum[t] + jg);
@@ -1025,7 +1044,7 @@ __device__ __forceinline__ int find_job(const DJob* __restrict__ jobs, int njobs
   return lo;
 }
 
-template <bool kMT>
+template <bool kMT, int ONLY = -1>
 __device__ __forceinline__ void run_task(const DJob* __restrict__ jobs, int njobs, long long t, int* hint) {
   const DJob& J = jobs[find_job(jobs, njobs, t, hint)];
   const int lane = static_cast<int>(threadIdx.x & 31), rpw = 32 / J.lpr;
@@ -1052,7 +1071,7 @@ __device__ __forceinline__ void run_task(const DJob* __restrict__ jobs, int njob
   // v26: each token's arithmetic is the one-token path's (lane_part on that token's inputs), so a row of a several-token
   // job equals the same token alone bit for bit
   for (int tk = 0; tk < J.ntok; ++tk) {
-    float acc = r < J.n ? lane_part<0>(J, r, part, J.xq + tk * J.xqs, J.xs + tk * J.xss, J.xsum + tk * J.xss, J.ntok == 1) : 0.f;
+    float acc = r < J.n ? lane_part<0, ONLY>(J, r, part, J.xq + tk * J.xqs, J.xs + tk * J.xss, J.xsum + tk * J.xss, J.ntok == 1) : 0.f;
     for (int o = J.lpr / 2; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
     if (r < J.n && part == 0) J.y[tk * J.ys + r] = acc;
   }
@@ -1082,23 +1101,23 @@ __device__ __forceinline__ void red_release_add(unsigned long long* p, unsigned 
 }
 
 // every job at once (r3_stream2<2, 1>)
-// v55c (author 03:43; v55b kernel report: 170-255 registers, 1 block of 256 per SM): the one-token kernels ask for 2 blocks
-// per SM (at most 128 registers, as r3_stream had on 2026-10-29 at 473 GB/s); the 2-4-token kernels keep 1 (their per-token
-// accumulators). The arithmetic is unchanged; only how many warps are in flight.
-template <bool kMT>
-__global__ void __launch_bounds__(256, kMT ? 1 : 2) k_stream(const DJob* __restrict__ jobs, int njobs, long long t_end) {
+// v55d: no register cap (v55c's 2-block cap spilled 152-424 B and ran 0.55-0.92 ms slower, MEASURED); instead the dense
+// one-token plans whose jobs are all one type run a kernel compiled for that type only (ONLY), which needs far fewer
+// registers (the 2026-11-02 texture probe's lean Q8_0 GEMV: 39-64 registers, 6 blocks per SM, 503 GB/s, MEASURED)
+template <bool kMT, int ONLY = -1>
+__global__ void __launch_bounds__(256) k_stream(const DJob* __restrict__ jobs, int njobs, long long t_end) {
   lut_setup();
   const long long warps = static_cast<long long>(gridDim.x) * (blockDim.x / 32);
   int hint = 0;
   for (long long t = static_cast<long long>(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32; t < t_end; t += warps)
-    run_task<kMT>(jobs, njobs, t, &hint);
+    run_task<kMT, ONLY>(jobs, njobs, t, &hint);
 }
 
 // the token (r3_grouped<2>): stages with a counter barrier per warp between them; inside a stage a job may wait for a
 // group's tasks (acquire) and its own tasks may signal a group (release). done[] and gdone[] are never reset: run number
 // epoch (1-based) waits for epoch x the counts.
 template <bool kMT>
-__global__ void __launch_bounds__(256, kMT ? 1 : 2) k_staged(const DJob* __restrict__ jobs, int njobs, const long long* __restrict__ stage_end, int nstages,
+__global__ void __launch_bounds__(256) k_staged(const DJob* __restrict__ jobs, int njobs, const long long* __restrict__ stage_end, int nstages,
                                                 unsigned long long* done, const int* __restrict__ grp, const int* __restrict__ dep,
                                                 const long long* __restrict__ gtasks, unsigned long long* gdone, unsigned long long epoch) {
   lut_setup();
@@ -1486,7 +1505,7 @@ __device__ __forceinline__ void rx_body(const std::uint8_t* __restrict__ plan, i
   }
 }
 template <bool kMT>
-__global__ void __launch_bounds__(256, kMT ? 1 : 2) k_rx(const std::uint8_t* __restrict__ plan, int maxp, int sbytes) {
+__global__ void __launch_bounds__(256) k_rx(const std::uint8_t* __restrict__ plan, int maxp, int sbytes) {
   lut_setup_rx();
   rx_body<kMT>(plan, maxp, sbytes);
 }
@@ -1499,7 +1518,7 @@ __global__ void __launch_bounds__(256, kMT ? 1 : 2) k_rx(const std::uint8_t* __r
 //  D every thread: the combine (md::rd3_combine_one) into y and the residual x = (x + a) + y
 // A grid barrier between phases. The values and their order are the separate kernels', so the bits are theirs.
 template <bool kMT, int NJ>
-__global__ void __launch_bounds__(256, kMT ? 1 : 2) k_moe_half(const MoeHalfArgs A, int sbytes) {
+__global__ void __launch_bounds__(256) k_moe_half(const MoeHalfArgs A, int sbytes) {
   namespace cg = cooperative_groups;
   cg::grid_group grid = cg::this_grid();
   __shared__ double s_sh[33];
@@ -1798,6 +1817,23 @@ bool StreamPlan::build(const StreamJob* jobs, int njobs, const int* stage_end, i
   if (occ < 1) return sfail("StreamPlan::build: the staged kernel does not fit on an SM");
   grid_ = sms * occ;
   epoch_ = 0;
+  // v55d: a one-token plan whose jobs are all Q8_0 (or all Q6_K) runs the kernel compiled for that format alone
+  only_ = -1;
+  grid_lean_ = 0;
+  if (!mt_ && !dj.empty()) {
+    const int f0 = dj[0].fmt;
+    bool same = f0 == kQ8_0 || f0 == kQ6K;
+    for (const DJob& D : dj) same = same && D.fmt == f0;
+    if (same) {
+      const void* fn = f0 == kQ8_0 ? reinterpret_cast<const void*>(k_stream<false, kQ8_0>) : reinterpret_cast<const void*>(k_stream<false, kQ6K>);
+      int occl = 0;
+      if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occl, fn, 256, kLutBytes) == cudaSuccess && occl >= 1) {
+        only_ = f0;
+        grid_lean_ = sms * occl;
+      }
+      (void)cudaGetLastError();
+    }
+  }
   return true;
 }
 
@@ -1846,6 +1882,8 @@ bool StreamPlan::run_unstaged(Stream s) {
   if (!dev_) return sfail("StreamPlan::run_unstaged: not built");
   const DJob* jobs = reinterpret_cast<const DJob*>(static_cast<std::uint8_t*>(dev_) + off_jobs_);
   if (mt_) k_stream<true><<<static_cast<unsigned>(grid_), 256, kLutBytes, sst(s)>>>(jobs, njobs_, ntasks_);
+  else if (only_ == kQ8_0) k_stream<false, kQ8_0><<<static_cast<unsigned>(grid_lean_), 256, kLutBytes, sst(s)>>>(jobs, njobs_, ntasks_);  // v55d
+  else if (only_ == kQ6K) k_stream<false, kQ6K><<<static_cast<unsigned>(grid_lean_), 256, kLutBytes, sst(s)>>>(jobs, njobs_, ntasks_);
   else k_stream<false><<<static_cast<unsigned>(grid_), 256, kLutBytes, sst(s)>>>(jobs, njobs_, ntasks_);
   return sck(cudaGetLastError(), "stream: launch");
 }
@@ -1985,6 +2023,8 @@ void stream_kernel_report() {  // v55b: registers, local memory and blocks per S
                   {reinterpret_cast<const void*>(k_rx<true>), "k_rx<2-4 tokens>", kLutRxBytes + 8 * sb},
                   {reinterpret_cast<const void*>(k_stream<false>), "k_stream<1 token>", kLutBytes},
                   {reinterpret_cast<const void*>(k_stream<true>), "k_stream<2-4 tokens>", kLutBytes},
+                  {reinterpret_cast<const void*>(k_stream<false, kQ8_0>), "k_stream<Q8_0 only>", kLutBytes},
+                  {reinterpret_cast<const void*>(k_stream<false, kQ6K>), "k_stream<Q6_K only>", kLutBytes},
                   {reinterpret_cast<const void*>(k_staged<false>), "k_staged<1 token>", kLutBytes}};
   for (const K& k : ks) {
     cudaFuncAttributes a{};

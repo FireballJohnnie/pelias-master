@@ -87,6 +87,8 @@ class StreamPlan {
   unsigned long long epoch_ = 0;  // runs so far: the counters are never reset, run e waits for e x the stage's tasks
   int grid_ = 0;                  // blocks of the cooperative launch (occupancy x SMs)
   bool mt_ = false;               // v47: a job has 2-4 tokens: the kernel that loads each row's weights once for all of them
+  int only_ = -1;                 // v55d: every job one format (Q8_0 or Q6_K) and one token: run_unstaged uses that format's lean kernel
+  int grid_lean_ = 0;             // its blocks (its own occupancy x SMs)
   std::uint64_t off_jobs_ = 0, off_stage_ = 0, off_grp_ = 0, off_dep_ = 0, off_gtasks_ = 0, off_done_ = 0, off_gdone_ = 0;
 };
 
