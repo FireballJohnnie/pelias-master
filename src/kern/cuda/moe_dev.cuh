@@ -301,14 +301,23 @@ __device__ __forceinline__ void rc_pool(const ReaderCache& c, int e, int* k0, in
   *boff = c.pboff[p];
 }
 
-// one thread (k_rd3_group's body): group the routed picks by expert (first appearance), then the shared expert as one more
-// group over every token; per group the source (bank / cache slot / file) and, on a cache miss, the slot its rows are
-// written into
+// k_rd3_group's body: group the routed picks by expert (first appearance), then the shared expert as one more group over
+// every token; per group the source (bank / cache slot / file) and, on a cache miss, the slot its rows are written into.
+// v55e (author 04:30): kWarp = the 32 lanes of one warp run it together. The cache pool scan of each new expert (the serial
+// cost of phase B: one thread walked every slot of the pool per pick) is split over the lanes, each lane keeping the serial
+// rule on its slots (the last slot holding e; the first slot of the lowest stamp that is not this call's), then merged by
+// shuffles (largest hit; lowest stamp, then lowest slot): the same slot as the one-thread walk. Lane 0 does every write and
+// the warp syncs after each pick, so the next pick's scan sees this call's tags and stamps. kWarp = false: one thread, as before.
+template <bool kWarp = false>
 __device__ __forceinline__ void rd3_group_one(const ExpertPtr* __restrict__ tab, const ExpertPtr* __restrict__ shx, const std::int32_t* __restrict__ sel,
                                               int tokens, int nu, const ReaderCache& c, std::int64_t F, int* __restrict__ grp, ExpertPtr* __restrict__ gsrc,
                                               ExpertPtr* __restrict__ gfill, const std::uint8_t* __restrict__ cmask) {
+  const int lane = kWarp ? static_cast<int>(threadIdx.x & 31) : 0;
+  const bool w0 = lane == 0;
   const int picks = tokens * nu;
-  const unsigned stamp = c.K > 0 ? ++(*c.stamp) : 0u;
+  unsigned stamp = 0u;
+  if (w0) stamp = c.K > 0 ? ++(*c.stamp) : 0u;
+  if constexpr (kWarp) stamp = __shfl_sync(0xffffffffu, stamp, 0);
   int U = 0;
   for (int pi = 0; pi < picks; ++pi) {
     const int e = sel[pi];
@@ -316,8 +325,6 @@ __device__ __forceinline__ void rd3_group_one(const ExpertPtr* __restrict__ tab,
     int u = 0;
     while (u < U && grp[1 + 6 * u] != e) ++u;
     if (u == U) {
-      grp[1 + 6 * u] = e;
-      grp[2 + 6 * u] = 0;
       ExpertPtr src = tab[e], fill;
       // v54b: an expert with plane matrices is read with the slider's bits; its slot holds those bits' prefix of each row
       auto pl = [](std::uint32_t t) { return t == g_q4_tg2p || t == g_q5_kp; };
@@ -329,11 +336,24 @@ __device__ __forceinline__ void rd3_group_one(const ExpertPtr* __restrict__ tab,
         std::uint64_t pslot = 0, poff = 0;
         rc_pool(c, e, &k0, &k1, &pslot, &poff);
         unsigned best = 0xffffffffu;
-        for (int k = k0; k < k1; ++k) {
+        for (int k = k0 + lane; k < k1; k += (kWarp ? 32 : 1)) {
           if (c.tag[k] == e) hit = k;
-          if (c.use[k] != stamp && c.use[k] < best) {
-            best = c.use[k];
+          const unsigned us = c.use[k];
+          if (us != stamp && us < best) {
+            best = us;
             victim = k;
+          }
+        }
+        if constexpr (kWarp) {
+#pragma unroll
+          for (int o = 16; o > 0; o >>= 1) {
+            const int oh = __shfl_xor_sync(0xffffffffu, hit, o), ov = __shfl_xor_sync(0xffffffffu, victim, o);
+            const unsigned ob = __shfl_xor_sync(0xffffffffu, best, o);
+            hit = oh > hit ? oh : hit;
+            if (ob < best || (ob == best && ov >= 0 && (victim < 0 || ov < victim))) {
+              best = ob;
+              victim = ov;
+            }
           }
         }
         const int slot = hit >= 0 ? hit : victim;
@@ -341,39 +361,50 @@ __device__ __forceinline__ void rd3_group_one(const ExpertPtr* __restrict__ tab,
           std::uint8_t* sb = c.base + poff + static_cast<std::uint64_t>(slot - k0) * pslot;
           // the slot's row bytes per matrix: a plane matrix's rows hold the first `want` bits only (packed)
           std::uint64_t srb[3];
+#pragma unroll
           for (int pj = 0; pj < 3; ++pj) srb[pj] = plane_prefix(src.type[pj], src.rb[pj], want);
           ExpertPtr at = src;
           at.w[0] = sb;
           at.w[1] = sb + srb[0] * static_cast<std::uint64_t>(F);
           at.w[2] = sb + (srb[0] + srb[1]) * static_cast<std::uint64_t>(F);
+#pragma unroll
           for (int pj = 0; pj < 3; ++pj) at.rb[pj] = srb[pj];
           at.vram = 1;
-          c.use[slot] = stamp;
+          if (w0) c.use[slot] = stamp;
           if (hit >= 0) {
             src = at;
           } else {
-            c.tag[slot] = e;
+            if (w0) c.tag[slot] = e;
             fill = at;
           }
         }
       }
-      gsrc[u] = src;
-      gfill[u] = fill;
+      if (w0) {
+        grp[1 + 6 * u] = e;
+        grp[2 + 6 * u] = 0;
+        gsrc[u] = src;
+        gfill[u] = fill;
+      }
       ++U;
     }
-    const int cn = grp[2 + 6 * u];
-    grp[3 + 6 * u + cn] = pi;
-    grp[2 + 6 * u] = cn + 1;
+    if (w0) {
+      const int cn = grp[2 + 6 * u];
+      grp[3 + 6 * u + cn] = pi;
+      grp[2 + 6 * u] = cn + 1;
+    }
+    if constexpr (kWarp) __syncwarp();
   }
-  if (shx) {  // the shared expert: picks picks .. picks + tokens - 1
-    grp[1 + 6 * U] = -1;
-    grp[2 + 6 * U] = tokens;
-    for (int t = 0; t < tokens; ++t) grp[3 + 6 * U + t] = picks + t;
-    gsrc[U] = *shx;
-    gfill[U] = ExpertPtr{};
-    ++U;
+  if (w0) {
+    if (shx) {  // the shared expert: picks picks .. picks + tokens - 1
+      grp[1 + 6 * U] = -1;
+      grp[2 + 6 * U] = tokens;
+      for (int t = 0; t < tokens; ++t) grp[3 + 6 * U + t] = picks + t;
+      gsrc[U] = *shx;
+      gfill[U] = ExpertPtr{};
+      ++U;
+    }
+    grp[0] = U;
   }
-  grp[0] = U;
 }
 
 // one output value t, r of k_rd3_combine: the picks' weighted rows in pick order, then the shared expert's

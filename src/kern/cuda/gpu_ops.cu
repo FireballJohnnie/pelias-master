@@ -1236,8 +1236,8 @@ using md::rc_pool;
 __global__ void k_rd3_group(const ExpertPtr* __restrict__ tab, const ExpertPtr* __restrict__ shx, const std::int32_t* __restrict__ sel, int tokens,
                             int nu, ReaderCache c, std::int64_t H, std::int64_t F, int* __restrict__ grp, ExpertPtr* __restrict__ gsrc,
                             ExpertPtr* __restrict__ gfill, const std::uint8_t* __restrict__ cmask) {
-  if (threadIdx.x != 0 || blockIdx.x != 0) return;
-  md::rd3_group_one(tab, shx, sel, tokens, nu, c, F, grp, gsrc, gfill, cmask);
+  if (blockIdx.x != 0) return;
+  md::rd3_group_one<true>(tab, shx, sel, tokens, nu, c, F, grp, gsrc, gfill, cmask);  // v55e: the launch's one warp (<<<1, 32>>>)
   (void)H;
 }
 // a group of `glanes` lanes (lane index gl within it) copies n bytes from src into a 16-byte aligned buffer (alignment of
