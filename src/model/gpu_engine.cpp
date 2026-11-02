@@ -468,6 +468,13 @@ struct GpuEngine::Impl {
   // the MTP block (stage 3)
   bool has_mtp = false;
   Layer M;
+  // v58: the MTP block's MoE half on the reader as its layer n_layer (EngineOptions::mtp_fused); the reader's per-layer
+  // tables (expert table, shared expert, cache, planes) then have n_layer + 1 rows
+  bool mtp_rd = false;
+  std::uint64_t mtp_fused_steps = 0, mtp_old_steps = 0;
+  std::uint32_t nlr() const { return s.n_layer + (mtp_rd ? 1u : 0u); }
+  const Qwen35MoeLayer& WL(std::uint32_t il) const { return il < s.n_layer ? w->layers[il] : w->mtp.layer; }
+  Layer& LL(std::uint32_t il) { return il < s.n_layer ? L[il] : M; }
   DevW eh, head;
   const float *enorm = nullptr, *hnorm = nullptr, *head_norm = nullptr;
   std::int64_t mtp_pos = 0;
@@ -1677,7 +1684,7 @@ struct GpuEngine::Impl {
     A.max_picks = rx_maxp;
     A.load_mode = o.rx_load;
     A.y = y;
-    A.ph = ph_d ? ph_d + static_cast<int64_t>(il) * 5 : nullptr;  // v55b
+    A.ph = ph_d && il < s.n_layer ? ph_d + static_cast<int64_t>(il) * 5 : nullptr;  // v55b (v58: not the MTP row)
     A.l2pf = o.l2_prefetch ? 1 : 0;  // v56
     A.pipe = o.rx_pipe && o.rx_load > 0 ? 1 : 0;  // v57
     A.sact = o.rx_sact ? 1 : 0;  // v57
@@ -1817,14 +1824,18 @@ struct GpuEngine::Impl {
       return;
     }
     std::uintptr_t lo = UINTPTR_MAX, hi = 0;
-    for (std::uint32_t il = 0; il < s.n_layer; ++il)
-      for (const WeightView* v : {&w->layers[il].gate_exps, &w->layers[il].up_exps, &w->layers[il].down_exps}) {
+    for (std::uint32_t il = 0; il < nlr(); ++il)  // v58: nlr() = n_layer (+ the MTP block's row with mtp_fused)
+      for (const WeightView* v : {&WL(il).gate_exps, &WL(il).up_exps, &WL(il).down_exps}) {
         if (v->rot32) {
           reader_note = "off (a rotated expert weight)";
           return;
         }
         for (int64_t ex = 0; ex < ne; ++ex) {
           const ExpRows r = exp_rows(*v, static_cast<int>(ex));
+          if (!g::type_supported(static_cast<std::uint32_t>(r.t)) && il >= s.n_layer) {  // v58: the MTP block keeps the old path
+            mtp_rd = false;
+            break;
+          }
           if (!g::type_supported(static_cast<std::uint32_t>(r.t))) {
             reader_note = "off (an expert type the reader cannot decode)";
             return;
@@ -1839,10 +1850,10 @@ struct GpuEngine::Impl {
     const bool split = o.cpu_light && o.doorbell && o.reader_v3;
     int n_light_all = 0;
     std::uint64_t light_b = 0;
-    for (std::uint32_t il = 0; il < s.n_layer; ++il) {
-      L[il].light.assign(z(ne), 0);
-      L[il].n_light = 0;
-      if (!split) continue;
+    for (std::uint32_t il = 0; il < nlr(); ++il) {
+      LL(il).light.assign(z(ne), 0);
+      LL(il).n_light = 0;
+      if (!split || il >= s.n_layer) continue;
       const WeightView* vv[3] = {&w->layers[il].gate_exps, &w->layers[il].up_exps, &w->layers[il].down_exps};
       for (int64_t ex = 0; ex < ne; ++ex) {
         if (L[il].hot[z(ex)]) continue;
@@ -1865,7 +1876,7 @@ struct GpuEngine::Impl {
     std::vector<std::uint64_t> poff;  // per (layer, matrix, expert): offset in planes_h + 1 (0: not in planes)
     void* planes_dev = nullptr;
     if (o.plane_bits > 0) {
-      poff.assign(z(static_cast<int64_t>(s.n_layer) * 3 * ne), 0);
+      poff.assign(z(static_cast<int64_t>(nlr()) * 3 * ne), 0);
       std::uint64_t tot = 0;
       struct PJob {
         const std::uint8_t* src;
@@ -1873,11 +1884,11 @@ struct GpuEngine::Impl {
         std::uint32_t t;
       };
       std::vector<PJob> jobs;
-      for (std::uint32_t il = 0; il < s.n_layer; ++il) {
-        const WeightView* vv[3] = {&w->layers[il].gate_exps, &w->layers[il].up_exps, &w->layers[il].down_exps};
+      for (std::uint32_t il = 0; il < nlr(); ++il) {
+        const WeightView* vv[3] = {&WL(il).gate_exps, &WL(il).up_exps, &WL(il).down_exps};
         for (int pj = 0; pj < 3; ++pj)
           for (int64_t ex = 0; ex < ne; ++ex) {
-            if (L[il].hot[z(ex)] || L[il].light[z(ex)]) continue;
+            if (LL(il).hot[z(ex)] || LL(il).light[z(ex)]) continue;
             const ExpRows r = exp_rows(*vv[pj], static_cast<int>(ex));
             if (!planed_type(r.t, r.rb)) continue;  // v54c: Q4_TG2 and Q5_K
             const std::uint64_t rows = static_cast<std::uint64_t>(vv[pj]->ne[1]), b = r.rb * rows;
@@ -1918,11 +1929,11 @@ struct GpuEngine::Impl {
     // device address. v28: not the light experts either when the split is on. v54: not the matrices held in bit planes.
     const std::uintptr_t pg = 4096;
     std::vector<std::pair<std::uintptr_t, std::uintptr_t>> want;
-    for (std::uint32_t il = 0; il < s.n_layer; ++il)
-      for (const WeightView* v : {&w->layers[il].gate_exps, &w->layers[il].up_exps, &w->layers[il].down_exps})
+    for (std::uint32_t il = 0; il < nlr(); ++il)
+      for (const WeightView* v : {&WL(il).gate_exps, &WL(il).up_exps, &WL(il).down_exps})
         for (int64_t ex = 0; ex < ne; ++ex) {
-          if (L[il].hot[z(ex)] || L[il].light[z(ex)]) continue;
-          const int pjv = v == &w->layers[il].gate_exps ? 0 : v == &w->layers[il].up_exps ? 1 : 2;
+          if (LL(il).hot[z(ex)] || LL(il).light[z(ex)]) continue;
+          const int pjv = v == &WL(il).gate_exps ? 0 : v == &WL(il).up_exps ? 1 : 2;
           if (!poff.empty() && poff[z((static_cast<int64_t>(il) * 3 + pjv) * ne + ex)]) continue;
           const ExpRows r = exp_rows(*v, static_cast<int>(ex));
           const auto a = reinterpret_cast<std::uintptr_t>(r.base);
@@ -1964,16 +1975,17 @@ struct GpuEngine::Impl {
     };
     const std::uintptr_t b0 = 0, b1 = pinned;
     const double reg_s = since(tr);
-    std::vector<g::ExpertPtr> tab(z(static_cast<int64_t>(s.n_layer) * ne));
-    for (std::uint32_t il = 0; il < s.n_layer; ++il) {
-      const Qwen35MoeLayer& l = w->layers[il];
+    std::vector<g::ExpertPtr> tab(z(static_cast<int64_t>(nlr()) * ne));
+    for (std::uint32_t il = 0; il < nlr(); ++il) {
+      const Qwen35MoeLayer& l = WL(il);
+      Layer& Li = LL(il);
       const WeightView* vv[3] = {&l.gate_exps, &l.up_exps, &l.down_exps};
       for (int64_t ex = 0; ex < ne; ++ex) {
         g::ExpertPtr& X = tab[z(static_cast<int64_t>(il) * ne + ex)];
         for (int pj = 0; pj < 3; ++pj) {
           const ExpRows r = exp_rows(*vv[pj], static_cast<int>(ex));
-          const std::uint8_t* bank = L[il].hot[z(ex)] && !L[il].bank_at[pj].empty() ? L[il].bank_at[pj][z(ex)] : nullptr;
-          X.w[pj] = bank ? bank : L[il].light[z(ex)] ? nullptr : dev_of(r.base);
+          const std::uint8_t* bank = Li.hot[z(ex)] && !Li.bank_at[pj].empty() ? Li.bank_at[pj][z(ex)] : nullptr;
+          X.w[pj] = bank ? bank : Li.light[z(ex)] ? nullptr : dev_of(r.base);
           X.type[pj] = static_cast<std::uint32_t>(r.t);
           X.rb[pj] = r.rb;
           if (bank) X.vram = 1;
@@ -1991,7 +2003,7 @@ struct GpuEngine::Impl {
     for (std::size_t ti = 0; ti < tab.size(); ++ti) {
       const g::ExpertPtr& X = tab[ti];
       const std::uint32_t til = static_cast<std::uint32_t>(static_cast<int64_t>(ti) / ne);
-      if (L[til].light[z(static_cast<int64_t>(ti) % ne)]) continue;  // v28: the CPU's, never read by the GPU
+      if (LL(til).light[z(static_cast<int64_t>(ti) % ne)]) continue;  // v28: the CPU's, never read by the GPU
       if (!X.w[0] || !X.w[1] || !X.w[2]) {
         reader_note = "off (an expert outside the pinned ranges)";
         return;
@@ -2048,8 +2060,8 @@ struct GpuEngine::Impl {
     std::vector<g::ExpertPtr> shx_h;
     if (o.fold_shared && o.reader_v3 && s.n_ff_shexp == s.n_ff_exp) {
       bool ok = true;
-      for (std::uint32_t il = 0; il < s.n_layer && ok; ++il) {
-        const Layer& D = L[il];
+      for (std::uint32_t il = 0; il < nlr() && ok; ++il) {
+        const Layer& D = LL(il);
         g::ExpertPtr X;
         const DevW* dw[3] = {&D.gate_sh, &D.up_sh, &D.down_sh};
         for (int pj = 0; pj < 3; ++pj) {
@@ -2058,6 +2070,11 @@ struct GpuEngine::Impl {
           X.w[pj] = static_cast<const std::uint8_t*>(W.d);
           X.type[pj] = W.dtype;
           X.rb[pj] = W.drb;
+        }
+        if (!ok && il >= s.n_layer) {  // v58: the MTP block's shared expert cannot be folded: its MoE half stays on the old path
+          mtp_rd = false;
+          ok = true;
+          break;
         }
         X.vram = 1;
         shx_h.push_back(X);
@@ -2098,7 +2115,7 @@ struct GpuEngine::Impl {
     std::string cache_note;
     if (cache_reserved > 0 && o.reader_v3) {
       int K = rc_eff;
-      const std::size_t nl = s.n_layer;
+      const std::size_t nl = nlr();
       const std::uint64_t budget = cslot * static_cast<std::uint64_t>(rc_eff);  // per layer, as before (v54b: rc_eff, the probe's or --reader-cache)
       // v51 size pools: per layer the file experts (not in the bank) by real size; each size's share of the budget follows
       // its experts' routes counts x size (counts + 1); at most kMaxPools sizes (the smallest-demand size merges upward)
@@ -2109,16 +2126,17 @@ struct GpuEngine::Impl {
       if (o.cache_pools) {
         kpool_max = 0;
         for (std::size_t il = 0; il < nl; ++il) {
-          const Qwen35MoeLayer& l = w->layers[il];
+          const Qwen35MoeLayer& l = WL(static_cast<std::uint32_t>(il));
+          Layer& Li = LL(static_cast<std::uint32_t>(il));
           std::vector<std::uint64_t> esz(z(ne), 0);
           std::map<std::uint64_t, double> dem;
           for (int ex = 0; ex < static_cast<int>(ne); ++ex) {
-            if (L[il].hot[z(ex)]) continue;
+            if (Li.hot[z(ex)]) continue;
             std::uint64_t b = 0;
             for (const WeightView* v : {&l.gate_exps, &l.up_exps, &l.down_exps}) {
               const ExpRows r = exp_rows(*v, ex);
               // v54b: a matrix held in bit planes takes the slider's prefix of each row in its slot (as rd3_group_one lays it)
-              const std::uint32_t pt = L[il].light[z(ex)] ? 0u : planed_type(r.t, r.rb);
+              const std::uint32_t pt = Li.light[z(ex)] ? 0u : planed_type(r.t, r.rb);
               b += (pt ? kern::gpu::plane_prefix(pt, r.rb, o.plane_bits) : r.rb) * static_cast<std::uint64_t>(v->ne[1]);
             }
             esz[z(ex)] = (b + 255) & ~std::uint64_t{255};
@@ -2248,7 +2266,7 @@ struct GpuEngine::Impl {
     if (o.plane_bits > 0 && rcache.empty()) {  // v54b: no slots, but the grouping still needs the slider
       g::ReaderCache c0;
       c0.plane_bits = o.plane_bits;
-      rcache.assign(s.n_layer, c0);
+      rcache.assign(nlr(), c0);
     }
     rtab_h = tab;
     // v46a-1: the R3 expert stage. It reads the experts as stored (Q4_TG2 / Q5_K / Q4_K with 16-byte aligned rows, Q6_K
@@ -2265,7 +2283,11 @@ struct GpuEngine::Impl {
         return true;
       };
       bool ok = true;
-      for (const g::ExpertPtr& X : tab) ok = ok && mat_ok(X);
+      for (std::size_t ti = 0; ti < tab.size(); ++ti) {
+        if (mat_ok(tab[ti])) continue;
+        if (ti >= z(static_cast<int64_t>(s.n_layer) * s.n_expert)) mtp_rd = false;  // v58: only the MTP row: its MoE half keeps the old path
+        else ok = false;
+      }
       if (!ok) rx_note = "off (an expert matrix the stage cannot read: type or alignment)";
       for (const g::ExpertPtr& X : shx_h)
         if (ok && !mat_ok(X)) {
@@ -2592,6 +2614,15 @@ std::string GpuEngine::moe_phase_report() const {  // v55b
   }
   return r;
 }
+std::string GpuEngine::mtp_path_report() const {
+  const Impl& I = *p_;
+  if (!I.has_mtp) return {};
+  char b[200];
+  std::snprintf(b, sizeof b, "MTP block MoE half (v58): %s; %llu steps on the fused launch, %llu on the old path", I.mtp_rd && I.rx_ok ? "on the fused launch (reader row n_layer)" : "old path",
+                static_cast<unsigned long long>(I.mtp_fused_steps), static_cast<unsigned long long>(I.mtp_old_steps));
+  return b;
+}
+
 std::string GpuEngine::graph_report() const {
   return p_->graph_note + "; captures " + std::to_string(p_->graph_captures) + ", replays " + std::to_string(p_->graph_replays) +
          "; DeltaNet dense halves in one launch (L3, v55g) " + std::to_string(p_->dn_half_runs);
@@ -2915,7 +2946,10 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
   if (!g::sync() || !g::mem_info(&free_b, &total_b)) return R::fail(Status::fail(Code::internal, std::string("engine: device memory: ") + g::last_error()));
   std::uint64_t left = free_b > o.vram_reserve ? free_b - o.vram_reserve : 0;
   if (o.vram_budget > 0) left = std::min<std::uint64_t>(left, o.vram_budget > I.dev_bytes ? o.vram_budget - I.dev_bytes : 0);
-  if (o.mtp && o.mtp_bank != 0) {  // the MTP block's fixed arena, for promotion
+  // v58: the MTP block's MoE half on the reader (its row n_layer: planes / file mapping and its own cache slots, no bank)
+  I.mtp_rd = o.mtp && o.mtp_fused && w.mtp.present && o.cold_on_gpu && o.reader_v3 && o.r3_experts && o.rx_load >= 1 && o.fused_moe &&
+             !o.cpu_light && !o.prefetch && o.plane_tail == 0;
+  if (o.mtp && o.mtp_bank != 0 && !I.mtp_rd) {  // the MTP block's fixed arena, for promotion
     const Qwen35MoeLayer& ml = w.mtp.layer;
     std::uint64_t eb = 0;
     int bankable_n = 0;
@@ -2947,10 +2981,10 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
   int hot_cap = o.max_hot_per_layer;
   if (o.cold_on_gpu && o.reader_v3 && (o.reader_cache > 0 || o.auto_vram)) {  // v26: the reader cache's bytes before the bank takes its share
     std::uint64_t mx = 0;
-    for (std::uint32_t il = 0; il < s.n_layer; ++il)
+    for (std::uint32_t il = 0; il < I.nlr(); ++il)  // v58: with the MTP row too
       for (int ex = 0; ex < static_cast<int>(ne); ++ex) {
         std::uint64_t b = 0;
-        for (const WeightView* v : {&w.layers[il].gate_exps, &w.layers[il].up_exps, &w.layers[il].down_exps}) b += exp_rows(*v, ex).rb * v->ne[1];
+        for (const WeightView* v : {&I.WL(il).gate_exps, &I.WL(il).up_exps, &I.WL(il).down_exps}) b += exp_rows(*v, ex).rb * v->ne[1];
         mx = std::max(mx, b);
       }
     const std::uint64_t slot_b = (mx + 255) & ~std::uint64_t{255};
@@ -2965,7 +2999,7 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
       double cache_b = static_cast<double>(ex_b) * o.cache_share;
       if (static_cast<double>(all_b) <= static_cast<double>(ex_b)) cache_b = 0.0;
       else cache_b = std::min(cache_b, static_cast<double>(all_b) - static_cast<double>(ex_b) * (1.0 - o.cache_share));
-      I.rc_eff = static_cast<int>(cache_b / static_cast<double>(slot_b * s.n_layer));
+      I.rc_eff = static_cast<int>(cache_b / static_cast<double>(slot_b * I.nlr()));
       hot_cap = static_cast<int>(ne);
       char pn[240];
       std::snprintf(pn, sizeof pn, "; VRAM probe: %.2f GB free after the dense weights (reserve %.2f GB kept), %.2f GB for experts: cache %.1f %% = %d slots of %.2f MB per layer, the bank the rest",
@@ -2973,7 +3007,7 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
                     static_cast<double>(slot_b) / 1e6);
       I.probe_note = pn;
     }
-    const std::uint64_t need = slot_b * static_cast<std::uint64_t>(I.rc_eff) * s.n_layer;
+    const std::uint64_t need = slot_b * static_cast<std::uint64_t>(I.rc_eff) * I.nlr();
     if (need < left) {
       left -= need;
       I.cache_reserved = need;
@@ -3536,10 +3570,16 @@ Status GpuEngine::mtp_step(const std::int32_t* tokens, const float* h_prev, int 
   Layer& D = I.M;
   if (!g::rms_norm(I.x, D.attn_norm, I.xn, e, 1, e, e, n, s.rms_eps)) return gfail("engine: MTP attn norm");
   if (!(st = I.attention_block(D, n, I.mtp_pos))) return st;
-  if (!g::add_rows(I.x, e, I.y, e, nullptr, e, n)) return gfail("engine: MTP residual");
-  if (!g::rms_norm(I.x, D.post_norm, I.xn, e, 1, e, e, n, s.rms_eps)) return gfail("engine: MTP post norm");
-  if (!(st = I.moe_block(w.mtp.layer, D, n, es))) return st;
-  if (!g::add_rows(I.x, e, I.y, e, nullptr, e, n)) return gfail("engine: MTP residual");
+  if (I.mtp_rd && I.fused_ok(D, n, false)) {  // v58: residual + MoE half + residual in one launch, the reader's row n_layer
+    if (!(st = I.moe_half_fused(D, n, s.n_layer))) return st;
+    ++I.mtp_fused_steps;
+  } else {
+    if (!g::add_rows(I.x, e, I.y, e, nullptr, e, n)) return gfail("engine: MTP residual");
+    if (!g::rms_norm(I.x, D.post_norm, I.xn, e, 1, e, e, n, s.rms_eps)) return gfail("engine: MTP post norm");
+    if (!(st = I.moe_block(w.mtp.layer, D, n, es))) return st;
+    if (!g::add_rows(I.x, e, I.y, e, nullptr, e, n)) return gfail("engine: MTP residual");
+    ++I.mtp_old_steps;
+  }
   const int64_t nvoc = s.n_vocab;
   for (int r0 = 0; r0 < n; r0 += Impl::kOutRows) {
     const int m = std::min(Impl::kOutRows, n - r0);

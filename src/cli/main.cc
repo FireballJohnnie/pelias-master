@@ -2452,7 +2452,7 @@ int cmd_engine_check(const Args& a) {
   };
   std::uint64_t npre = 0, ndec = 0, ctx = 0, batch = 0, thr = 0, hmax = 0, ndraft = 0, skip = 0;
   if (!num("prefill", 64, 1, 1 << 20, npre) || !num("decode", 32, 0, 1 << 20, ndec) || !num("ctx", 4096, 2, 1 << 20, ctx) || !num("batch", 64, 1, 4096, batch) ||
-      !num("threads", 0, 0, 4096, thr) || !num("hot-max", 256, 0, 4096, hmax) || !num("mtp-draft", 0, 0, 16, ndraft) ||
+      !num("threads", 0, 0, 4096, thr) || !num("hot-max", 40, 0, 4096, hmax) || !num("mtp-draft", 0, 0, 16, ndraft) ||
       !num("skip-tokens", 0, 0, std::uint64_t{1} << 40, skip))
     return 1;
   const std::string dump_top = a.get("dump-top");
@@ -2491,7 +2491,7 @@ int cmd_engine_check(const Args& a) {
   Result<model::Qwen35MoeWeights> w = model::bind_qwen35moe(g, m.data(), spec.value);
   if (!w.ok()) return fail_input(w.status);
   const model::Qwen35MoeSpec& s = spec.value;
-  model::EngineOptions eo;
+  model::EngineOptions eo = model::EngineOptions::production();  // v58: the measured fast path is the starting point
   eo.max_ctx = static_cast<int>(ctx);
   eo.max_batch = static_cast<int>(batch);
   eo.cpu_threads = static_cast<int>(thr);
@@ -2505,7 +2505,7 @@ int cmd_engine_check(const Args& a) {
   eo.timeline_ops = a.has("timeline-ops");
   // v24: the tie rule's band (the engine and the rounded CPU reference; the float reference keeps the plain order) and the
   // picked-expert reader
-  float tie_band = 0.0f;
+  float tie_band = eo.router_tie;  // v58: 0.01 unless --router-tie says otherwise
   if (a.has("router-tie")) {
     const std::string tv = a.get("router-tie");
     char* endp = nullptr;
@@ -2516,11 +2516,11 @@ int cmd_engine_check(const Args& a) {
     }
   }
   eo.router_tie = tie_band;
-  eo.cold_on_gpu = a.has("cold-on-gpu");
+  eo.cold_on_gpu = !a.has("no-cold-on-gpu");  // v58: on by default (--cold-on-gpu still accepted)
   // v26 switches (each measured on its own in the run)
   eo.reader_v3 = !a.has("reader-v25");
-  eo.fold_shared = a.has("fold-shared");
-  eo.r3_experts = a.has("r3-experts");  // v46a-1
+  eo.fold_shared = !a.has("no-fold-shared");  // v58: on by default
+  eo.r3_experts = !a.has("no-r3-experts");  // v46a-1; v58: on by default
   eo.gpu_prompt = !a.has("cpu-prompt");  // v49e: the GPU prompt by default (fix forward); --cpu-prompt / --prompt-batched are temporary diagnosis switches
   eo.prompt_r3 = !a.has("prompt-batched");
   eo.prompt_halves = a.has("prompt-halves");  // v50, parked at v51 (temporary switch)                       // v49d: the GPU prompt's steps on the batched kernels
@@ -2535,7 +2535,7 @@ int cmd_engine_check(const Args& a) {
     }
   }
   eo.batch_identical = a.has("batch-identical");
-  eo.graph = a.has("graph");
+  eo.graph = !a.has("no-graph");  // v58: on by default
   eo.prefetch = a.has("prefetch");
   if (a.has("plane-tail")) {
     const Result<std::uint64_t> pt = io::parse_whole(a.get("plane-tail"), 8);
@@ -2661,6 +2661,7 @@ int cmd_engine_check(const Args& a) {
   eo.rx_pipe = !a.has("no-rx-pipe");  // v57 (temporary, A/B)
   eo.rx_sact = !a.has("no-rx-sact");  // v57 (temporary, A/B)
   eo.fused_moe = !a.has("no-fused-moe");      // v52 (temporary switch)
+  eo.mtp_fused = !a.has("no-mtp-fused");      // v58 (temporary, A/B)
   eo.verbose_gpu = a.has("verbose-gpu");       // v55b
   if (a.has("plane-bits")) {  // v54b
     const Result<std::uint64_t> pb = io::parse_whole(a.get("plane-bits"), 5);
@@ -2670,7 +2671,7 @@ int cmd_engine_check(const Args& a) {
     }
     eo.plane_bits = static_cast<int>(pb.value);
   }
-  eo.auto_vram = a.has("auto-vram");  // v54b
+  eo.auto_vram = !a.has("no-auto-vram");  // v54b; v58: on by default
   if (a.has("cache-share")) {
     char* end = nullptr;
     const std::string cs = a.get("cache-share");
@@ -3029,6 +3030,7 @@ int cmd_engine_check(const Args& a) {
       std::printf("  MTP check: plain prefill %.3f s, MTP prompt %.3f s (%.3f s more, charged to the MTP run above); decode phase alone: plain %.3f s vs MTP %.3f s = %.2fx; listed parts %.3f s, not listed %.3f s\n",
                   pre_s, tmg.prompt_s, tmg.prompt_s - pre_s, plain_s, mtp_dec, mtp_dec > 0 ? plain_s / mtp_dec : 0.0, listed, mtp_dec - listed);
       if (const std::string ph = eng.value->moe_phase_report(); !ph.empty()) std::printf("  after the MTP run (v57): %s\n", ph.c_str());  // the verify-step stamps
+      if (const std::string mp = eng.value->mtp_path_report(); !mp.empty()) std::printf("  %s\n", mp.c_str());  // v58
       if (a.has("timeline")) {
         const model::EngineTimeline& T = eng.value->timeline();
         for (int b2 = 1; b2 < 10; ++b2) {
@@ -3572,7 +3574,7 @@ int cmd_generate(const Args& a) {
       std::fprintf(stderr, "pelias: --engine runs the engine's own rounding (per-32 int8); planes and --act-int8 are reference options\n");
       return 1;
     }
-    model::EngineOptions eo2;
+    model::EngineOptions eo2 = model::EngineOptions::production();  // v58: the measured fast path (was the bank + CPU path)
     eo2.max_ctx = n_ctx;
     eo2.max_batch = 64;
     eo2.cpu_threads = threads;

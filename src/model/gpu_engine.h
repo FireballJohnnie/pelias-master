@@ -95,6 +95,10 @@ struct EngineOptions {
   // many as the trunk's average per layer would get if the bank budget were spread over n_layer + 1 layers (DERIVED at
   // open); 0 = none (the MTP experts stay on the CPU path)
   int mtp_bank = -1;
+  // v58 (author 13:57 / 15:00): the MTP block's MoE half on the fused GPU launch, as the reader's layer n_layer (its
+  // experts in bit planes / the file mapping, its own cache slots, no bank, no CPU picks); needs the reader with the R3
+  // expert stage and staged loads. Steps of more than 4 tokens keep the old path. --no-mtp-fused (temporary, A/B)
+  bool mtp_fused = true;
   // R3 (kern/gpu_stream, the measured decode kernel; author 03:28-03:29): one-token steps run every dense product R3
   // reads (Q7_ZT, Q4_TG2, Q5_K, Q6_K, Q8_0, Q4_K, IQ4_XS; k 256-4096) on R3, grouped by shared input; batches keep the
   // batched kernels. One device copy per weight: Q8_0 in R3's repacked layout, read by the batched kernels as g_q8_0r;
@@ -195,6 +199,21 @@ struct EngineOptions {
   // v30 (author 00:04-00:05, "open the door"): after start-up a background thread touches every page of the light experts
   // once (in place in the mapped file, no copy), so the CPU's split work stops paying the drive bridge's page faults
   bool preload_light = false;
+  // v58 (bloat audit, author 15:00 "okay 1-3"): the measured fast path as one set, the starting point of engine-check and
+  // generate --engine (the v57 runs' flags: --router-tie 0.01 --cold-on-gpu --hot-max 40 --fold-shared --graph
+  // --r3-experts --rx-load miss --auto-vram). The struct's own defaults stay as they were (the GPU tests set what they test).
+  static EngineOptions production() {
+    EngineOptions o;
+    o.router_tie = 0.01f;
+    o.cold_on_gpu = true;
+    o.max_hot_per_layer = 40;
+    o.fold_shared = true;
+    o.graph = true;
+    o.r3_experts = true;
+    o.rx_load = 1;
+    o.auto_vram = true;
+    return o;
+  }
 };
 
 struct EngineStats {
@@ -311,6 +330,7 @@ class GpuEngine {
   std::string graph_report() const;
   // v55b: with EngineOptions::verbose_gpu, the fused MoE half's phases per token (ms, decode one-token steps); empty if off
   std::string moe_phase_report() const;
+  std::string mtp_path_report() const;  // v58: MTP block steps on the fused launch vs the old path
   // v30: wait for the light experts' pre-load (if any); its seconds and bytes; false if none was started
   bool preload_wait(double* seconds, std::uint64_t* bytes);
   // v19 timeline (empty unless EngineOptions::timeline and the doorbell are on)
