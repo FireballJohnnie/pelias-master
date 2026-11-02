@@ -81,6 +81,9 @@ struct EngineOptions {
   // bytes from VRAM / the file, and the reader's four launch times (GPU stamps), and per step the wall time; read with
   // trace_take(). Off by default (stamps cost launches).
   bool trace = false;
+  // v49 (accuracy tail step 2a): copy each reader step's router logits to pinned host memory and keep, per position, every
+  // layer's router margins (logit 8th - 9th pick: the edge of the picks; logit 1st - 2nd); read with router_margins()
+  bool router_margins = false;
   // v26 (author 20:39 "don't hold back"): the reader v3 kernels (Q4_TG2 grid per lane in shared memory, two rows staged
   // per warp, half-warp down rows; bit for bit with v25's reader); false: v25's reader
   bool reader_v3 = true;
@@ -253,6 +256,9 @@ class GpuEngine {
   bool probe_get_ops(std::vector<float>* block_out, std::vector<float>* router_logits, std::vector<float>* moe_out);
   // v25 trace text gathered since the last call (EngineOptions::trace), tab-separated lines
   std::string trace_take();
+  // v49: per position 0 .. max_ctx-1, 2 x n_layer floats (layer il: [2 il] = 8th - 9th router logit, [2 il + 1] = 1st - 2nd);
+  // have[pos] = 1 where a reader step filled it (EngineOptions::router_margins); false if off
+  bool router_margins(std::vector<float>* m, std::vector<std::uint8_t>* have) const;
   // v26: the graph's state: "<note>; captures C, replays R"
   std::string graph_report() const;
   // v30: wait for the light experts' pre-load (if any); its seconds and bytes; false if none was started

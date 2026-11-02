@@ -402,6 +402,9 @@ struct GpuEngine::Impl {
   std::int32_t *trc_sel_h = nullptr, *trc_sel_d = nullptr;
   int *trc_u_h = nullptr, *trc_u_d = nullptr;
   std::string trace_text;
+  float *rlg_h = nullptr, *rlg_d = nullptr;  // v49: router logits per layer (kReaderMax x n_expert each), pinned mapped
+  std::vector<float> rmarg;                  // v49: per position 2 x n_layer router margins
+  std::vector<std::uint8_t> rmarg_have;
   std::uint64_t trace_seq = 0;
   static constexpr int kOutRows = 64;
   // host side of the cold path (sized once)
@@ -1387,6 +1390,7 @@ struct GpuEngine::Impl {
     const int64_t e = s.n_embd, ne = s.n_expert, nu = s.n_expert_used, ffs = s.n_ff_shexp;
     Status st;
     if (!(st = prod(D.gate_inp, xn, n, logits_r))) return st;
+    if (rlg_d && !g::dcopy(rlg_d + static_cast<int64_t>(il) * kReaderMax * ne, logits_r, z(n * ne) * sizeof(float))) return gfail("engine: router margins");  // v49
     if (!g::router_topk(logits_r, ne, n, static_cast<int>(nu), s.expert_weights_scale, sel, wsel, nullptr, o.router_tie)) return gfail("engine: router");
     if (!opstamp(8) || !opstamp(9)) return gfail("engine: stamp");
     if (!g::act_q8x32(xn, e, n, e, false, xr, e, q, scale, sum)) return gfail("engine: expert input rounding");
@@ -1820,6 +1824,15 @@ struct GpuEngine::Impl {
         trc_fill_d = reinterpret_cast<g::ExpertPtr*>(db + o2 + b_src);
       }
     }
+    if (o.router_margins) {  // v49
+      void* dv = nullptr;
+      rlg_h = static_cast<float*>(g::host_alloc_mapped(z(s.n_layer) * kReaderMax * z(ne) * sizeof(float), &dv));
+      rlg_d = static_cast<float*>(dv);
+      if (rlg_h) {
+        rmarg.assign(z(o.max_ctx) * 2 * z(s.n_layer), 0.0f);
+        rmarg_have.assign(z(o.max_ctx), 0);
+      }
+    }
     reader = true;
     char b[160];
     char b2[640];
@@ -1887,6 +1900,7 @@ GpuEngine::~GpuEngine() {
   g::dfree(p_->cache_mem);
   g::dfree(p_->cache_meta);
   g::host_free(p_->trc_hv);
+  g::host_free(p_->rlg_h);  // v49
   g::dfree(p_->probe_bd);
   g::dfree(p_->probe_ld);
   g::dfree(p_->probe_md);
@@ -1976,6 +1990,12 @@ bool GpuEngine::probe_get_ops(std::vector<float>* block_out, std::vector<float>*
 }
 std::string GpuEngine::graph_report() const {
   return p_->graph_note + "; captures " + std::to_string(p_->graph_captures) + ", replays " + std::to_string(p_->graph_replays);
+}
+bool GpuEngine::router_margins(std::vector<float>* m, std::vector<std::uint8_t>* have) const {
+  if (!p_->rlg_h) return false;
+  if (m) *m = p_->rmarg;
+  if (have) *have = p_->rmarg_have;
+  return true;
 }
 std::string GpuEngine::trace_take() {
   std::string out;
@@ -2711,6 +2731,22 @@ Status GpuEngine::Impl::run(const std::int32_t* tokens, int n, float* logits, bo
   if (rd) {  // v25: every pick of a reader step runs on the GPU
     es.hot_picks += static_cast<std::uint64_t>(n) * s.n_expert_used;
     if (I.trc_ts_h) I.trace_step(n, since(t0));
+    if (I.rlg_h) {  // v49: this step's router margins, per token and layer (8th - 9th logit, 1st - 2nd)
+      const int64_t ne2 = s.n_expert, nu2 = s.n_expert_used, nl = s.n_layer;
+      std::vector<float> row(z(ne2));
+      for (int t = 0; t < n; ++t) {
+        const int64_t p = I.pos + t;  // pos advances after this (I.pos += n below)
+        if (p < 0 || p >= I.o.max_ctx) continue;
+        for (int64_t il = 0; il < nl; ++il) {
+          const float* lr = I.rlg_h + (il * Impl::kReaderMax + t) * ne2;
+          row.assign(lr, lr + ne2);
+          std::partial_sort(row.begin(), row.begin() + nu2 + 1, row.end(), std::greater<float>());
+          I.rmarg[z(p) * 2 * z(nl) + 2 * z(il)] = row[z(nu2 - 1)] - row[z(nu2)];
+          I.rmarg[z(p) * 2 * z(nl) + 2 * z(il) + 1] = row[0] - row[1];
+        }
+        I.rmarg_have[z(p)] = 1;
+      }
+    }
   }
   if (rd && I.tl_on) {  // v24: the reader's steps: wall time per step size, and the per-operation segments
     const int b = n > 8 ? 9 : n;

@@ -2431,7 +2431,7 @@ int cmd_engine_check(const Args& a) {
     std::fprintf(stderr,
                  "usage: pelias engine-check --model FILE [--routes ROUTES.bin] [--prefill 64] [--decode 32] [--ctx 4096] [--batch 64] [--threads N]\n"
                  "                           [--budget-gb G] [--hot-max N] [--mtp-draft K] [--fast-cpu] [--no-cpu] [--float-ref]\n"
-                 "                           [--text FILE [--skip-tokens N]] [--timeline] [--dump-top OUT.tsv] [--dump-split [--split-sizes 2,3,4] [--split-step]]\n"
+                 "                           [--text FILE [--skip-tokens N]] [--timeline] [--dump-top OUT.tsv] [--dump-router OUT.tsv] [--dump-split [--split-sizes 2,3,4] [--split-step]]\n"
                  "                           [--no-doorbell] [--timeline-ops] [--split-ref] [--bank-selftest MIXES] [--probe-pos P]\n"
                  "                           [--router-tie BAND] [--cold-on-gpu] [--trace OUT.tsv] [--reader-v25] [--reader-cache K] [--fold-shared]\n"
                  "                           [--batch-identical] [--graph] [--prefetch] [--plane-tail N] [--cpu-light] [--reader-rpw 1|2] [--r3-experts] [--rx-load lane|miss|all] [--cpu-prompt]\n"
@@ -2465,6 +2465,11 @@ int cmd_engine_check(const Args& a) {
       return 1;
     }
   }
+  const std::string dump_router = a.get("dump-router");  // v49: per position, every layer's router margins
+  if (!dump_router.empty() && std::ifstream(dump_router).good()) {
+    std::fprintf(stderr, "pelias: %s exists (nothing is overwritten)\n", dump_router.c_str());
+    return 1;
+  }
   if (npre + ndec > ctx) {
     std::fprintf(stderr, "pelias: --prefill + --decode must fit --ctx\n");
     return 1;
@@ -2489,6 +2494,7 @@ int cmd_engine_check(const Args& a) {
   eo.mtp = ndraft > 0;
   eo.max_verify = static_cast<int>(ndraft) + 1;
   eo.timeline = a.has("timeline");
+  eo.router_margins = !a.get("dump-router").empty();  // v49
   eo.doorbell = !a.has("no-doorbell");
   eo.timeline_ops = a.has("timeline-ops");
   // v24: the tie rule's band (the engine and the rounded CPU reference; the float reference keeps the plain order) and the
@@ -2725,6 +2731,36 @@ int cmd_engine_check(const Args& a) {
     if (Status st = eng.value->step(ids.data() + t, 1, lg.data() + static_cast<std::size_t>(t) * nv, true, &es); !st) return fail_input(st);
     add(tot_dec, es);
     per.push_back(es.seconds);
+  }
+  if (!dump_router.empty()) {  // v49: the main pass's router margins, one line per position (layer il: e8_il = 8th - 9th logit, t1_il = 1st - 2nd)
+    std::vector<float> rm;
+    std::vector<std::uint8_t> rh;
+    if (!eng.value->router_margins(&rm, &rh)) {
+      std::fprintf(stderr, "pelias: --dump-router: the router margins are off (needs the expert reader)\n");
+      return 1;
+    }
+    std::FILE* fr = std::fopen(dump_router.c_str(), "w");
+    if (!fr) {
+      std::fprintf(stderr, "pelias: cannot write %s\n", dump_router.c_str());
+      return 1;
+    }
+    const std::size_t nl = s.n_layer;
+    std::fprintf(fr, "pos");
+    for (std::size_t il = 0; il < nl; ++il) std::fprintf(fr, "\te8_%zu", il);
+    for (std::size_t il = 0; il < nl; ++il) std::fprintf(fr, "\tt1_%zu", il);
+    std::fprintf(fr, "\n");
+    int rows = 0;
+    for (int t2 = 0; t2 < n; ++t2) {
+      if (!rh[static_cast<std::size_t>(t2)]) continue;
+      const float* r = rm.data() + static_cast<std::size_t>(t2) * 2 * nl;
+      std::fprintf(fr, "%d", t2);
+      for (std::size_t il = 0; il < nl; ++il) std::fprintf(fr, "\t%.5f", r[2 * il]);
+      for (std::size_t il = 0; il < nl; ++il) std::fprintf(fr, "\t%.5f", r[2 * il + 1]);
+      std::fprintf(fr, "\n");
+      ++rows;
+    }
+    std::fclose(fr);
+    std::printf("  router margins: %d of %d positions written to %s\n", rows, n, dump_router.c_str());
   }
   auto share = [](const model::EngineStats& e2) {
     const double all = static_cast<double>(e2.hot_picks + e2.cold_picks);
