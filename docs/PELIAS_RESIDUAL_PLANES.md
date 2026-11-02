@@ -1,5 +1,7 @@
 # Residual sign planes: what was measured, the GPU plan, and how to keep the cost down
 
+Confidential, not for distribution. Updated 2026-11-02 (section 8).
+
 Pelias, 2026-10-29/30. Model: Qwen3.6-35B-A3B. Every number is labelled: **MEASURED** (on the author's one machine: RTX 4070
 12 GB, Ryzen 7 5800X3D, 64 GB DDR4, WSL2 48 GB; or in the sandbox where it says so), **DERIVED** (worked out from measured
 numbers, the working shown), **ESTIMATE** or **UNMEASURED** (with the run that would measure it). Scoring: KL divergence
@@ -580,6 +582,46 @@ A2: mean PPL ratio 1.003082; tokens where A2 has lower KL than the tiered file 5
   --planes-mode all|prefill|start:N` and `--prompt-list` (model loaded once); `pelias teacher` and
   `tools/split_grade.py` (grading against the original). Commits fdb63e1, 52c3eda, 76b1166 and the build-log entries after.
 - GP3-08 (MTP) is paused (author 2026-10-30 05:08): the cost-down runs of 4.4 come first.
+
+## 8. In the engine (2026-11-01/02, update of 2026-11-02)
+
+Sections 1-7 are kept as written on 2026-10-29/30. Since then the engine runs, and two different kinds of plane are in play;
+they must not be confused:
+
+- **Bit planes of the stored codes** (built, MEASURED): the engine re-lays each Q4_TG2 / Q5_K expert matrix outside the
+  bank into planes of its own code bits (top bit first) at open, so a reader can take 2-5 bits of every code from the same
+  file (one slider, `--plane-bits`). These are not corrections; fewer bits are a rougher copy of the stored weight.
+- **Residual sign planes** (this document, sections 1-7): one sign bit per weight plus a scale per 256 that move the stored
+  weight *toward the original*. Measured on the CPU reference (sections 2, 6.9, 6.12); **not yet in the GPU engine.**
+
+### 8.1 What the engine measured (labels as in the build log)
+
+- The 1-bit path this document planned for the planes (section 1: "added by the 1-bit path (AND + popcount), which is idle
+  during decode") is in the engine's expert stage since v55f: every plane of a Q5_K matrix is read as
+  sum_k 2^k popcount(w AND u_k) - 128 popcount(w) against the inputs' bit planes. **Exact on the real model at 5, 3 and 2
+  bits** (accuracy gates bit for bit equal to the earlier dp4a route, MEASURED) and **cheaper**: a Q5_K plane task 29,883 ->
+  23,966 GPU cycles (-20 %, MEASURED). Q4_TG2's grid codes still go through the grid table.
+- Plane A (the top 2 bits) is stored as two 1-bit planes (Q4_TG2 bits 3 / 2, Q5_K bits 4 / 3); same bytes.
+- Accuracy by bits read (W1 gate, MEASURED): 5 bits (as stored) KL 3.767e-03, top-1 624 / 640, PASS; 4 bits 1.120e-02 FAIL;
+  3 bits 4.415e-02, 580 / 640 FAIL; 2 bits FAIL. Rank matters more than count: with every pick at 2 bits the 4 top-ranked
+  picks carry 83 % of the added error (v54, MEASURED). The author parked the sub-5-bit accuracy until the speed work is done
+  (2026-11-02 00:31).
+- Speed (decode median, MEASURED, v58): 13.66-13.73 ms per token at 5 bits (72.8 tok/s, gate PASS); 11.57-11.65 ms at
+  3 bits (86.4 tok/s, gate FAIL). At 3 bits the bank holds 3,110-3,311 experts in the same VRAM as 2,062 at 5 bits.
+
+### 8.2 Where the residual planes come back in
+
+- The 3-bit read is the fast mode that fails the gate; a residual sign plane fitted to *the 3-bit copy* (not the stored
+  file) is the correction this document describes, and the engine already has the 1-bit path to add it. Its accuracy and
+  cost in the engine are **UNMEASURED**; the run is after the speed work (game plan order: speed, then P1, then P4 with the
+  7+1 gated bit and residual sign planes).
+- Section 6.8's lesson (planes for the most-weighted picks only, 92 % of the gain at half the reads) fits the measured rank
+  effect above: the top 4 picks are where a correction pays (DERIVED from the two).
+
+### 8.3 Status (replaces section 7's last line)
+
+- GP3-08 (MTP) resumed and measured on the engine: output equal to plain decoding, 89.6 % of single drafts kept, but
+  0.93-0.94x of plain speed (MEASURED, v57-v58); the fused draft path is built and its first run is pending.
 
 ## Sources
 
