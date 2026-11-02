@@ -2653,6 +2653,7 @@ int cmd_engine_check(const Args& a) {
   eo.fast_f32 = !a.has("no-fast-f32");        // v52 (temporary switch)
   eo.lean_dense = a.has("lean-dense");        // v55e (temporary switch; off by default since v55e2)
   eo.dn_half = !a.has("no-dn-half");  // v55g (L3); v57: on by default again, --no-dn-half off (temporary, A/B)
+  eo.dn_half_mt = a.has("dn-half-mt");  // v57 (temporary, A/B)
   eo.l2_prefetch = a.has("l2pf") && !a.has("no-l2pf");  // v56; v56b: off by default, --l2pf on (temporary, A/B)
   eo.dn_smem = !a.has("no-dn-smem");  // v56b (temporary, A/B)
   eo.dn_mlp2 = !a.has("no-dn-mlp2");  // v56c (temporary, A/B)
@@ -3026,6 +3027,7 @@ int cmd_engine_check(const Args& a) {
       const double listed = tmg.draft_s + vs + tmg.keep_s + tmg.catchup_s + tmg.promote_s + tmg.argmax_s;
       std::printf("  MTP check: plain prefill %.3f s, MTP prompt %.3f s (%.3f s more, charged to the MTP run above); decode phase alone: plain %.3f s vs MTP %.3f s = %.2fx; listed parts %.3f s, not listed %.3f s\n",
                   pre_s, tmg.prompt_s, tmg.prompt_s - pre_s, plain_s, mtp_dec, mtp_dec > 0 ? plain_s / mtp_dec : 0.0, listed, mtp_dec - listed);
+      if (const std::string ph = eng.value->moe_phase_report(); !ph.empty()) std::printf("  after the MTP run (v57): %s\n", ph.c_str());  // the verify-step stamps
       if (a.has("timeline")) {
         const model::EngineTimeline& T = eng.value->timeline();
         for (int b2 = 1; b2 < 10; ++b2) {

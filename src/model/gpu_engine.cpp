@@ -926,7 +926,9 @@ struct GpuEngine::Impl {
   // launches; *took false (nothing run) where it does not apply, and the caller runs the attn norm and deltanet_block
   Status dn_half_layer(Layer& D, int64_t n, bool* took) {
     *took = false;
-    if (n < 1 || n > 4 || (n > 1 && (!bi_now || halves_now))) return Status::good();  // v56: 2-4 tokens where the products of n take R3
+    // v56: 2-4 tokens where the products of n take R3; v57: only with dn_half_mt (v56b MEASURED: L3 for 3-token verify steps 33.5 ms
+    // vs 24.8 ms without, the prompt 5.06 vs 3.82 s: its several-token stages still read the inputs from L2)
+    if (n < 1 || n > 4 || (n > 1 && (!o.dn_half_mt || !bi_now || halves_now))) return Status::good();
     const int64_t ch = s.conv_channels(), ds = s.ssm_d_state, nk = s.ssm_n_group, nv = s.ssm_dt_rank, taps = s.ssm_d_conv, e = s.n_embd;
     if (!o.dn_half || !dn_hcnt || halves_now || !D.wqkv.r3 || !D.wgate.r3 || !D.ssm_out.r3 || D.wqkv.k != e || D.wgate.k != e || D.ssm_out.k != nv * ds ||
         D.wqkv.v->rot32 != D.wgate.v->rot32 || D.wbeta.v->rot32 || D.walpha.v->rot32 || D.wbeta.k != e || D.walpha.k != e || D.wbeta.n_out != nv ||
