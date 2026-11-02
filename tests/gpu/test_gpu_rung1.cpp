@@ -303,58 +303,6 @@ TEST(rung1_act_q8x32_equals_the_reference_rounding) {
   }
 }
 
-// v50: act_q8x32_halves: rows 0 .. rows - 1 bit for bit act_q8x32's (int8, scales, sums, rounded floats); rows rows .. 2 rows - 1
-// the leftover at scale / 256 with consistent sums; hi + lo / 256 within half a fine step of the (rotated) input except where
-// the leftover hit the +-127 clamp; error vs the input about 1/256 of int8's
-TEST(rung1_act_q8x32_halves) {
-  if (!gpu_or_skip()) return;
-  const std::int64_t n = 2048, rows = 3;
-  std::vector<float> x = wave(n * rows, 77u, 4.0f);
-  for (const bool rot : {false, true}) {
-    const std::size_t nb = static_cast<std::size_t>(rows * n / 32);
-    Dev<float> dx(x), dr1(x.size()), dr2(x.size()), ds1(nb), ds2(2 * nb);
-    Dev<std::int8_t> dq1(x.size()), dq2(2 * x.size());
-    Dev<int> dm1(nb), dm2(2 * nb);
-    CHECK(g::act_q8x32(dx.p, n, rows, n, rot, dr1.p, n, dq1.p, ds1.p, dm1.p));
-    CHECK(g::act_q8x32_halves(dx.p, n, rows, n, rot, dr2.p, n, dq2.p, ds2.p, dm2.p));
-    CHECK(g::sync());
-    const std::vector<std::int8_t> q1 = dq1.get(), q2 = dq2.get();
-    const std::vector<float> s1 = ds1.get(), s2 = ds2.get(), r1 = dr1.get(), r2 = dr2.get();
-    const std::vector<int> m1 = dm1.get(), m2 = dm2.get();
-    bool hi_eq = bits_equal(r1, r2);
-    for (std::size_t i = 0; i < q1.size(); ++i) hi_eq = hi_eq && q1[i] == q2[i];
-    for (std::size_t b = 0; b < nb; ++b) hi_eq = hi_eq && s1[b] == s2[b] && m1[b] == m2[b];
-    CHECK(hi_eq);
-    std::vector<float> ref = x;
-    if (rot)
-      for (std::int64_t t = 0; t < rows; ++t) q::hadamard32(ref.data() + t * n, n);
-    bool sums = true, within = true;
-    double e8 = 0.0, e16 = 0.0, den = 0.0;
-    int clamped = 0;
-    for (std::size_t b = 0; b < nb; ++b) {
-      int sl = 0;
-      for (int i = 0; i < 32; ++i) {
-        const std::size_t k = 32 * b + static_cast<std::size_t>(i);
-        const int lo = q2[q1.size() + k];
-        sl += lo;
-        const double hv = static_cast<double>(s2[b]) * q2[k], fine = static_cast<double>(s2[nb + b]);
-        const double v = hv + fine * lo, xv = ref[k];
-        if (lo == 127 || lo == -127) ++clamped;
-        else within = within && std::fabs(v - xv) <= 0.5 * fine * (1.0 + 1e-3) + 4e-7 * std::fabs(xv) + 1e-30;  // + float rounding of the leftover
-        e8 += (hv - xv) * (hv - xv);
-        e16 += (v - xv) * (v - xv);
-        den += xv * xv;
-      }
-      sums = sums && sl == m2[nb + b];
-    }
-    CHECK(sums);
-    CHECK(within);
-    CHECK(e16 * 1000.0 < e8);
-    std::printf("    %s: hi rows bit for bit act_q8x32's; lo sums consistent; hi + lo / 256 rel error %.3e vs int8 %.3e (%d values at the lo clamp)\n",
-                rot ? "rotated" : "plain", std::sqrt(e16 / den), std::sqrt(e8 / den), clamped);
-  }
-}
-
 // the fused norm + rounding (rms_norm_q8x32) equals rms_norm then act_q8x32 bit for bit: normalized floats, rounded
 // floats, int8 values, scales, sums; with and without the weight, plain and rotated, rows of 512 / 2048 / 4096 (a row
 // longer than 256 blocks of 32 is not needed by the model; 4096 = 128 blocks). Both paths timed (information only).
@@ -729,7 +677,7 @@ TEST(rung1_moe_reader_against_fp64) {
   std::uint64_t row_max = 0;
   for (const g::ExpertPtr& X : tab)
     for (int pj = 0; pj < 3; ++pj) row_max = std::max<std::uint64_t>(row_max, X.rb[pj]);
-  bool ok_all = true, same = true, v25_eq = true, alone_eq = true;
+  bool ok_all = true, same = true, alone_eq = true;
   double worst = 0.0;
   for (const std::int64_t T : {std::int64_t{1}, std::int64_t{2}, std::int64_t{4}}) {
     const std::vector<float> x = wave(T * H, static_cast<std::uint32_t>(7 + T), 1.0f);
@@ -740,19 +688,20 @@ TEST(rung1_moe_reader_against_fp64) {
         sel[static_cast<std::size_t>(t * nu + j)] = static_cast<std::int32_t>((t + 2 * j + (j == 2 ? 1 : 0)) % ne);
         wsel[static_cast<std::size_t>(t * nu + j)] = 0.2f + 0.15f * static_cast<float>(j);
       }
-    Dev<float> dx(x), dw(wsel), dgu(static_cast<std::size_t>(T * nu * 2 * F)), dh(static_cast<std::size_t>(T * nu * F)), dy(static_cast<std::size_t>(T * H)),
-        dy2(static_cast<std::size_t>(T * H)), dy1(static_cast<std::size_t>(T * H)), dyd(static_cast<std::size_t>(T * nu * H));
+    const std::int64_t P = T * (nu + 1);  // reader v3's scratch (room for a shared expert's picks)
+    Dev<float> dx(x), dw(wsel), dgu(static_cast<std::size_t>(P * 2 * F)), dh(static_cast<std::size_t>(P * F)), dy(static_cast<std::size_t>(T * H)),
+        dy2(static_cast<std::size_t>(T * H)), dyd(static_cast<std::size_t>(P * H));
     Dev<std::int32_t> ds(sel);
-    Dev<int> dgrp(static_cast<std::size_t>(1 + 6 * T * nu));
+    Dev<int> dgrp(static_cast<std::size_t>(1 + 6 * P));
+    Dev<g::ExpertPtr> gsrc(static_cast<std::size_t>(P)), gfill(static_cast<std::size_t>(P));
     Dev<unsigned long long> dts(6);
-    // v25 grouped reader (the engine's), twice (repeatable), with stamps the second time; the v24 reader for comparison
-    CHECK(g::moe_reader(dtab.p, ds.p, dw.p, nu, dx.p, T, H, F, row_max, dgu.p, dh.p, dyd.p, dgrp.p, dy.p));
-    CHECK(g::moe_reader(dtab.p, ds.p, dw.p, nu, dx.p, T, H, F, row_max, dgu.p, dh.p, dyd.p, dgrp.p, dy2.p, dts.p));
-    CHECK(g::moe_reader_v24(dtab.p, ds.p, dw.p, nu, dx.p, T, H, F, dgu.p, dh.p, dy1.p));
+    // v58: the grouped reader v3 (the engine's reader; v24 / v25 removed in the bloat audit), twice (repeatable), with
+    // stamps the second time
+    CHECK(g::moe_reader3(dtab.p, nullptr, ds.p, dw.p, nullptr, nu, dx.p, T, H, F, row_max, nullptr, dgu.p, dh.p, dyd.p, dgrp.p, gsrc.p, gfill.p, dy.p));
+    CHECK(g::moe_reader3(dtab.p, nullptr, ds.p, dw.p, nullptr, nu, dx.p, T, H, F, row_max, nullptr, dgu.p, dh.p, dyd.p, dgrp.p, gsrc.p, gfill.p, dy2.p, dts.p));
     CHECK(g::sync());
-    const std::vector<float> y = dy.get(), y2 = dy2.get(), y1 = dy1.get();
+    const std::vector<float> y = dy.get(), y2 = dy2.get();
     same = same && std::memcmp(y.data(), y2.data(), y.size() * sizeof(float)) == 0;
-    v25_eq = v25_eq && std::memcmp(y.data(), y1.data(), y.size() * sizeof(float)) == 0;
     const std::vector<unsigned long long> tsv = dts.get();
     for (int k = 1; k < 6; ++k) CHECK(tsv[static_cast<std::size_t>(k)] >= tsv[static_cast<std::size_t>(k - 1)]);
     // batch invariance: each token alone gives its row of the batch bit for bit
@@ -760,7 +709,7 @@ TEST(rung1_moe_reader_against_fp64) {
       Dev<float> dxa(std::vector<float>(x.begin() + t * H, x.begin() + (t + 1) * H)),
           dwa(std::vector<float>(wsel.begin() + t * nu, wsel.begin() + (t + 1) * nu)), dya(static_cast<std::size_t>(H));
       Dev<std::int32_t> dsa(std::vector<std::int32_t>(sel.begin() + t * nu, sel.begin() + (t + 1) * nu));
-      CHECK(g::moe_reader(dtab.p, dsa.p, dwa.p, nu, dxa.p, 1, H, F, row_max, dgu.p, dh.p, dyd.p, dgrp.p, dya.p));
+      CHECK(g::moe_reader3(dtab.p, nullptr, dsa.p, dwa.p, nullptr, nu, dxa.p, 1, H, F, row_max, nullptr, dgu.p, dh.p, dyd.p, dgrp.p, gsrc.p, gfill.p, dya.p));
       CHECK(g::sync());
       const std::vector<float> ya = dya.get();
       alone_eq = alone_eq && std::memcmp(ya.data(), y.data() + t * H, static_cast<std::size_t>(H) * sizeof(float)) == 0;
@@ -804,11 +753,10 @@ TEST(rung1_moe_reader_against_fp64) {
   }
   CHECK(ok_all);
   CHECK(same);
-  CHECK(v25_eq);
   CHECK(alone_eq);
   std::printf("    1 / 2 / 4 tokens x 3 picks, q8_0 / q6_k / q4_tg2, %s: worst rel L2 %.3e against fp64 (the per-32 rounding may flip a step); repeat %s; "
-              "grouped = v24 %s; each token alone = its batch row %s\n",
-              reg ? "3 experts from registered host memory" : "all on the device", worst, same ? "bit for bit" : "DIFFERS", v25_eq ? "bit for bit" : "DIFFERS",
+              "each token alone = its batch row %s\n",
+              reg ? "3 experts from registered host memory" : "all on the device", worst, same ? "bit for bit" : "DIFFERS",
               alone_eq ? "bit for bit" : "DIFFERS");
   for (void* d : dmem) g::dfree(d);
   if (reg) g::host_unregister(hm);
@@ -821,7 +769,7 @@ TEST(rung1_moe_reader_against_fp64) {
 TEST(rung1_moe_reader3_equals_v25_cache_and_shared) {
   if (!gpu_or_skip()) return;
   const q::Type types[3] = {q::Type::q8_0, q::Type::q6_k, q::Type::q4_tg2};
-  bool eq_all = true, cache_eq = true, cache_hits_ok = true, shared_ok = true, plane_ok = true, rpw_ok = true, mask_ok = true;
+  bool cache_eq = true, cache_hits_ok = true, shared_ok = true, plane_ok = true, rpw_ok = true, mask_ok = true;
   double worst_sh = 0.0, worst_plane = 0.0;
   for (const std::int64_t F : {std::int64_t{256}, std::int64_t{1024}}) {
     const std::int64_t H = 512, ne = 6;
@@ -879,12 +827,11 @@ TEST(rung1_moe_reader3_equals_v25_cache_and_shared) {
         }
       }
       Dev<float> dx(x), dw(wsel), dg(gshv), dgu(static_cast<std::size_t>(P * 2 * F)), dh(static_cast<std::size_t>(P * F)), dyd(static_cast<std::size_t>(P * H)),
-          y24(static_cast<std::size_t>(T * H)), y3(static_cast<std::size_t>(T * H)), yc1(static_cast<std::size_t>(T * H)), yc2(static_cast<std::size_t>(T * H)),
+          y3(static_cast<std::size_t>(T * H)), yc1(static_cast<std::size_t>(T * H)), yc2(static_cast<std::size_t>(T * H)),
           ysh(static_cast<std::size_t>(T * H));
       Dev<std::int32_t> ds(sel);
       Dev<int> dgrp(static_cast<std::size_t>(1 + 6 * P));
       Dev<g::ExpertPtr> gsrc(static_cast<std::size_t>(P)), gfill(static_cast<std::size_t>(P));
-      CHECK(g::moe_reader_v24(dtab.p, ds.p, dw.p, nu, dx.p, T, H, F, dgu.p, dh.p, y24.p));
       CHECK(g::moe_reader3(dtab.p, nullptr, ds.p, dw.p, nullptr, nu, dx.p, T, H, F, row_max, nullptr, dgu.p, dh.p, dyd.p, dgrp.p, gsrc.p, gfill.p, y3.p));
       CHECK(g::moe_reader3(dtab.p, nullptr, ds.p, dw.p, nullptr, nu, dx.p, T, H, F, row_max, &rc, dgu.p, dh.p, dyd.p, dgrp.p, gsrc.p, gfill.p, yc1.p));
       CHECK(g::moe_reader3(dtab.p, nullptr, ds.p, dw.p, nullptr, nu, dx.p, T, H, F, row_max, &rc, dgu.p, dh.p, dyd.p, dgrp.p, gsrc.p, gfill.p, yc2.p));
@@ -942,10 +889,9 @@ TEST(rung1_moe_reader3_equals_v25_cache_and_shared) {
         plane_ok = plane_ok && fin && rel > 0.0 && rel < 0.5;
         worst_plane = std::max(worst_plane, rel);
       }
-      const std::vector<float> a24 = y24.get(), a3 = y3.get(), c1 = yc1.get(), c2 = yc2.get(), sh = ysh.get();
-      const std::size_t nb = a24.size() * sizeof(float);
-      eq_all = eq_all && std::memcmp(a24.data(), a3.data(), nb) == 0;
-      cache_eq = cache_eq && std::memcmp(a24.data(), c1.data(), nb) == 0 && std::memcmp(a24.data(), c2.data(), nb) == 0;
+      const std::vector<float> a3 = y3.get(), c1 = yc1.get(), c2 = yc2.get(), sh = ysh.get();
+      const std::size_t nb = a3.size() * sizeof(float);  // v58: v24 removed; the cached calls against the uncached one
+      cache_eq = cache_eq && std::memcmp(a3.data(), c1.data(), nb) == 0 && std::memcmp(a3.data(), c2.data(), nb) == 0;
       // the shared term: sh - routed = gsh x the shared expert (fp64, the per-32 rounding of silu x up as the reader)
       double num = 0.0, den = 0.0;
       for (std::int64_t t = 0; t < T; ++t) {
@@ -982,7 +928,6 @@ TEST(rung1_moe_reader3_equals_v25_cache_and_shared) {
     }
     for (void* d : dmem) g::dfree(d);
   }
-  CHECK(eq_all);
   CHECK(cache_eq);
   CHECK(cache_hits_ok);
   CHECK(shared_ok);
@@ -992,9 +937,9 @@ TEST(rung1_moe_reader3_equals_v25_cache_and_shared) {
   std::printf("    v28: one row per warp = two %s; CPU mask (experts 3, 4 skipped) = those picks at weight 0 %s\n", rpw_ok ? "bit for bit" : "DIFFERS",
               mask_ok ? "(equal values)" : "DIFFERS");
   std::printf("    plane test (last pick's Q4_TG2 rows on the 2-bit base plane): tail 0 bit for bit; tail 1 changes the output by up to %.3e (rel L2)\n", worst_plane);
-  std::printf("    F 256 (half-warp down) / 1024 (warp down), 1 / 2 / 4 tokens, q8_0 / q6_k / q4_tg2: v3 = v24 %s; cached (fill, then read) %s, "
+  std::printf("    F 256 (half-warp down) / 1024 (warp down), 1 / 2 / 4 tokens, q8_0 / q6_k / q4_tg2: cached (fill, then read) = uncached %s, "
               "second call from VRAM %s; shared expert folded in: worst rel L2 %.3e against fp64\n",
-              eq_all ? "bit for bit" : "DIFFERS", cache_eq ? "bit for bit" : "DIFFERS", cache_hits_ok ? "yes" : "NO", worst_sh);
+              cache_eq ? "bit for bit" : "DIFFERS", cache_hits_ok ? "yes" : "NO", worst_sh);
 }
 
 TEST(rung1_attention_against_fp64) {

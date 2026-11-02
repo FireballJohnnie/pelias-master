@@ -60,10 +60,6 @@ bool gather_rows(std::uint32_t type, const void* w, std::uint64_t row_bytes, std
 // value for value model::act_round_q8_256x8. rot32: Walsh-Hadamard per 32 first (a weight stored rotated), norm =
 // 1 / sqrt(32) as quant::hadamard32 computes it on the host. Writes the rounded floats to xr (may equal x) and, when q is
 // not null, the int8 values, the scale and the integer sum per 32 (the R3 kernel's inputs).
-// v50: as act_q8x32, plus the leftover of each row rounded at scale / 256 written as rows rows .. 2 rows - 1 of q / scale /
-// sum (q, scale, sum hold 2 rows); hi + lo / 256 is an int16-level input
-bool act_q8x32_halves(const float* x, std::int64_t n, std::int64_t rows, std::int64_t ldx, bool rot32, float* xr, std::int64_t ldr, std::int8_t* q,
-                      float* scale, int* sum, Stream s = nullptr);
 bool act_q8x32(const float* x, std::int64_t n, std::int64_t rows, std::int64_t ldx, bool rot32, float* xr, std::int64_t ldr,
                std::int8_t* q, float* scale, int* sum, Stream s = nullptr);
 
@@ -233,19 +229,7 @@ struct ReaderCache {
   // the row (tg2p_prefix), packed, so a slot's size (and the pools sized by it) follows the slider
   int plane_bits = 4;
 };
-// tab: n_expert entries (device); sel / wsel: tokens x n_used picks and weights (device, as router_topk); xr: tokens x H
-// rounded inputs; gu: scratch tokens x n_used x 2F; h: scratch tokens x n_used x F; y: tokens x H, overwritten with the
-// weighted sum of the picked experts (pick order)
-bool moe_reader_v24(const ExpertPtr* tab, const std::int32_t* sel, const float* wsel, int n_used, const float* xr, std::int64_t tokens, std::int64_t H,
-                    std::int64_t F, float* gu, float* h, float* y, Stream s = nullptr);
-// v25 grouped reader (the engine's): the picks grouped by expert, each expert's rows read once (16-byte staged) for every
-// token that picked it; bit for bit equal to moe_reader_v24. tokens 1-4. row_max: the longest row (bytes) in tab. yd:
-// scratch tokens x n_used x H; grp: scratch 1 + 6 x tokens x n_used ints (device). ts (optional, device): 6 GPU stamps
-// (start, after grouping, after gate/up, after silu, after down, after combine).
-bool moe_reader(const ExpertPtr* tab, const std::int32_t* sel, const float* wsel, int n_used, const float* xr, std::int64_t tokens, std::int64_t H,
-                std::int64_t F, std::uint64_t row_max, float* gu, float* h, float* yd, int* grp, float* y, unsigned long long* ts = nullptr,
-                Stream s = nullptr);
-// v26 reader v3: the v25 grouped reader with (1) the Q4_TG2 grid replicated per lane in shared memory (R3's grid path:
+// v26 reader v3 (v58: the v24 / v25 readers it replaced are removed): the v25 grouped reader with (1) the Q4_TG2 grid replicated per lane in shared memory (R3's grid path:
 // the same floats as decode32, conflict-free), (2) two rows staged per warp before decoding (more bytes in flight), (3) the
 // down projection by half-warps when its rows have at most 16 blocks of 32 (F = 512: v25 left half of each warp idle);
 // each pick's arithmetic is v25's, so it equals moe_reader bit for bit without a shared expert. Optional: the cache (c,

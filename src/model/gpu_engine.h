@@ -122,15 +122,12 @@ struct EngineOptions {
   // v49 (accuracy tail step 2a): copy each reader step's router logits to pinned host memory and keep, per position, every
   // layer's router margins (logit 8th - 9th pick: the edge of the picks; logit 1st - 2nd); read with router_margins()
   bool router_margins = false;
-  // v26 (author 20:39 "don't hold back"): the reader v3 kernels (Q4_TG2 grid per lane in shared memory, two rows staged
-  // per warp, half-warp down rows; bit for bit with v25's reader); false: v25's reader
-  bool reader_v3 = true;
   // v26: VRAM cache of file experts for the reader, slots per layer (0: none). Its bytes come out of the bank's budget
   // before the bank is filled (the bank's least-used experts make room); misses are written into the least recently used
   // slot as the reader stages them.
   int reader_cache = 0;
   // v26: the shared expert as one more pick of the reader (its weights in VRAM; its sigmoid gate as the weight, added after
-  // the routed picks). Needs reader_v3 and the shared expert's shape equal to a routed expert's.
+  // the routed picks). Needs the shared expert's shape equal to a routed expert's.
   bool fold_shared = false;
   // v26 option B (author 20:20-20:39): steps of 2-4 tokens with the reader run every quantized product through R3 with the
   // weights read once for all the tokens and each token's arithmetic the one-token path's, so a verify batch's rows equal
@@ -167,9 +164,6 @@ struct EngineOptions {
   bool gpu_prompt = true;  // v49e (author 21:09-21:13): the GPU prompt stays the default and is fixed forward; --cpu-prompt (temporary, for the diagnosis)
   // v49d: the GPU prompt's steps on R3 (true, v48b) or on the batched kernels (false, v48's plain path; --prompt-batched)
   bool prompt_r3 = true;
-  // v50: the GPU prompt's R3 products take int16-level inputs as two int8 halves (hi + lo / 256, one load of the weights);
-  // decode steps unchanged. MEASURED v49e: the int8 prompt's state cost W2's decode rows +65 % KL (--no-prompt-halves, temporary)
-  bool prompt_halves = false;  // v51: parked (author 21:50 "screw stage 1"), unrun; --prompt-halves turns it on
   // v28: gate / up rows per warp in the reader v3 kernels (1 or 2; 2 = v26's shape)
   int reader_rows_per_warp = 2;
   // v28: pinned ranges are merged across gaps smaller than this (bytes; v27 used 8 MiB; 0 = exact ranges, one per matrix

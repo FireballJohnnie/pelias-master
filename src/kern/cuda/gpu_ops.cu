@@ -1007,38 +1007,10 @@ bool read_chunks_rate(const void* dev_base, const std::uint64_t* offsets, int n,
   return ok;
 }
 
-// ------------------------------------------------------------------------------------------------ v24 expert reader
+// ------------------------------------------------------------------------------------------------ expert reader helpers
+// v58 (bloat audit): the v24 / v25 readers (moe_reader_v24, moe_reader) removed; reader v3 below is the engine's
 bool device_tables(Tables* out);  // defined below
-// For 1-4 tokens (decode, the MTP verify): the router's picks read straight from device memory, each picked expert's rows
-// read from wherever its table entry points (the VRAM bank, or the model file's mapping registered for the GPU), one warp
-// per output row, lanes over 32-value blocks (decode32, as k_matmul), on the rounded inputs. Three launches per layer:
-// gate and up; silu x up rounded per 32 (the CPU cold path's rule); down summed over a token's picks in pick order (a
-// deterministic sum) into y, overwritten.
-__global__ void __launch_bounds__(128) k_rd_gate_up(const ExpertPtr* __restrict__ tab, const std::int32_t* __restrict__ sel, int nu,
-                                                    const float* __restrict__ xr, std::int64_t H, std::int64_t F, float* __restrict__ gu,
-                                                    const Tables tb) {
-  const std::int64_t pi = blockIdx.y;  // pick index t * nu + j
-  const std::int64_t r = static_cast<std::int64_t>(blockIdx.x) * 4 + (threadIdx.x >> 5);
-  const int lane = static_cast<int>(threadIdx.x & 31);
-  if (r >= 2 * F) return;
-  const int e = sel[pi];
-  const int pj = r < F ? 0 : 1;
-  const std::int64_t rr = r < F ? r : r - F;
-  const ExpertPtr& X = tab[e];
-  const std::uint8_t* row = X.w[pj] + static_cast<std::uint64_t>(rr) * X.rb[pj];
-  const float* x = xr + (pi / nu) * H;
-  float acc = 0.0f;
-  for (std::int64_t j = lane; j < H / 32; j += 32) {
-    float wv[32];
-    decode32(X.type[pj], row, j, tb, wv);
-    float s = 0.0f;
-#pragma unroll
-    for (int i = 0; i < 32; ++i) s += wv[i] * x[32 * j + i];
-    acc += s;
-  }
-  acc = warp_sum(acc);
-  if (lane == 0) gu[(pi * 2 + pj) * F + rr] = acc;
-}
+// silu x up rounded per 32 (the CPU cold path's rule), one thread per 32 values
 __global__ void k_rd_silu_round(const float* __restrict__ gu, std::int64_t picks, std::int64_t F, float* __restrict__ h) {
   const std::int64_t id = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x, nb = F / 32;
   if (id >= picks * nb) return;
@@ -1055,181 +1027,7 @@ __global__ void k_rd_silu_round(const float* __restrict__ gu, std::int64_t picks
   const float inv = quo(1.0f, sc);
   for (int i = 0; i < 32; ++i) h[pi * F + 32 * b + i] = mul(sc, fminf(127.0f, fmaxf(-127.0f, rintf(mul(v[i], inv)))));
 }
-__global__ void __launch_bounds__(128) k_rd_down(const ExpertPtr* __restrict__ tab, const std::int32_t* __restrict__ sel,
-                                                 const float* __restrict__ wsel, int nu, const float* __restrict__ h, std::int64_t H,
-                                                 std::int64_t F, float* __restrict__ y, const Tables tb) {
-  const std::int64_t t = blockIdx.y;
-  const std::int64_t r = static_cast<std::int64_t>(blockIdx.x) * 4 + (threadIdx.x >> 5);
-  const int lane = static_cast<int>(threadIdx.x & 31);
-  if (r >= H) return;
-  float tot = 0.0f;
-  for (int j = 0; j < nu; ++j) {
-    const std::int64_t pi = t * nu + j;
-    const ExpertPtr& X = tab[sel[pi]];
-    const std::uint8_t* row = X.w[2] + static_cast<std::uint64_t>(r) * X.rb[2];
-    const float* hv = h + pi * F;
-    float acc = 0.0f;
-    for (std::int64_t q = lane; q < F / 32; q += 32) {
-      float wv[32];
-      decode32(X.type[2], row, q, tb, wv);
-      float s = 0.0f;
-#pragma unroll
-      for (int i = 0; i < 32; ++i) s += wv[i] * hv[32 * q + i];
-      acc += s;
-    }
-    acc = warp_sum(acc);
-    tot = add(tot, mul(wsel[pi], acc));
-  }
-  if (lane == 0) y[t * H + r] = tot;
-}
-bool moe_reader_v24(const ExpertPtr* tab, const std::int32_t* sel, const float* wsel, int n_used, const float* xr, std::int64_t tokens, std::int64_t H,
-                    std::int64_t F, float* gu, float* h, float* y, Stream s) {
-  if (!tab || !sel || !wsel || !xr || !gu || !h || !y || n_used <= 0 || H % 32 != 0 || F % 32 != 0) return fail("moe_reader: bad shape or pointer");
-  if (tokens <= 0) return true;
-  Tables tb;
-  if (!device_tables(&tb)) return false;
-  const std::int64_t picks = tokens * n_used;
-  k_rd_gate_up<<<dim3(static_cast<unsigned>((2 * F + 3) / 4), static_cast<unsigned>(picks)), 128, 0, st(s)>>>(tab, sel, n_used, xr, H, F, gu, tb);
-  k_rd_silu_round<<<blocks_for(picks * (F / 32), 128), 128, 0, st(s)>>>(gu, picks, F, h);
-  k_rd_down<<<dim3(static_cast<unsigned>((H + 3) / 4), static_cast<unsigned>(tokens)), 128, 0, st(s)>>>(tab, sel, wsel, n_used, h, H, F, y, tb);
-  return launched("moe_reader");
-}
-
-// v25 grouped reader. The picks of all the step's tokens grouped by expert (first-appearance order, one thread: at most
-// kRdMaxTok x 8 picks); each expert's rows read once for every token that picked it. A warp stages its row into shared
-// memory with 16-byte loads (the source's alignment kept, so the middle is whole uint4s; head and tail bytes one by one),
-// then the lanes decode 32-value blocks from shared memory as v24 did. Each token's dot runs in the same order as v24's
-// one-token warp (lane-strided blocks, warp_sum), so a pick's value does not depend on the batch or the grouping: the
-// result equals moe_reader_v24 bit for bit. Down writes each pick's unweighted row; the combine sums a token's picks in
-// pick order (as v24).
 constexpr int kRdMaxTok = 4;
-__global__ void k_rd_group(const std::int32_t* __restrict__ sel, int picks, int nu, int* __restrict__ grp) {
-  // grp: [0] = U; then U x (expert, count, pick0..pick3)
-  if (threadIdx.x != 0 || blockIdx.x != 0) return;
-  int U = 0;
-  for (int pi = 0; pi < picks; ++pi) {
-    const int e = sel[pi];
-    int u = 0;
-    while (u < U && grp[1 + 6 * u] != e) ++u;
-    if (u == U) {
-      grp[1 + 6 * u] = e;
-      grp[2 + 6 * u] = 0;
-      ++U;
-    }
-    const int c = grp[2 + 6 * u];
-    grp[3 + 6 * u + c] = pi;
-    grp[2 + 6 * u] = c + 1;
-  }
-  grp[0] = U;
-  (void)nu;
-}
-__device__ __forceinline__ const std::uint8_t* rd_stage(const std::uint8_t* src, std::uint64_t n, std::uint8_t* buf, int lane) {
-  const std::uint64_t mis = reinterpret_cast<std::uintptr_t>(src) & 15u;
-  std::uint8_t* dst = buf + mis;  // dst and src agree mod 16
-  std::uint64_t head = (16u - mis) & 15u;
-  if (head > n) head = n;
-  for (std::uint64_t i = static_cast<std::uint64_t>(lane); i < head; i += 32) dst[i] = src[i];
-  const std::uint64_t n4 = (n - head) / 16;
-  const uint4* s4 = reinterpret_cast<const uint4*>(src + head);
-  uint4* d4 = reinterpret_cast<uint4*>(dst + head);
-  for (std::uint64_t i = static_cast<std::uint64_t>(lane); i < n4; i += 32) d4[i] = s4[i];
-  for (std::uint64_t i = head + n4 * 16 + static_cast<std::uint64_t>(lane); i < n; i += 32) dst[i] = src[i];
-  __syncwarp();
-  return dst;
-}
-__global__ void __launch_bounds__(128) k_rd2_gate_up(const ExpertPtr* __restrict__ tab, const int* __restrict__ grp, int nu, const float* __restrict__ xr,
-                                                     std::int64_t H, std::int64_t F, std::uint64_t slot, float* __restrict__ gu, const Tables tb) {
-  extern __shared__ __align__(16) std::uint8_t rd_sh[];
-  const int u = static_cast<int>(blockIdx.y);
-  if (u >= grp[0]) return;
-  const int warp = static_cast<int>(threadIdx.x >> 5), lane = static_cast<int>(threadIdx.x & 31);
-  const std::int64_t r = static_cast<std::int64_t>(blockIdx.x) * 4 + warp;
-  if (r >= 2 * F) return;
-  const int* G = grp + 1 + 6 * u;
-  const int e = G[0], cnt = G[1];
-  const int pj = r < F ? 0 : 1;
-  const std::int64_t rr = r < F ? r : r - F;
-  const ExpertPtr& X = tab[e];
-  const std::uint8_t* row = rd_stage(X.w[pj] + static_cast<std::uint64_t>(rr) * X.rb[pj], X.rb[pj], rd_sh + slot * static_cast<std::uint64_t>(warp), lane);
-  float acc[kRdMaxTok] = {0.0f, 0.0f, 0.0f, 0.0f};
-  for (std::int64_t j = lane; j < H / 32; j += 32) {
-    float wv[32];
-    decode32(X.type[pj], row, j, tb, wv);
-    for (int c = 0; c < cnt; ++c) {
-      const float* x = xr + (G[2 + c] / nu) * H + 32 * j;
-      float s = 0.0f;
-#pragma unroll
-      for (int i = 0; i < 32; ++i) s += wv[i] * x[i];
-      acc[c] += s;
-    }
-  }
-  for (int c = 0; c < cnt; ++c) {
-    const float a = warp_sum(acc[c]);
-    if (lane == 0) gu[(static_cast<std::int64_t>(G[2 + c]) * 2 + pj) * F + rr] = a;
-  }
-}
-__global__ void __launch_bounds__(128) k_rd2_down(const ExpertPtr* __restrict__ tab, const int* __restrict__ grp, const float* __restrict__ h, std::int64_t H,
-                                                  std::int64_t F, std::uint64_t slot, float* __restrict__ yd, const Tables tb) {
-  extern __shared__ __align__(16) std::uint8_t rd_sh[];
-  const int u = static_cast<int>(blockIdx.y);
-  if (u >= grp[0]) return;
-  const int warp = static_cast<int>(threadIdx.x >> 5), lane = static_cast<int>(threadIdx.x & 31);
-  const std::int64_t r = static_cast<std::int64_t>(blockIdx.x) * 4 + warp;
-  if (r >= H) return;
-  const int* G = grp + 1 + 6 * u;
-  const int e = G[0], cnt = G[1];
-  const ExpertPtr& X = tab[e];
-  const std::uint8_t* row = rd_stage(X.w[2] + static_cast<std::uint64_t>(r) * X.rb[2], X.rb[2], rd_sh + slot * static_cast<std::uint64_t>(warp), lane);
-  float acc[kRdMaxTok] = {0.0f, 0.0f, 0.0f, 0.0f};
-  for (std::int64_t q = lane; q < F / 32; q += 32) {
-    float wv[32];
-    decode32(X.type[2], row, q, tb, wv);
-    for (int c = 0; c < cnt; ++c) {
-      const float* hv = h + static_cast<std::int64_t>(G[2 + c]) * F + 32 * q;
-      float s = 0.0f;
-#pragma unroll
-      for (int i = 0; i < 32; ++i) s += wv[i] * hv[i];
-      acc[c] += s;
-    }
-  }
-  for (int c = 0; c < cnt; ++c) {
-    const float a = warp_sum(acc[c]);
-    if (lane == 0) yd[static_cast<std::int64_t>(G[2 + c]) * H + r] = a;
-  }
-}
-__global__ void k_rd2_combine(const float* __restrict__ yd, const float* __restrict__ wsel, int nu, std::int64_t tokens, std::int64_t H, float* __restrict__ y) {
-  const std::int64_t id = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (id >= tokens * H) return;
-  const std::int64_t t = id / H, r = id % H;
-  float tot = 0.0f;
-  for (int j = 0; j < nu; ++j) tot = add(tot, mul(wsel[t * nu + j], yd[(t * nu + j) * H + r]));
-  y[id] = tot;
-}
-bool moe_reader(const ExpertPtr* tab, const std::int32_t* sel, const float* wsel, int n_used, const float* xr, std::int64_t tokens, std::int64_t H,
-                std::int64_t F, std::uint64_t row_max, float* gu, float* h, float* yd, int* grp, float* y, unsigned long long* ts, Stream s) {
-  if (!tab || !sel || !wsel || !xr || !gu || !h || !yd || !grp || !y || n_used <= 0 || H % 32 != 0 || F % 32 != 0 || row_max == 0)
-    return fail("moe_reader: bad shape or pointer");
-  if (tokens <= 0) return true;
-  if (tokens > kRdMaxTok) return fail("moe_reader: at most 4 tokens");
-  Tables tb;
-  if (!device_tables(&tb)) return false;
-  const std::int64_t picks = tokens * n_used;
-  const std::uint64_t slot = (row_max + 32 + 15) & ~std::uint64_t{15};
-  const std::size_t shm = static_cast<std::size_t>(4 * slot);
-  if (shm > 48 * 1024) return fail("moe_reader: rows too long for the shared staging");
-  if (ts) k_stamp<<<1, 1, 0, st(s)>>>(ts + 0);
-  k_rd_group<<<1, 32, 0, st(s)>>>(sel, static_cast<int>(picks), n_used, grp);
-  if (ts) k_stamp<<<1, 1, 0, st(s)>>>(ts + 1);
-  k_rd2_gate_up<<<dim3(static_cast<unsigned>((2 * F + 3) / 4), static_cast<unsigned>(picks)), 128, shm, st(s)>>>(tab, grp, n_used, xr, H, F, slot, gu, tb);
-  if (ts) k_stamp<<<1, 1, 0, st(s)>>>(ts + 2);
-  k_rd_silu_round<<<blocks_for(picks * (F / 32), 128), 128, 0, st(s)>>>(gu, picks, F, h);
-  if (ts) k_stamp<<<1, 1, 0, st(s)>>>(ts + 3);
-  k_rd2_down<<<dim3(static_cast<unsigned>((H + 3) / 4), static_cast<unsigned>(picks)), 128, shm, st(s)>>>(tab, grp, h, H, F, slot, yd, tb);
-  if (ts) k_stamp<<<1, 1, 0, st(s)>>>(ts + 4);
-  k_rd2_combine<<<blocks_for(tokens * H, 256), 256, 0, st(s)>>>(yd, wsel, n_used, tokens, H, y);
-  if (ts) k_stamp<<<1, 1, 0, st(s)>>>(ts + 5);
-  return launched("moe_reader");
-}
 
 // ------------------------------------------------------------------------------------------------ v26 reader v3
 using md::rc_pool;
@@ -1659,15 +1457,6 @@ bool act_q8x32(const float* x, std::int64_t n, std::int64_t rows, std::int64_t l
   const float norm = 1.0f / std::sqrt(32.0f);  // as quant::hadamard32 computes it
   k_act_q8x32<false><<<blocks_for(rows * (n / 32), 128), 128, 0, st(s)>>>(x, n, rows, ldx, rot32 ? 1 : 0, norm, xr, ldr, q, scale, sum);
   return launched("act_q8x32");
-}
-
-bool act_q8x32_halves(const float* x, std::int64_t n, std::int64_t rows, std::int64_t ldx, bool rot32, float* xr, std::int64_t ldr, std::int8_t* q,
-                      float* scale, int* sum, Stream s) {
-  if (n <= 0 || n % 32 != 0 || ldx < n || ldr < n || !x || !xr || !q || !scale || !sum) return fail("act_q8x32_halves: bad shape or a null output");
-  if (rows <= 0) return true;
-  const float norm = 1.0f / std::sqrt(32.0f);
-  k_act_q8x32<true><<<blocks_for(rows * (n / 32), 128), 128, 0, st(s)>>>(x, n, rows, ldx, rot32 ? 1 : 0, norm, xr, ldr, q, scale, sum);
-  return launched("act_q8x32_halves");
 }
 
 bool rms_norm_q8x32(const float* x, const float* w, std::int64_t n, std::int64_t ldx, std::int64_t rows, float eps, bool rot32, float* y,

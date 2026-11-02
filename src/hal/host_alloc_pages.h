@@ -20,7 +20,8 @@ bool advise_small_pages(void* p, std::size_t bytes);
 bool advise_huge_pages(void* p, std::size_t bytes);
 
 // v43 (author 02:52 "lets pin and go"): bind the calling thread to one logical CPU (Linux: pthread_setaffinity_np). Kept in
-// this file because it is one of the two places allowed OS headers (BC6). Windows / other systems: nothing, returns false.
+// this file because it is one of the two places allowed OS headers (BC6). v58: Windows SetThreadAffinityMask (CPUs 0-63);
+// other systems: nothing, returns false.
 bool pin_this_thread(int cpu);
 
 // v46 arena probe (author 19:34 "probe it"; the author's WSL RAM dossiers, workaround 3A): an anonymous mapping of `bytes`

@@ -2434,7 +2434,7 @@ int cmd_engine_check(const Args& a) {
                  "                           [--budget-gb G] [--hot-max N] [--mtp-draft K] [--fast-cpu] [--no-cpu] [--float-ref]\n"
                  "                           [--text FILE [--skip-tokens N]] [--timeline] [--dump-top OUT.tsv] [--dump-router OUT.tsv] [--dump-draft OUT.tsv] [--dump-split [--split-sizes 2,3,4] [--split-step]]\n"
                  "                           [--no-doorbell] [--timeline-ops] [--split-ref] [--bank-selftest MIXES] [--probe-pos P]\n"
-                 "                           [--router-tie BAND] [--cold-on-gpu] [--trace OUT.tsv] [--reader-v25] [--reader-cache K] [--fold-shared]\n"
+                 "                           [--router-tie BAND] [--cold-on-gpu] [--trace OUT.tsv] [--reader-cache K] [--fold-shared]\n"
                  "                           [--batch-identical] [--graph] [--prefetch] [--plane-tail N] [--cpu-light] [--reader-rpw 1|2] [--r3-experts] [--rx-load lane|miss|all] [--prompt-batched] [--prompt-halves] [--cpu-prompt] [--no-cache-pools] [--no-fast-f32] [--lean-dense] [--dn-half] [--l2pf] [--no-dn-smem] [--dn-mlp2] [--no-rx-pipe] [--no-rx-sact] [--no-fused-moe] [--plane-bits 2|3|4|5] [--auto-vram [--cache-share F]] [--verbose-gpu]\n"
                  "                           [--pin-gap-kib K] [--pin-huge-ok] [--cpu-up-rows N] [--cpu-down2] [--cpu-gu2] [--cpu-tile] [--spin-pause] [--cpu-prefetch] [--cpu-check] [--host-wait auto|spin|yield|block] [--pin-cpus 0,2,4,...] [--pin-host N] [--ref-threads N] [--no-cpu-light] [--split-slow] [--preload-light]\n");
     return 1;
@@ -2518,12 +2518,10 @@ int cmd_engine_check(const Args& a) {
   eo.router_tie = tie_band;
   eo.cold_on_gpu = !a.has("no-cold-on-gpu");  // v58: on by default (--cold-on-gpu still accepted)
   // v26 switches (each measured on its own in the run)
-  eo.reader_v3 = !a.has("reader-v25");
   eo.fold_shared = !a.has("no-fold-shared");  // v58: on by default
   eo.r3_experts = !a.has("no-r3-experts");  // v46a-1; v58: on by default
   eo.gpu_prompt = !a.has("cpu-prompt");  // v49e: the GPU prompt by default (fix forward); --cpu-prompt / --prompt-batched are temporary diagnosis switches
   eo.prompt_r3 = !a.has("prompt-batched");
-  eo.prompt_halves = a.has("prompt-halves");  // v50, parked at v51 (temporary switch)                       // v49d: the GPU prompt's steps on the batched kernels
   if (a.has("rx-load")) {  // v46a-2
     const std::string rxl = a.get("rx-load");
     if (rxl == "lane") eo.rx_load = 0;

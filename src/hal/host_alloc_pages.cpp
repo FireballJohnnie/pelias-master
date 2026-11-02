@@ -17,6 +17,15 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 
 namespace pelias::hal {
 
@@ -47,6 +56,10 @@ bool pin_this_thread(int cpu) {
   CPU_ZERO(&set);
   CPU_SET(static_cast<std::size_t>(cpu), &set);
   return pthread_setaffinity_np(pthread_self(), sizeof set, &set) == 0;
+#elif defined(_WIN32)
+  // v58 (author 15:09: on Windows the GPU's threads can be pinned): processor group 0, logical CPUs 0-63
+  if (cpu < 0 || cpu >= 64) return false;
+  return SetThreadAffinityMask(GetCurrentThread(), static_cast<DWORD_PTR>(1) << cpu) != 0;
 #else
   (void)cpu;
   return false;

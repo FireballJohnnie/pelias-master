@@ -799,7 +799,6 @@ struct GpuEngine::Impl {
     return use_r3 ? "; R3 products: outputs written in place, one-stage groups as plain launches (v55)" : "";
   }
   std::map<std::pair<const DevW*, int>, R3Group> r3plans;  // v26: per group and token count
-  bool halves_now = false;  // v50: this step's R3 products take int16-level inputs as two int8 halves (the GPU prompt's steps)
   bool bi_now = false;  // v26 option B: this step's products of 2-4 tokens go through R3 (set by run())
   // v26 CUDA graph
   g::Stream stm = nullptr;
@@ -826,23 +825,6 @@ struct GpuEngine::Impl {
   Status prod_r3(std::initializer_list<std::pair<const DevW*, float*>> jobs, const float* xin, int64_t n = 1) {
     const DevW& W0 = *jobs.begin()->first;
     if (n < 1 || n > kReaderMax) return Status::fail(Code::internal, "engine: R3 takes 1-4 tokens");
-    if (halves_now) {  // v50: per 2 tokens, the hi rows then the lo rows (4 rows, one load of the weights), outputs added
-      for (int64_t c0 = 0; c0 < n; c0 += 2) {
-        const int64_t m = std::min<int64_t>(2, n - c0);
-        R3Group* G = nullptr;
-        if (Status st = r3_group(jobs, 2 * m, 0x100, &G); !st) return st;
-        if (!g::act_q8x32_halves(xin + c0 * W0.k, W0.k, m, W0.k, W0.v->rot32, xr, W0.k, q, scale, sum)) return gfail("engine: halves rounding for R3");
-        if (!(o.graph ? G->plan->run_reset() : G->plan->run())) return Status::fail(Code::internal, std::string("engine: R3 run: ") + g::stream_last_error());
-        std::size_t i = 0;
-        for (const auto& [W, yo] : jobs) {
-          const float* yr = r3y + G->off[i++];
-          float* yd = yo + c0 * W->n_out;
-          if (!g::dcopy(yd, yr, z(m * W->n_out) * sizeof(float)) || !g::add_rows(yd, W->n_out, yr + m * W->n_out, W->n_out, nullptr, W->n_out, m))
-            return gfail("engine: R3 halves output");
-        }
-      }
-      return Status::good();
-    }
     // v55: the direct plan (built with this call's outputs) when the outputs match; otherwise the scratch plan and copies
     R3Group* Dp = nullptr;
     if (Status st = r3_group(jobs, n, 0x200, &Dp); !st) return st;
@@ -944,9 +926,9 @@ struct GpuEngine::Impl {
     *took = false;
     // v56: 2-4 tokens where the products of n take R3; v57: only with dn_half_mt (v56b MEASURED: L3 for 3-token verify steps 33.5 ms
     // vs 24.8 ms without, the prompt 5.06 vs 3.82 s: its several-token stages still read the inputs from L2)
-    if (n < 1 || n > 4 || (n > 1 && (!o.dn_half_mt || !bi_now || halves_now))) return Status::good();
+    if (n < 1 || n > 4 || (n > 1 && (!o.dn_half_mt || !bi_now))) return Status::good();
     const int64_t ch = s.conv_channels(), ds = s.ssm_d_state, nk = s.ssm_n_group, nv = s.ssm_dt_rank, taps = s.ssm_d_conv, e = s.n_embd;
-    if (!o.dn_half || !dn_hcnt || halves_now || !D.wqkv.r3 || !D.wgate.r3 || !D.ssm_out.r3 || D.wqkv.k != e || D.wgate.k != e || D.ssm_out.k != nv * ds ||
+    if (!o.dn_half || !dn_hcnt || !D.wqkv.r3 || !D.wgate.r3 || !D.ssm_out.r3 || D.wqkv.k != e || D.wgate.k != e || D.ssm_out.k != nv * ds ||
         D.wqkv.v->rot32 != D.wgate.v->rot32 || D.wbeta.v->rot32 || D.walpha.v->rot32 || D.wbeta.k != e || D.walpha.k != e || D.wbeta.n_out != nv ||
         D.walpha.n_out != nv || !is_float_type(D.wbeta.v->type) || !is_float_type(D.walpha.v->type) ||
         !g::deltanet_ba_fast(D.wbeta.dtype, D.wbeta.d, D.wbeta.drb, D.walpha.dtype, D.walpha.d, D.walpha.drb, nv, e, xn, n, e))
@@ -1636,7 +1618,7 @@ struct GpuEngine::Impl {
   bool fused_ok(const Layer& D, int64_t n, bool probe_row) const {
     const int64_t e = s.n_embd;
     auto k_ok = [](int64_t k) { return k == 256 || k == 512 || k == 1024 || k == 2048 || k == 4096; };
-    return o.fused_moe && k_ok(e) && g::fused_width_ok(static_cast<int>(e)) && k_ok(s.n_ff_exp) && s.n_expert <= 1024 && s.n_expert_used <= 8 && rx_ok && fold_ok && !split_ok && !pf_ok && o.plane_tail == 0 && !halves_now && !rlg_d && !cur_ops && !trc_src_d &&
+    return o.fused_moe && k_ok(e) && g::fused_width_ok(static_cast<int>(e)) && k_ok(s.n_ff_exp) && s.n_expert <= 1024 && s.n_expert_used <= 8 && rx_ok && fold_ok && !split_ok && !pf_ok && o.plane_tail == 0 && !rlg_d && !cur_ops && !trc_src_d &&
            !trc_sel_d && !probe_row && n >= 1 && n <= 4 && D.gate_inp.v && !D.gate_inp.v->rot32 &&
            D.gate_inp.dtype == static_cast<std::uint32_t>(quant::Type::f32) && D.gate_inp.drb == static_cast<std::uint64_t>(e) * sizeof(float) &&
            D.gate_inp_sh && D.post_norm && (reinterpret_cast<std::uintptr_t>(D.gate_inp.d) & 15u) == 0 &&
@@ -1723,13 +1705,11 @@ struct GpuEngine::Impl {
         use_rx ? g::moe_r3(rtab + static_cast<int64_t>(il) * ne, fold ? rshx + il : nullptr, sel, wsel, gsh, static_cast<int>(nu), q, scale, sum, n, e,
                            s.n_ff_exp, rcache.empty() ? nullptr : &rcache[il], rgu, rhq, rhs, rhsum, ryd, rgrp, rgsrc, rgfill, rxplan, rx_maxp, y, tsl,
                            nullptr, o.rx_load)
-        : o.reader_v3
-            ? g::moe_reader3(rtab + static_cast<int64_t>(il) * ne, fold ? rshx + il : nullptr, sel, wsel, gsh, static_cast<int>(nu), xr, n, e, s.n_ff_exp,
-                             rrow_max, rcache.empty() ? nullptr : &rcache[il], rgu, rh, ryd, rgrp, rgsrc, rgfill, y, tsl, nullptr, o.plane_tail,
-                             split_ok ? lmask_d + static_cast<int64_t>(il) * ne : nullptr, o.reader_rows_per_warp)
-            : g::moe_reader(rtab + static_cast<int64_t>(il) * ne, sel, wsel, static_cast<int>(nu), xr, n, e, s.n_ff_exp, rrow_max, rgu, rh, ryd, rgrp, y, tsl);
+        : g::moe_reader3(rtab + static_cast<int64_t>(il) * ne, fold ? rshx + il : nullptr, sel, wsel, gsh, static_cast<int>(nu), xr, n, e, s.n_ff_exp,
+                         rrow_max, rcache.empty() ? nullptr : &rcache[il], rgu, rh, ryd, rgrp, rgsrc, rgfill, y, tsl, nullptr, o.plane_tail,
+                         split_ok ? lmask_d + static_cast<int64_t>(il) * ne : nullptr, o.reader_rows_per_warp);
     if (!rd_ok) return use_rx ? Status::fail(Code::internal, std::string("engine: R3 expert stage: ") + g::stream_last_error()) : gfail("engine: expert reader");
-    if (trc_src_d && o.reader_v3) {
+    if (trc_src_d) {
       const int64_t P = kReaderMax * (nu + 1);
       if (!g::dcopy(trc_src_d + static_cast<int64_t>(il) * P, rgsrc, z(n * (nu + 1)) * sizeof(g::ExpertPtr)) ||
           !g::dcopy(trc_fill_d + static_cast<int64_t>(il) * P, rgfill, z(n * (nu + 1)) * sizeof(g::ExpertPtr)))
@@ -1789,7 +1769,7 @@ struct GpuEngine::Impl {
                     dus(2, 3), dus(3, 4), dus(4, 5));
       trace_text += b;
       trace_text += picks;
-      if (trc_src_h && o.reader_v3) {  // v26: groups served from VRAM by the cache, and misses written into a slot
+      if (trc_src_h) {  // v26: groups served from VRAM by the cache, and misses written into a slot
         const int64_t P = kReaderMax * (nu + 1);
         const int U = trc_u_h[il];
         int hits = 0, fills = 0;
@@ -1844,7 +1824,7 @@ struct GpuEngine::Impl {
       }
     if (hi <= lo) return;
     // v28 the author's split: light experts (every matrix Q4_TG2, not in the bank) go to the CPU and are not pinned
-    const bool split = o.cpu_light && o.doorbell && o.reader_v3;
+    const bool split = o.cpu_light && o.doorbell;
     int n_light_all = 0;
     std::uint64_t light_b = 0;
     for (std::uint32_t il = 0; il < nlr(); ++il) {
@@ -2055,7 +2035,7 @@ struct GpuEngine::Impl {
     }
     // v26: the shared expert as a pick (its three matrices as the batched kernels read them, in VRAM)
     std::vector<g::ExpertPtr> shx_h;
-    if (o.fold_shared && o.reader_v3 && s.n_ff_shexp == s.n_ff_exp) {
+    if (o.fold_shared && s.n_ff_shexp == s.n_ff_exp) {
       bool ok = true;
       for (std::uint32_t il = 0; il < nlr() && ok; ++il) {
         const Layer& D = LL(il);
@@ -2110,7 +2090,7 @@ struct GpuEngine::Impl {
     dev_bytes += tab.size() * sizeof(g::ExpertPtr) + z(P * 3 * ff + P * s.n_embd) * sizeof(float) + z(1 + 6 * P) * sizeof(int) + z(2 * P) * sizeof(g::ExpertPtr);
     // v26 cache: the bytes reserved before the bank was filled
     std::string cache_note;
-    if (cache_reserved > 0 && o.reader_v3) {
+    if (cache_reserved > 0) {
       int K = rc_eff;
       const std::size_t nl = nlr();
       const std::uint64_t budget = cslot * static_cast<std::uint64_t>(rc_eff);  // per layer, as before (v54b: rc_eff, the probe's or --reader-cache)
@@ -2390,7 +2370,7 @@ struct GpuEngine::Impl {
     char b[160];
     char b2[640];
     std::snprintf(b2, sizeof b2, "on (%s, %d rows per warp, steps of 1-%d tokens; %.2f GB of the file (%s) registered in %zu ranges (gap %llu KiB; small pages advised on %zu) in %.2f s%s%s)",
-                  o.reader_v3 ? "v3" : "v25", o.reader_rows_per_warp, kReaderMax, static_cast<double>(b1 - b0) / 1e9,
+                  "v3", o.reader_rows_per_warp, kReaderMax, static_cast<double>(b1 - b0) / 1e9,
                   lmask_d ? "the heavy experts outside the bank" : "the experts outside the bank", runs.size(),
                   static_cast<unsigned long long>(o.pin_gap >> 10), small_ok, reg_s, fold_ok ? "; shared expert folded in" : "", cache_note.c_str());
     reader_note = b2;
@@ -2943,7 +2923,7 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
   std::uint64_t left = free_b > o.vram_reserve ? free_b - o.vram_reserve : 0;
   if (o.vram_budget > 0) left = std::min<std::uint64_t>(left, o.vram_budget > I.dev_bytes ? o.vram_budget - I.dev_bytes : 0);
   // v58: the MTP block's MoE half on the reader (its row n_layer: planes / file mapping and its own cache slots, no bank)
-  I.mtp_rd = o.mtp && o.mtp_fused && w.mtp.present && o.cold_on_gpu && o.reader_v3 && o.r3_experts && o.rx_load >= 1 && o.fused_moe &&
+  I.mtp_rd = o.mtp && o.mtp_fused && w.mtp.present && o.cold_on_gpu && o.r3_experts && o.rx_load >= 1 && o.fused_moe &&
              !o.cpu_light && !o.prefetch && o.plane_tail == 0;
   if (o.mtp && o.mtp_bank != 0 && !I.mtp_rd) {  // the MTP block's fixed arena, for promotion
     const Qwen35MoeLayer& ml = w.mtp.layer;
@@ -2975,7 +2955,7 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
   if (o.mtp) I.M.picks.assign(z(ne), 0);
   I.rc_eff = o.reader_cache;
   int hot_cap = o.max_hot_per_layer;
-  if (o.cold_on_gpu && o.reader_v3 && (o.reader_cache > 0 || o.auto_vram)) {  // v26: the reader cache's bytes before the bank takes its share
+  if (o.cold_on_gpu && (o.reader_cache > 0 || o.auto_vram)) {  // v26: the reader cache's bytes before the bank takes its share
     std::uint64_t mx = 0;
     for (std::uint32_t il = 0; il < I.nlr(); ++il)  // v58: with the MTP row too
       for (int ex = 0; ex < static_cast<int>(ne); ++ex) {
@@ -3240,12 +3220,10 @@ Status GpuEngine::Impl::run(const std::int32_t* tokens, int n, float* logits, bo
   const bool bl = I.bell && !rd;
   const bool cl = rd && I.split_ok;  // v28: a reader step whose light picks the CPU computes
   I.bi_now = rd && (I.o.batch_identical || (I.in_prompt && I.o.prompt_r3));  // v26 option B; v48b: the GPU prompt's steps too (MEASURED v48: 99.0 vs 49.9 tok/s)
-  I.halves_now = I.bi_now && I.in_prompt && I.o.prompt_halves;  // v50
   struct BiReset {
     bool& f;
     ~BiReset() { f = false; }
   } bi_reset{I.bi_now};
-  BiReset halves_reset{I.halves_now};  // v50: only this step's products
   if (bl || cl) {  // the CPU side starts waiting for this step's rings
     if (cl) {  // v28: the generation the reader steps' rings carry (device-resident, so a graph replay rings this step's)
       *I.gen_hp = g0;

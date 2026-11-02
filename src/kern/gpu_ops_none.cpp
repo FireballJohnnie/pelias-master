@@ -42,14 +42,6 @@ bool host_register(void*, std::size_t, void**, std::string* why) {
 void host_unregister(void*) {}
 bool read_rate(const void*, std::size_t, int, double*) { return false; }
 bool read_chunks_rate(const void*, const std::uint64_t*, int, std::size_t, double*) { return false; }
-bool moe_reader_v24(const ExpertPtr*, const std::int32_t*, const float*, int, const float*, std::int64_t, std::int64_t, std::int64_t, float*, float*, float*,
-                    Stream) {
-  return false;
-}
-bool moe_reader(const ExpertPtr*, const std::int32_t*, const float*, int, const float*, std::int64_t, std::int64_t, std::int64_t, std::uint64_t, float*, float*,
-                float*, int*, float*, unsigned long long*, Stream) {
-  return false;
-}
 bool kv_store(float*, float*, const float*, const float*, std::int64_t, std::int64_t, const int*, Stream) { return false; }
 void set_stream(Stream) {}
 Stream stream_new() { return nullptr; }
@@ -82,7 +74,6 @@ bool moe_matmul(std::uint32_t, const void*, std::uint64_t, std::uint64_t, std::i
   return false;
 }
 bool gather_rows(std::uint32_t, const void*, std::uint64_t, std::int64_t, const std::int32_t*, std::int64_t, float*, Stream) { return false; }
-bool act_q8x32_halves(const float*, std::int64_t, std::int64_t, std::int64_t, bool, float*, std::int64_t, std::int8_t*, float*, int*, Stream) { return false; }
 void set_fast_f32(bool) {}
 bool router_fast_for(std::int64_t, float) { return false; }
 bool act_q8x32(const float*, std::int64_t, std::int64_t, std::int64_t, bool, float*, std::int64_t, std::int8_t*, float*, int*, Stream) {
