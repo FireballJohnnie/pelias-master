@@ -1961,9 +1961,12 @@ bool moe_r3(const ExpertPtr* tab, const ExpertPtr* shx, const std::int32_t* sel,
   const int sbytes = load_mode ? g_stage_bytes : 0;  // v55f
   const int smem = kLutRxBytes + 8 * sbytes;  // v54: 24 KB of grids + the warps' buffers (59 KB: opted in past 48 KB)
   static int grids[2][3] = {{0, 0, 0}, {0, 0, 0}};
+  static int gsm[2][3] = {{0, 0, 0}, {0, 0, 0}};  // v57: the shared memory each grid was opted in for (the staging follows the model)
   const bool mt = tokens > 1;  // v47: steps of 2-4 tokens run the kernel that loads each row once for all of a group's picks
   int& grid = grids[mt ? 1 : 0][load_mode];
-  if (!grid) {
+  int& gs = gsm[mt ? 1 : 0][load_mode];
+  if (!grid || smem > gs) {
+    gs = smem;
     int dev = 0, sms = 0, occ = 0, coop = 0;
     if (!sck(cudaGetDevice(&dev), "cudaGetDevice") || !sck(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev), "SM count") ||
         !sck(cudaDeviceGetAttribute(&coop, cudaDevAttrCooperativeLaunch, dev), "cooperative launch attribute") ||
@@ -2032,8 +2035,14 @@ bool moe_half(const MoeHalfArgs& A, Stream s) {
   else if (nj == 2) fn = mt ? reinterpret_cast<void*>(k_moe_half<true, 2>) : reinterpret_cast<void*>(k_moe_half<false, 2>);
   else fn = mt ? reinterpret_cast<void*>(k_moe_half<true, 4>) : reinterpret_cast<void*>(k_moe_half<false, 4>);
   static int grids[2][3][3][2][3] = {};  // v57: [pipe, + shared inputs]
-  int& grid = grids[mt ? 1 : 0][nj == 1 ? 0 : (nj == 2 ? 1 : 2)][A.load_mode][stat ? 1 : 0][A.pipe ? (A.sact ? 2 : 1) : 0];
-  if (!grid) {
+  static int gsm[2][3][3][2][3] = {};    // v57: the shared memory each grid was sized and opted in for
+  const int gi0 = mt ? 1 : 0, gi1 = nj == 1 ? 0 : (nj == 2 ? 1 : 2), gi4 = A.pipe ? (A.sact ? 2 : 1) : 0;
+  int& grid = grids[gi0][gi1][A.load_mode][stat ? 1 : 0][gi4];
+  int& gs = gsm[gi0][gi1][A.load_mode][stat ? 1 : 0][gi4];
+  // v57 (v57 GPU tests: two engines of different shapes in one process): the shared memory now depends on the model (the
+  // staging per its formats, the inputs' copy per H); a larger request than the kernel was opted in for re-opts and re-sizes
+  if (!grid || smem > gs) {
+    gs = smem;
     int dev = 0, sms = 0, occ = 0, coop = 0;
     if (!sck(cudaGetDevice(&dev), "cudaGetDevice") || !sck(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev), "SM count") ||
         !sck(cudaDeviceGetAttribute(&coop, cudaDevAttrCooperativeLaunch, dev), "cooperative launch attribute") ||
@@ -2545,8 +2554,11 @@ bool dn_half(const DnHalfArgs& A, Stream s) {
   const int smem = mt ? (lean ? 0 : kLutBytes) + std::max(4 * nsub * md::kGvPad * 4, 4 * (2 * A.ds + kDnRows) * 4)
                       : (lean ? 0 : kLutBytes) + std::max(nsub * md::kGvPad * 4, (2 * A.ds + kDnRows) * 4) + dmax + 2 * (dmax / 32) * 4;
   static int grids[2][2][3] = {};
+  static int gsm[2][2][3] = {};  // v57: the shared memory each grid was sized and opted in for (it depends on the model's shapes)
   int& grid = grids[lean ? 1 : 0][mt ? 1 : 0][ji];
-  if (!grid) {
+  int& gs = gsm[lean ? 1 : 0][mt ? 1 : 0][ji];
+  if (!grid || smem > gs) {
+    gs = smem;
     int dev = 0, sms = 0, occ = 0, coop = 0;
     if (!sck(cudaGetDevice(&dev), "cudaGetDevice") || !sck(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev), "SM count") ||
         !sck(cudaDeviceGetAttribute(&coop, cudaDevAttrCooperativeLaunch, dev), "cooperative launch attribute") ||
