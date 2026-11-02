@@ -1313,6 +1313,55 @@ __device__ PG_NOINL void mh_phase_b(const MoeHalfArgs& A, float* stg, float* s_r
   rx_plan_body(A.grp, A.gsrc, A.gfill, n, A.nu, A.H, A.F, A.xq, A.xs, A.xsum, A.gu, A.hq, A.hs, A.hsum, A.yd, static_cast<std::uint8_t*>(A.plan),
                A.max_picks, A.load_mode, A.xb, A.hb);
 }
+// v56: while block 0 runs phase B (picks, grouping, plan: ~22 us per layer, v55f3 MEASURED 0.887 ms per token), the other
+// blocks find the same picks (md::router_row on the logits phase A wrote, into their own shared arrays; only addresses come
+// of it) and prefetch the picked experts' rows into L2: bank experts from VRAM, misses from host RAM over PCIe (the plane
+// prefix at the slider's bits), cached experts from their slot; the expert stage then finds them in L2. Data unchanged.
+__device__ __forceinline__ void pf_lines(const std::uint8_t* b, std::uint64_t rows, std::uint64_t stride, std::uint64_t bytes, long long g, long long G) {
+  if (!b || rows == 0 || bytes == 0) return;
+  const std::uint64_t lr = (bytes + 127) / 128, tot = rows * lr;
+  for (std::uint64_t L = static_cast<std::uint64_t>(g); L < tot; L += static_cast<std::uint64_t>(G)) {
+    const std::uint64_t r = L / lr, c = L - r * lr;
+    asm volatile("prefetch.global.L2 [%0];" ::"l"(b + r * stride + 128 * c));
+  }
+}
+__device__ PG_NOINL void mh_prefetch_picks(const MoeHalfArgs& A, float* stg, float* s_rsh, float* s_inv, float* s_bv, int* s_bi, std::int32_t* s_psel,
+                                           float* s_pw) {
+  const int n = A.n, nu = A.nu;
+  const md::RouterSmem S{stg, stg + md::kRouterMaxExperts, reinterpret_cast<unsigned char*>(stg + 2 * md::kRouterMaxExperts), s_rsh, s_inv, s_bv, s_bi};
+  for (int t = 0; t < n; ++t) {
+    md::router_row(A.logits + static_cast<long long>(t) * A.ne, A.ne, nu, A.wscale, s_psel + t * nu, s_pw + t * nu, A.band, S);
+    __syncthreads();
+  }
+  const long long G = static_cast<long long>(gridDim.x - 1) * blockDim.x, g = static_cast<long long>(blockIdx.x - 1) * blockDim.x + threadIdx.x;
+  const ReaderCache& c = A.cache;
+  const std::uint64_t Fr = static_cast<std::uint64_t>(A.F), Hr = static_cast<std::uint64_t>(A.H);
+  for (int pi = 0; pi < n * nu; ++pi) {
+    const int e = s_psel[pi];
+    if (e < 0 || e >= A.ne) continue;
+    const ExpertPtr X = A.tab[e];
+    auto pl = [](std::uint32_t t) { return t == g_q4_tg2p || t == g_q5_kp; };
+    const int want = (pl(X.type[0]) || pl(X.type[1]) || pl(X.type[2])) ? c.plane_bits : 4;
+    if (!X.vram && c.K > 0) {  // cached: the slot (its rows packed back to back); a miss: the host rows below
+      int k0 = 0, k1 = 0;
+      std::uint64_t pslot = 0, poff = 0;
+      md::rc_pool(c, e, &k0, &k1, &pslot, &poff);
+      int hit = -1;
+      for (int k = k0; k < k1 && hit < 0; ++k)
+        if (c.tag[k] == e) hit = k;
+      if (hit >= 0) {
+        pf_lines(c.base + poff + static_cast<std::uint64_t>(hit - k0) * pslot, 1, 0, pslot, g, G);
+        continue;
+      }
+    }
+    for (int m = 0; m < 3; ++m)
+      pf_lines(X.w[m], m < 2 ? Fr : Hr, X.rb[m], plane_prefix(X.type[m], X.rb[m], want), g, G);
+  }
+  if (A.wsh && A.shx) {  // the shared expert (VRAM)
+    const ExpertPtr X = *A.shx;
+    for (int m = 0; m < 3; ++m) pf_lines(X.w[m], m < 2 ? Fr : Hr, X.rb[m], X.rb[m], g, G);
+  }
+}
 // v55f3 (author 06:41, the v55f2 listing): without a bound the compiler squeezed the one-token kernel to 128 registers for
 // 2 blocks per SM and spilled 168 B in the kernel body (the expert loop; the out-of-line phases A / B: 0 spill), while
 // it gave the counting copy of the same code 173 registers, 1 block, 0 spill. Measured so far: 1 block with no spill
@@ -1327,6 +1376,8 @@ __global__ void __launch_bounds__(256, 1) k_moe_half(const __grid_constant__ Moe
   __shared__ float s_inv;
   __shared__ float s_bv[8];
   __shared__ int s_bi[8];
+  __shared__ std::int32_t s_psel[32];  // v56: the picks as the prefetching blocks find them (n x nu <= 32)
+  __shared__ float s_pw[32];
   float* stg = s_lut;  // the dynamic shared memory: staging (A), the router's arrays (B), the LUT + warp buffers (C)
   const int H = A.H, n = A.n;
   const int tid = static_cast<int>(threadIdx.x);
@@ -1336,8 +1387,9 @@ __global__ void __launch_bounds__(256, 1) k_moe_half(const __grid_constant__ Moe
   mh_phase_a<NJ>(A, stg, s_sh);
   grid.sync();
   if (phs) A.ph[1] = gtimer_s();
-  // ---- B
+  // ---- B (v56: the other blocks prefetch the picks' rows meanwhile)
   if (blockIdx.x == 0) mh_phase_b(A, stg, s_rsh, &s_inv, s_bv, s_bi);
+  else if (A.l2pf && gridDim.x > 1) mh_prefetch_picks(A, stg, s_rsh, &s_inv, s_bv, s_bi, s_psel, s_pw);
   grid.sync();
   if (phs) A.ph[2] = gtimer_s();
   // ---- C
