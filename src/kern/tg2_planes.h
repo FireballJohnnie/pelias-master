@@ -115,6 +115,20 @@ PG_HD void q5p_unpack_half(const std::uint32_t* a, const std::uint32_t* b, const
       qh[l] = static_cast<std::uint8_t>(qh[l] | (((q >> 4) & 1u) << (4 * h + jj)));
     }
 }
+// v55: four consecutive values' codes straight from the plane bits, one per byte (byte k = 8 A + 4 B + 2 C + D of value
+// k), ready for dp4a: a8 = their 4 x 2 bits of plane A, b4 / c4 / d4 = their 4 bits of planes B, C, D (zero where not
+// read). Replaces the unpack to the stored bytes on the GPU (no byte arrays, so nothing goes to local memory)
+PG_HD std::uint32_t q5p_bytes4(std::uint32_t a8, std::uint32_t b4, std::uint32_t c4, std::uint32_t d4) {
+  std::uint32_t a = a8 & 0xffu;
+  a = (a | (a << 12)) & 0x000f000fu;
+  a = (a | (a << 6)) & 0x03030303u;
+  constexpr std::uint32_t m = 0x00204081u;  // bit k -> byte k (the four shifted copies never overlap, so no carries)
+  return (a << 3) | ((((b4 & 15u) * m) & 0x01010101u) << 2) | ((((c4 & 15u) * m) & 0x01010101u) << 1) | (((d4 & 15u) * m) & 0x01010101u);
+}
+// v55: the word for values 4 g .. 4 g + 3 of sub-block jj of a half, from the half's plane words as loaded (a[8], b/c/d[4])
+PG_HD std::uint32_t q5p_word(const std::uint32_t* a, const std::uint32_t* b, const std::uint32_t* c, const std::uint32_t* d, int jj, int g) {
+  return q5p_bytes4(a[2 * jj + (g >> 2)] >> (8 * (g & 3)), b[jj] >> (4 * g), c[jj] >> (4 * g), d[jj] >> (4 * g));
+}
 // host: one row of nB stored Q5_K blocks (176 nB bytes) into the plane layout (g_q5_kp)
 inline void q5p_plane_row(const std::uint8_t* in, std::uint8_t* out, int nB) {
   std::memset(out, 0, static_cast<std::size_t>(176) * static_cast<std::size_t>(nB));

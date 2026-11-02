@@ -204,23 +204,29 @@ __device__ __forceinline__ int4 tg2p_words(const DJob& J, bool cs, const std::ui
       cw[jj * 4 + g] = tg2p_codes8((aw[2 * jj + (g >> 1)] >> (16 * (g & 1))) & 0xffffu, (bw[jj] >> (8 * g)) & 0xffu, (cv[jj] >> (8 * g)) & 0xffu);
   return hd;
 }
-// v54c: one lane part of a Q5_K plane row at R: the 16-byte header, and the half's stored bytes (qh bits of its sub-blocks,
-// qlb) from planes A-D as J.pb asks (missing low bits zero; the caller adds their midpoint through the input sums)
+// v54c: one lane part of a Q5_K plane row at R: the 16-byte header, and the half's plane words A-D as J.pb asks (missing
+// low bits zero; the caller adds their midpoint through the input sums). v55: the words are returned as loaded and read by
+// q5p_word straight into dp4a (v54c unpacked them to the stored bytes first: byte arrays, the suspected decode cost)
 template <int M>
-__device__ __forceinline__ int4 q5p_part(const DJob& J, bool cs, const std::uint8_t* R, int B, int half, int nB, std::uint8_t* qh, std::uint8_t* qlb) {
+__device__ __forceinline__ int4 q5p_part(const DJob& J, bool cs, const std::uint8_t* R, int B, int half, int nB, std::uint32_t* aw,
+                                         std::uint32_t* bw, std::uint32_t* cw, std::uint32_t* dw) {
   const int4 hd = ldwf<M>(J, cs, R + 16 * B, half == 0);
   const int4 a0 = ldwf<M>(J, cs, R + 16 * nB + 64 * B + 32 * half, true), a1 = ldwf<M>(J, cs, R + 16 * nB + 64 * B + 32 * half + 16, true);
   int4 b4 = make_int4(0, 0, 0, 0), c4 = make_int4(0, 0, 0, 0), d4 = make_int4(0, 0, 0, 0);
   if (J.pb >= 3) b4 = ldwf<M>(J, cs, R + 80 * nB + 32 * B + 16 * half, true);
   if (J.pb >= 4) c4 = ldwf<M>(J, cs, R + 112 * nB + 32 * B + 16 * half, true);
   if (J.pb >= 5) d4 = ldwf<M>(J, cs, R + 144 * nB + 32 * B + 16 * half, true);
-  const std::uint32_t aw[8] = {static_cast<std::uint32_t>(a0.x), static_cast<std::uint32_t>(a0.y), static_cast<std::uint32_t>(a0.z),
-                               static_cast<std::uint32_t>(a0.w), static_cast<std::uint32_t>(a1.x), static_cast<std::uint32_t>(a1.y),
-                               static_cast<std::uint32_t>(a1.z), static_cast<std::uint32_t>(a1.w)};
-  const std::uint32_t bw[4] = {static_cast<std::uint32_t>(b4.x), static_cast<std::uint32_t>(b4.y), static_cast<std::uint32_t>(b4.z), static_cast<std::uint32_t>(b4.w)};
-  const std::uint32_t cw[4] = {static_cast<std::uint32_t>(c4.x), static_cast<std::uint32_t>(c4.y), static_cast<std::uint32_t>(c4.z), static_cast<std::uint32_t>(c4.w)};
-  const std::uint32_t dw[4] = {static_cast<std::uint32_t>(d4.x), static_cast<std::uint32_t>(d4.y), static_cast<std::uint32_t>(d4.z), static_cast<std::uint32_t>(d4.w)};
-  q5p_unpack_half(aw, bw, cw, dw, half, qh, qlb);
+  auto put = [](std::uint32_t* w, int4 v) {
+    w[0] = static_cast<std::uint32_t>(v.x);
+    w[1] = static_cast<std::uint32_t>(v.y);
+    w[2] = static_cast<std::uint32_t>(v.z);
+    w[3] = static_cast<std::uint32_t>(v.w);
+  };
+  put(aw, a0);
+  put(aw + 4, a1);
+  put(bw, b4);
+  put(cw, c4);
+  put(dw, d4);
   return hd;
 }
 // v54: the grid the codes are read through (the stored levels, or the 3-bit / 2-bit base) and the mask that clears the code
@@ -361,11 +367,12 @@ __device__ float lane_part(const DJob& J, int r, int part, const std::int8_t* xq
   } else if (J.fmt == kQ5K || J.fmt == kQ5KP) {  // v54c: stored, or in bit planes (the same bytes when all 5 bits are read)
     int4 hd;
     std::uint8_t hb[4], qh[32], qlb[64];
+    std::uint32_t pa[8], pb[4], pc[4], pd[4];  // v55: the plane words (kQ5KP)
     int kmiss = 0;  // code bits not read (their midpoint is added through the input sums)
     if (J.fmt == kQ5KP) {
       const long long r0s = M == 3 ? rb0 / nB : 0;
       const long long stride = M == 3 ? static_cast<long long>(plane_prefix(g_q5_kp, 176ull * static_cast<unsigned long long>(nB), J.pb)) : J.rs;
-      hd = q5p_part<M>(J, cs, W + (r - r0s) * stride, B, half, nB, qh, qlb);
+      hd = q5p_part<M>(J, cs, W + (r - r0s) * stride, B, half, nB, pa, pb, pc, pd);
       kmiss = 5 - J.pb;
     } else {
       const std::uint8_t* bp = W + rbw * 176;
@@ -395,12 +402,17 @@ __device__ float lane_part(const DJob& J, int r, int part, const std::int8_t* xq
         sc = (qb(j + 4) & 0xF) | ((qb(j - 4) >> 6) << 4);
         mn = (qb(j + 4) >> 4) | ((qb(j) >> 6) << 4);
       }
-      const std::uint8_t* q = qlb + 32 * (jj >> 1);
       int sq = 0;
+      if (J.fmt == kQ5KP) {  // v55: plane words -> 4 codes a word -> dp4a (same integer sum as the stored loop)
 #pragma unroll
-      for (int l = 0; l < 32; ++l) {
-        const int lo = (j & 1) ? (q[l] >> 4) : (q[l] & 0xF);
-        sq += (lo + (((qh[l] >> j) & 1) << 4)) * sx8(xw, 32 * jj + l);
+        for (int g = 0; g < 8; ++g) sq = __dp4a(static_cast<int>(q5p_word(pa, pb, pc, pd, jj, g)), xw[8 * jj + g], sq);
+      } else {
+        const std::uint8_t* q = qlb + 32 * (jj >> 1);
+#pragma unroll
+        for (int l = 0; l < 32; ++l) {
+          const int lo = (j & 1) ? (q[l] >> 4) : (q[l] & 0xF);
+          sq += (lo + (((qh[l] >> j) & 1) << 4)) * sx8(xw, 32 * jj + l);
+        }
       }
       const int xsi = ldxi<M>(xsum + jg);
       const float sqf = kmiss > 0 ? 0.5f * static_cast<float>(2 * sq + ((1 << kmiss) - 1) * xsi) : static_cast<float>(sq);
@@ -694,11 +706,12 @@ __device__ __forceinline__ void lane_part_n(const DJob& J, int r, int part, cons
   } else if (J.fmt == kQ5K || J.fmt == kQ5KP) {  // v54c: stored, or in bit planes (the same bytes when all 5 bits are read)
     int4 hd;
     std::uint8_t hb[4], qh[32], qlb[64];
+    std::uint32_t pa[8], pb[4], pc[4], pd[4];  // v55: the plane words (kQ5KP)
     int kmiss = 0;  // code bits not read (their midpoint is added through the input sums)
     if (J.fmt == kQ5KP) {
       const long long r0s = M == 3 ? rb0 / nB : 0;
       const long long stride = M == 3 ? static_cast<long long>(plane_prefix(g_q5_kp, 176ull * static_cast<unsigned long long>(nB), J.pb)) : J.rs;
-      hd = q5p_part<M>(J, cs, W + (r - r0s) * stride, B, half, nB, qh, qlb);
+      hd = q5p_part<M>(J, cs, W + (r - r0s) * stride, B, half, nB, pa, pb, pc, pd);
       kmiss = 5 - J.pb;
     } else {
       const std::uint8_t* bp = W + rbw * 176;
@@ -742,12 +755,17 @@ __device__ __forceinline__ void lane_part_n(const DJob& J, int r, int part, cons
           sc = (qb(j + 4) & 0xF) | ((qb(j - 4) >> 6) << 4);
           mn = (qb(j + 4) >> 4) | ((qb(j) >> 6) << 4);
         }
-        const std::uint8_t* q = qlb + 32 * (jj >> 1);
         int sq = 0;
+        if (J.fmt == kQ5KP) {  // v55: plane words -> dp4a, as in rx_body
 #pragma unroll
-        for (int l = 0; l < 32; ++l) {
-          const int lo = (j & 1) ? (q[l] >> 4) : (q[l] & 0xF);
-          sq += (lo + (((qh[l] >> j) & 1) << 4)) * sx8(xj, l);
+          for (int g = 0; g < 8; ++g) sq = __dp4a(static_cast<int>(q5p_word(pa, pb, pc, pd, jj, g)), xj[g], sq);
+        } else {
+          const std::uint8_t* q = qlb + 32 * (jj >> 1);
+#pragma unroll
+          for (int l = 0; l < 32; ++l) {
+            const int lo = (j & 1) ? (q[l] >> 4) : (q[l] & 0xF);
+            sq += (lo + (((qh[l] >> j) & 1) << 4)) * sx8(xj, l);
+          }
         }
         const int xsi = ldxi<M>(xsum[t] + jg);
         const float sqf = kmiss > 0 ? 0.5f * static_cast<float>(2 * sq + ((1 << kmiss) - 1) * xsi) : static_cast<float>(sq);

@@ -204,7 +204,7 @@ TEST(q5_planes_layout_and_reads) {
     return static_cast<std::uint8_t>(seed >> 24);
   };
   int rows = 0;
-  bool round = true, masked = true, halves = true;
+  bool round = true, masked = true, halves = true, words = true;
   for (const int nB : {1, 2, 8}) {
     for (int rep = 0; rep < 20; ++rep, ++rows) {
       std::vector<std::uint8_t> row(static_cast<std::size_t>(176 * nB)), pl(row.size()), back(row.size()), want(row.size());
@@ -248,6 +248,25 @@ TEST(q5_planes_layout_and_reads) {
           bool ok = std::memcmp(qlb, blk + 48 + 64 * h, 64) == 0;
           for (int l = 0; l < 32; ++l) ok = ok && qh[l] == (blk[16 + l] & (0x0f << (4 * h)));
           halves = halves && ok;
+          // v55: the dp4a words straight from the planes, at 5 / 4 / 3 / 2 bits (planes not read passed as zero)
+          for (int bits = 2; bits <= 5; ++bits) {
+            std::uint32_t b2[4], c2[4], d2[4];
+            for (int i = 0; i < 4; ++i) {
+              b2[i] = bits >= 3 ? bb[i] : 0u;
+              c2[i] = bits >= 4 ? c[i] : 0u;
+              d2[i] = bits >= 5 ? d[i] : 0u;
+            }
+            for (int jj = 0; jj < 4; ++jj)
+              for (int g8 = 0; g8 < 8; ++g8) {
+                const std::uint32_t w = g::q5p_word(a, b2, c2, d2, jj, g8);
+                for (int k = 0; k < 4; ++k) {
+                  const int j = 4 * h + jj, l = 4 * g8 + k;
+                  int q = ((blk[48 + 32 * (j / 2) + l] >> (4 * (j & 1))) & 15) | (((blk[16 + l] >> j) & 1) << 4);
+                  q &= ~((1 << (5 - bits)) - 1);
+                  words = words && static_cast<int>((w >> (8 * k)) & 0xffu) == q;
+                }
+              }
+          }
         }
     }
   }
@@ -257,7 +276,10 @@ TEST(q5_planes_layout_and_reads) {
   CHECK(round);
   CHECK(masked);
   CHECK(halves);
+  CHECK(words);
   CHECK(pre);
-  std::printf("    Q5_K planes: %d rows: 5 bits round trip %s; 2 / 3 / 4 bits = stored with low code bits zero %s; GPU half unpack %s; prefixes %s\n",
-              rows, round ? "exact" : "WRONG", masked ? "yes" : "NO", halves ? "= stored" : "WRONG", pre ? "ok" : "WRONG");
+  std::printf("    Q5_K planes: %d rows: 5 bits round trip %s; 2 / 3 / 4 bits = stored with low code bits zero %s; GPU half unpack %s; "
+              "dp4a words at 5/4/3/2 bits %s; prefixes %s\n",
+              rows, round ? "exact" : "WRONG", masked ? "yes" : "NO", halves ? "= stored" : "WRONG", words ? "= stored codes" : "WRONG",
+              pre ? "ok" : "WRONG");
 }
