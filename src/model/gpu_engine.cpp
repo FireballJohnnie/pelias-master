@@ -353,6 +353,8 @@ struct GpuEngine::Impl {
   int* sum = nullptr;
   float *qg = nullptr, *att = nullptr, *ascr = nullptr;
   float *mixed = nullptr, *zg = nullptr, *beta = nullptr, *alpha = nullptr, *conv = nullptr, *core = nullptr;
+  std::int32_t* top_d = nullptr;    // v56: device argmax per output row (max_batch)
+  std::int32_t* top_req = nullptr;  // v56: non-null during step_top / verify_top / mtp_step_top: the host destination
   unsigned* dn_hcnt = nullptr;  // v55g (L3): per value head, the dense half's units that finished it (zero between launches)
   std::uint64_t dn_half_runs = 0;
   float *logits_r = nullptr, *wsel = nullptr, *gs = nullptr, *us = nullptr, *sh = nullptr, *gsh = nullptr, *galpha = nullptr, *zero2 = nullptr;
@@ -405,6 +407,12 @@ struct GpuEngine::Impl {
   int rx_maxp = 0;
   bool rx_ok = false;
   unsigned long long *ph_h = nullptr, *ph_d = nullptr;  // v55b: n_layer x 5 phase stamps of the fused MoE half (verbose_gpu)
+  unsigned long long *dph_h = nullptr, *dph_d = nullptr;  // v56: n_layer x 5 stage stamps of the DeltaNet dense half (L3; verbose_gpu)
+  double dph_sum[4] = {0, 0, 0, 0};
+  std::uint64_t dph_steps = 0, dph_layers = 0;
+  // v56: the same stamps of verify steps (2-4 tokens; MTP), per step size: [n - 2][phase]
+  double vph_sum[3][4] = {}, vdph_sum[3][4] = {};
+  std::uint64_t vph_steps[3] = {}, vdph_steps[3] = {};
   unsigned long long* rst_d = nullptr;                    // v55e3 diagnosis: the expert stage's counters (g::kRxStatN, verbose_gpu)
   double ph_sum[4] = {0, 0, 0, 0};
   std::uint64_t ph_steps = 0, ph_layers = 0;
@@ -914,18 +922,19 @@ struct GpuEngine::Impl {
   // v55g (L3): a DeltaNet layer's dense half for one token in one cooperative launch (attn norm + rounding, qkv + gate,
   // beta / alpha + gates, conv + tail, l2 norms, recurrence, gated norm + rounding, ssm_out), the same bits as the separate
   // launches; *took false (nothing run) where it does not apply, and the caller runs the attn norm and deltanet_block
-  Status dn_half_layer(Layer& D, bool* took) {
+  Status dn_half_layer(Layer& D, int64_t n, bool* took) {
     *took = false;
+    if (n < 1 || n > 4 || (n > 1 && (!bi_now || halves_now))) return Status::good();  // v56: 2-4 tokens where the products of n take R3
     const int64_t ch = s.conv_channels(), ds = s.ssm_d_state, nk = s.ssm_n_group, nv = s.ssm_dt_rank, taps = s.ssm_d_conv, e = s.n_embd;
     if (!o.dn_half || !dn_hcnt || halves_now || !D.wqkv.r3 || !D.wgate.r3 || !D.ssm_out.r3 || D.wqkv.k != e || D.wgate.k != e || D.ssm_out.k != nv * ds ||
         D.wqkv.v->rot32 != D.wgate.v->rot32 || D.wbeta.v->rot32 || D.walpha.v->rot32 || D.wbeta.k != e || D.walpha.k != e || D.wbeta.n_out != nv ||
         D.walpha.n_out != nv || !is_float_type(D.wbeta.v->type) || !is_float_type(D.walpha.v->type) ||
-        !g::deltanet_ba_fast(D.wbeta.dtype, D.wbeta.d, D.wbeta.drb, D.walpha.dtype, D.walpha.d, D.walpha.drb, nv, e, xn, 1, e))
+        !g::deltanet_ba_fast(D.wbeta.dtype, D.wbeta.d, D.wbeta.drb, D.walpha.dtype, D.walpha.d, D.walpha.drb, nv, e, xn, n, e))
       return Status::good();
     R3Group* G1 = nullptr;
     R3Group* G2 = nullptr;
-    if (Status st = r3_group({{&D.wqkv, mixed}, {&D.wgate, zg}}, 1, 0x200, &G1); !st) return st;
-    if (Status st = r3_group({{&D.ssm_out, y}}, 1, 0x200, &G2); !st) return st;
+    if (Status st = r3_group({{&D.wqkv, mixed}, {&D.wgate, zg}}, n, 0x200, &G1); !st) return st;
+    if (Status st = r3_group({{&D.ssm_out, y}}, n, 0x200, &G2); !st) return st;
     if (G1->yo.size() != 2 || G1->yo[0] != mixed || G1->yo[1] != zg || G2->yo.size() != 1 || G2->yo[0] != y) return Status::good();
     g::DnHalfArgs A;
     A.x = x;
@@ -964,6 +973,13 @@ struct GpuEngine::Impl {
     A.gn_w = D.ssm_norm;
     A.qscale = 1.0f / std::sqrt(static_cast<float>(ds));  // as deltanet_recurrent_reg computes it
     A.hcnt = dn_hcnt;
+    A.l2pf = o.l2_prefetch ? 1 : 0;
+    A.n = static_cast<int>(n);
+    const bool ck = ckpt_mode && n > 1;  // v56: a verify step keeps every prefix's state (k_dn_rec_reg_ck) and the batch's conv inputs
+    A.ckpt = ck ? D.ckpt : nullptr;
+    A.msave = ck ? D.mixed_save : nullptr;
+    if (ck && (!D.ckpt || !D.mixed_save)) return Status::good();
+    A.ph = dph_d ? dph_d + static_cast<int64_t>(&D - L.data()) * 5 : nullptr;  // v56: stage stamps (verbose_gpu)
     if (!g::dn_half_ok(A)) return Status::good();
     if (!g::dn_half(A)) return Status::fail(Code::internal, std::string("engine: dense half (L3): ") + g::stream_last_error());
     D.cur = 1 - D.cur;
@@ -1647,6 +1663,7 @@ struct GpuEngine::Impl {
     A.load_mode = o.rx_load;
     A.y = y;
     A.ph = ph_d ? ph_d + static_cast<int64_t>(il) * 5 : nullptr;  // v55b
+    A.l2pf = o.l2_prefetch ? 1 : 0;  // v56
     A.st = rst_d;                                                 // v55e3
     // v55f / v55f2: the bit planes only feed planed experts' 1-bit route; with no planes (--plane-bits 0) nothing reads
     // them, so they are not built (v55f2 S0 +0.33 ms vs g55e3, MEASURED)
@@ -2288,6 +2305,10 @@ struct GpuEngine::Impl {
             ph_h = static_cast<unsigned long long*>(g::host_alloc_mapped(static_cast<std::size_t>(s.n_layer) * 5 * sizeof(unsigned long long), &phd));
             ph_d = static_cast<unsigned long long*>(phd);
             if (!ph_h || !ph_d) ph_h = ph_d = nullptr;
+            void* dphd = nullptr;  // v56
+            dph_h = static_cast<unsigned long long*>(g::host_alloc_mapped(static_cast<std::size_t>(s.n_layer) * 5 * sizeof(unsigned long long), &dphd));
+            dph_d = static_cast<unsigned long long*>(dphd);
+            if (!dph_h || !dph_d) dph_h = dph_d = nullptr;
             rst_d = static_cast<unsigned long long*>(g::dalloc(g::kRxStatN * sizeof(unsigned long long)));  // v55e3
             if (rst_d && !g::dzero(rst_d, g::kRxStatN * sizeof(unsigned long long))) {
               g::dfree(rst_d);
@@ -2400,6 +2421,7 @@ GpuEngine::~GpuEngine() {
   g::host_free(p_->trc_hv);
   g::host_free(p_->planes_h);  // v54
   g::host_free(p_->ph_h);  // v55b
+  g::host_free(p_->dph_h);  // v56
   g::dfree(p_->rst_d);      // v55e3
   g::host_free(p_->rlg_h);  // v49
   g::dfree(p_->probe_bd);
@@ -2500,6 +2522,33 @@ std::string GpuEngine::moe_phase_report() const {  // v55b
                 static_cast<unsigned long long>(I.ph_steps), static_cast<double>(I.ph_layers) / st, I.ph_sum[0] / st, I.ph_sum[1] / st, I.ph_sum[2] / st,
                 I.ph_sum[3] / st, (I.ph_sum[0] + I.ph_sum[1] + I.ph_sum[2] + I.ph_sum[3]) / st);
   std::string r = b;
+  if (I.dph_h && I.dph_steps > 0) {  // v56
+    const double ds2 = static_cast<double>(I.dph_steps);
+    char d[400];
+    std::snprintf(d, sizeof d,
+                  "\nDeltaNet dense half (L3), ms per token over %llu decode steps (%.1f layers per step; GPU clock, block 0): 0 norm + rounding %.3f, "
+                  "1 qkv + gate + beta / alpha %.3f, 2 conv + l2 + recurrence + gated norm %.3f, 3 ssm_out %.3f; total %.3f",
+                  static_cast<unsigned long long>(I.dph_steps), static_cast<double>(I.dph_layers) / ds2, I.dph_sum[0] / ds2, I.dph_sum[1] / ds2,
+                  I.dph_sum[2] / ds2, I.dph_sum[3] / ds2, (I.dph_sum[0] + I.dph_sum[1] + I.dph_sum[2] + I.dph_sum[3]) / ds2);
+    r += d;
+  }
+  for (int k = 0; k < 3; ++k) {  // v56: verify steps (MTP) by size
+    char d[400];
+    if (I.vph_steps[k] > 0) {
+      const double st2 = static_cast<double>(I.vph_steps[k]);
+      std::snprintf(d, sizeof d, "\nverify steps of %d tokens (%llu): fused MoE half ms per step: A %.3f, B %.3f, C expert stage %.3f, D %.3f; total %.3f", k + 2,
+                    static_cast<unsigned long long>(I.vph_steps[k]), I.vph_sum[k][0] / st2, I.vph_sum[k][1] / st2, I.vph_sum[k][2] / st2, I.vph_sum[k][3] / st2,
+                    (I.vph_sum[k][0] + I.vph_sum[k][1] + I.vph_sum[k][2] + I.vph_sum[k][3]) / st2);
+      r += d;
+    }
+    if (I.vdph_steps[k] > 0) {
+      const double st2 = static_cast<double>(I.vdph_steps[k]);
+      std::snprintf(d, sizeof d, "\nverify steps of %d tokens (%llu): DeltaNet dense half ms per step: 0 %.3f, 1 %.3f, 2 %.3f, 3 %.3f; total %.3f", k + 2,
+                    static_cast<unsigned long long>(I.vdph_steps[k]), I.vdph_sum[k][0] / st2, I.vdph_sum[k][1] / st2, I.vdph_sum[k][2] / st2,
+                    I.vdph_sum[k][3] / st2, (I.vdph_sum[k][0] + I.vdph_sum[k][1] + I.vdph_sum[k][2] + I.vdph_sum[k][3]) / st2);
+      r += d;
+    }
+  }
   if (I.rst_d) {  // v55e3 diagnosis: the one-token expert stage's counters (SM cycles; every one-token step since open)
     unsigned long long c[g::kRxStatN] = {};
     if (g::sync() && g::to_host(c, I.rst_d, sizeof c)) {
@@ -2746,6 +2795,7 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
       {reinterpret_cast<void**>(&I.beta), np * z(nv) * 4},      {reinterpret_cast<void**>(&I.alpha), np * z(nv) * 4},
       {reinterpret_cast<void**>(&I.conv), np * z(ch) * 4},      {reinterpret_cast<void**>(&I.core), np * z(di) * 4},
       {reinterpret_cast<void**>(&I.dn_hcnt), z(nv > 0 ? nv : 1) * 4},
+      {reinterpret_cast<void**>(&I.top_d), np * 4 + 64},
       {reinterpret_cast<void**>(&I.logits_r), np * z(ne) * 4},  {reinterpret_cast<void**>(&I.sel), np * z(nu) * 4},
       {reinterpret_cast<void**>(&I.wsel), np * z(nu) * 4},      {reinterpret_cast<void**>(&I.gs), np * z(ffs) * 4},
       {reinterpret_cast<void**>(&I.us), np * z(ffs) * 4},       {reinterpret_cast<void**>(&I.sh), np * z(e) * 4},
@@ -3193,8 +3243,8 @@ Status GpuEngine::Impl::run(const std::int32_t* tokens, int n, float* logits, bo
     const Qwen35MoeLayer& l = wt.layers[il];
     Layer& D = I.L[il];
     I.cur_ops = (I.ops_d && (bl || rd) && n == 1) ? I.ops_d + z(EngineTimeline::kOps) * il : nullptr;
-    bool dnh = false;  // v55g (L3): the DeltaNet dense half in one launch (one token, no per-op stamps)
-    if (l.recurrent && n == 1 && !I.cur_ops && !(st = I.dn_half_layer(D, &dnh))) return st;
+    bool dnh = false;  // v55g (L3): the DeltaNet dense half in one launch (1-4 tokens since v56, no per-op stamps)
+    if (l.recurrent && n <= 4 && !I.cur_ops && !(st = I.dn_half_layer(D, n, &dnh))) return st;
     if (!dnh) {
     if (!I.opstamp(0)) return gfail("engine: stamp");
     if (!g::rms_norm(I.x, D.attn_norm, I.xn, e, 1, e, e, n, s.rms_eps)) return gfail("engine: attn norm");
@@ -3316,24 +3366,43 @@ Status GpuEngine::Impl::run(const std::int32_t* tokens, int n, float* logits, bo
     // from r_begin on are copied out
     if (!(st = I.prod(I.out, I.xn, m, I.lg))) return st;
     const int c0 = std::max(r0, r_begin);
-    if (!g::to_host(logits + static_cast<int64_t>(c0 - r_begin) * nvoc, I.lg + static_cast<int64_t>(c0 - r0) * nvoc, z(r0 + m - c0) * z(nvoc) * sizeof(float)))
+    if (I.top_req) {  // v56: the argmax on the device
+      if (!g::argmax_rows(I.lg + static_cast<int64_t>(c0 - r0) * nvoc, nvoc, r0 + m - c0, nvoc, I.top_d + (c0 - r_begin))) return gfail("engine: argmax");
+    } else if (!g::to_host(logits + static_cast<int64_t>(c0 - r_begin) * nvoc, I.lg + static_cast<int64_t>(c0 - r0) * nvoc, z(r0 + m - c0) * z(nvoc) * sizeof(float))) {
       return gfail("engine: logits");
+    }
   }
+  if (I.top_req && n > r_begin && !g::to_host(I.top_req, I.top_d, z(n - r_begin) * sizeof(std::int32_t))) return gfail("engine: argmax out");
   if (!g::sync()) return gfail("engine: sync");
   if (rd) {  // v25: every pick of a reader step runs on the GPU
     es.hot_picks += static_cast<std::uint64_t>(n) * s.n_expert_used;
     if (I.trc_ts_h) I.trace_step(n, since(t0));
-    if (I.ph_h && n == 1 && !I.in_prompt) {  // v55b: the fused MoE half's phases of this decode step (layers that ran it fill stamp 0)
+    // v55b / v56: the fused halves' stamps of this step (layers that ran one fill stamp 0): decode steps into ph / dph,
+    // verify steps of 2-4 tokens into vph / vdph by size; prompt steps are not counted (stamps cleared)
+    auto take = [&](unsigned long long* base, double* acc, std::uint64_t* nlay) {
       bool any = false;
       for (std::uint32_t il = 0; il < s.n_layer; ++il) {
-        unsigned long long* pq = I.ph_h + static_cast<int64_t>(il) * 5;
-        if (pq[0] == 0 || pq[4] < pq[0]) continue;
-        for (int k = 0; k < 4; ++k) I.ph_sum[k] += static_cast<double>(pq[k + 1] - pq[k]) * 1e-6;
-        ++I.ph_layers;
+        unsigned long long* pq = base + static_cast<int64_t>(il) * 5;
+        if (pq[0] == 0 || pq[4] < pq[0]) {
+          pq[0] = 0;
+          continue;
+        }
+        if (acc)
+          for (int k = 0; k < 4; ++k) acc[k] += static_cast<double>(pq[k + 1] - pq[k]) * 1e-6;
+        if (nlay) ++*nlay;
         pq[0] = 0;
         any = true;
       }
-      if (any) ++I.ph_steps;
+      return any;
+    };
+    const bool dec = !I.in_prompt && n >= 1 && n <= 4;
+    if (I.ph_h) {
+      const bool any = take(I.ph_h, dec ? (n == 1 ? I.ph_sum : I.vph_sum[n - 2]) : nullptr, dec && n == 1 ? &I.ph_layers : nullptr);
+      if (any && dec) ++(n == 1 ? I.ph_steps : I.vph_steps[n - 2]);
+    }
+    if (I.dph_h) {
+      const bool any = take(I.dph_h, dec ? (n == 1 ? I.dph_sum : I.vdph_sum[n - 2]) : nullptr, dec && n == 1 ? &I.dph_layers : nullptr);
+      if (any && dec) ++(n == 1 ? I.dph_steps : I.vdph_steps[n - 2]);
     }
     if (I.rlg_h) {  // v49: this step's router margins, per token and layer (8th - 9th logit, 1st - 2nd)
       const int64_t ne2 = s.n_expert, nu2 = s.n_expert_used, nl = s.n_layer;
@@ -3461,14 +3530,43 @@ Status GpuEngine::mtp_step(const std::int32_t* tokens, const float* h_prev, int 
     if (h_out && !g::to_host(h_out + static_cast<int64_t>(r0) * e, I.xn, z(m) * z(e) * sizeof(float))) return gfail("engine: MTP hidden");
     if (logits) {
       if (!(st = I.prod(I.head, I.xn, m, I.lg))) return st;
-      if (!g::to_host(logits + static_cast<int64_t>(r0) * nvoc, I.lg, z(m) * z(nvoc) * sizeof(float))) return gfail("engine: MTP logits");
+      if (I.top_req) {  // v56
+        if (!g::argmax_rows(I.lg, nvoc, m, nvoc, I.top_d + r0)) return gfail("engine: MTP argmax");
+      } else if (!g::to_host(logits + static_cast<int64_t>(r0) * nvoc, I.lg, z(m) * z(nvoc) * sizeof(float))) {
+        return gfail("engine: MTP logits");
+      }
     }
   }
+  if (I.top_req && logits && !g::to_host(I.top_req, I.top_d, z(n) * sizeof(std::int32_t))) return gfail("engine: MTP argmax out");
   if (!g::sync()) return gfail("engine: MTP sync");
   I.mtp_pos += n;
   es.seconds = since(t0);
   if (stats) *stats = es;
   return Status::good();
+}
+
+// v56: the argmax variants (Impl::top_req routes the head's rows to the device argmax; the logits pointer is never written)
+namespace {
+struct TopReq {
+  std::int32_t*& r;
+  TopReq(std::int32_t*& slot, std::int32_t* v) : r(slot) { r = v; }
+  ~TopReq() { r = nullptr; }
+};
+}  // namespace
+Status GpuEngine::step_top(const std::int32_t* tokens, int n, std::int32_t* top, bool last_only, EngineStats* st, float* hidden_out) {
+  if (!top) return Status::fail(Code::invalid_argument, "engine: step_top needs an output");
+  TopReq g{p_->top_req, top};
+  return step(tokens, n, reinterpret_cast<float*>(top), last_only, st, hidden_out);
+}
+Status GpuEngine::verify_top(const std::int32_t* tokens, int n, std::int32_t* top, float* hidden_out, EngineStats* st) {
+  if (!top) return Status::fail(Code::invalid_argument, "engine: verify_top needs an output");
+  TopReq g{p_->top_req, top};
+  return verify(tokens, n, reinterpret_cast<float*>(top), hidden_out, st);
+}
+Status GpuEngine::mtp_step_top(const std::int32_t* tokens, const float* h_prev, int n, std::int32_t* top, float* h_out, EngineStats* st) {
+  if (!top) return Status::fail(Code::invalid_argument, "engine: mtp_step_top needs an output");
+  TopReq g{p_->top_req, top};
+  return mtp_step(tokens, h_prev, n, reinterpret_cast<float*>(top), h_out, st);
 }
 
 Result<int> GpuEngine::mtp_promote() {
@@ -3566,7 +3664,7 @@ Status engine_generate_greedy_mtp(GpuEngine& eng, const Qwen35MoeSpec& s, const 
   std::int32_t last = argmax_of(lg.data(), nv);
   out.push_back(last);
   if (on_token) on_token(last);
-  std::vector<float> dl(z(nv)), hn(z(e)), h(z(e)), bl, bh;
+  std::vector<float> hn(z(e)), h(z(e)), bh;
   while (static_cast<int>(out.size()) < n_predict && !is_stop(last)) {
     ++stt.steps;
     if (n_draft > 0 && stt.steps % 32 == 0) {  // idle-time promotion: the MTP bank follows the block's own picks
@@ -3584,13 +3682,12 @@ Status engine_generate_greedy_mtp(GpuEngine& eng, const Qwen35MoeSpec& s, const 
       for (int i = 0; i < k; ++i) {
         EngineStats x;
         const Clock::time_point tq = Clock::now();
-        if (Status r = eng.mtp_step(&tok, h.data(), 1, dl.data(), hn.data(), &x); !r) return r;
+        std::int32_t nt = 0;  // v56: the draft's argmax on the device (one int to the host instead of n_vocab floats)
+        if (Status r = eng.mtp_step_top(&tok, h.data(), 1, &nt, hn.data(), &x); !r) return r;
         T.draft_s += secs(tq);
         ++T.drafts;
         add_stats(tot, x);
-        const Clock::time_point ta = Clock::now();
-        tok = argmax_of(dl.data(), nv);
-        T.argmax_s += secs(ta);
+        tok = nt;
         drafts.push_back(tok);
         h = hn;
       }
@@ -3600,19 +3697,20 @@ Status engine_generate_greedy_mtp(GpuEngine& eng, const Qwen35MoeSpec& s, const 
     const int nb = 1 + k;
     std::vector<std::int32_t> batch{last};
     batch.insert(batch.end(), drafts.begin(), drafts.end());
-    bl.resize(z(nb * nv));
+    std::vector<std::int32_t> tops(z(nb));  // v56: each verified row's argmax from the device
     bh.resize(z(nb * e));
     EngineStats x;
     const Clock::time_point tv = Clock::now();
-    if (Status r = k > 0 ? eng.verify(batch.data(), nb, bl.data(), bh.data(), &x) : eng.step(batch.data(), 1, bl.data(), true, &x, bh.data()); !r) return r;
+    if (Status r = k > 0 ? eng.verify_top(batch.data(), nb, tops.data(), bh.data(), &x) : eng.step_top(batch.data(), 1, tops.data(), true, &x, bh.data()); !r)
+      return r;
     T.verify_s[nb > 8 ? 9 : nb] += secs(tv);
     ++T.verify_n[nb > 8 ? 9 : nb];
     add_stats(tot, x);
     const Clock::time_point ta2 = Clock::now();
     int a = 0;
-    while (a < k && argmax_of(bl.data() + a * nv, nv) == drafts[z(a)] && !is_stop(drafts[z(a)])) ++a;
-    if (a < k && is_stop(drafts[z(a)]) && argmax_of(bl.data() + a * nv, nv) == drafts[z(a)]) ++a;
-    const std::int32_t next = argmax_of(bl.data() + a * nv, nv);
+    while (a < k && tops[z(a)] == drafts[z(a)] && !is_stop(drafts[z(a)])) ++a;
+    if (a < k && is_stop(drafts[z(a)]) && tops[z(a)] == drafts[z(a)]) ++a;
+    const std::int32_t next = tops[z(a)];
     T.argmax_s += secs(ta2);
     const Clock::time_point tk = Clock::now();
     if (k > 0)

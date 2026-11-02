@@ -2434,7 +2434,7 @@ int cmd_engine_check(const Args& a) {
                  "                           [--text FILE [--skip-tokens N]] [--timeline] [--dump-top OUT.tsv] [--dump-router OUT.tsv] [--dump-draft OUT.tsv] [--dump-split [--split-sizes 2,3,4] [--split-step]]\n"
                  "                           [--no-doorbell] [--timeline-ops] [--split-ref] [--bank-selftest MIXES] [--probe-pos P]\n"
                  "                           [--router-tie BAND] [--cold-on-gpu] [--trace OUT.tsv] [--reader-v25] [--reader-cache K] [--fold-shared]\n"
-                 "                           [--batch-identical] [--graph] [--prefetch] [--plane-tail N] [--cpu-light] [--reader-rpw 1|2] [--r3-experts] [--rx-load lane|miss|all] [--prompt-batched] [--prompt-halves] [--cpu-prompt] [--no-cache-pools] [--no-fast-f32] [--lean-dense] [--no-dn-half] [--no-fused-moe] [--plane-bits 2|3|4|5] [--auto-vram [--cache-share F]] [--verbose-gpu]\n"
+                 "                           [--batch-identical] [--graph] [--prefetch] [--plane-tail N] [--cpu-light] [--reader-rpw 1|2] [--r3-experts] [--rx-load lane|miss|all] [--prompt-batched] [--prompt-halves] [--cpu-prompt] [--no-cache-pools] [--no-fast-f32] [--lean-dense] [--no-dn-half] [--no-l2pf] [--no-fused-moe] [--plane-bits 2|3|4|5] [--auto-vram [--cache-share F]] [--verbose-gpu]\n"
                  "                           [--pin-gap-kib K] [--pin-huge-ok] [--cpu-up-rows N] [--cpu-down2] [--cpu-gu2] [--cpu-tile] [--spin-pause] [--cpu-prefetch] [--cpu-check] [--host-wait auto|spin|yield|block] [--pin-cpus 0,2,4,...] [--pin-host N] [--ref-threads N] [--no-cpu-light] [--split-slow] [--preload-light]\n");
     return 1;
   }
@@ -2653,6 +2653,7 @@ int cmd_engine_check(const Args& a) {
   eo.fast_f32 = !a.has("no-fast-f32");        // v52 (temporary switch)
   eo.lean_dense = a.has("lean-dense");        // v55e (temporary switch; off by default since v55e2)
   eo.dn_half = !a.has("no-dn-half");         // v55g (L3; temporary switch for the A/B)
+  eo.l2_prefetch = !a.has("no-l2pf");       // v56 (temporary switch for the A/B)
   eo.fused_moe = !a.has("no-fused-moe");      // v52 (temporary switch)
   eo.verbose_gpu = a.has("verbose-gpu");       // v55b
   if (a.has("plane-bits")) {  // v54b
@@ -2965,14 +2966,23 @@ int cmd_engine_check(const Args& a) {
     std::vector<std::int32_t> psa, psb;
     std::vector<float> boa, loa, moa, bob, lob, mob;  // v25: per-operation rows at the probe (one-token / batched)
     Timer tdp;
+    std::int32_t next_top = -1;  // v56: without --dump-split the plain run takes each step's argmax from the device, as the MTP run does
     for (std::uint64_t i = 0; i < ndec; ++i) {
       std::int32_t best = 0;
-      for (std::size_t j = 1; j < nv; ++j)
-        if (row[j] > row[static_cast<std::size_t>(best)]) best = static_cast<std::int32_t>(j);
+      if (next_top >= 0) {
+        best = next_top;
+      } else {
+        for (std::size_t j = 1; j < nv; ++j)
+          if (row[j] > row[static_cast<std::size_t>(best)]) best = static_cast<std::int32_t>(j);
+      }
       if (split) std::copy(row.begin(), row.end(), one_rows.begin() + static_cast<std::ptrdiff_t>(i * nv));
       plain.push_back(best);
       if (i + 1 == ndec) break;
-      if (Status st = eng.value->step(&best, 1, row.data(), true); !st) return fail_input(st);
+      if (split) {
+        if (Status st = eng.value->step(&best, 1, row.data(), true); !st) return fail_input(st);
+      } else if (Status st = eng.value->step_top(&best, 1, &next_top, true); !st) {
+        return fail_input(st);
+      }
     }
     const double plain_s = tdp.seconds();
     if (probe_p >= 0 && !eng.value->probe_get(&pxa, &psa, &pwa)) std::printf("  probe: nothing captured in the plain run\n");

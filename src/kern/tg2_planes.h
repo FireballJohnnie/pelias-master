@@ -15,6 +15,7 @@
 // bits gives the stored code exactly (the same values, the same bits as the stored layout). Reading fewer bits gives the
 // code with the missing low bits zero, and the base grid replaces each of the 16 levels by the mean of the levels sharing
 // its top bits (the v27 rule), so a 2-bit code reads the mean of its 4 levels, a 3-bit code the mean of its 2.
+#include <bit>
 #include <cstdint>
 #include <cstring>
 
@@ -145,8 +146,8 @@ PG_HD int plane_dot32(std::uint32_t w, const std::uint32_t* u8) {
   return s - (__popc(w) << 7);
 #else
   int s = 0;
-  for (int k = 0; k < 8; ++k) s += __builtin_popcount(w & u8[k]) << k;
-  return s - (__builtin_popcount(w) << 7);
+  for (int k = 0; k < 8; ++k) s += std::popcount(w & u8[k]) << k;  // v56: std::popcount (MSVC has no __builtin_popcount)
+  return s - (std::popcount(w) << 7);
 #endif
 }
 // host: one row of nB stored Q5_K blocks (176 nB bytes) into the plane layout (g_q5_kp)

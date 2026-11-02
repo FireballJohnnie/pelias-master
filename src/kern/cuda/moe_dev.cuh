@@ -185,6 +185,46 @@ __device__ __forceinline__ void gemv_row(const float* __restrict__ w, std::uint6
   }
 }
 
+// v56: gemv_row with the weights loaded one sub-block group (jj) at a time instead of all NJ first (8 float4 live instead of
+// 8 NJ: no spill under a 128-register bound). The sums are gemv_row's: per lane the same terms in the same order (jj, then
+// the token, then the 8 float4 of the sub-block), then warp_sum
+template <int NJ>
+__device__ __forceinline__ void gemv_row_lr(const float* __restrict__ w, std::uint64_t rb, std::int64_t r, const float* xs, int nsub, int n_tok,
+                                            float* __restrict__ y, std::int64_t ldy) {
+  const int lane = static_cast<int>(threadIdx.x & 31);
+  const float4* p4 = reinterpret_cast<const float4*>(reinterpret_cast<const std::uint8_t*>(w) + static_cast<std::uint64_t>(r) * rb);
+  float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+  for (int jj = 0; jj < NJ; ++jj) {
+    const int j = lane + 32 * jj;
+    if (j >= nsub) break;
+    float4 wv[8];
+#pragma unroll
+    for (int i4 = 0; i4 < 8; ++i4) wv[i4] = p4[8 * j + i4];
+#pragma unroll
+    for (int tt = 0; tt < 4; ++tt) {
+      if (tt >= n_tok) break;
+      const float4* xr = reinterpret_cast<const float4*>(xs + (tt * nsub + j) * kGvPad);
+      float s = 0.0f;
+#pragma unroll
+      for (int i4 = 0; i4 < 8; ++i4) {
+        const float4 a = wv[i4], b = xr[i4];
+        s += a.x * b.x;
+        s += a.y * b.y;
+        s += a.z * b.z;
+        s += a.w * b.w;
+      }
+      acc[tt] += s;
+    }
+  }
+#pragma unroll
+  for (int tt = 0; tt < 4; ++tt) {
+    if (tt >= n_tok) break;
+    const float v = warp_sum(acc[tt]);
+    if (lane == 0) y[tt * ldy + r] = v;
+  }
+}
+
 // ------------------------------------------------------------------------------------------------ route
 
 constexpr int kRouterMaxExperts = 1024;

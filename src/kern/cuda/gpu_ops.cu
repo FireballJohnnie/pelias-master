@@ -1835,6 +1835,57 @@ bool deltanet_beta_alpha_gates(std::uint32_t type_b, const void* wb, std::uint64
   return launched("deltanet beta / alpha / gates");
 }
 
+// v56 (MTP and greedy decode): each row's argmax on the device (the first index of the largest value, as the host's strict
+// > scan from index 0), so a step copies one int per row to the host instead of the row's n_vocab floats
+__global__ void __launch_bounds__(1024) k_argmax_rows(const float* __restrict__ x, std::int64_t n, std::int64_t ld, std::int32_t* __restrict__ out) {
+  __shared__ float sv[32];
+  __shared__ long long si[32];
+  const float* r = x + static_cast<std::int64_t>(blockIdx.x) * ld;
+  const int tid = static_cast<int>(threadIdx.x), lane = tid & 31, w = tid >> 5;
+  float bv = 0.0f;
+  long long bi = -1;
+  for (std::int64_t i = tid; i < n; i += blockDim.x) {
+    const float v = r[i];
+    if (bi < 0 || v > bv) {
+      bv = v;
+      bi = i;
+    }
+  }
+  for (int o = 16; o > 0; o >>= 1) {
+    const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+    const long long oi = __shfl_xor_sync(0xffffffffu, bi, o);
+    if (oi >= 0 && (bi < 0 || ov > bv || (ov == bv && oi < bi))) {
+      bv = ov;
+      bi = oi;
+    }
+  }
+  if (lane == 0) {
+    sv[w] = bv;
+    si[w] = bi;
+  }
+  __syncthreads();
+  if (w == 0) {
+    const int nw = static_cast<int>(blockDim.x) >> 5;
+    bv = lane < nw ? sv[lane] : 0.0f;
+    bi = lane < nw ? si[lane] : -1;
+    for (int o = 16; o > 0; o >>= 1) {
+      const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+      const long long oi = __shfl_xor_sync(0xffffffffu, bi, o);
+      if (oi >= 0 && (bi < 0 || ov > bv || (ov == bv && oi < bi))) {
+        bv = ov;
+        bi = oi;
+      }
+    }
+    if (lane == 0) out[blockIdx.x] = static_cast<std::int32_t>(bi < 0 ? 0 : bi);
+  }
+}
+bool argmax_rows(const float* x, std::int64_t n, std::int64_t rows, std::int64_t ld, std::int32_t* out, Stream s) {
+  if (n <= 0 || ld < n || !x || !out) return fail("argmax_rows: bad shape");
+  if (rows <= 0) return true;
+  k_argmax_rows<<<static_cast<unsigned>(rows), 1024, 0, st(s)>>>(x, n, ld, out);
+  return launched("argmax rows");
+}
+
 bool deltanet_gates(float* beta, float* alpha, const float* dt, const float* a, std::int64_t n, std::int64_t nv, Stream s) {
   if (nv <= 0 || !beta || !alpha || !dt || !a) return fail("deltanet_gates: bad pointer");
   if (n <= 0) return true;

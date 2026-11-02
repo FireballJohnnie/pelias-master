@@ -131,6 +131,8 @@ bool stream_wait(Stream s, void* e);
 // + kk); tail null = zeros (a fresh sequence); new_tail (taps - 1 rows, may be null) receives the last taps - 1 inputs
 bool deltanet_conv(const float* mixed, const float* tail, const float* w, std::int64_t n, std::int64_t ch, std::int64_t taps,
                    float* conv, float* new_tail, Stream s = nullptr);
+// v56: out[r] = the first index of row r's largest value (rows of n floats at stride ld), as a host scan with strict >
+bool argmax_rows(const float* x, std::int64_t n, std::int64_t rows, std::int64_t ld, std::int32_t* out, Stream s = nullptr);
 // in place: beta = sigmoid(beta); alpha = softplus(alpha + dt[h]) * a[h]  (n rows of nv)
 bool deltanet_gates(float* beta, float* alpha, const float* dt, const float* a, std::int64_t n, std::int64_t nv, Stream s = nullptr);
 // v55g (L3): whether deltanet_beta_alpha_gates takes these (both products on k_gemv_f32's fast F32 path, so the same sums)

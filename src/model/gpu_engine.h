@@ -52,6 +52,7 @@ struct EngineOptions {
   // v55e: v55d's lean one-format dense kernels (--lean-dense, temporary; off since v55e2 measured +1.1 ms per token); same bits
   bool lean_dense = false;
   bool dn_half = true;  // v55g (L3): a DeltaNet layer's dense half for one token in one launch (temporary switch --no-dn-half for the A/B)
+  bool l2_prefetch = true;  // v56: inside the fused launches, the next stage's rows prefetched into L2 (temporary switch --no-l2pf)
   // v52: the MoE half of each layer (residual, post norm, rounding, router, shared gate, picks, grouping, plan, R3 expert
   // stage, combine, residual) in one cooperative launch (g::moe_half); same bits (--no-fused-moe, temporary)
   bool fused_moe = true;
@@ -271,6 +272,11 @@ class GpuEngine {
   // h_prev + t x n_embd (host); as model::mtp_forward. logits (n x n_vocab) and h_out (n x n_embd) may be null.
   Status mtp_step(const std::int32_t* tokens, const float* h_prev, int n, float* logits, float* h_out, EngineStats* st = nullptr);
   void mtp_truncate(std::int64_t pos);
+  // v56: the same steps with each row's argmax computed on the device (first index of the largest logit, as a host scan):
+  // top gets one int per row the logits would have had (n, or 1 with last_only); no logits are copied to the host
+  Status step_top(const std::int32_t* tokens, int n, std::int32_t* top, bool last_only, EngineStats* st = nullptr, float* hidden_out = nullptr);
+  Status verify_top(const std::int32_t* tokens, int n, std::int32_t* top, float* hidden_out, EngineStats* st = nullptr);
+  Status mtp_step_top(const std::int32_t* tokens, const float* h_prev, int n, std::int32_t* top, float* h_out, EngineStats* st = nullptr);
   // idle-time promotion: the MTP block's bank is refilled with its most picked experts so far (picks counted on every MTP
   // step); nothing is uploaded when the set is unchanged. Returns the experts swapped in.
   Result<int> mtp_promote();

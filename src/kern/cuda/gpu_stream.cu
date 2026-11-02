@@ -703,7 +703,7 @@ __device__ __forceinline__ void run_task(const DJob* __restrict__ jobs, int njob
         yo[tk] = u * J.ys;
       }
       float acc[4] = {0.f, 0.f, 0.f, 0.f};
-      if (r < J.n) lane_part_d<0, ONLY>(J, r, part, xq, xs, xsum, J.ntok, acc);
+      if (r < J.n) lane_part_d<MA, ONLY>(J, r, part, xq, xs, xsum, J.ntok, acc);
       store_rows(J, r, part, acc, J.ntok, yo);
       return;
     }
@@ -1127,6 +1127,35 @@ __device__ __forceinline__ void rx_rows_staged(const DJob& J, long long t, std::
   }
   __syncwarp();  // the buffer is reused by the warp's next task
 }
+// v56 (v55f3 counters MEASURED: the expert stage reads ~0.46 GB per token in 5.58 ms, ~80 GB/s, at 8 warps per SM): every
+// warp first issues L2 prefetches for the rows of all its tasks of the layer (VRAM rows, cache slots, and host-RAM rows
+// over PCIe alike), then runs the tasks, which then find their rows in L2; the stage becomes bound by the bytes, not by
+// each task's memory latency. Data and arithmetic unchanged.
+__device__ __forceinline__ void rx_prefetch_rows(const std::uint8_t* b, long long n, int lane) {
+  const long long lines = (n + 127) / 128;
+  for (long long c = lane; c < lines; c += 32) asm volatile("prefetch.global.L2 [%0];" ::"l"(b + 128 * c));
+}
+__device__ __forceinline__ void rx_prefetch_tasks(const DJob* __restrict__ jobs, int njobs, long long t0, long long end, long long step) {
+  const int lane = static_cast<int>(threadIdx.x & 31);
+  int j = 0;
+  for (long long t = t0; t < end; t += step) {
+    while (j + 1 < njobs && jobs[j + 1].task0 <= t) ++j;
+    const DJob& J = jobs[j];
+    if (J.fmt == kEpi) continue;
+    const int rpw = 32 / J.lpr, nB = J.K / 256;
+    const int r0 = static_cast<int>((t - J.task0) * rpw);
+    const int nr = J.n - r0 < rpw ? J.n - r0 : rpw;
+    if (nr <= 0) continue;
+    if (J.fmt == kQ4TG2P || J.fmt == kQ5KP) {
+      const long long pfx = static_cast<long long>(plane_prefix(J.fmt == kQ4TG2P ? g_q4_tg2p : g_q5_kp,
+                                                                static_cast<std::uint64_t>(nB) * (J.fmt == kQ4TG2P ? 144u : 176u), J.pb));
+      for (int rr = 0; rr < nr; ++rr) rx_prefetch_rows(J.w + (r0 + rr) * J.rs, pfx, lane);
+    } else {
+      const long long rowb = static_cast<long long>(nB) * rx_blk(J.fmt);
+      rx_prefetch_rows(J.w + static_cast<long long>(r0) * rowb, nr * rowb, lane);
+    }
+  }
+}
 // the layer's experts: every warp walks the tasks in table order (gate and up of all experts first, then the roundings,
 // then the downs); a task whose job waits for a group starts once the group's count is complete (acquire), and a task of
 // a signalling job adds 1 (release). All blocks are resident (cooperative launch), and a job waits only for groups of
@@ -1136,7 +1165,7 @@ __device__ __forceinline__ void rx_rows_staged(const DJob& J, long long t, std::
 // tasks, tasks, the loop's span; per format (J.fmt 0..10) the cycles and tasks; staged and filling tasks (st layout:
 // gpu_stream.h kRxStatN)
 template <bool kMT, int ONLY = kOnlyRx, bool kStat = false>
-__device__ __forceinline__ void rx_body(const std::uint8_t* __restrict__ plan, int maxp, int sbytes, unsigned long long* st = nullptr) {
+__device__ __forceinline__ void rx_body(const std::uint8_t* __restrict__ plan, int maxp, int sbytes, unsigned long long* st = nullptr, int l2pf = 0) {
   std::uint8_t* sbuf = reinterpret_cast<std::uint8_t*>(s_lut) + kLutRxBytes + static_cast<long long>(threadIdx.x / 32) * sbytes;  // v46a-2, v54
   const RxLayout Lo = rx_layout(maxp);
   const auto* hd = reinterpret_cast<const RxHdr*>(plan);
@@ -1153,6 +1182,7 @@ __device__ __forceinline__ void rx_body(const std::uint8_t* __restrict__ plan, i
   int j = 0;
   long long c_wait = 0, c_work = 0, c_beg = 0, ntk = 0;
   if constexpr (kStat) c_beg = clock64();
+  if (l2pf) rx_prefetch_tasks(jobs, njobs, w0, end, warps);  // v56
   for (long long t = w0; t < end; t += warps) {
     long long ca = 0, cb = 0;
     if constexpr (kStat) ca = clock64();
@@ -1229,7 +1259,7 @@ __global__ void __launch_bounds__(256) k_rx_probe(const std::uint8_t* __restrict
 // expert pointers). As separate, non-inlined functions their registers and any spill stay in that setup code, and the
 // expert loop (phase C) keeps its own allocation. The kernel's argument is a __grid_constant__, so the functions read it
 // in place (no copy). Same code, same order: the bits are unchanged.
-#define PG_NOINL __attribute__((noinline))
+#define PG_NOINL __noinline__  // v56: the CUDA keyword (nvcc with MSVC as the host compiler too)
 template <int NJ>
 __device__ PG_NOINL void mh_phase_a(const MoeHalfArgs& A, float* stg, double* s_sh) {
   const int H = A.H, n = A.n, nsub = H / 32;
@@ -1312,7 +1342,7 @@ __global__ void __launch_bounds__(256, 1) k_moe_half(const __grid_constant__ Moe
   if (phs) A.ph[2] = gtimer_s();
   // ---- C
   lut_setup_rx();
-  rx_body<kMT, kOnlyRx, kStat>(static_cast<const std::uint8_t*>(A.plan), A.max_picks, sbytes, A.st);
+  rx_body<kMT, kOnlyRx, kStat>(static_cast<const std::uint8_t*>(A.plan), A.max_picks, sbytes, A.st, A.l2pf);
   grid.sync();
   if (phs) A.ph[3] = gtimer_s();
   // ---- D
@@ -1552,7 +1582,7 @@ bool StreamPlan::build(const StreamJob* jobs, int njobs, const int* stage_end, i
   only_ = -1;
   grid_lean_ = 0;
   fmt1_ = -1;
-  if (!mt_ && !dj.empty()) {  // v55g: the one format, for a fused launch (L3) whatever the lean switch
+  if (!dj.empty()) {  // v55g: the one format, for a fused launch (L3) whatever the lean switch (v56: several-token plans too)
     bool one = true;
     for (const DJob& D : dj) one = one && D.fmt == dj[0].fmt;
     if (one) fmt1_ = dj[0].fmt;
@@ -1754,121 +1784,174 @@ bool moe_half(const MoeHalfArgs& A, Stream s) {
 // of a DeltaNet layer for one token in one cooperative launch (DnHalfArgs in gpu_stream.h)
 constexpr int kDnRows = 64;  // state rows per unit (256 threads, ds / 32 = 4 threads a row as k_dn_rec_reg)
 
-// (0) block 0: k_rms_norm_q8x32 for one row (the same partial order and block_sum_d as k_rms_norm, then each thread whole
+// v56: L3 takes 1-4 tokens (the MTP verify steps, with the DeltaNet checkpoints, and the prompt's steps): every per-token
+// operation is the separate kernels' for that token, in token order, as the multi-token kernels they replace
+// (k_rms_norm_q8x32 / act_q8x32 rows, k_dn_beta_alpha_gates with n_tok, k_dn_conv / k_dn_tail over n, k_rms_norm l2
+// segments per token, k_dn_rec_reg(_ck) over t, k_gated_norm per (t, head), R3's multi-token tasks).
+
+// (0) block 0: k_rms_norm_q8x32 for each row (the same partial order and block_sum_d as k_rms_norm, then each thread whole
 // 32-value blocks rounded with md::round32, the loops of k_act_q8x32)
 __device__ PG_NOINL void dn_stage0(const DnHalfArgs& A, double* sh) {
-  const float* xs = A.x;
   const int n = A.H;
-  double part = 0.0;
-  for (int i = static_cast<int>(threadIdx.x); i < n; i += static_cast<int>(blockDim.x)) part += static_cast<double>(mul(xs[i], xs[i]));
-  const double ssum = md::block_sum_d(part, sh);
-  const float mean = static_cast<float>(ssum / static_cast<double>(n));
-  const float rs = quo(1.0f, sqrtf(add(mean, A.eps)));
   const float norm = 1.0f / sqrtf(32.0f);
-  for (int b = static_cast<int>(threadIdx.x); b < n / 32; b += static_cast<int>(blockDim.x)) {
-    float v[32];
+  for (int t = 0; t < A.n; ++t) {
+    const float* xs = A.x + static_cast<long long>(t) * n;
+    double part = 0.0;
+    for (int i = static_cast<int>(threadIdx.x); i < n; i += static_cast<int>(blockDim.x)) part += static_cast<double>(mul(xs[i], xs[i]));
+    const double ssum = md::block_sum_d(part, sh);
+    const float mean = static_cast<float>(ssum / static_cast<double>(n));
+    const float rs = quo(1.0f, sqrtf(add(mean, A.eps)));
+    for (int b = static_cast<int>(threadIdx.x); b < n / 32; b += static_cast<int>(blockDim.x)) {
+      float v[32];
 #pragma unroll
-    for (int i = 0; i < 32; ++i) {
-      const int c = 32 * b + i;
-      v[i] = mul(mul(xs[c], rs), A.norm_w[c]);
-      A.xn[c] = v[i];
+      for (int i = 0; i < 32; ++i) {
+        const int c = 32 * b + i;
+        v[i] = mul(mul(xs[c], rs), A.norm_w[c]);
+        A.xn[static_cast<long long>(t) * n + c] = v[i];
+      }
+      md::round32<false>(v, t, b, n, A.n, A.rot_in, norm, A.xr, n, A.q, A.scale, A.sum);
     }
-    md::round32<false>(v, 0, b, n, 1, A.rot_in, norm, A.xr, n, A.q, A.scale, A.sum);
   }
 }
 
-// (1b) blocks 0 .. 2 nv / 8 - 1: one warp per beta / alpha row (md::gemv_row on the staged normalized row, k_gemv_f32's sums),
-// then that row's gate by lane 0 (k_dn_beta_alpha_gates' expressions)
+// (1b) blocks 0 .. 2 nv / 8 - 1: one warp per beta / alpha row (md::gemv_row on the staged normalized rows, k_gemv_f32's sums),
+// then that row's gates by lane 0 for each token (k_dn_beta_alpha_gates' expressions)
 template <int NJ>
 __device__ PG_NOINL void dn_stage1_ba(const DnHalfArgs& A, float* xs) {
   const int nsub = A.H / 32, warp = static_cast<int>(threadIdx.x >> 5), lane = static_cast<int>(threadIdx.x & 31);
-  md::gemv_stage(A.xn, 1, nsub, A.H, xs);
+  md::gemv_stage(A.xn, A.n, nsub, A.H, xs);
   __syncthreads();
   const int r = static_cast<int>(blockIdx.x) * 8 + warp;
   if (r < 2 * A.nv) {
     const int h = r % A.nv;
     if (r < A.nv) {
-      md::gemv_row<NJ>(A.wb, A.rbb, h, xs, nsub, 1, A.beta, A.nv);
-      if (lane == 0) A.beta[h] = md::sigmoid_d(A.beta[h]);
+      md::gemv_row_lr<NJ>(A.wb, A.rbb, h, xs, nsub, A.n, A.beta, A.nv);  // v56: low-register form, the same sums
+      if (lane == 0)
+        for (int t = 0; t < A.n; ++t) A.beta[t * A.nv + h] = md::sigmoid_d(A.beta[t * A.nv + h]);
     } else {
-      md::gemv_row<NJ>(A.wa, A.rba, h, xs, nsub, 1, A.alpha, A.nv);
-      if (lane == 0) {
-        const float xv = add(A.alpha[h], A.dt[h]);
-        const float sp = xv > 20.0f ? xv : logf(add(1.0f, expf(xv)));
-        A.alpha[h] = mul(sp, A.ssm_a[h]);
-      }
+      md::gemv_row_lr<NJ>(A.wa, A.rba, h, xs, nsub, A.n, A.alpha, A.nv);
+      if (lane == 0)
+        for (int t = 0; t < A.n; ++t) {
+          const int id = t * A.nv + h;
+          const float xv = add(A.alpha[id], A.dt[h]);
+          const float sp = xv > 20.0f ? xv : logf(add(1.0f, expf(xv)));
+          A.alpha[id] = mul(sp, A.ssm_a[h]);
+        }
     }
   }
 }
 
-// one channel of k_dn_conv for one token (silu of the taps' sum; earlier positions from the tail), and its k_dn_tail entries
-__device__ __forceinline__ float dn_conv1(const DnHalfArgs& A, int c, bool wtail) {
+// one channel of k_dn_conv for token t (silu of the taps' sum; positions before the batch from the tail)
+__device__ __forceinline__ float dn_conv1(const DnHalfArgs& A, int c, int t) {
   const int T = A.taps;
   float s = 0.0f;
   for (int kk = 0; kk < T; ++kk) {
-    const int src = kk - (T - 1);
-    const float xv = src >= 0 ? ld_cgf(A.mixed + c) : A.tail[(T - 1 + src) * A.ch + c];
+    const int src = t + kk - (T - 1);
+    const float xv = src >= 0 ? ld_cgf(A.mixed + static_cast<long long>(src) * A.ch + c) : A.tail[(T - 1 + src) * A.ch + c];
     s = add(s, mul(xv, A.conv_w[c * T + kk]));
   }
-  if (wtail)
-    for (int r = 0; r < T - 1; ++r) {
-      const int src = 1 - (T - 1) + r;
-      A.new_tail[r * A.ch + c] = src >= 0 ? ld_cgf(A.mixed + src * A.ch + c) : A.tail[(T - 1 + src) * A.ch + c];
-    }
   return md::silu_d(s);
 }
+// channel c's k_dn_tail entries (the last taps - 1 inputs after the batch) and, in a verify step, its saved inputs
+__device__ __forceinline__ void dn_tail1(const DnHalfArgs& A, int c) {
+  const int T = A.taps;
+  for (int r = 0; r < T - 1; ++r) {
+    const int src = A.n - (T - 1) + r;
+    A.new_tail[r * A.ch + c] = src >= 0 ? ld_cgf(A.mixed + static_cast<long long>(src) * A.ch + c) : A.tail[(T - 1 + src) * A.ch + c];
+  }
+  if (A.msave)
+    for (int t = 0; t < A.n; ++t) A.msave[static_cast<long long>(t) * A.ch + c] = ld_cgf(A.mixed + static_cast<long long>(t) * A.ch + c);
+}
 
-// (2) unit u = (value head hv, rows part x 64 .. + 63)
-__device__ PG_NOINL void dn_stage2_unit(const DnHalfArgs& A, int u, float* sm, double* sh, int* s_last) {
-  const int ds = A.ds, nk = A.nk, upH = ds / kDnRows;
+// (2) unit u = (value head hv, rows part x 64 .. + 63): every token's conv of the head's q and k channels and of its 64 v
+// rows into shared memory (the unit with hv < nk and part 0 also writes the q / k channels' tail, every unit its v rows'),
+// then the l2 norms of each token's q and k (k_rms_norm with l2, 256 threads a segment)
+__device__ PG_NOINL void dn_stage2_unit(const DnHalfArgs& A, int u, float* sm, double* sh) {
+  const int ds = A.ds, nk = A.nk, upH = ds / kDnRows, n = A.n;
   const int hv = u / upH, part = u - hv * upH, hk = hv % nk;
   const int tid = static_cast<int>(threadIdx.x);
   float* qv = sm;
-  float* kv = sm + ds;
-  float* vv = sm + 2 * ds;
-  // the conv of the head's q and k channels (the unit with hv < nk and part 0 also writes their tail) and of its 64 v rows
+  float* kv = sm + n * ds;
+  float* vv = sm + 2 * n * ds;
   if (tid < 2 * ds) {
     const int i = tid < ds ? tid : tid - ds;
     const int c = (tid < ds ? 0 : nk * ds) + hk * ds + i;
-    const float v = dn_conv1(A, c, hv < nk && part == 0);
-    (tid < ds ? qv : kv)[i] = v;
+    for (int t = 0; t < n; ++t) (tid < ds ? qv : kv)[t * ds + i] = dn_conv1(A, c, t);
+    if (hv < nk && part == 0) dn_tail1(A, c);
   }
-  if (tid < kDnRows) vv[tid] = dn_conv1(A, 2 * nk * ds + hv * ds + part * kDnRows + tid, true);
+  if (tid < kDnRows) {
+    const int c = 2 * nk * ds + hv * ds + part * kDnRows + tid;
+    for (int t = 0; t < n; ++t) vv[t * kDnRows + tid] = dn_conv1(A, c, t);
+    dn_tail1(A, c);
+  }
   __syncthreads();
-  // the l2 norms of q and k (k_rms_norm with l2, 256 threads a segment)
-  md::rms_norm_seg([qv](std::int64_t i) { return qv[i]; }, [qv](std::int64_t i, float v) { qv[i] = v; }, nullptr, ds, A.eps, 1, sh);
-  md::rms_norm_seg([kv](std::int64_t i) { return kv[i]; }, [kv](std::int64_t i, float v) { kv[i] = v; }, nullptr, ds, A.eps, 1, sh);
+  for (int t = 0; t < n; ++t) {
+    float* qt = qv + t * ds;
+    float* kt = kv + t * ds;
+    md::rms_norm_seg([qt](std::int64_t i) { return qt[i]; }, [qt](std::int64_t i, float v) { qt[i] = v; }, nullptr, ds, A.eps, 1, sh);
+    md::rms_norm_seg([kt](std::int64_t i) { return kt[i]; }, [kt](std::int64_t i, float v) { kt[i] = v; }, nullptr, ds, A.eps, 1, sh);
+  }
   __syncthreads();
-  // the recurrence: k_dn_rec_reg's per-row arithmetic (thread l of a row owns columns c * tpr + l)
+}
+__device__ PG_NOINL void dn_stage2_gate(const DnHalfArgs& A, int hv, float* sm, double* sh, int* s_last);
+// v56 (ptxas v56a: 68-72 B spill in one function at 128 registers): the recurrence and the head's gated norm on their own
+__device__ PG_NOINL void dn_stage2_rec(const DnHalfArgs& A, int u, float* sm, double* sh, int* s_last) {
+  const int ds = A.ds, upH = ds / kDnRows, n = A.n;
+  const int hv = u / upH, part = u - hv * upH;
+  const int tid = static_cast<int>(threadIdx.x);
+  const long long di = static_cast<long long>(A.nv) * ds;
+  float* qv = sm;
+  float* kv = sm + n * ds;
+  float* vv = sm + 2 * n * ds;
+  // the recurrence: k_dn_rec_reg(_ck)'s per-row arithmetic over the tokens (thread l of a row owns columns c * tpr + l); tpr
+  // a constant (ds 128), so the shared addresses are not live registers (v55g: 213-215 registers without a bound)
   {
-    const int tpr = ds / 32, l = tid % tpr;
+    constexpr int tpr = 4;
+    const int l = tid % tpr;
     const int jr = tid / tpr, j = part * kDnRows + jr;
     float* grow = A.state + (static_cast<long long>(hv) * ds + j) * ds;
     float M[32];
 #pragma unroll
     for (int c = 0; c < 32; ++c) M[c] = grow[c * tpr + l];
-    const float decay = expf(ld_cgf(A.alpha + hv)), b = ld_cgf(A.beta + hv);
-    float sum = 0.0f;
+    for (int t = 0; t < n; ++t) {
+      const float* qt = qv + t * ds;
+      const float* kt = kv + t * ds;
+      const float decay = expf(ld_cgf(A.alpha + t * A.nv + hv)), b = ld_cgf(A.beta + t * A.nv + hv);
+      float sum = 0.0f;
 #pragma unroll
-    for (int c = 0; c < 32; ++c) {
-      M[c] *= decay;
-      sum += M[c] * kv[c * tpr + l];
-    }
-    for (int o = tpr / 2; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o, tpr);
-    const float delta = (vv[jr] - sum) * b;
-    float out = 0.0f;
+      for (int c = 0; c < 32; ++c) {
+        M[c] *= decay;
+        sum += M[c] * kt[c * tpr + l];
+      }
+      for (int o = tpr / 2; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o, tpr);
+      const float delta = (vv[t * kDnRows + jr] - sum) * b;
+      float out = 0.0f;
 #pragma unroll
-    for (int c = 0; c < 32; ++c) {
-      M[c] += kv[c * tpr + l] * delta;
-      out += M[c] * qv[c * tpr + l];
+      for (int c = 0; c < 32; ++c) {
+        M[c] += kt[c * tpr + l] * delta;
+        out += M[c] * qt[c * tpr + l];
+      }
+      for (int o = tpr / 2; o > 0; o >>= 1) out += __shfl_xor_sync(0xffffffffu, out, o, tpr);
+      if (l == 0) A.core[t * di + hv * ds + j] = out * A.qscale;
+      if (A.ckpt && t + 1 < n) {  // k_dn_rec_reg_ck: the state after token t
+        float* crow = A.ckpt + static_cast<long long>(t) * A.nv * ds * ds + (static_cast<long long>(hv) * ds + j) * ds;
+#pragma unroll
+        for (int c = 0; c < 32; ++c) crow[c * tpr + l] = M[c];
+      }
     }
-    for (int o = tpr / 2; o > 0; o >>= 1) out += __shfl_xor_sync(0xffffffffu, out, o, tpr);
-    if (l == 0) A.core[hv * ds + j] = out * A.qscale;
 #pragma unroll
     for (int c = 0; c < 32; ++c) grow[c * tpr + l] = M[c];
   }
-  // the unit that finishes the head last: k_gated_norm on it (128 values, one per thread: the same partials; the extra
-  // warps add exact zeros), then its 32-value blocks rounded for ssm_out (md::round32, as k_act_q8x32)
+  dn_stage2_gate(A, hv, sm, sh, s_last);
+}
+// the unit that finishes the head last: k_gated_norm on it for each token (128 values, one per thread: the same partials;
+// the extra warps add exact zeros), then the token's 32-value blocks rounded for ssm_out (md::round32, as k_act_q8x32).
+// v56 (ptxas v56c2: 12 B spill in dn_stage2_rec): on its own
+__device__ PG_NOINL void dn_stage2_gate(const DnHalfArgs& A, int hv, float* sm, double* sh, int* s_last) {
+  const int ds = A.ds, upH = ds / kDnRows, n = A.n;
+  const int tid = static_cast<int>(threadIdx.x);
+  const long long di = static_cast<long long>(A.nv) * ds;
+  float* qv = sm;
   __threadfence();  // every thread's core and state writes ordered before the head's count (then the block barrier)
   __syncthreads();
   if (tid == 0) {
@@ -1878,38 +1961,68 @@ __device__ PG_NOINL void dn_stage2_unit(const DnHalfArgs& A, int u, float* sm, d
   __syncthreads();
   if (*s_last) {
     __threadfence();
-    double pt = 0.0;
-    float o = 0.0f;
-    if (tid < ds) {
-      o = ld_cgf(A.core + hv * ds + tid);
-      pt = static_cast<double>(mul(o, o));
-    }
-    const double ssum = md::block_sum_d(pt, sh);
-    const float mean = static_cast<float>(ssum / static_cast<double>(ds));
-    const float scl = quo(1.0f, sqrtf(add(mean, A.eps)));
-    if (tid < ds) {
-      const float g = mul(mul(mul(o, scl), A.gn_w[tid]), md::silu_d(ld_cgf(A.zg + hv * ds + tid)));
-      qv[tid] = g;
-      A.core[hv * ds + tid] = g;
-    }
-    __syncthreads();
-    if (tid < ds / 32) {
-      float v[32];
+    for (int t = 0; t < n; ++t) {
+      double pt = 0.0;
+      float o = 0.0f;
+      if (tid < ds) {
+        o = ld_cgf(A.core + t * di + hv * ds + tid);
+        pt = static_cast<double>(mul(o, o));
+      }
+      const double ssum = md::block_sum_d(pt, sh);
+      const float mean = static_cast<float>(ssum / static_cast<double>(ds));
+      const float scl = quo(1.0f, sqrtf(add(mean, A.eps)));
+      if (tid < ds) {
+        const float g = mul(mul(mul(o, scl), A.gn_w[tid]), md::silu_d(ld_cgf(A.zg + t * di + hv * ds + tid)));
+        qv[tid] = g;
+        A.core[t * di + hv * ds + tid] = g;
+      }
+      __syncthreads();
+      if (tid < ds / 32) {
+        float v[32];
 #pragma unroll
-      for (int i = 0; i < 32; ++i) v[i] = qv[32 * tid + i];
-      const int n = A.nv * ds;
-      md::round32<false>(v, 0, hv * (ds / 32) + tid, n, 1, A.rot_out, 1.0f / sqrtf(32.0f), A.xr, n, A.q, A.scale, A.sum);
+        for (int i = 0; i < 32; ++i) v[i] = qv[32 * tid + i];
+        md::round32<false>(v, t, hv * (ds / 32) + tid, di, n, A.rot_out, 1.0f / sqrtf(32.0f), A.xr, di, A.q, A.scale, A.sum);
+      }
+      __syncthreads();
     }
     if (tid == 0) A.hcnt[hv] = 0u;  // every unit of this head has arrived in this launch
   }
   __syncthreads();  // the shared arrays are reused by the next unit
 }
 
-// v55g2 (build55g listing, MEASURED: 213-215 registers without a bound = 1 block of 256 per SM, so the dense stream stages
-// ran on 8 warps per SM; the lean Q8_0 GEMV needed ~6 blocks per SM for 503 GB/s): bound to 2 blocks per SM (128 registers)
-template <int ONLY, int NJ>
+// v56: a warp's tasks of a Q8_0 plan prefetched into L2 (the rows a task reads are contiguous: rpw rows of nB 272-byte
+// blocks); issued while an earlier stage runs, so the stage that reads them finds them in L2. Data unchanged.
+__device__ PG_NOINL void l2_prefetch_q8(const DJob* __restrict__ jobs, int njobs, long long t0, long long t_end, long long step, int maxn) {  // v56: out of line (kernel-body registers)
+  const int lane = static_cast<int>(threadIdx.x & 31);
+  int hint = 0, k = 0;
+  for (long long t = t0; t < t_end && k < maxn; t += step, ++k) {
+    const DJob& J = jobs[find_job(jobs, njobs, t, &hint)];
+    if (J.fmt != kQ8_0) continue;
+    const int rpw = 32 / J.lpr, nB = J.K / 256;
+    const long long r0 = (t - J.task0) * rpw;
+    const int rows = static_cast<int>(min(static_cast<long long>(rpw), static_cast<long long>(J.n) - r0));
+    if (rows <= 0) continue;
+    const std::uint8_t* b = J.w + r0 * nB * 272;
+    const int lines = (rows * nB * 272 + 127) / 128;
+    for (int c = lane; c < lines; c += 32) asm volatile("prefetch.global.L2 [%0];" ::"l"(b + 128 * c));
+  }
+}
+
+// v56 (ptxas v56a: the kernel body spilled 12-20 B with both stream loops inlined): a stream stage's task loop on its own
+template <int ONLY, bool kMT>
+__device__ PG_NOINL void dn_stream(const DJob* __restrict__ jobs, int nj, long long nt) {
+  const long long warps = static_cast<long long>(gridDim.x) * (blockDim.x / 32);
+  int hint = 0;
+  for (long long t = static_cast<long long>(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32; t < nt; t += warps) run_task<kMT, ONLY, 1>(jobs, nj, t, &hint);
+}
+
+// v56 (v55g MEASURED: 213-215 registers without a bound = 1 block of 256 per SM, grid 46: the streams ran on 8 warps per SM,
+// stage 2 took two rounds; +4.2 ms per token): bound to 2 blocks per SM (128 registers; ptxas v56b: 128, 0 spill), stage 2
+// in one round (92 blocks for 64 units); the next stage's Q8_0 rows prefetched into L2 during stages 0 and 2; GPU-clock
+// stamps per stage. kMT: 2-4 tokens (the plans' jobs carry the tokens; each weight row loaded once for all of them)
+template <int ONLY, int NJ, bool kMT>
 __global__ void __launch_bounds__(256, 2) k_dn_half(const __grid_constant__ DnHalfArgs A, const DJob* __restrict__ j1, int nj1, long long nt1,
-                                                 const DJob* __restrict__ j2, int nj2, long long nt2) {
+                                                    const DJob* __restrict__ j2, int nj2, long long nt2) {
   namespace cg = cooperative_groups;
   cg::grid_group grid = cg::this_grid();
   __shared__ double s_sh[33];
@@ -1918,25 +2031,30 @@ __global__ void __launch_bounds__(256, 2) k_dn_half(const __grid_constant__ DnHa
   float* sm = s_lut + (ONLY < 0 ? 2048 : 0);  // past the LUT: the beta / alpha staging, then the units' q / k / v
   const long long warps = static_cast<long long>(gridDim.x) * (blockDim.x / 32);
   const long long w0 = static_cast<long long>(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32;
-  // ---- 0
+  const bool phs = A.ph != nullptr && blockIdx.x == 0 && threadIdx.x == 0;
+  if (phs) A.ph[0] = gtimer_s();
+  // ---- 0 (block 0); the others prefetch their first stage-1 tasks
   if (blockIdx.x == 0) dn_stage0(A, s_sh);
+  else if (A.l2pf) l2_prefetch_q8(j1, nj1, w0, nt1, warps, 4);
   grid.sync();
+  if (phs) A.ph[1] = gtimer_s();
   // ---- 1
   if (static_cast<int>(blockIdx.x) < (2 * A.nv + 7) / 8) dn_stage1_ba<NJ>(A, sm);
-  {
-    int hint = 0;
-    for (long long t = w0; t < nt1; t += warps) run_task<false, ONLY, 1>(j1, nj1, t, &hint);
-  }
+  dn_stream<ONLY, kMT>(j1, nj1, nt1);
   grid.sync();
-  // ---- 2
+  if (phs) A.ph[2] = gtimer_s();
+  // ---- 2; every warp first prefetches its stage-3 tasks
+  if (A.l2pf) l2_prefetch_q8(j2, nj2, w0, nt2, warps, 64);
   const int nu = A.nv * (A.ds / kDnRows);
-  for (int u = static_cast<int>(blockIdx.x); u < nu; u += static_cast<int>(gridDim.x)) dn_stage2_unit(A, u, sm, s_sh, &s_last);
-  grid.sync();
-  // ---- 3
-  {
-    int hint = 0;
-    for (long long t = w0; t < nt2; t += warps) run_task<false, ONLY, 1>(j2, nj2, t, &hint);
+  for (int u = static_cast<int>(blockIdx.x); u < nu; u += static_cast<int>(gridDim.x)) {
+    dn_stage2_unit(A, u, sm, s_sh);
+    dn_stage2_rec(A, u, sm, s_sh, &s_last);
   }
+  grid.sync();
+  if (phs) A.ph[3] = gtimer_s();
+  // ---- 3
+  dn_stream<ONLY, kMT>(j2, nj2, nt2);
+  if (phs) A.ph[4] = gtimer_s();  // block 0's end of stage 3
 }
 
 bool dn_half_ok(const DnHalfArgs& A) {
@@ -1944,27 +2062,34 @@ bool dn_half_ok(const DnHalfArgs& A) {
   if (!A.x || !A.norm_w || !A.xn || !A.xr || !A.q || !A.scale || !A.sum || !A.p_in || !A.p_out || !A.wb || !A.wa || !A.beta || !A.alpha || !A.dt ||
       !A.ssm_a || !A.mixed || !A.zg || !A.tail || !A.new_tail || !A.conv_w || !A.state || !A.core || !A.gn_w || !A.hcnt)
     return false;
-  if (A.H % 32 != 0 || !(nsub == 8 || nsub == 16 || nsub == 32 || nsub == 64 || nsub == 128) || A.ds != 128 || A.nk <= 0 || A.nv <= 0 ||
-      A.nv % A.nk != 0 || A.taps < 1 || A.ch < (2 * A.nk + A.nv) * A.ds)
+  if (A.n < 1 || A.n > 4 || (A.n > 1 && A.ckpt && !A.msave) || A.H % 32 != 0 || !(nsub == 8 || nsub == 16 || nsub == 32 || nsub == 64 || nsub == 128) ||
+      A.n * nsub * md::kGvPad * 4 > 48 * 1024 || A.ds != 128 || A.nk <= 0 || A.nv <= 0 || A.nv % A.nk != 0 || A.taps < 1 || A.ch < (2 * A.nk + A.nv) * A.ds)
     return false;
   if (A.rbb % 16 != 0 || A.rba % 16 != 0 || (reinterpret_cast<std::uintptr_t>(A.wb) & 15u) || (reinterpret_cast<std::uintptr_t>(A.wa) & 15u) ||
       (reinterpret_cast<std::uintptr_t>(A.xn) & 15u) || reinterpret_cast<std::uintptr_t>(A.q) % 16 != 0)
     return false;
   const int f1 = A.p_in->fmt1(), f2 = A.p_out->fmt1();
-  return f1 >= 0 && f2 >= 0 && A.p_in->jobs_dev() && A.p_out->jobs_dev();  // one-token plans
+  return f1 >= 0 && f2 >= 0 && A.p_in->jobs_dev() && A.p_out->jobs_dev() && A.p_in->multi() == (A.n > 1) && A.p_out->multi() == (A.n > 1);
 }
 
 bool dn_half(const DnHalfArgs& A, Stream s) {
   if (!dn_half_ok(A)) return sfail("dn_half: shapes or pointers it does not take");
   if (!grid_ready()) return false;
-  const int nsub = A.H / 32, nj = nsub <= 32 ? 1 : nsub / 32;
+  const int nsub = A.H / 32, nj = nsub <= 32 ? 1 : nsub / 32, ji = nj == 1 ? 0 : (nj == 2 ? 1 : 2);
   const bool lean = A.p_in->fmt1() == kQ8_0 && A.p_out->fmt1() == kQ8_0;  // the dense half's Q8_0 decode alone (v55d's lean kernel)
-  void* fn = nullptr;
-  if (lean) fn = nj == 1 ? reinterpret_cast<void*>(k_dn_half<kQ8_0, 1>) : nj == 2 ? reinterpret_cast<void*>(k_dn_half<kQ8_0, 2>) : reinterpret_cast<void*>(k_dn_half<kQ8_0, 4>);
-  else fn = nj == 1 ? reinterpret_cast<void*>(k_dn_half<-1, 1>) : nj == 2 ? reinterpret_cast<void*>(k_dn_half<-1, 2>) : reinterpret_cast<void*>(k_dn_half<-1, 4>);
-  const int smem = (lean ? 0 : kLutBytes) + std::max(nsub * md::kGvPad * 4, (2 * A.ds + kDnRows) * 4);
-  static int grids[2][3] = {};
-  int& grid = grids[lean ? 1 : 0][nj == 1 ? 0 : (nj == 2 ? 1 : 2)];
+  const bool mt = A.n > 1;
+  static void* const fns[2][2][3] = {
+      {{reinterpret_cast<void*>(k_dn_half<-1, 1, false>), reinterpret_cast<void*>(k_dn_half<-1, 2, false>), reinterpret_cast<void*>(k_dn_half<-1, 4, false>)},
+       {reinterpret_cast<void*>(k_dn_half<-1, 1, true>), reinterpret_cast<void*>(k_dn_half<-1, 2, true>), reinterpret_cast<void*>(k_dn_half<-1, 4, true>)}},
+      {{reinterpret_cast<void*>(k_dn_half<kQ8_0, 1, false>), reinterpret_cast<void*>(k_dn_half<kQ8_0, 2, false>),
+        reinterpret_cast<void*>(k_dn_half<kQ8_0, 4, false>)},
+       {reinterpret_cast<void*>(k_dn_half<kQ8_0, 1, true>), reinterpret_cast<void*>(k_dn_half<kQ8_0, 2, true>),
+        reinterpret_cast<void*>(k_dn_half<kQ8_0, 4, true>)}}};
+  void* fn = fns[lean ? 1 : 0][mt ? 1 : 0][ji];
+  // the largest shared memory any token count uses (so one opt-in and one grid per kernel)
+  const int smem = (lean ? 0 : kLutBytes) + std::max(4 * nsub * md::kGvPad * 4, 4 * (2 * A.ds + kDnRows) * 4);
+  static int grids[2][2][3] = {};
+  int& grid = grids[lean ? 1 : 0][mt ? 1 : 0][ji];
   if (!grid) {
     int dev = 0, sms = 0, occ = 0, coop = 0;
     if (!sck(cudaGetDevice(&dev), "cudaGetDevice") || !sck(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev), "SM count") ||
@@ -1976,8 +2101,8 @@ bool dn_half(const DnHalfArgs& A, Stream s) {
     if (occ < 1) return sfail("dn_half: the kernel does not fit on an SM");
     if (sms * occ < (2 * A.nv + 7) / 8) return sfail("dn_half: fewer blocks than the beta / alpha rows need");
     grid = sms * occ;
-    std::fprintf(stderr, "dn_half (L3): %s decode, H %d: grid %d (%d SMs x %d blocks), shared memory %d B\n", lean ? "Q8_0" : "every format", A.H, grid, sms,
-                 occ, smem);
+    std::fprintf(stderr, "dn_half (L3): %s decode, %s, H %d: grid %d (%d SMs x %d blocks), shared memory %d B\n", lean ? "Q8_0" : "every format",
+                 mt ? "2-4 tokens" : "1 token", A.H, grid, sms, occ, smem);
   }
   DnHalfArgs a = A;
   const DJob* j1 = static_cast<const DJob*>(A.p_in->jobs_dev());
@@ -2027,8 +2152,9 @@ void stream_kernel_report() {  // v55b: registers, local memory and blocks per S
                   {reinterpret_cast<const void*>(k_stream<false, kQ8_0>), "k_stream<Q8_0 only>", kLutBytes},
                   {reinterpret_cast<const void*>(k_stream<false, kQ6K>), "k_stream<Q6_K only>", kLutBytes},
                   {reinterpret_cast<const void*>(k_staged<false>), "k_staged<1 token>", kLutBytes},
-                  {reinterpret_cast<const void*>(k_dn_half<kQ8_0, 2>), "k_dn_half<Q8_0> (L3)", 64 * md::kGvPad * 4},
-                  {reinterpret_cast<const void*>(k_dn_half<-1, 2>), "k_dn_half<every format>", kLutBytes + 64 * md::kGvPad * 4},
+                  {reinterpret_cast<const void*>(k_dn_half<kQ8_0, 2, false>), "k_dn_half<Q8_0, 1 token>", 4 * 64 * md::kGvPad * 4},
+                  {reinterpret_cast<const void*>(k_dn_half<kQ8_0, 2, true>), "k_dn_half<Q8_0, 2-4>", 4 * 64 * md::kGvPad * 4},
+                  {reinterpret_cast<const void*>(k_dn_half<-1, 2, false>), "k_dn_half<every format>", kLutBytes + 4 * 64 * md::kGvPad * 4},
                   // v55e diagnosis (temporary): the planner, and the expert stage compiled for each one format
                   {reinterpret_cast<const void*>(k_rx_plan), "k_rx_plan", 0},
                   {reinterpret_cast<const void*>(k_rx_probe<kQ4TG2P>), "k_rx<Q4_TG2 planes only>", kLutRxBytes + 8 * sb},

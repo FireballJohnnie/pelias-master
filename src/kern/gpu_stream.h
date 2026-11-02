@@ -79,9 +79,10 @@ class StreamPlan {
   long long tasks() const { return ntasks_; }
   std::uint64_t bytes() const { return bytes_; }  // weight bytes one run reads
   // v55g (L3): the device job table (for a fused launch that runs this plan's tasks as one of its stages) and the one format
-  // every job has (one-token plans only; -1: mixed formats or several tokens)
+  // every job has (-1: mixed formats)
   const void* jobs_dev() const;
   int fmt1() const { return fmt1_; }
+  bool multi() const { return mt_; }  // v56: the jobs carry 2-4 tokens
 
  private:
   void* dev_ = nullptr;           // device copy: job table, stage ends (in tasks), groups, counters
@@ -156,6 +157,7 @@ struct MoeHalfArgs {
   // 0 warp cycles waiting for a group, 1 cycles running tasks, 2 tasks, 3 the warps' loop spans, 4 warps, 5 staged tasks,
   // 6 filling tasks, 7 cycles of staged tasks, 8 + f cycles of format f (DJob fmt 0..10, 11 other), 20 + f tasks of format f
   unsigned long long* st = nullptr;
+  int l2pf = 0;  // v56: each warp prefetches its expert-stage rows into L2 before running its tasks (EngineOptions::l2_prefetch)
 };
 constexpr int kRxStatN = 32;
 bool moe_half(const MoeHalfArgs& args, Stream s = nullptr);
@@ -197,6 +199,11 @@ struct DnHalfArgs {
   const float* gn_w = nullptr;     // ds gated norm weight
   float qscale = 0.0f;             // 1 / sqrt(ds) as the host computes it
   unsigned* hcnt = nullptr;        // nv counters, zero between launches (the last unit of a head resets its own)
+  int n = 1;                       // v56: tokens (1-4; rows of H / ch / nv x ds at their strides; the plans' jobs carry n tokens)
+  float* ckpt = nullptr;           // v56: verify steps: the state after each token t < n - 1 (k_dn_rec_reg_ck's layout), or null
+  float* msave = nullptr;          // v56: with ckpt: the batch's conv inputs (n x ch) copied, as deltanet_block's mixed_save
+  int l2pf = 1;                    // v56: the next stage's Q8_0 rows prefetched into L2 during stages 0 and 2 (0: off, the A/B)
+  unsigned long long* ph = nullptr;  // v56: null, or 5 GPU-clock stamps by block 0 (start, after stages 0, 1, 2, end)
 };
 // whether dn_half takes these shapes and pointers (ds 128, F32 beta / alpha on the fast path's terms, one-token direct plans)
 bool dn_half_ok(const DnHalfArgs& args);
