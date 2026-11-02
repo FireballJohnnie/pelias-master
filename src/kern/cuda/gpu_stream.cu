@@ -1082,8 +1082,11 @@ __device__ __forceinline__ void red_release_add(unsigned long long* p, unsigned 
 }
 
 // every job at once (r3_stream2<2, 1>)
+// v55c (author 03:43; v55b kernel report: 170-255 registers, 1 block of 256 per SM): the one-token kernels ask for 2 blocks
+// per SM (at most 128 registers, as r3_stream had on 2026-10-29 at 473 GB/s); the 2-4-token kernels keep 1 (their per-token
+// accumulators). The arithmetic is unchanged; only how many warps are in flight.
 template <bool kMT>
-__global__ void __launch_bounds__(256) k_stream(const DJob* __restrict__ jobs, int njobs, long long t_end) {
+__global__ void __launch_bounds__(256, kMT ? 1 : 2) k_stream(const DJob* __restrict__ jobs, int njobs, long long t_end) {
   lut_setup();
   const long long warps = static_cast<long long>(gridDim.x) * (blockDim.x / 32);
   int hint = 0;
@@ -1095,7 +1098,7 @@ __global__ void __launch_bounds__(256) k_stream(const DJob* __restrict__ jobs, i
 // group's tasks (acquire) and its own tasks may signal a group (release). done[] and gdone[] are never reset: run number
 // epoch (1-based) waits for epoch x the counts.
 template <bool kMT>
-__global__ void __launch_bounds__(256) k_staged(const DJob* __restrict__ jobs, int njobs, const long long* __restrict__ stage_end, int nstages,
+__global__ void __launch_bounds__(256, kMT ? 1 : 2) k_staged(const DJob* __restrict__ jobs, int njobs, const long long* __restrict__ stage_end, int nstages,
                                                 unsigned long long* done, const int* __restrict__ grp, const int* __restrict__ dep,
                                                 const long long* __restrict__ gtasks, unsigned long long* gdone, unsigned long long epoch) {
   lut_setup();
@@ -1483,7 +1486,7 @@ __device__ __forceinline__ void rx_body(const std::uint8_t* __restrict__ plan, i
   }
 }
 template <bool kMT>
-__global__ void __launch_bounds__(256) k_rx(const std::uint8_t* __restrict__ plan, int maxp, int sbytes) {
+__global__ void __launch_bounds__(256, kMT ? 1 : 2) k_rx(const std::uint8_t* __restrict__ plan, int maxp, int sbytes) {
   lut_setup_rx();
   rx_body<kMT>(plan, maxp, sbytes);
 }
@@ -1496,7 +1499,7 @@ __global__ void __launch_bounds__(256) k_rx(const std::uint8_t* __restrict__ pla
 //  D every thread: the combine (md::rd3_combine_one) into y and the residual x = (x + a) + y
 // A grid barrier between phases. The values and their order are the separate kernels', so the bits are theirs.
 template <bool kMT, int NJ>
-__global__ void __launch_bounds__(256) k_moe_half(const MoeHalfArgs A, int sbytes) {
+__global__ void __launch_bounds__(256, kMT ? 1 : 2) k_moe_half(const MoeHalfArgs A, int sbytes) {
   namespace cg = cooperative_groups;
   cg::grid_group grid = cg::this_grid();
   __shared__ double s_sh[33];
