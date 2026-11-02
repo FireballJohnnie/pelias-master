@@ -332,7 +332,9 @@ std::vector<float> engine_case(const Small& sm, int hot, const char* what, bool 
         if (tr.compare(i, 2, "L\t") == 0) ++l_lines;
         i = j == std::string::npos ? tr.size() : j + 1;
       }
-      CHECK(s_lines == static_cast<std::size_t>(std::max(0, n - 29)) && l_lines == s_lines * s.n_layer);
+      // v48: with the prompt on the GPU (the default), the prefill pieces (16, 13) are reader steps too: 4 + 4 steps of up to 4
+      const std::size_t pre = eo.gpu_prompt && n >= 29 ? 8 : 0;
+      CHECK(s_lines == pre + static_cast<std::size_t>(std::max(0, n - 29)) && l_lines == s_lines * s.n_layer);
       if (pass == 0) std::printf("    %s: trace %zu steps, %zu layer lines\n", what, s_lines, l_lines);
     }
     if (pass == 0) first = eng;
@@ -364,7 +366,8 @@ std::vector<float> engine_case(const Small& sm, int hot, const char* what, bool 
   CHECK(top >= 0.95);
   if (hot == 0 && !reader) CHECK(hp == 0);  // v25: a reader step counts every pick as on the GPU
   if (hot == static_cast<int>(s.n_expert)) CHECK(cp == 0);
-  if (hot > 0 && hot < static_cast<int>(s.n_expert)) CHECK(hp > 0 && cp > 0);
+  // v48: with the reader on and the prompt on the GPU (the default) no pick goes to the CPU, the prompt's included
+  if (hot > 0 && hot < static_cast<int>(s.n_expert)) CHECK(reader && eo.gpu_prompt ? hp > 0 && cp == 0 : hp > 0 && cp > 0);
   if (timeline) {  // v19: every doorbell step counted (2 passes of 2 prefill pieces + the single tokens), times sane
     const m::EngineTimeline& T = f.value->timeline();
     const int steps_per_pass = 2 + std::max(0, n - 29);
