@@ -2434,7 +2434,7 @@ int cmd_engine_check(const Args& a) {
                  "                           [--text FILE [--skip-tokens N]] [--timeline] [--dump-top OUT.tsv] [--dump-router OUT.tsv] [--dump-draft OUT.tsv] [--dump-split [--split-sizes 2,3,4] [--split-step]]\n"
                  "                           [--no-doorbell] [--timeline-ops] [--split-ref] [--bank-selftest MIXES] [--probe-pos P]\n"
                  "                           [--router-tie BAND] [--cold-on-gpu] [--trace OUT.tsv] [--reader-v25] [--reader-cache K] [--fold-shared]\n"
-                 "                           [--batch-identical] [--graph] [--prefetch] [--plane-tail N] [--cpu-light] [--reader-rpw 1|2] [--r3-experts] [--rx-load lane|miss|all] [--prompt-batched] [--prompt-halves] [--cpu-prompt] [--no-cache-pools] [--no-fast-f32] [--no-fused-moe] [--plane-bits 2|3|4|5] [--auto-vram [--cache-share F]] [--verbose-gpu]\n"
+                 "                           [--batch-identical] [--graph] [--prefetch] [--plane-tail N] [--cpu-light] [--reader-rpw 1|2] [--r3-experts] [--rx-load lane|miss|all] [--prompt-batched] [--prompt-halves] [--cpu-prompt] [--no-cache-pools] [--no-fast-f32] [--no-lean-dense] [--no-fused-moe] [--plane-bits 2|3|4|5] [--auto-vram [--cache-share F]] [--verbose-gpu]\n"
                  "                           [--pin-gap-kib K] [--pin-huge-ok] [--cpu-up-rows N] [--cpu-down2] [--cpu-gu2] [--cpu-tile] [--spin-pause] [--cpu-prefetch] [--cpu-check] [--host-wait auto|spin|yield|block] [--pin-cpus 0,2,4,...] [--pin-host N] [--ref-threads N] [--no-cpu-light] [--split-slow] [--preload-light]\n");
     return 1;
   }
@@ -2651,6 +2651,7 @@ int cmd_engine_check(const Args& a) {
   }
   eo.cache_pools = !a.has("no-cache-pools");  // v51 (temporary switch)
   eo.fast_f32 = !a.has("no-fast-f32");        // v52 (temporary switch)
+  eo.lean_dense = !a.has("no-lean-dense");    // v55e (temporary switch)
   eo.fused_moe = !a.has("no-fused-moe");      // v52 (temporary switch)
   eo.verbose_gpu = a.has("verbose-gpu");       // v55b
   if (a.has("plane-bits")) {  // v54b

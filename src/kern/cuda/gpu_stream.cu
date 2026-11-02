@@ -68,7 +68,8 @@ struct DJob {
 __constant__ float c_grid[4][16];  // the Q4_TG2 grids (quant::q4_tg_grid(tag, 2)), uploaded once
 __constant__ float c_grid3[4][16];  // v54: the 3-bit and 2-bit base grids (tg2p_base_grid of c_grid), uploaded once
 __constant__ float c_grid2[4][16];
-__constant__ int c_rx_bits;  // v55b: the one grid the expert stage loads (4, 3 or 2; 0 = 4)
+__constant__ int c_rx_bits;
+bool g_lean_dense = true;  // v55e experiment switch (--no-lean-dense): v55d's lean one-format dense kernels on / off; removed once measured  // v55b: the one grid the expert stage loads (4, 3 or 2; 0 = 4)
 __device__ __forceinline__ unsigned long long gtimer_s() {  // v55b: the GPU's global nanosecond clock (as gpu_ops.cu's gtimer)
   unsigned long long t;
   asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
@@ -726,7 +727,7 @@ __device__ __forceinline__ void red_release_add(unsigned long long* p, unsigned 
 // registers (the 2026-11-02 texture probe's lean Q8_0 GEMV: 39-64 registers, 6 blocks per SM, 503 GB/s, MEASURED)
 template <bool kMT, int ONLY = -1>
 __global__ void __launch_bounds__(256) k_stream(const DJob* __restrict__ jobs, int njobs, long long t_end) {
-  lut_setup();
+  if constexpr (ONLY < 0 || ONLY == kQ4TG2 || ONLY == kQ4TG2P) lut_setup();  // v55e: a lean kernel of another format reads no grid
   const long long warps = static_cast<long long>(gridDim.x) * (blockDim.x / 32);
   int hint = 0;
   for (long long t = static_cast<long long>(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32; t < t_end; t += warps)
@@ -1453,7 +1454,7 @@ bool StreamPlan::build(const StreamJob* jobs, int njobs, const int* stage_end, i
   // v55d: a one-token plan whose jobs are all Q8_0 (or all Q6_K) runs the kernel compiled for that format alone
   only_ = -1;
   grid_lean_ = 0;
-  if (!mt_ && !dj.empty()) {
+  if (g_lean_dense && !mt_ && !dj.empty()) {
     const int f0 = dj[0].fmt;
     bool same = f0 == kQ8_0 || f0 == kQ6K;
     for (const DJob& D : dj) same = same && D.fmt == f0;
@@ -1462,7 +1463,11 @@ bool StreamPlan::build(const StreamJob* jobs, int njobs, const int* stage_end, i
       int occl = 0;
       if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occl, fn, 256, kLutBytes) == cudaSuccess && occl >= 1) {
         only_ = f0;
-        grid_lean_ = sms * occl;
+        // v55e: no more blocks than the plan's tasks fill (8 warps a block): v55d launched every resident block (5 x 46
+        // for Q8_0) even for a matrix of a few hundred tasks (v55d A/B: 1.2-1.3 ms per token slower than g55b, MEASURED;
+        // the lean kernels are the suspect, --no-lean-dense the control)
+        const long long need = (ntasks_ + 7) / 8;
+        grid_lean_ = static_cast<int>(std::min<long long>(static_cast<long long>(sms) * occl, need < 1 ? 1 : need));
       }
       (void)cudaGetLastError();
     }
@@ -1636,6 +1641,8 @@ bool moe_half(const MoeHalfArgs& A, Stream s) {
   return sck(cudaLaunchCooperativeKernel(fn, dim3(static_cast<unsigned>(grid)), dim3(256), args, static_cast<std::size_t>(smem), sst(s)),
              "moe_half: cooperative launch");
 }
+
+void set_lean_dense(bool on) { g_lean_dense = on; }  // v55e (temporary switch)
 
 bool rx_set_grid_bits(int bits) {  // v55b
   const int b = bits == 3 || bits == 2 ? bits : 4;

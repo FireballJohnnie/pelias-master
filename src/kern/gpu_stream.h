@@ -151,6 +151,8 @@ bool moe_half(const MoeHalfArgs& args, Stream s = nullptr);
 bool rx_set_grid_bits(int bits);
 // v55b: the kernels' resource use for the log (registers, local memory, blocks per SM), one line per kernel
 void stream_kernel_report();
+// v55e (temporary switch, --no-lean-dense): v55d's lean one-format dense kernels on (default) or off; set before plans are built
+void set_lean_dense(bool on);
 // v46a-2 load_mode: 0 each lane loads its own 16-byte pieces (v46a-1); 1 a warp first copies its task's rows contiguously into
 // shared memory for experts read from RAM (every 32-byte sector over PCIe once; the slot filled by the same copy); 2 the same
 // for every expert. The arithmetic is the same in all three, so the outputs are equal bit for bit.
