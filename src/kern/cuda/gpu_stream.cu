@@ -2124,14 +2124,82 @@ __device__ PG_NOINL void dn_stage1_ba_sm(const DnHalfArgs& A, const float* xs) {
     }
   }
 }
-// a one-token plan's tasks with the activations from shared memory (run_task's one-token arithmetic, M = 4)
+// a one-token plan's tasks with the activations from shared memory (run_task's one-token arithmetic, M = 4).
+// v56c (author 12:57 "do it"): Q8_0 tasks two at a time per warp: both tasks' weight loads (8 x 16 B per lane each, and
+// the scales) are issued before either is computed, so each warp keeps twice the bytes in flight (L3 runs 2 blocks of 8
+// warps per SM, against the 6 blocks of the 503 GB/s lean GEMV). Each task's sums are lane_part's Q8_0 branch, operation
+// for operation (the same loads, dp4a order and d x scale x P), so the bits are the same.
+struct DnQ8Lane {
+  int4 q[8];
+  uint2 dd;
+};
+__device__ __forceinline__ void dn_q8_load(const DJob& J, int r, int part, DnQ8Lane& L) {
+  const int B = part >> 1, half = part & 1, nB = J.K / 256;
+  const std::uint8_t* bp = J.w + (static_cast<long long>(r) * nB + B) * 272;
+  L.dd = *reinterpret_cast<const uint2*>(bp + 256 + half * 8);
+#pragma unroll
+  for (int jj = 0; jj < 4; ++jj) {
+    L.q[2 * jj] = ldw(true, bp + half * 128 + 32 * jj);
+    L.q[2 * jj + 1] = ldw(true, bp + half * 128 + 32 * jj + 16);
+  }
+}
+__device__ __forceinline__ float dn_q8_dot(int part, const DnQ8Lane& L, const std::int8_t* xq, const float* xs) {
+  const int B = part >> 1, half = part & 1, jg0 = B * 8 + half * 4;
+  float acc = 0.f;
+#pragma unroll
+  for (int jj = 0; jj < 4; ++jj) {
+    const int jg = jg0 + jj;
+    const int4 qa = L.q[2 * jj], qb = L.q[2 * jj + 1];
+    const std::uint32_t dw = (jj < 2 ? L.dd.x : L.dd.y) >> (16 * (jj & 1));
+    const float d = __half2float(__ushort_as_half(static_cast<unsigned short>(dw & 0xffffu)));
+    int xj[8];
+    ld_x8<4>(xq, jg, xj);
+    int P = 0;
+    P = __dp4a(qa.x, xj[0], P);
+    P = __dp4a(qa.y, xj[1], P);
+    P = __dp4a(qa.z, xj[2], P);
+    P = __dp4a(qa.w, xj[3], P);
+    P = __dp4a(qb.x, xj[4], P);
+    P = __dp4a(qb.y, xj[5], P);
+    P = __dp4a(qb.z, xj[6], P);
+    P = __dp4a(qb.w, xj[7], P);
+    acc += d * ldxs<4>(xs + jg) * static_cast<float>(P);
+  }
+  return acc;
+}
 template <int ONLY>
 __device__ PG_NOINL void dn_stream_sm(const DnHalfArgs& A, const DJob* __restrict__ jobs, int nj, long long nt, const std::int8_t* sq, const float* ssc,
                                       const int* ssum) {
   const long long warps = static_cast<long long>(gridDim.x) * (blockDim.x / 32);
   const int lane = static_cast<int>(threadIdx.x & 31);
   int hint = 0;
-  for (long long t = static_cast<long long>(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32; t < nt; t += warps) {
+  long long t = static_cast<long long>(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32;
+  if constexpr (ONLY == kQ8_0) {
+    if (A.mlp2) {
+      for (; t < nt; t += 2 * warps) {
+        const long long t2 = t + warps;
+        const bool two = t2 < nt;
+        const DJob& J1 = jobs[find_job(jobs, nj, t, &hint)];
+        const DJob& J2 = jobs[find_job(jobs, nj, two ? t2 : t, &hint)];
+        const int r1 = static_cast<int>((t - J1.task0) * (32 / J1.lpr)) + lane / J1.lpr, p1 = lane % J1.lpr;
+        const int r2 = two ? static_cast<int>((t2 - J2.task0) * (32 / J2.lpr)) + lane / J2.lpr : 0, p2 = lane % J2.lpr;
+        const bool ok1 = r1 < J1.n, ok2 = two && r2 < J2.n;
+        DnQ8Lane L1, L2;
+        if (ok1) dn_q8_load(J1, r1, p1, L1);
+        if (ok2) dn_q8_load(J2, r2, p2, L2);
+        float a1 = ok1 ? dn_q8_dot(p1, L1, sq + (J1.xq - A.q), ssc + (J1.xs - A.scale)) : 0.f;
+        for (int o = J1.lpr / 2; o > 0; o >>= 1) a1 += __shfl_xor_sync(0xffffffffu, a1, o);
+        if (ok1 && p1 == 0) J1.y[r1] = a1;
+        if (two) {
+          float a2 = ok2 ? dn_q8_dot(p2, L2, sq + (J2.xq - A.q), ssc + (J2.xs - A.scale)) : 0.f;
+          for (int o = J2.lpr / 2; o > 0; o >>= 1) a2 += __shfl_xor_sync(0xffffffffu, a2, o);
+          if (ok2 && p2 == 0) J2.y[r2] = a2;
+        }
+      }
+      return;
+    }
+  }
+  for (; t < nt; t += warps) {
     const DJob& J = jobs[find_job(jobs, nj, t, &hint)];
     const int rpw = 32 / J.lpr;
     const int r = static_cast<int>((t - J.task0) * rpw) + lane / J.lpr, part = lane % J.lpr;

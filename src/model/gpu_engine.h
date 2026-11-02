@@ -54,6 +54,7 @@ struct EngineOptions {
   bool dn_half = false;  // v55g (L3): a DeltaNet layer's dense half in one launch; v56b: off by default (v56 MEASURED +4.6 ms), --dn-half for the A/B
   bool l2_prefetch = false;  // v56: L2 prefetch inside the fused launches; v56b: off by default (v56 MEASURED +0.5 ms, no gain), --l2pf for the A/B
   bool dn_smem = true;  // v56b: inside L3, each block normalizes and rounds the inputs itself into shared memory (no stage-0 barrier; tasks read shared); --no-dn-smem
+  bool dn_mlp2 = true;  // v56c: inside L3 (shared inputs), Q8_0 tasks two at a time per warp; --no-dn-mlp2
   // v52: the MoE half of each layer (residual, post norm, rounding, router, shared gate, picks, grouping, plan, R3 expert
   // stage, combine, residual) in one cooperative launch (g::moe_half); same bits (--no-fused-moe, temporary)
   bool fused_moe = true;
