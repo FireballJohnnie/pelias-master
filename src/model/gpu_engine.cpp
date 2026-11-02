@@ -977,6 +977,7 @@ struct GpuEngine::Impl {
     A.hcnt = dn_hcnt;
     A.l2pf = o.l2_prefetch ? 1 : 0;
     A.n = static_cast<int>(n);
+    A.smact = o.dn_smem && n == 1 && A.rot_in == 0 ? 1 : 0;  // v56b
     const bool ck = ckpt_mode && n > 1;  // v56: a verify step keeps every prefix's state (k_dn_rec_reg_ck) and the batch's conv inputs
     A.ckpt = ck ? D.ckpt : nullptr;
     A.msave = ck ? D.mixed_save : nullptr;

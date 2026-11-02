@@ -203,6 +203,7 @@ struct DnHalfArgs {
   float* ckpt = nullptr;           // v56: verify steps: the state after each token t < n - 1 (k_dn_rec_reg_ck's layout), or null
   float* msave = nullptr;          // v56: with ckpt: the batch's conv inputs (n x ch) copied, as deltanet_block's mixed_save
   int l2pf = 1;                    // v56: the next stage's Q8_0 rows prefetched into L2 during stages 0 and 2 (0: off, the A/B)
+  int smact = 1;                   // v56b: one token, Q8_0, rot_in 0: every block keeps the inputs in shared memory (0: v56's stages)
   unsigned long long* ph = nullptr;  // v56: null, or 5 GPU-clock stamps by block 0 (start, after stages 0, 1, 2, end)
 };
 // whether dn_half takes these shapes and pointers (ds 128, F32 beta / alpha on the fast path's terms, one-token direct plans)

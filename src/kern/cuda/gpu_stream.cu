@@ -137,19 +137,23 @@ __device__ __forceinline__ std::uint32_t ld_cs1(const void* p) {
   asm volatile("ld.global.cs.u32 %0, [%1];" : "=r"(v) : "l"(p));
   return v;
 }
+// v56b: M = 4 reads the activations with generic loads (L3 keeps each block's copy of them in shared memory); the weights as M 0
 template <int M>
 __device__ __forceinline__ int4 ldx4(const int4* p) {
   if constexpr (M == 0) return __ldg(p);
+  else if constexpr (M == 4) return *p;
   else return ld_cg4(p);
 }
 template <int M>
 __device__ __forceinline__ float ldxs(const float* p) {
   if constexpr (M == 0) return __ldg(p);
+  else if constexpr (M == 4) return *p;
   else return ld_cgf(p);
 }
 template <int M>
 __device__ __forceinline__ int ldxi(const int* p) {
   if constexpr (M == 0) return __ldg(p);
+  else if constexpr (M == 4) return *p;
   else return ld_cgi(p);
 }
 // a weight load; with M = 2 (a cache miss being filled) and st, the 16 bytes also go to the same offset in the slot
@@ -2068,6 +2072,90 @@ __device__ PG_NOINL void dn_stream(const DJob* __restrict__ jobs, int nj, long l
   for (long long t = static_cast<long long>(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32; t < nt; t += warps) run_task<kMT, ONLY, 1>(jobs, nj, t, &hint);
 }
 
+// v56b (v56 MEASURED: L3's streams at ~195 / ~128 GB/s against the separate kernels' ~236 with the same tasks; their
+// activations were read with L1-bypassing loads, one L2 read per warp task, as many bytes as the weights; and stage 0 ran
+// on block 0 alone, 0.50 ms per token): one-token L3 with the inputs in each block's shared memory. Stage 0 runs in every
+// block (the same sums: k_rms_norm_q8x32's sum of squares and expressions; the rounding by warps as round32_lanes, whose
+// max and integer sum do not depend on order), so no barrier follows it; block 0 also writes xn, xr, q, scale, sum. The
+// stream tasks read the activations from shared memory (M = 4); stage 3 first copies the ssm_out inputs stage 2 wrote.
+// Shared: [staging nsub x 36 floats, reused by stage 2] [q max(H, di)] [scale max / 32] [sum max / 32]
+__device__ PG_NOINL void dn_stage0_sm(const DnHalfArgs& A, double* sh, float* xs, std::int8_t* sq, float* ssc, int* ssum) {
+  const int n = A.H, nsub = n / 32;
+  const int tid = static_cast<int>(threadIdx.x), lane = tid & 31, warp = tid >> 5;
+  const float* x = A.x;
+  double part = 0.0;
+  for (int i = tid; i < n; i += static_cast<int>(blockDim.x)) part += static_cast<double>(mul(x[i], x[i]));
+  const double ssum2 = md::block_sum_d(part, sh);
+  const float mean = static_cast<float>(ssum2 / static_cast<double>(n));
+  const float rs = quo(1.0f, sqrtf(add(mean, A.eps)));
+  const bool b0 = blockIdx.x == 0;
+  for (int b = warp; b < nsub; b += static_cast<int>(blockDim.x >> 5)) {
+    const int c = 32 * b + lane;
+    const float v = mul(mul(x[c], rs), A.norm_w[c]);
+    xs[b * md::kGvPad + lane] = v;
+    if (b0) A.xn[c] = v;
+    round32_lanes(v, lane, b0 ? A.xr + 32 * b : nullptr, sq + 32 * b, ssc + b, ssum + b, nullptr);
+    if (b0) {
+      __syncwarp();
+      A.q[c] = sq[c];
+      if (lane == 0) {
+        A.scale[b] = ssc[b];
+        A.sum[b] = ssum[b];
+      }
+    }
+  }
+  __syncthreads();
+}
+template <int NJ>
+__device__ PG_NOINL void dn_stage1_ba_sm(const DnHalfArgs& A, const float* xs) {
+  const int nsub = A.H / 32, warp = static_cast<int>(threadIdx.x >> 5), lane = static_cast<int>(threadIdx.x & 31);
+  const int r = static_cast<int>(blockIdx.x) * 8 + warp;
+  if (r >= 2 * A.nv) return;
+  const int h = r % A.nv;
+  if (r < A.nv) {
+    md::gemv_row_lr<NJ>(A.wb, A.rbb, h, xs, nsub, 1, A.beta, A.nv);
+    if (lane == 0) A.beta[h] = md::sigmoid_d(A.beta[h]);
+  } else {
+    md::gemv_row_lr<NJ>(A.wa, A.rba, h, xs, nsub, 1, A.alpha, A.nv);
+    if (lane == 0) {
+      const float xv = add(A.alpha[h], A.dt[h]);
+      const float sp = xv > 20.0f ? xv : logf(add(1.0f, expf(xv)));
+      A.alpha[h] = mul(sp, A.ssm_a[h]);
+    }
+  }
+}
+// a one-token plan's tasks with the activations from shared memory (run_task's one-token arithmetic, M = 4)
+template <int ONLY>
+__device__ PG_NOINL void dn_stream_sm(const DnHalfArgs& A, const DJob* __restrict__ jobs, int nj, long long nt, const std::int8_t* sq, const float* ssc,
+                                      const int* ssum) {
+  const long long warps = static_cast<long long>(gridDim.x) * (blockDim.x / 32);
+  const int lane = static_cast<int>(threadIdx.x & 31);
+  int hint = 0;
+  for (long long t = static_cast<long long>(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32; t < nt; t += warps) {
+    const DJob& J = jobs[find_job(jobs, nj, t, &hint)];
+    const int rpw = 32 / J.lpr;
+    const int r = static_cast<int>((t - J.task0) * rpw) + lane / J.lpr, part = lane % J.lpr;
+    const std::int8_t* xq = sq + (J.xq - A.q);
+    const float* xsv = ssc + (J.xs - A.scale);
+    const int* xsm = ssum + (J.xsum - A.sum);
+    float acc = r < J.n ? lane_part<4, ONLY>(J, r, part, xq, xsv, xsm, true) : 0.f;
+    for (int o = J.lpr / 2; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+    if (r < J.n && part == 0) J.y[r] = acc;
+  }
+}
+// the ssm_out inputs (stage 2's rounding of every head, written by other blocks) into this block's shared copy
+__device__ PG_NOINL void dn_load_act(const DnHalfArgs& A, std::int8_t* sq, float* ssc, int* ssum) {
+  const int di = A.nv * A.ds, nb = di / 32, tid = static_cast<int>(threadIdx.x), nth = static_cast<int>(blockDim.x);
+  const int4* g4 = reinterpret_cast<const int4*>(A.q);
+  int4* s4 = reinterpret_cast<int4*>(sq);
+  for (int i = tid; i < di / 16; i += nth) s4[i] = ld_cg4(g4 + i);
+  for (int i = tid; i < nb; i += nth) {
+    ssc[i] = ld_cgf(A.scale + i);
+    ssum[i] = ld_cgi(A.sum + i);
+  }
+  __syncthreads();
+}
+
 // v56 (v55g MEASURED: 213-215 registers without a bound = 1 block of 256 per SM, grid 46: the streams ran on 8 warps per SM,
 // stage 2 took two rounds; +4.2 ms per token): bound to 2 blocks per SM (128 registers; ptxas v56b: 128, 0 spill), stage 2
 // in one round (92 blocks for 64 units); the next stage's Q8_0 rows prefetched into L2 during stages 0 and 2; GPU-clock
@@ -2085,6 +2173,21 @@ __global__ void __launch_bounds__(256, 2) k_dn_half(const __grid_constant__ DnHa
   const long long w0 = static_cast<long long>(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32;
   const bool phs = A.ph != nullptr && blockIdx.x == 0 && threadIdx.x == 0;
   if (phs) A.ph[0] = gtimer_s();
+  // v56b: one token, Q8_0, no rotation: the inputs in shared memory (dn_stage0_sm); otherwise v56's stages
+  constexpr bool kSmOk = !kMT && ONLY == kQ8_0;
+  const bool smact = kSmOk && A.smact;
+  const int nsub = A.H / 32, dmax = A.H > A.nv * A.ds ? A.H : A.nv * A.ds;
+  std::int8_t* sq = reinterpret_cast<std::int8_t*>(sm + nsub * md::kGvPad);
+  float* ssc = reinterpret_cast<float*>(sq + dmax);
+  int* ssum = reinterpret_cast<int*>(ssc + dmax / 32);
+  if (smact) {
+    // ---- 0 (every block, into its shared memory; no barrier)
+    dn_stage0_sm(A, s_sh, sm, sq, ssc, ssum);
+    if (phs) A.ph[1] = gtimer_s();
+    // ---- 1
+    if (static_cast<int>(blockIdx.x) < (2 * A.nv + 7) / 8) dn_stage1_ba_sm<NJ>(A, sm);
+    dn_stream_sm<ONLY>(A, j1, nj1, nt1, sq, ssc, ssum);
+  } else {
   // ---- 0 (block 0); the others prefetch their first stage-1 tasks
   if (blockIdx.x == 0) dn_stage0(A, s_sh);
   else if (A.l2pf) l2_prefetch_q8(j1, nj1, w0, nt1, warps, 4);
@@ -2093,6 +2196,7 @@ __global__ void __launch_bounds__(256, 2) k_dn_half(const __grid_constant__ DnHa
   // ---- 1
   if (static_cast<int>(blockIdx.x) < (2 * A.nv + 7) / 8) dn_stage1_ba<NJ>(A, sm);
   dn_stream<ONLY, kMT>(j1, nj1, nt1);
+  }
   grid.sync();
   if (phs) A.ph[2] = gtimer_s();
   // ---- 2; every warp first prefetches its stage-3 tasks
@@ -2105,7 +2209,12 @@ __global__ void __launch_bounds__(256, 2) k_dn_half(const __grid_constant__ DnHa
   grid.sync();
   if (phs) A.ph[3] = gtimer_s();
   // ---- 3
-  dn_stream<ONLY, kMT>(j2, nj2, nt2);
+  if (smact) {
+    dn_load_act(A, sq, ssc, ssum);
+    dn_stream_sm<ONLY>(A, j2, nj2, nt2, sq, ssc, ssum);
+  } else {
+    dn_stream<ONLY, kMT>(j2, nj2, nt2);
+  }
   if (phs) A.ph[4] = gtimer_s();  // block 0's end of stage 3
 }
 
@@ -2138,8 +2247,11 @@ bool dn_half(const DnHalfArgs& A, Stream s) {
        {reinterpret_cast<void*>(k_dn_half<kQ8_0, 1, true>), reinterpret_cast<void*>(k_dn_half<kQ8_0, 2, true>),
         reinterpret_cast<void*>(k_dn_half<kQ8_0, 4, true>)}}};
   void* fn = fns[lean ? 1 : 0][mt ? 1 : 0][ji];
-  // the largest shared memory any token count uses (so one opt-in and one grid per kernel)
-  const int smem = (lean ? 0 : kLutBytes) + std::max(4 * nsub * md::kGvPad * 4, 4 * (2 * A.ds + kDnRows) * 4);
+  // the largest shared memory any token count of the kernel uses (one opt-in and one grid per kernel); v56b: the one-token
+  // kernel also holds the inputs (q, scale, sum of the larger of H and nv x ds) after the staging
+  const int dmax = std::max(A.H, A.nv * A.ds);
+  const int smem = mt ? (lean ? 0 : kLutBytes) + std::max(4 * nsub * md::kGvPad * 4, 4 * (2 * A.ds + kDnRows) * 4)
+                      : (lean ? 0 : kLutBytes) + std::max(nsub * md::kGvPad * 4, (2 * A.ds + kDnRows) * 4) + dmax + 2 * (dmax / 32) * 4;
   static int grids[2][2][3] = {};
   int& grid = grids[lean ? 1 : 0][mt ? 1 : 0][ji];
   if (!grid) {
@@ -2153,8 +2265,8 @@ bool dn_half(const DnHalfArgs& A, Stream s) {
     if (occ < 1) return sfail("dn_half: the kernel does not fit on an SM");
     if (sms * occ < (2 * A.nv + 7) / 8) return sfail("dn_half: fewer blocks than the beta / alpha rows need");
     grid = sms * occ;
-    std::fprintf(stderr, "dn_half (L3): %s decode, %s, H %d: grid %d (%d SMs x %d blocks), shared memory %d B\n", lean ? "Q8_0" : "every format",
-                 mt ? "2-4 tokens" : "1 token", A.H, grid, sms, occ, smem);
+    std::fprintf(stderr, "dn_half (L3): %s decode, %s, H %d: grid %d (%d SMs x %d blocks), shared memory %d B%s\n", lean ? "Q8_0" : "every format",
+                 mt ? "2-4 tokens" : "1 token", A.H, grid, sms, occ, smem, !mt && lean && A.smact ? ", inputs in shared memory (v56b)" : "");
   }
   DnHalfArgs a = A;
   const DJob* j1 = static_cast<const DJob*>(A.p_in->jobs_dev());
