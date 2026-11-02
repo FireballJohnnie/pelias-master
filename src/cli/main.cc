@@ -2431,7 +2431,7 @@ int cmd_engine_check(const Args& a) {
     std::fprintf(stderr,
                  "usage: pelias engine-check --model FILE [--routes ROUTES.bin] [--prefill 64] [--decode 32] [--ctx 4096] [--batch 64] [--threads N]\n"
                  "                           [--budget-gb G] [--hot-max N] [--mtp-draft K] [--fast-cpu] [--no-cpu] [--float-ref]\n"
-                 "                           [--text FILE [--skip-tokens N]] [--timeline] [--dump-top OUT.tsv] [--dump-router OUT.tsv] [--dump-split [--split-sizes 2,3,4] [--split-step]]\n"
+                 "                           [--text FILE [--skip-tokens N]] [--timeline] [--dump-top OUT.tsv] [--dump-router OUT.tsv] [--dump-draft OUT.tsv] [--dump-split [--split-sizes 2,3,4] [--split-step]]\n"
                  "                           [--no-doorbell] [--timeline-ops] [--split-ref] [--bank-selftest MIXES] [--probe-pos P]\n"
                  "                           [--router-tie BAND] [--cold-on-gpu] [--trace OUT.tsv] [--reader-v25] [--reader-cache K] [--fold-shared]\n"
                  "                           [--batch-identical] [--graph] [--prefetch] [--plane-tail N] [--cpu-light] [--reader-rpw 1|2] [--r3-experts] [--rx-load lane|miss|all] [--cpu-prompt]\n"
@@ -2466,6 +2466,11 @@ int cmd_engine_check(const Args& a) {
     }
   }
   const std::string dump_router = a.get("dump-router");  // v49: per position, every layer's router margins
+  const std::string dump_draft = a.get("dump-draft");    // v49b: per position, the MTP draft's top-2 for the same prediction
+  if (!dump_draft.empty() && std::ifstream(dump_draft).good()) {
+    std::fprintf(stderr, "pelias: %s exists (nothing is overwritten)\n", dump_draft.c_str());
+    return 1;
+  }
   if (!dump_router.empty() && std::ifstream(dump_router).good()) {
     std::fprintf(stderr, "pelias: %s exists (nothing is overwritten)\n", dump_router.c_str());
     return 1;
@@ -2491,7 +2496,7 @@ int cmd_engine_check(const Args& a) {
   eo.cpu_threads = static_cast<int>(thr);
   eo.vram_budget = budget;
   eo.max_hot_per_layer = static_cast<int>(hmax);
-  eo.mtp = ndraft > 0;
+  eo.mtp = ndraft > 0 || !a.get("dump-draft").empty();  // v49b: the draft dump needs the MTP block
   eo.max_verify = static_cast<int>(ndraft) + 1;
   eo.timeline = a.has("timeline");
   eo.router_margins = !a.get("dump-router").empty();  // v49
@@ -2706,10 +2711,13 @@ int cmd_engine_check(const Args& a) {
     a2.cold_bytes += b2.cold_bytes;
   };
   int t = 0;
+  const std::size_t ne_ = s.n_embd;
+  std::vector<float> hid(dump_draft.empty() ? 0 : static_cast<std::size_t>(n) * ne_);  // v49b: every position's post-norm hidden
+  auto hrow = [&](int p) { return hid.empty() ? nullptr : hid.data() + static_cast<std::size_t>(p) * ne_; };
   while (t < static_cast<int>(npre)) {
     const int k = std::min(static_cast<int>(batch), static_cast<int>(npre) - t);
     model::EngineStats es;
-    if (Status st = eng.value->step(ids.data() + t, k, lg.data() + static_cast<std::size_t>(t) * nv, false, &es); !st) return fail_input(st);
+    if (Status st = eng.value->step(ids.data() + t, k, lg.data() + static_cast<std::size_t>(t) * nv, false, &es, hrow(t)); !st) return fail_input(st);
     add(tot_pre, es);
     t += k;
   }
@@ -2728,9 +2736,35 @@ int cmd_engine_check(const Args& a) {
 #endif
   for (; t < n; ++t) {
     model::EngineStats es;
-    if (Status st = eng.value->step(ids.data() + t, 1, lg.data() + static_cast<std::size_t>(t) * nv, true, &es); !st) return fail_input(st);
+    if (Status st = eng.value->step(ids.data() + t, 1, lg.data() + static_cast<std::size_t>(t) * nv, true, &es, hrow(t)); !st) return fail_input(st);
     add(tot_dec, es);
     per.push_back(es.seconds);
+  }
+  if (!dump_draft.empty()) {  // v49b: the MTP block at position p (id p with the trunk's hidden of p - 1, zeros at 0) predicts the
+    // same next token as the trunk's row p; its top-2 and margin are known before the trunk runs p (the early signal)
+    std::FILE* fd = std::fopen(dump_draft.c_str(), "w");
+    if (!fd) {
+      std::fprintf(stderr, "pelias: cannot write %s\n", dump_draft.c_str());
+      return 1;
+    }
+    std::fprintf(fd, "pos\td1\td2\td_margin\teng1\teng_margin\n");
+    const int kc = 4;
+    std::vector<float> hp(static_cast<std::size_t>(kc) * ne_), dl(static_cast<std::size_t>(kc) * nv);
+    for (int p0 = 0; p0 < n; p0 += kc) {
+      const int k = std::min(kc, n - p0);
+      for (int j = 0; j < k; ++j) {
+        float* d = hp.data() + static_cast<std::size_t>(j) * ne_;
+        if (p0 + j == 0) std::fill(d, d + ne_, 0.0f);
+        else std::copy(hrow(p0 + j - 1), hrow(p0 + j - 1) + ne_, d);
+      }
+      if (Status st = eng.value->mtp_step(ids.data() + p0, hp.data(), k, dl.data(), nullptr); !st) return fail_input(st);
+      for (int j = 0; j < k; ++j) {
+        const Top2 td = top2(dl.data() + static_cast<std::size_t>(j) * nv, nv), te = top2(lg.data() + static_cast<std::size_t>(p0 + j) * nv, nv);
+        std::fprintf(fd, "%d\t%zu\t%zu\t%.6f\t%zu\t%.6f\n", p0 + j, td.i1, td.i2, td.margin, te.i1, te.margin);
+      }
+    }
+    std::fclose(fd);
+    std::printf("  MTP draft margins: %d positions written to %s\n", n, dump_draft.c_str());
   }
   if (!dump_router.empty()) {  // v49: the main pass's router margins, one line per position (layer il: e8_il = 8th - 9th logit, t1_il = 1st - 2nd)
     std::vector<float> rm;
