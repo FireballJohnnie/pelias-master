@@ -2520,7 +2520,7 @@ int cmd_engine_check(const Args& a) {
   eo.reader_v3 = !a.has("reader-v25");
   eo.fold_shared = a.has("fold-shared");
   eo.r3_experts = a.has("r3-experts");  // v46a-1
-  eo.gpu_prompt = a.has("gpu-prompt") && !a.has("cpu-prompt");  // v49d: the GPU prompt only when asked (v48-v49 default; fails W2's gate)
+  eo.gpu_prompt = !a.has("cpu-prompt");  // v49e: the GPU prompt by default (fix forward); --cpu-prompt / --prompt-batched are temporary diagnosis switches
   eo.prompt_r3 = !a.has("prompt-batched");                       // v49d: the GPU prompt's steps on the batched kernels
   if (a.has("rx-load")) {  // v46a-2
     const std::string rxl = a.get("rx-load");
