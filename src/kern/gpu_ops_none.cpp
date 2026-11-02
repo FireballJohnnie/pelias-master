@@ -154,6 +154,8 @@ bool moe_half(const MoeHalfArgs&, Stream) { return false; }
 bool rx_set_grid_bits(int) { return false; }
 void stream_kernel_report() {}
 void set_lean_dense(bool) {}
+int rx_stage_block_bytes(std::uint32_t, int) { return 272; }
+void rx_set_stage_bytes(int) {}
 bool moe_r3(const ExpertPtr*, const ExpertPtr*, const std::int32_t*, const float*, const float*, int, const std::int8_t*, const float*, const int*,
             std::int64_t, std::int64_t, std::int64_t, const ReaderCache*, float*, std::int8_t*, float*, int*, float*, int*, ExpertPtr*, ExpertPtr*, void*,
             int, float*, unsigned long long*, Stream, int) {

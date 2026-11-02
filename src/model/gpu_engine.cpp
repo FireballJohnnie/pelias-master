@@ -396,6 +396,7 @@ struct GpuEngine::Impl {
   // v46a-1 (THE PLAN 46a): the R3 expert stage instead of the reader v3 kernels (EngineOptions::r3_experts): the int8
   // silu x up per pick, its scales and sums, the plan buffer; on only if every expert matrix is one the stage reads
   std::int8_t* rhq = nullptr;
+  std::uint32_t *rxb = nullptr, *rhb = nullptr;  // v55f: the expert inputs' and the down inputs' bit planes (the 1-bit route)
   float* rhs = nullptr;
   int* rhsum = nullptr;
   void* rxplan = nullptr;
@@ -1577,6 +1578,8 @@ struct GpuEngine::Impl {
     A.y = y;
     A.ph = ph_d ? ph_d + static_cast<int64_t>(il) * 5 : nullptr;  // v55b
     A.st = rst_d;                                                 // v55e3
+    A.xb = rxb;                                                   // v55f
+    A.hb = rhb;
     if (!g::moe_half(A)) return Status::fail(Code::internal, std::string("engine: fused MoE half: ") + g::stream_last_error());
     return Status::good();
   }
@@ -2175,11 +2178,34 @@ struct GpuEngine::Impl {
         rhsum = static_cast<int*>(g::dalloc(z(P * Fx / 32) * sizeof(int)));
         const std::uint64_t pb = g::rx_scratch_bytes(rx_maxp);
         rxplan = g::dalloc(pb);
+        // v55f: bit planes for the 1-bit route (8 words per 32 inputs = 1 byte per input): up to 4 tokens of H, every pick's
+        // F; without them the stage reads planed experts by dp4a as before
+        rxb = static_cast<std::uint32_t*>(g::dalloc(z(4 * s.n_embd)));
+        rhb = static_cast<std::uint32_t*>(g::dalloc(z(P * Fx)));
+        if (!rxb || !rhb) {
+          g::dfree(rxb);
+          g::dfree(rhb);
+          rxb = rhb = nullptr;
+        } else {
+          dev_bytes += z(4 * s.n_embd) + z(P * Fx);
+        }
         if (rhq && rhs && rhsum && rxplan) {
           dev_bytes += z(P * Fx) + z(P * Fx / 32) * 8 + pb;
           rx_ok = true;
           rx_note = "on (gate / up, silu x up, down of every pick in one R3 launch per layer)";
           // v55b: the stage's one grid in shared memory: the slider's bits for every Q4_TG2 job (planes), else the stored grid
+          {  // v55f: the staging buffer sized to the largest block of any matrix the stage stages (load mode 1: the experts
+             // not in VRAM; 2: every expert and the shared one), at the slider's bits for the plane matrices
+            int mb = 0;
+            auto take = [&](const g::ExpertPtr& X) {
+              for (int pj = 0; pj < 3; ++pj) mb = std::max(mb, g::rx_stage_block_bytes(X.type[pj], o.plane_bits));
+            };
+            for (const g::ExpertPtr& X : tab)
+              if (o.rx_load == 2 || !X.vram) take(X);
+            if (o.rx_load == 2)
+              for (const g::ExpertPtr& X : shx_h) take(X);
+            g::rx_set_stage_bytes(mb);
+          }
           if (!g::rx_set_grid_bits(o.plane_bits > 0 ? std::min(o.plane_bits, 4) : 4)) {
             rx_ok = false;
             rx_note = std::string("off (grid bits: ") + g::stream_last_error() + ")";
@@ -2292,6 +2318,8 @@ GpuEngine::~GpuEngine() {
   g::dfree(p_->rgfill);
   g::dfree(p_->rshx);
   g::dfree(p_->rhq);
+  g::dfree(p_->rxb);  // v55f
+  g::dfree(p_->rhb);
   g::dfree(p_->rhs);
   g::dfree(p_->rhsum);
   g::dfree(p_->rxplan);

@@ -142,6 +142,10 @@ struct MoeHalfArgs {
   void* plan = nullptr;
   int max_picks = 0, load_mode = 0;
   float* y = nullptr;              // n x H the MoE output (as moe_r3's y)
+  // v55f (the 1-bit route): null, or the expert inputs' bit planes (n x H / 4 words: 8 per 32 values) and the down inputs'
+  // (max_picks x F / 4 words); written by the MoE half itself (rounding, silu x up), read by the planed experts' decode
+  std::uint32_t* xb = nullptr;
+  std::uint32_t* hb = nullptr;
   unsigned long long* ph = nullptr;  // v55b: null, or 5 GPU-clock stamps by block 0 (start, after phases A, B, C, end)
   // v55e3 diagnosis (temporary): null, or kRxStatN device counters the one-token expert stage adds to (a counting kernel):
   // 0 warp cycles waiting for a group, 1 cycles running tasks, 2 tasks, 3 the warps' loop spans, 4 warps, 5 staged tasks,
@@ -158,6 +162,10 @@ bool rx_set_grid_bits(int bits);
 void stream_kernel_report();
 // v55e (temporary switch, --no-lean-dense): v55d's lean one-format dense kernels on (default) or off; set before plans are built
 void set_lean_dense(bool on);
+// v55f: the expert stage's per-warp staging buffer, sized to the largest block any staged matrix has (rx_stage_block_bytes of
+// each staged expert matrix's type at the slider's bits); set before plans and launches; default: Q8_0's 272
+int rx_stage_block_bytes(std::uint32_t type, int plane_bits);
+void rx_set_stage_bytes(int max_block_bytes);
 // v46a-2 load_mode: 0 each lane loads its own 16-byte pieces (v46a-1); 1 a warp first copies its task's rows contiguously into
 // shared memory for experts read from RAM (every 32-byte sector over PCIe once; the slot filled by the same copy); 2 the same
 // for every expert. The arithmetic is the same in all three, so the outputs are equal bit for bit.

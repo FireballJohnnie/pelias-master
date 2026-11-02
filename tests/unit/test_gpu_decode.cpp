@@ -115,11 +115,6 @@ TEST(gpu_decoder_q8_0_r3_layout_equals_q8_0) {
 // (the R3 stage's reads) equal the stored nibble words; the base grids are the means of the levels sharing the top bits.
 TEST(tg2_planes_layout_and_reads) {
   bool sp = true;
-  for (std::uint32_t a = 0; a < 65536u; ++a) {
-    std::uint32_t r = 0;
-    for (int k = 0; k < 8; ++k) r |= ((a >> (2 * k)) & 3u) << (4 * k);
-    sp = sp && g::tg2p_spread2(a) == r;
-  }
   for (std::uint32_t b = 0; b < 256u; ++b) {
     std::uint32_t r = 0;
     for (int k = 0; k < 8; ++k) r |= ((b >> k) & 1u) << (4 * k);
@@ -162,13 +157,15 @@ TEST(tg2_planes_layout_and_reads) {
             for (int gq = 0; gq < 4; ++gq) {
               const std::size_t ab = static_cast<std::size_t>(16 * nB + 64 * b + 32 * h), bb = static_cast<std::size_t>(80 * nB + 32 * b + 16 * h),
                                 cb = static_cast<std::size_t>(112 * nB + 32 * b + 16 * h);
-              const std::uint32_t a16 = (u32(ab + 4 * static_cast<std::size_t>(2 * jj + (gq >> 1))) >> (16 * (gq & 1))) & 0xffffu;
+              // v55f: plane A as two 1-bit planes (word 2 jj: code bit 3, word 2 jj + 1: code bit 2)
+              const std::uint32_t ah = (u32(ab + 4 * static_cast<std::size_t>(2 * jj)) >> (8 * gq)) & 0xffu;
+              const std::uint32_t al = (u32(ab + 4 * static_cast<std::size_t>(2 * jj + 1)) >> (8 * gq)) & 0xffu;
               const std::uint32_t b8 = (u32(bb + 4 * static_cast<std::size_t>(jj)) >> (8 * gq)) & 0xffu;
               const std::uint32_t c8 = (u32(cb + 4 * static_cast<std::size_t>(jj)) >> (8 * gq)) & 0xffu;
               std::uint32_t want;
               std::memcpy(&want, row.data() + 144 * b + 16 + 64 * h + 4 * (4 * jj + gq), 4);
-              words = words && g::tg2p_codes8(a16, b8, c8) == want;
-              words = words && g::tg2p_codes8(a16, b8, 0) == (want & 0xEEEEEEEEu) && g::tg2p_codes8(a16, 0, 0) == (want & 0xCCCCCCCCu);
+              words = words && g::tg2p_codes8(ah, al, b8, c8) == want;
+              words = words && g::tg2p_codes8(ah, al, b8, 0) == (want & 0xEEEEEEEEu) && g::tg2p_codes8(ah, al, 0, 0) == (want & 0xCCCCCCCCu);
             }
     }
   }
@@ -190,7 +187,7 @@ TEST(tg2_planes_layout_and_reads) {
     }
   }
   CHECK(grids);
-  std::printf("    spreads exhaustive %s; %d rows (1 / 2 / 8 blocks): 4 bits round trip %s, 3 / 2 bits = stored with low bits zero %s; "
+  std::printf("    spread exhaustive %s; %d rows (1 / 2 / 8 blocks): 4 bits round trip %s, 3 / 2 bits = stored with low bits zero %s; "
               "GPU word reads %s; base grids %s\n",
               sp ? "ok" : "WRONG", rows, round ? "exact" : "WRONG", masked ? "yes" : "NO", words ? "= stored words" : "WRONG", grids ? "ok" : "WRONG");
 }
@@ -204,7 +201,8 @@ TEST(q5_planes_layout_and_reads) {
     return static_cast<std::uint8_t>(seed >> 24);
   };
   int rows = 0;
-  bool round = true, masked = true, halves = true, words = true;
+  bool round = true, masked = true, halves = true, words = true, ones = true;
+  long dots = 0;
   for (const int nB : {1, 2, 8}) {
     for (int rep = 0; rep < 20; ++rep, ++rows) {
       std::vector<std::uint8_t> row(static_cast<std::size_t>(176 * nB)), pl(row.size()), back(row.size()), want(row.size());
@@ -266,6 +264,28 @@ TEST(q5_planes_layout_and_reads) {
                   words = words && static_cast<int>((w >> (8 * k)) & 0xffu) == q;
                 }
               }
+            // v55f, the 1-bit route: per sub-block, the sum of q x over its 32 values from each plane by AND + popcount
+            // against the input's bit planes (act_bits32) equals the stored codes' sum (q with the unread low bits zero)
+            for (int jj = 0; jj < 4; ++jj) {
+              std::int8_t x[32];
+              for (int l = 0; l < 32; ++l) x[l] = static_cast<std::int8_t>(rnd());
+              if (rep == 0) x[0] = -128, x[1] = 127, x[2] = 0;  // the input range's ends
+              std::uint32_t u8[8];
+              g::act_bits32(x, u8);
+              int got = (g::plane_dot32(a[2 * jj], u8) << 4) + (g::plane_dot32(a[2 * jj + 1], u8) << 3);
+              if (bits >= 3) got += g::plane_dot32(bb[jj], u8) << 2;
+              if (bits >= 4) got += g::plane_dot32(c[jj], u8) << 1;
+              if (bits >= 5) got += g::plane_dot32(d[jj], u8);
+              int ref = 0;
+              for (int l = 0; l < 32; ++l) {
+                const int j = 4 * h + jj;
+                int q = ((blk[48 + 32 * (j / 2) + l] >> (4 * (j & 1))) & 15) | (((blk[16 + l] >> j) & 1) << 4);
+                q &= ~((1 << (5 - bits)) - 1);
+                ref += q * x[l];
+              }
+              ones = ones && got == ref;
+              ++dots;
+            }
           }
         }
     }
@@ -277,9 +297,10 @@ TEST(q5_planes_layout_and_reads) {
   CHECK(masked);
   CHECK(halves);
   CHECK(words);
+  CHECK(ones);
   CHECK(pre);
   std::printf("    Q5_K planes: %d rows: 5 bits round trip %s; 2 / 3 / 4 bits = stored with low code bits zero %s; GPU half unpack %s; "
-              "dp4a words at 5/4/3/2 bits %s; prefixes %s\n",
-              rows, round ? "exact" : "WRONG", masked ? "yes" : "NO", halves ? "= stored" : "WRONG", words ? "= stored codes" : "WRONG",
-              pre ? "ok" : "WRONG");
+              "dp4a words at 5/4/3/2 bits %s; 1-bit route (AND + popcount) %ld sub-block sums %s; prefixes %s\n",
+              rows, round ? "exact" : "WRONG", masked ? "yes" : "NO", halves ? "= stored" : "WRONG", words ? "= stored codes" : "WRONG", dots,
+              ones ? "= stored codes x inputs" : "WRONG", pre ? "ok" : "WRONG");
 }

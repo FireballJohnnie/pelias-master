@@ -5,8 +5,10 @@
 // all 4 bits of every code (the sliding precision of the user's slider) and fetch only those bytes. The same 144 bytes per
 // 256 values, rearranged per row of nB blocks:
 //   [16 nB]  the blocks' 16-byte headers, block after block (fp16 d, six level bytes, eight tag bytes: as stored)
-//   [64 nB]  plane A: the top two bits of every code; per block, per half (128 values) 32 bytes: value v of the half at
-//            bits 2 (v & 15) of 32-bit word v >> 4
+//   [64 nB]  plane A: the top two bits of every code, as two 1-bit planes (v55f, author: the planes are read as 1-bit
+//            layers): per block, per half (128 values) 32 bytes = 8 words; for sub-block j' (values 32 j' .. 32 j' + 31
+//            of the half) word 2 j' holds the top bit (code bit 3) and word 2 j' + 1 the next (code bit 2), value l of the
+//            sub-block at bit l (v55e and before: 2-bit fields, value v at bits 2 (v & 15) of word v >> 4)
 //   [32 nB]  plane B: the third bit; per block, per half 16 bytes: value v at bit v & 31 of word v >> 5
 //   [32 nB]  plane C: the fourth (lowest) bit, as plane B
 // A row's first 80 nB bytes are the 2-bit base, the first 112 nB the 3-bit base, all 144 nB the stored code. Reading 4
@@ -23,8 +25,9 @@ namespace pelias::kern::gpu {
 constexpr std::uint32_t g_q4_tg2p = 1009;  // GPU-path id (not a file type): Q4_TG2 rows in the plane layout above
 // v54c (author 00:22-00:25: the hot experts are Q5_K; "more experts on the vram"): Q5_K rows (176 bytes per 256 values) in
 // the same plane layout, its 5-bit code q = low nibble | high bit << 4 split top bits first:
-//   [16 nB] headers (fp16 d, fp16 dmin, 12 scale bytes, as stored) | [64 nB] A (bits 4-3) | [32 nB] B (bit 2) |
-//   [32 nB] C (bit 1) | [32 nB] D (bit 0); value v of a half (v = 32 j' + l for the half's sub-block j' and value l)
+//   [16 nB] headers (fp16 d, fp16 dmin, 12 scale bytes, as stored) | [64 nB] A (bits 4 and 3 as two 1-bit planes, as
+//   Q4_TG2's A since v55f: word 2 j' bit 4, word 2 j' + 1 bit 3) | [32 nB] B (bit 2) | [32 nB] C (bit 1) | [32 nB] D
+//   (bit 0); value v of a half (v = 32 j' + l for the half's sub-block j' and value l) at bit l of its sub-block's word
 // A row's first 16 nB + 32 nB x b bytes hold b bits; 5 bits = the stored code exactly. Fewer bits read the code with its
 // missing low bits at the middle of their range (the expected value of a uniform remainder).
 constexpr std::uint32_t g_q5_kp = 1010;
@@ -45,14 +48,6 @@ PG_HD std::uint64_t plane_prefix(std::uint32_t type, std::uint64_t rb, int bits)
 // the bytes of a row's first `bits` bits (2, 3 or 4)
 PG_HD std::uint64_t tg2p_prefix(std::uint64_t nB, int bits) { return bits >= 4 ? 144 * nB : bits == 3 ? 112 * nB : 80 * nB; }
 
-// eight 2-bit fields (bits 2k, 2k + 1 of a16) to bits 4k, 4k + 1
-PG_HD std::uint32_t tg2p_spread2(std::uint32_t a16) {
-  std::uint32_t t = a16 & 0xffffu;
-  t = (t | (t << 8)) & 0x00ff00ffu;
-  t = (t | (t << 4)) & 0x0f0f0f0fu;
-  t = (t | (t << 2)) & 0x33333333u;
-  return t;
-}
 // eight bits (bit k of b8) to bit 4k
 PG_HD std::uint32_t tg2p_spread1(std::uint32_t b8) {
   std::uint32_t u = b8 & 0xffu;
@@ -61,10 +56,10 @@ PG_HD std::uint32_t tg2p_spread1(std::uint32_t b8) {
   u = (u | (u << 3)) & 0x11111111u;
   return u;
 }
-// the 8 codes (nibble k = value k) of 8 consecutive values from their plane bits (a16: 8 x 2 bits, b8 / c8: 8 x 1 bit);
-// with fewer bits read, pass zero for the missing planes
-PG_HD std::uint32_t tg2p_codes8(std::uint32_t a16, std::uint32_t b8, std::uint32_t c8) {
-  return (tg2p_spread2(a16) << 2) | (tg2p_spread1(b8) << 1) | tg2p_spread1(c8);
+// the 8 codes (nibble k = value k) of 8 consecutive values from their plane bits (v55f: ah8 / al8 the two bits of plane
+// A, b8 / c8 planes B / C; 8 x 1 bit each); with fewer bits read, pass zero for the missing planes
+PG_HD std::uint32_t tg2p_codes8(std::uint32_t ah8, std::uint32_t al8, std::uint32_t b8, std::uint32_t c8) {
+  return (tg2p_spread1(ah8) << 3) | (tg2p_spread1(al8) << 2) | (tg2p_spread1(b8) << 1) | tg2p_spread1(c8);
 }
 
 // host: one row of nB stored Q4_TG2 blocks (144 nB bytes) into the plane layout (out: 144 nB bytes, not overlapping in)
@@ -77,7 +72,9 @@ inline void tg2p_plane_row(const std::uint8_t* in, std::uint8_t* out, int nB) {
       for (int v = 0; v < 128; ++v) {
         const int idx = 128 * h + v;
         const int code = (blk[16 + idx / 2] >> (4 * (idx & 1))) & 15;
-        out[16 * nB + 64 * b + 32 * h + (v >> 2)] |= static_cast<std::uint8_t>((code >> 2) << (2 * (v & 3)));
+        const int jp = v >> 5, l = v & 31;  // the half's sub-block, the value in it
+        out[16 * nB + 64 * b + 32 * h + 8 * jp + (l >> 3)] |= static_cast<std::uint8_t>(((code >> 3) & 1) << (l & 7));
+        out[16 * nB + 64 * b + 32 * h + 8 * jp + 4 + (l >> 3)] |= static_cast<std::uint8_t>(((code >> 2) & 1) << (l & 7));
         out[80 * nB + 32 * b + 16 * h + (v >> 3)] |= static_cast<std::uint8_t>(((code >> 1) & 1) << (v & 7));
         out[112 * nB + 32 * b + 16 * h + (v >> 3)] |= static_cast<std::uint8_t>((code & 1) << (v & 7));
       }
@@ -92,7 +89,9 @@ inline void tg2p_unplane_row(const std::uint8_t* in, std::uint8_t* out, int nB, 
     for (int h = 0; h < 2; ++h)
       for (int v = 0; v < 128; ++v) {
         const int idx = 128 * h + v;
-        int code = ((in[16 * nB + 64 * b + 32 * h + (v >> 2)] >> (2 * (v & 3))) & 3) << 2;
+        const int jp = v >> 5, l = v & 31;
+        int code = (((in[16 * nB + 64 * b + 32 * h + 8 * jp + (l >> 3)] >> (l & 7)) & 1) << 3) |
+                   (((in[16 * nB + 64 * b + 32 * h + 8 * jp + 4 + (l >> 3)] >> (l & 7)) & 1) << 2);
         if (bits >= 3) code |= ((in[80 * nB + 32 * b + 16 * h + (v >> 3)] >> (v & 7)) & 1) << 1;
         if (bits >= 4) code |= (in[112 * nB + 32 * b + 16 * h + (v >> 3)] >> (v & 7)) & 1;
         blk[16 + idx / 2] |= static_cast<std::uint8_t>(code << (4 * (idx & 1)));
@@ -109,25 +108,46 @@ PG_HD void q5p_unpack_half(const std::uint32_t* a, const std::uint32_t* b, const
   for (int i = 0; i < 64; ++i) qlb[i] = 0;
   for (int jj = 0; jj < 4; ++jj)
     for (int l = 0; l < 32; ++l) {
-      const std::uint32_t q = (((a[2 * jj + (l >> 4)] >> (2 * (l & 15))) & 3u) << 3) | (((b[jj] >> l) & 1u) << 2) | (((c[jj] >> l) & 1u) << 1) |
-                              ((d[jj] >> l) & 1u);
+      const std::uint32_t q = (((a[2 * jj] >> l) & 1u) << 4) | (((a[2 * jj + 1] >> l) & 1u) << 3) | (((b[jj] >> l) & 1u) << 2) |
+                              (((c[jj] >> l) & 1u) << 1) | ((d[jj] >> l) & 1u);
       qlb[32 * (jj >> 1) + l] = static_cast<std::uint8_t>(qlb[32 * (jj >> 1) + l] | ((q & 15u) << (4 * (jj & 1))));
       qh[l] = static_cast<std::uint8_t>(qh[l] | (((q >> 4) & 1u) << (4 * h + jj)));
     }
 }
-// v55: four consecutive values' codes straight from the plane bits, one per byte (byte k = 8 A + 4 B + 2 C + D of value
-// k), ready for dp4a: a8 = their 4 x 2 bits of plane A, b4 / c4 / d4 = their 4 bits of planes B, C, D (zero where not
-// read). Replaces the unpack to the stored bytes on the GPU (no byte arrays, so nothing goes to local memory)
-PG_HD std::uint32_t q5p_bytes4(std::uint32_t a8, std::uint32_t b4, std::uint32_t c4, std::uint32_t d4) {
-  std::uint32_t a = a8 & 0xffu;
-  a = (a | (a << 12)) & 0x000f000fu;
-  a = (a | (a << 6)) & 0x03030303u;
+// v55: four consecutive values' codes straight from the plane bits, one per byte (byte k = 16 A4 + 8 A3 + 4 B + 2 C + D
+// of value k), ready for dp4a: ah4 / al4 = their 4 bits of plane A's two bits (v55f), b4 / c4 / d4 = their 4 bits of
+// planes B, C, D (zero where not read). The dp4a route; the 1-bit route (q5p_sq_bits) reads the planes without this
+PG_HD std::uint32_t q5p_bytes4(std::uint32_t ah4, std::uint32_t al4, std::uint32_t b4, std::uint32_t c4, std::uint32_t d4) {
   constexpr std::uint32_t m = 0x00204081u;  // bit k -> byte k (the four shifted copies never overlap, so no carries)
-  return (a << 3) | ((((b4 & 15u) * m) & 0x01010101u) << 2) | ((((c4 & 15u) * m) & 0x01010101u) << 1) | (((d4 & 15u) * m) & 0x01010101u);
+  return ((((ah4 & 15u) * m) & 0x01010101u) << 4) | ((((al4 & 15u) * m) & 0x01010101u) << 3) | ((((b4 & 15u) * m) & 0x01010101u) << 2) |
+         ((((c4 & 15u) * m) & 0x01010101u) << 1) | (((d4 & 15u) * m) & 0x01010101u);
 }
 // v55: the word for values 4 g .. 4 g + 3 of sub-block jj of a half, from the half's plane words as loaded (a[8], b/c/d[4])
 PG_HD std::uint32_t q5p_word(const std::uint32_t* a, const std::uint32_t* b, const std::uint32_t* c, const std::uint32_t* d, int jj, int g) {
-  return q5p_bytes4(a[2 * jj + (g >> 2)] >> (8 * (g & 3)), b[jj] >> (4 * g), c[jj] >> (4 * g), d[jj] >> (4 * g));
+  return q5p_bytes4(a[2 * jj] >> (4 * g), a[2 * jj + 1] >> (4 * g), b[jj] >> (4 * g), c[jj] >> (4 * g), d[jj] >> (4 * g));
+}
+// v55f (author: the 1-bit decoder, "AND and count the ones"): an activation sub-block (32 int8 values x) as its 8 bit planes
+// of u = x + 128 (0..255): plane k bit l = bit k of u_l. Built once per token and sub-block, shared by every row
+PG_HD void act_bits32(const std::int8_t* x, std::uint32_t* u8) {
+  for (int k = 0; k < 8; ++k) u8[k] = 0u;
+  for (int l = 0; l < 32; ++l) {
+    const std::uint32_t u = static_cast<std::uint32_t>(static_cast<int>(x[l]) + 128);
+    for (int k = 0; k < 8; ++k) u8[k] |= ((u >> k) & 1u) << l;
+  }
+}
+// v55f: sum over the 32 values of w_l x_l for one weight bit plane w (bit l = 0 / 1) by AND + popcount against the
+// activation's bit planes: sum w u = sum_k 2^k popc(w & U_k), sum w x = that - 128 popc(w). Exact integers
+PG_HD int plane_dot32(std::uint32_t w, const std::uint32_t* u8) {
+#if defined(__CUDA_ARCH__)
+  int s = 0;
+#pragma unroll
+  for (int k = 0; k < 8; ++k) s += __popc(w & u8[k]) << k;
+  return s - (__popc(w) << 7);
+#else
+  int s = 0;
+  for (int k = 0; k < 8; ++k) s += __builtin_popcount(w & u8[k]) << k;
+  return s - (__builtin_popcount(w) << 7);
+#endif
 }
 // host: one row of nB stored Q5_K blocks (176 nB bytes) into the plane layout (g_q5_kp)
 inline void q5p_plane_row(const std::uint8_t* in, std::uint8_t* out, int nB) {
@@ -141,7 +161,8 @@ inline void q5p_plane_row(const std::uint8_t* in, std::uint8_t* out, int nB) {
       for (int l = 0; l < 32; ++l) {
         const int q = ((qs[32 * (j / 2) + l] >> (4 * (j & 1))) & 15) | (((qh[l] >> j) & 1) << 4);
         const int h = j >> 2, v = 32 * (j & 3) + l;
-        out[16 * nB + 64 * b + 32 * h + (v >> 2)] |= static_cast<std::uint8_t>((q >> 3) << (2 * (v & 3)));
+        out[16 * nB + 64 * b + 32 * h + 8 * (j & 3) + (l >> 3)] |= static_cast<std::uint8_t>(((q >> 4) & 1) << (l & 7));
+        out[16 * nB + 64 * b + 32 * h + 8 * (j & 3) + 4 + (l >> 3)] |= static_cast<std::uint8_t>(((q >> 3) & 1) << (l & 7));
         out[80 * nB + 32 * b + 16 * h + (v >> 3)] |= static_cast<std::uint8_t>(((q >> 2) & 1) << (v & 7));
         out[112 * nB + 32 * b + 16 * h + (v >> 3)] |= static_cast<std::uint8_t>(((q >> 1) & 1) << (v & 7));
         out[144 * nB + 32 * b + 16 * h + (v >> 3)] |= static_cast<std::uint8_t>((q & 1) << (v & 7));
@@ -157,7 +178,8 @@ inline void q5p_unplane_row(const std::uint8_t* in, std::uint8_t* out, int nB, i
     for (int j = 0; j < 8; ++j)
       for (int l = 0; l < 32; ++l) {
         const int h = j >> 2, v = 32 * (j & 3) + l;
-        int q = ((in[16 * nB + 64 * b + 32 * h + (v >> 2)] >> (2 * (v & 3))) & 3) << 3;
+        int q = (((in[16 * nB + 64 * b + 32 * h + 8 * (j & 3) + (l >> 3)] >> (l & 7)) & 1) << 4) |
+                (((in[16 * nB + 64 * b + 32 * h + 8 * (j & 3) + 4 + (l >> 3)] >> (l & 7)) & 1) << 3);
         if (bits >= 3) q |= ((in[80 * nB + 32 * b + 16 * h + (v >> 3)] >> (v & 7)) & 1) << 2;
         if (bits >= 4) q |= ((in[112 * nB + 32 * b + 16 * h + (v >> 3)] >> (v & 7)) & 1) << 1;
         if (bits >= 5) q |= (in[144 * nB + 32 * b + 16 * h + (v >> 3)] >> (v & 7)) & 1;

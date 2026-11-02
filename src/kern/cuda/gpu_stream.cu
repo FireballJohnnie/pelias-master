@@ -63,12 +63,17 @@ struct DJob {
   long long rs;             // kQ4TG2P: w's row bytes (144 nB in RAM; the prefix of pb bits in a cache slot)
   std::uint8_t* fw;         // kQ4TG2P: a miss's slot matrix (its rows packed at frs bytes: the prefix), or null
   long long frs;
+  // v55f (the 1-bit route): the inputs' bit planes (act_bits32: 8 words per 32 values, at word (input byte offset) / 4
+  // from xb, so they follow xq's layout), or null (the dp4a route); hbo: where a kEpi job writes its picks' planes
+  const std::uint32_t* xb;
+  std::uint32_t* hbo;
 };
 
 __constant__ float c_grid[4][16];  // the Q4_TG2 grids (quant::q4_tg_grid(tag, 2)), uploaded once
 __constant__ float c_grid3[4][16];  // v54: the 3-bit and 2-bit base grids (tg2p_base_grid of c_grid), uploaded once
 __constant__ float c_grid2[4][16];
 __constant__ int c_rx_bits;
+int g_stage_bytes = 16 * 272 + 32;  // v55f: a warp's staging buffer: 16 blocks of the largest staged format + 32 (rx_set_stage_bytes)
 bool g_lean_dense = false;  // v55e experiment switch (--lean-dense since v55e3): v55d's lean one-format dense kernels; off (v55e2: +1.1 ms per token, MEASURED); removed once understood  // v55b: the one grid the expert stage loads (4, 3 or 2; 0 = 4)
 __device__ __forceinline__ unsigned long long gtimer_s() {  // v55b: the GPU's global nanosecond clock (as gpu_ops.cu's gtimer)
   unsigned long long t;
@@ -205,7 +210,8 @@ __device__ __forceinline__ int4 tg2p_words(const DJob& J, bool cs, const std::ui
   for (int jj = 0; jj < 4; ++jj)
 #pragma unroll
     for (int g = 0; g < 4; ++g)
-      cw[jj * 4 + g] = tg2p_codes8((aw[2 * jj + (g >> 1)] >> (16 * (g & 1))) & 0xffffu, (bw[jj] >> (8 * g)) & 0xffu, (cv[jj] >> (8 * g)) & 0xffu);
+      cw[jj * 4 + g] = tg2p_codes8((aw[2 * jj] >> (8 * g)) & 0xffu, (aw[2 * jj + 1] >> (8 * g)) & 0xffu, (bw[jj] >> (8 * g)) & 0xffu,
+                                   (cv[jj] >> (8 * g)) & 0xffu);  // v55f: plane A as two 1-bit planes
   return hd;
 }
 // v54c: one lane part of a Q5_K plane row at R: the 16-byte header, and the half's plane words A-D as J.pb asks (missing
@@ -445,11 +451,23 @@ __device__ __forceinline__ void lane_part_n(const DJob& J, int r, int part, cons
       k4_scmn(hd, j, &sc, &mn);
 #pragma unroll
       for (int t = 0; t < NT; ++t) {
-        int xj[8];
-        ld_x8<M>(xq[t], jg, xj);
         int sq = 0;
+        if (J.xb) {  // v55f, the 1-bit route (author's 1-bit decoder): each plane AND + popcount against the input's bit planes
+          const int4* u4 = reinterpret_cast<const int4*>(J.xb + ((xq[t] - J.xq) >> 2) + 8 * jg);
+          const int4 v0 = ldx4<M>(u4), v1 = ldx4<M>(u4 + 1);
+          const std::uint32_t u8[8] = {static_cast<std::uint32_t>(v0.x), static_cast<std::uint32_t>(v0.y), static_cast<std::uint32_t>(v0.z),
+                                       static_cast<std::uint32_t>(v0.w), static_cast<std::uint32_t>(v1.x), static_cast<std::uint32_t>(v1.y),
+                                       static_cast<std::uint32_t>(v1.z), static_cast<std::uint32_t>(v1.w)};
+          sq = (plane_dot32(pa[2 * jj], u8) << 4) + (plane_dot32(pa[2 * jj + 1], u8) << 3);
+          if (J.pb >= 3) sq += plane_dot32(pb[jj], u8) << 2;
+          if (J.pb >= 4) sq += plane_dot32(pc[jj], u8) << 1;
+          if (J.pb >= 5) sq += plane_dot32(pd[jj], u8);
+        } else {  // the dp4a route (inputs without planes: the separate expert kernels)
+          int xj[8];
+          ld_x8<M>(xq[t], jg, xj);
 #pragma unroll
-        for (int g = 0; g < 8; ++g) sq = __dp4a(static_cast<int>(q5p_word(pa, pb, pc, pd, jj, g)), xj[g], sq);
+          for (int g = 0; g < 8; ++g) sq = __dp4a(static_cast<int>(q5p_word(pa, pb, pc, pd, jj, g)), xj[g], sq);
+        }
         const int xsi = ldxi<M>(xsum[t] + jg);
         const float sqf = kmiss > 0 ? 0.5f * static_cast<float>(2 * sq + ((1 << kmiss) - 1) * xsi) : static_cast<float>(sq);
         acc[t] += ldxs<M>(xs[t] + jg) * (d * static_cast<float>(sc) * sqf - dmin * static_cast<float>(mn) * static_cast<float>(xsi));
@@ -825,7 +843,8 @@ __host__ __device__ inline RxLayout rx_layout(int maxp) {
 // v52: the planning body (the whole block; any block size) for k_rx_plan and the fused MoE half
 __device__ __forceinline__ void rx_plan_body(const int* __restrict__ grp, const ExpertPtr* __restrict__ gsrc, const ExpertPtr* __restrict__ gfill,
                                              int tokens, int nu, int H, int F, const std::int8_t* xq, const float* xs, const int* xsum, float* gu,
-                                             std::int8_t* hq, float* hs, int* hsum, float* yd, std::uint8_t* plan, int maxp, int load_mode) {
+                                             std::int8_t* hq, float* hs, int* hsum, float* yd, std::uint8_t* plan, int maxp, int load_mode,
+                                             const std::uint32_t* xb = nullptr, std::uint32_t* hb = nullptr) {
   const RxLayout Lo = rx_layout(maxp);
   auto* hd = reinterpret_cast<RxHdr*>(plan);
   auto* jobs = reinterpret_cast<DJob*>(plan + Lo.jobs);
@@ -842,10 +861,30 @@ __device__ __forceinline__ void rx_plan_body(const int* __restrict__ grp, const 
   __syncthreads();
   if (s_err == 0)
     for (int i = static_cast<int>(threadIdx.x); i < nj; i += static_cast<int>(blockDim.x)) {
-      // jobs: gate u, up u for every u (2U), then silu x up per u (U), then down per u (U)
-      const int kind = i < 2 * U ? (i & 1) : (i < 3 * U ? 3 : 2);  // 0 gate, 1 up, 2 down, 3 silu x up
-      const int u = i < 2 * U ? (i >> 1) : (i < 3 * U ? i - 2 * U : i - 3 * U);
-      const long long task0 = i < 2 * U ? i * nt_gu : (i < 3 * U ? 2 * U * nt_gu + (i - 2 * U) : 2 * U * nt_gu + U + (i - 3 * U) * nt_dn);
+      // v55f, pipelined (author: no warp idles while work exists): gate / up of expert s, then silu x up and down of expert
+      // s - 1, so a down starts one expert behind its gate / up instead of after every expert's gate / up (v55e3: 20 % of
+      // the warps' time waited for a group). Order: GU0 | GU1 EP0 DN0 | GU2 EP1 DN1 | ... | EP(U-1) DN(U-1). A job waits only
+      // for jobs before it, so the lowest unfinished task can always run. Same jobs, same outputs; only the order moves.
+      const long long t4 = 2 * nt_gu + 1 + nt_dn;  // one expert's tasks
+      int kind, u;
+      long long task0;
+      if (i < 2) {
+        kind = i;
+        u = 0;
+        task0 = i * nt_gu;
+      } else if (i < 2 + 4 * (U - 1)) {
+        const int sx = 1 + (i - 2) / 4, r = (i - 2) % 4;
+        const long long base = 2 * nt_gu + static_cast<long long>(sx - 1) * t4;
+        kind = r < 2 ? r : (r == 2 ? 3 : 2);  // 0 gate, 1 up, 2 down, 3 silu x up
+        u = r < 2 ? sx : sx - 1;
+        task0 = r == 0 ? base : r == 1 ? base + nt_gu : r == 2 ? base + 2 * nt_gu : base + 2 * nt_gu + 1;
+      } else {
+        const int r = i - (2 + 4 * (U - 1));
+        const long long base = 2 * nt_gu + static_cast<long long>(U - 1) * t4;
+        kind = r == 0 ? 3 : 2;
+        u = U - 1;
+        task0 = r == 0 ? base : base + 1;
+      }
       const int* G = grp + 1 + 6 * u;
       const int cnt = G[1];
       DJob J{};
@@ -871,6 +910,7 @@ __device__ __forceinline__ void rx_plan_body(const int* __restrict__ grp, const 
         J.hq = hq;
         J.hs = hs;
         J.hsum = hsum;
+        J.hbo = hb;  // v55f
         sig[i] = U + u;
         dep[i] = u;
       } else {
@@ -897,6 +937,7 @@ __device__ __forceinline__ void rx_plan_body(const int* __restrict__ grp, const 
           J.xq = xq;
           J.xs = xs;
           J.xsum = xsum;
+          J.xb = xb;  // v55f
           J.xqs = H;
           J.xss = H / 32;
           J.y = gu + static_cast<long long>(kind) * F;
@@ -907,6 +948,7 @@ __device__ __forceinline__ void rx_plan_body(const int* __restrict__ grp, const 
           J.xq = hq;
           J.xs = hs;
           J.xsum = hsum;
+          J.xb = hb;  // v55f
           J.xqs = F;
           J.xss = F / 32;
           J.y = yd;
@@ -962,6 +1004,7 @@ __device__ __forceinline__ void rx_epi(const DJob& J) {
       }
       J.hs[pk * nb + b] = sc;
       J.hsum[pk * nb + b] = sm;
+      if (J.hbo) act_bits32(J.hq + pk * F + 32 * b, J.hbo + (pk * F + 32 * b) / 4);  // v55f: the down inputs' bit planes
     }
   }
 }
@@ -1003,7 +1046,7 @@ __device__ __forceinline__ void rx_rows(const DJob& J, long long t) {
   }
 }
 // v46a-2: bytes per 256-value block of the stage's formats (as read: Q8_0 in R3's repacked layout)
-__device__ __forceinline__ int rx_blk(int fmt) {
+__host__ __device__ inline int rx_blk(int fmt) {
   return fmt == kQ5K || fmt == kQ5KP ? 176 : fmt == kQ6KS ? 210 : fmt == kQ8_0 ? 272 : 144;  // Q4_TG2(P), Q4_K: 144
 }
 // a warp copies n contiguous bytes from src into its shared buffer, keeping src's 16-byte phase (32 lanes x 16 bytes per
@@ -1221,6 +1264,7 @@ __global__ void __launch_bounds__(256) k_moe_half(const MoeHalfArgs A, int sbyte
       const float* sb = stg + (t * nsub + b) * md::kGvPad;
       for (int i = 0; i < 32; ++i) v[i] = sb[i];
       md::round32<false>(v, t, b, H, n, 0, 0.0f, A.xr, H, A.xq, A.xs, A.xsum);
+      if (A.xb) act_bits32(A.xq + t * H + 32 * b, A.xb + (t * H + 32 * b) / 4);  // v55f: the expert inputs' bit planes (this thread's values)
     }
   {
     const long long rows = A.ne + (A.wsh ? 1 : 0);
@@ -1243,7 +1287,7 @@ __global__ void __launch_bounds__(256) k_moe_half(const MoeHalfArgs A, int sbyte
     if (tid < 32) md::rd3_group_one<true>(A.tab, A.wsh ? A.shx : nullptr, A.sel, n, A.nu, A.cache, A.F, A.grp, A.gsrc, A.gfill, nullptr);  // v55e: one warp
     __syncthreads();
     rx_plan_body(A.grp, A.gsrc, A.gfill, n, A.nu, H, A.F, A.xq, A.xs, A.xsum, A.gu, A.hq, A.hs, A.hsum, A.yd, static_cast<std::uint8_t*>(A.plan),
-                 A.max_picks, A.load_mode);
+                 A.max_picks, A.load_mode, A.xb, A.hb);
   }
   grid.sync();
   if (phs) A.ph[2] = gtimer_s();
@@ -1584,7 +1628,7 @@ bool moe_r3(const ExpertPtr* tab, const ExpertPtr* shx, const std::int32_t* sel,
   if (!grid_ready()) return false;
   // v46a-2: the staging buffer per warp: one task's 16 blocks of the largest format (Q8_0 repacked, 272 bytes) + the 16-byte
   // phase, 8 warps per block: 8 KB grid + 34.3 KB (under the 48 KB a launch gets without opting in)
-  const int sbytes = load_mode ? 16 * 272 + 32 : 0;
+  const int sbytes = load_mode ? g_stage_bytes : 0;  // v55f
   const int smem = kLutRxBytes + 8 * sbytes;  // v54: 24 KB of grids + the warps' buffers (59 KB: opted in past 48 KB)
   static int grids[2][3] = {{0, 0, 0}, {0, 0, 0}};
   const bool mt = tokens > 1;  // v47: steps of 2-4 tokens run the kernel that loads each row once for all of a group's picks
@@ -1641,7 +1685,7 @@ bool moe_half(const MoeHalfArgs& A, Stream s) {
       reinterpret_cast<std::uintptr_t>(A.xq) % 16 != 0 || reinterpret_cast<std::uintptr_t>(A.hq) % 16 != 0)
     return sfail("moe_half: wr / wsh / xq / hq must be 16-byte aligned");
   if (!grid_ready()) return false;
-  const int sbytes = A.load_mode ? 16 * 272 + 32 : 0;
+  const int sbytes = A.load_mode ? g_stage_bytes : 0;  // v55f
   // dynamic shared memory: the largest of the phases' uses (at most 4 x 128 x 144 B staging = 72 KB: opt in past 48 KB)
   const int sm_stage = 4 * nsub * md::kGvPad * 4, sm_router = 2 * md::kRouterMaxExperts * 4 + md::kRouterMaxExperts, sm_rx = kLutRxBytes + 8 * sbytes;
   const int smem = std::max(sm_stage, std::max(sm_router, sm_rx));
@@ -1681,6 +1725,19 @@ bool moe_half(const MoeHalfArgs& A, Stream s) {
 
 void set_lean_dense(bool on) { g_lean_dense = on; }  // v55e (temporary switch)
 
+// v55f: a warp task stages 16 blocks of 256 values whatever the matrix shape (rows x blocks per row = 4096 / K x K / 256), so
+// the buffer is 16 x the largest block a staged matrix has, as staged (a plane matrix: its prefix at the slider's bits)
+int rx_stage_block_bytes(std::uint32_t type, int plane_bits) {
+  if (type == g_q4_tg2p) return static_cast<int>(tg2p_prefix(1, plane_bits >= 2 ? plane_bits : 4));
+  if (type == g_q5_kp) return static_cast<int>(plane_prefix(g_q5_kp, 176, plane_bits >= 2 ? plane_bits : 5));
+  const int f = rx_fmt(type);
+  return f < 0 ? 272 : rx_blk(f);
+}
+void rx_set_stage_bytes(int max_block_bytes) {
+  const int b = max_block_bytes > 0 && max_block_bytes <= 272 ? max_block_bytes : 272;
+  g_stage_bytes = 16 * b + 32;
+}
+
 bool rx_set_grid_bits(int bits) {  // v55b
   const int b = bits == 3 || bits == 2 ? bits : 4;
   return sck(cudaMemcpyToSymbol(c_rx_bits, &b, sizeof b), "stream: expert stage grid bits");
@@ -1692,7 +1749,7 @@ void stream_kernel_report() {  // v55b: registers, local memory and blocks per S
     const char* name;
     int smem;
   };
-  const int sb = 16 * 272 + 32;
+  const int sb = g_stage_bytes;  // v55f
   const int sm_moe = std::max(4 * 64 * md::kGvPad * 4, std::max(2 * md::kRouterMaxExperts * 4 + md::kRouterMaxExperts, kLutRxBytes + 8 * sb));
   const K ks[] = {{reinterpret_cast<const void*>(k_moe_half<false, 1>), "k_moe_half<1 token>", sm_moe},
                   {reinterpret_cast<const void*>(k_moe_half<true, 1>), "k_moe_half<2-4 tokens>", sm_moe},
