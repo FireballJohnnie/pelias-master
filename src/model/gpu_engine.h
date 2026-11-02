@@ -55,9 +55,11 @@ struct EngineOptions {
   // v54b sliding bit planes (endgame; author 23:14, 23:54 "a slider ... 2, 3 or 4 bit", 23:56): plane_bits 2, 3 or 4 puts
   // the RAM experts' Q4_TG2 matrices in bit planes (kern/tg2_planes.h; pinned at open, their file bytes not registered) and
   // the R3 expert stage reads every pick with that many code bits; the cache's slots hold exactly those bits, so their size
-  // follows the slider (2-bit -27 %, 3-bit -14 % of an average expert, DERIVED) and more experts fit. 4 = the stored codes
-  // bit for bit. 0: off (the stored layout). Needs the R3 expert stage with staged loads; not with the split, prefetch or
-  // the plane test. (--plane-bits)
+  // follows the slider (2-bit -27 %, 3-bit -14 % of an average expert, DERIVED) and more experts fit. v54c (author 00:22-00:25:
+  // "more experts on the vram"): Q5_K matrices too (5-bit codes), and the bank holds the slider's bits as well (a planed
+  // bank: matrices alone, no batched-kernel tables). Each matrix reads min(plane_bits, its own bits); 5 = every code as
+  // stored, bit for bit. 0: off. Needs the R3 expert stage with staged loads and the GPU prompt; not with the split,
+  // prefetch or the plane test. (--plane-bits)
   int plane_bits = 0;
   // v54b VRAM probe (author 23:55: any system, any MoE): after the dense weights, the free VRAM (minus vram_reserve) is split
   // between the reader cache (cache_share of it, as whole slots of the largest expert) and the bank (the rest, no per-layer

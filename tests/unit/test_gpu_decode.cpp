@@ -194,3 +194,70 @@ TEST(tg2_planes_layout_and_reads) {
               "GPU word reads %s; base grids %s\n",
               sp ? "ok" : "WRONG", rows, round ? "exact" : "WRONG", masked ? "yes" : "NO", words ? "= stored words" : "WRONG", grids ? "ok" : "WRONG");
 }
+
+// v54c: Q5_K bit planes: rows planed and back (5 bits = stored; fewer = stored with low code bits zero), the per-half
+// unpack the GPU runs gives the stored half bytes, and plane_prefix's byte counts
+TEST(q5_planes_layout_and_reads) {
+  std::uint32_t seed = 777u;
+  auto rnd = [&]() {
+    seed = seed * 1664525u + 1013904223u;
+    return static_cast<std::uint8_t>(seed >> 24);
+  };
+  int rows = 0;
+  bool round = true, masked = true, halves = true;
+  for (const int nB : {1, 2, 8}) {
+    for (int rep = 0; rep < 20; ++rep, ++rows) {
+      std::vector<std::uint8_t> row(static_cast<std::size_t>(176 * nB)), pl(row.size()), back(row.size()), want(row.size());
+      for (auto& x : row) x = rnd();
+      g::q5p_plane_row(row.data(), pl.data(), nB);
+      g::q5p_unplane_row(pl.data(), back.data(), nB, 5);
+      round = round && back == row;
+      for (const int bits : {2, 3, 4}) {
+        g::q5p_unplane_row(pl.data(), back.data(), nB, bits);
+        // expected: every code with its low 5 - bits bits cleared
+        want = row;
+        for (int b = 0; b < nB; ++b) {
+          std::uint8_t* blk = want.data() + 176 * b;
+          for (int j = 0; j < 8; ++j)
+            for (int l = 0; l < 32; ++l) {
+              int q = ((blk[48 + 32 * (j / 2) + l] >> (4 * (j & 1))) & 15) | (((blk[16 + l] >> j) & 1) << 4);
+              q &= ~((1 << (5 - bits)) - 1);
+              blk[48 + 32 * (j / 2) + l] = static_cast<std::uint8_t>((blk[48 + 32 * (j / 2) + l] & ~(15 << (4 * (j & 1)))) | ((q & 15) << (4 * (j & 1))));
+              blk[16 + l] = static_cast<std::uint8_t>((blk[16 + l] & ~(1 << j)) | (((q >> 4) & 1) << j));
+            }
+        }
+        masked = masked && back == want;
+      }
+      auto u32 = [&](std::size_t off) {
+        std::uint32_t v;
+        std::memcpy(&v, pl.data() + off, 4);
+        return v;
+      };
+      for (int b = 0; b < nB; ++b)
+        for (int h = 0; h < 2; ++h) {
+          std::uint32_t a[8], bb[4], c[4], d[4];
+          for (int i = 0; i < 8; ++i) a[i] = u32(static_cast<std::size_t>(16 * nB + 64 * b + 32 * h + 4 * i));
+          for (int i = 0; i < 4; ++i) {
+            bb[i] = u32(static_cast<std::size_t>(80 * nB + 32 * b + 16 * h + 4 * i));
+            c[i] = u32(static_cast<std::size_t>(112 * nB + 32 * b + 16 * h + 4 * i));
+            d[i] = u32(static_cast<std::size_t>(144 * nB + 32 * b + 16 * h + 4 * i));
+          }
+          std::uint8_t qh[32], qlb[64];
+          g::q5p_unpack_half(a, bb, c, d, h, qh, qlb);
+          const std::uint8_t* blk = row.data() + 176 * b;
+          bool ok = std::memcmp(qlb, blk + 48 + 64 * h, 64) == 0;
+          for (int l = 0; l < 32; ++l) ok = ok && qh[l] == (blk[16 + l] & (0x0f << (4 * h)));
+          halves = halves && ok;
+        }
+    }
+  }
+  const bool pre = g::plane_prefix(g::g_q5_kp, 176 * 8, 2) == 640 && g::plane_prefix(g::g_q5_kp, 176 * 8, 5) == 1408 &&
+                   g::plane_prefix(g::g_q5_kp, 176 * 8, 9) == 1408 && g::plane_prefix(g::g_q4_tg2p, 144 * 2, 3) == 224 &&
+                   g::plane_prefix(g::g_q4_tg2p, 144 * 2, 5) == 288 && g::plane_prefix(13, 1408, 2) == 1408;
+  CHECK(round);
+  CHECK(masked);
+  CHECK(halves);
+  CHECK(pre);
+  std::printf("    Q5_K planes: %d rows: 5 bits round trip %s; 2 / 3 / 4 bits = stored with low code bits zero %s; GPU half unpack %s; prefixes %s\n",
+              rows, round ? "exact" : "WRONG", masked ? "yes" : "NO", halves ? "= stored" : "WRONG", pre ? "ok" : "WRONG");
+}

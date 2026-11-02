@@ -218,8 +218,8 @@ struct ReaderCache {
   std::uint64_t pbytes[kMaxPools] = {};
   std::uint64_t pboff[kMaxPools] = {};
   const signed char* pool_of = nullptr;  // n_expert (device), this layer's
-  // v54b sliding bit planes (kern/tg2_planes.h; author 23:54-23:56): every pick reads the plane matrices (g_q4_tg2p) with
-  // plane_bits code bits (2, 3 or 4), and a slot holds exactly those: its plane matrices' rows are plane_bits' prefix of
+  // v54b sliding bit planes (kern/tg2_planes.h; author 23:54-23:56): every pick reads the plane matrices (g_q4_tg2p,
+  // v54c g_q5_kp) with plane_bits code bits (2-5; at most the matrix's own), and a slot holds exactly those: its plane matrices' rows are plane_bits' prefix of
   // the row (tg2p_prefix), packed, so a slot's size (and the pools sized by it) follows the slider
   int plane_bits = 4;
 };

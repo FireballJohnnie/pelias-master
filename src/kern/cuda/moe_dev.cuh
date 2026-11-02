@@ -320,7 +320,8 @@ __device__ __forceinline__ void rd3_group_one(const ExpertPtr* __restrict__ tab,
       grp[2 + 6 * u] = 0;
       ExpertPtr src = tab[e], fill;
       // v54b: an expert with plane matrices is read with the slider's bits; its slot holds those bits' prefix of each row
-      const bool planed = src.type[0] == g_q4_tg2p || src.type[1] == g_q4_tg2p || src.type[2] == g_q4_tg2p;
+      auto pl = [](std::uint32_t t) { return t == g_q4_tg2p || t == g_q5_kp; };
+      const bool planed = pl(src.type[0]) || pl(src.type[1]) || pl(src.type[2]);
       const int want = planed ? c.plane_bits : 4;
       src.pbits = static_cast<std::uint32_t>(want);
       if (c.K > 0 && !src.vram) {
@@ -340,7 +341,7 @@ __device__ __forceinline__ void rd3_group_one(const ExpertPtr* __restrict__ tab,
           std::uint8_t* sb = c.base + poff + static_cast<std::uint64_t>(slot - k0) * pslot;
           // the slot's row bytes per matrix: a plane matrix's rows hold the first `want` bits only (packed)
           std::uint64_t srb[3];
-          for (int pj = 0; pj < 3; ++pj) srb[pj] = src.type[pj] == g_q4_tg2p ? tg2p_prefix(src.rb[pj] / 144, want) : src.rb[pj];
+          for (int pj = 0; pj < 3; ++pj) srb[pj] = plane_prefix(src.type[pj], src.rb[pj], want);
           ExpertPtr at = src;
           at.w[0] = sb;
           at.w[1] = sb + srb[0] * static_cast<std::uint64_t>(F);

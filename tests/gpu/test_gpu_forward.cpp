@@ -570,10 +570,11 @@ TEST(rung4_engine_fused_moe_half) {
               eq ? "bit for bit" : "DIFFER", noted ? "names the fused path" : "MISSING the fused note");
 }
 
-// v54b: the sliding bit planes (kern/tg2_planes.h) in the R3 expert stage, one slider for every pick (--plane-bits). 4 bits
-// through the planes = the stored layout bit for bit; 2 / 3 bits change the logits (finite), one token = verify batches of 4;
-// the slots hold the slider's prefix (packed rows): no cache, 1 slot or 4 slots, staged misses or every expert staged give
-// the same bits; the VRAM probe (--auto-vram) runs and, at 4 bits, changes nothing
+// v54b / v54c: the sliding bit planes (kern/tg2_planes.h) in the R3 expert stage, one slider for every pick (--plane-bits),
+// Q4_TG2 (layer 0) and Q5_K (layer 1) matrices, bank and cache. 5 bits = the stored layout bit for bit; 4 (Q5_K cut), 3 and
+// 2 bits change the logits (finite), one token = verify batches of 4; the slots hold the slider's prefix (packed rows): no
+// cache, 1 slot or 4 slots, staged misses or every expert staged give the same bits; the VRAM probe (--auto-vram) runs
+// and, at 5 bits, changes nothing
 TEST(rung4_engine_bit_planes) {
   if (!g::available()) return;
   Small sm;
@@ -645,26 +646,26 @@ TEST(rung4_engine_bit_planes) {
   };
   std::string summ, summp;
   const std::vector<float> base = run({0, 3, 1, false}, nullptr);
-  const std::vector<float> p4 = run({4, 3, 1, false}, &summ);
-  const bool full_eq = same(base, p4);
+  const std::vector<float> p5 = run({5, 3, 1, false}, &summ);
+  const bool full_eq = same(base, p5);
   CHECK(full_eq);
   CHECK(summ.find("bit planes:") != std::string::npos);
-  const std::vector<float> p2 = run({2, 3, 1, false}, nullptr), p3 = run({3, 3, 1, false}, nullptr);
-  const bool lossy = !same(p2, base) && !same(p3, base) && !same(p2, p3) && finite(p2) && finite(p3);
+  const std::vector<float> p4 = run({4, 3, 1, false}, nullptr), p2 = run({2, 3, 1, false}, nullptr), p3 = run({3, 3, 1, false}, nullptr);
+  const bool lossy = !same(p4, base) && !same(p2, base) && !same(p3, base) && !same(p2, p3) && !same(p3, p4) && finite(p2) && finite(p3) && finite(p4);
   CHECK(lossy);
-  const bool det = one_vs_ver(p2) && one_vs_ver(p3);
+  const bool det = one_vs_ver(p2) && one_vs_ver(p3) && one_vs_ver(p4);
   CHECK(det);
   const std::vector<float> c0 = run({2, 0, 1, false}, nullptr), c1 = run({2, 1, 1, false}, nullptr), c4 = run({2, 4, 1, false}, nullptr),
                            l2 = run({2, 3, 2, false}, nullptr);
   const bool cache_free = same(p2, c0) && same(p2, c1) && same(p2, c4) && same(p2, l2);
   CHECK(cache_free);
-  const std::vector<float> pr = run({4, 3, 1, true}, &summp);
+  const std::vector<float> pr = run({5, 3, 1, true}, &summp);
   const bool probe = same(base, pr) && summp.find("VRAM probe:") != std::string::npos;
   CHECK(probe);
-  std::printf("    bit planes: 4 bits = stored layout %s; 2 / 3 bits change the logits %s, one token = verify batches %s; "
+  std::printf("    bit planes: 5 bits = stored layout %s; 4 / 3 / 2 bits change the logits %s, one token = verify batches %s; "
               "2 bits with no cache / 1 / 3 / 4 slots / every expert staged %s; VRAM probe %s\n",
               full_eq ? "bit for bit" : "DIFFER", lossy ? "(finite)" : "NOT AS EXPECTED", det ? "bit for bit" : "DIFFER",
-              cache_free ? "bit for bit" : "DIFFER", probe ? "runs, same bits at 4" : "WRONG");
+              cache_free ? "bit for bit" : "DIFFER", probe ? "runs, same bits at 5" : "WRONG");
   std::printf("      %s\n", summp.c_str());
 }
 

@@ -581,7 +581,25 @@ struct GpuEngine::Impl {
 
   // ---- the bank
   // device bytes of expert e's three projections in the bank (matrices and their share of the side tables)
+  // v54c: the plane format a stored matrix takes when the slider is on (Q4_TG2 / Q5_K rows), or 0
+  std::uint32_t planed_type(quant::Type t, std::uint64_t rb) const {
+    if (o.plane_bits <= 0) return 0;
+    if (t == quant::Type::q4_tg2 && rb % 144 == 0) return kern::gpu::g_q4_tg2p;
+    if (t == quant::Type::q5_k && rb % 176 == 0) return kern::gpu::g_q5_kp;
+    return 0;
+  }
+  // v54c: an expert's matrices at the slider's bits (the bytes a bank copy or a cache slot of it takes)
+  std::size_t planed_bytes(const Qwen35MoeLayer& l, int e) const {
+    std::size_t b = 0;
+    for (const WeightView* v : {&l.gate_exps, &l.up_exps, &l.down_exps}) {
+      const ExpRows r = exp_rows(*v, e);
+      const std::uint32_t pt = planed_type(r.t, r.rb);
+      b += z(static_cast<int64_t>(pt ? kern::gpu::plane_prefix(pt, r.rb, o.plane_bits) : r.rb)) * z(static_cast<int64_t>(v->ne[1]));
+    }
+    return b;
+  }
   std::size_t expert_bytes(const Qwen35MoeLayer& l, int e) const {
+    if (o.plane_bits > 0) return al(planed_bytes(l, e));  // v54c: the planed bank holds the matrices alone
     std::size_t b = 0;
     for (const WeightView* v : {&l.gate_exps, &l.up_exps, &l.down_exps}) {
       const std::uint32_t t = exp_type(*v, e);
@@ -597,6 +615,52 @@ struct GpuEngine::Impl {
     for (const WeightView* v : {&l.gate_exps, &l.up_exps, &l.down_exps})
       if (!g::prompt_type_ok(exp_type(*v, e), static_cast<int64_t>(v->ne[0])) || v->rot32) return false;
     return true;
+  }
+  // v54c: the bank in bit planes (the slider on): each hot expert's matrices back to back in VRAM, plane matrices as the
+  // slider's prefix of each row (packed), the rest as stored. Only the R3 expert stage reads it (no stacks, no tables)
+  Status build_bank_planes(const Qwen35MoeLayer& l, Layer& D) {
+    const int ne = static_cast<int>(s.n_expert);
+    std::size_t need_b = 0;
+    for (int e = 0; e < ne; ++e)
+      if (D.hot[z(e)]) need_b += al(planed_bytes(l, e));
+    D.bg.clear();
+    D.bu.clear();
+    D.bd.clear();
+    for (auto& ba : D.bank_at) ba.assign(z(ne), nullptr);
+    if (need_b == 0) return Status::good();
+    D.bank_mem = g::dalloc(need_b);
+    if (!D.bank_mem) return gfail("engine: bank memory (planes)");
+    dev_bytes += need_b;
+    bank_bytes_total += need_b;
+    auto* base = static_cast<std::uint8_t*>(D.bank_mem);
+    std::size_t off = 0;
+    std::vector<std::uint8_t> row, host;
+    for (int e = 0; e < ne; ++e) {
+      if (!D.hot[z(e)]) continue;
+      host.clear();
+      const WeightView* vv[3] = {&l.gate_exps, &l.up_exps, &l.down_exps};
+      std::size_t moff[3];
+      for (int pj = 0; pj < 3; ++pj) {
+        const ExpRows r = exp_rows(*vv[pj], e);
+        const std::uint32_t pt = planed_type(r.t, r.rb);
+        const std::uint64_t rows = static_cast<std::uint64_t>(vv[pj]->ne[1]);
+        moff[pj] = host.size();
+        if (!pt) {
+          host.insert(host.end(), r.base, r.base + r.rb * rows);
+          continue;
+        }
+        const std::uint64_t pf = kern::gpu::plane_prefix(pt, r.rb, o.plane_bits);
+        row.resize(z(static_cast<int64_t>(r.rb)));
+        for (std::uint64_t rr = 0; rr < rows; ++rr) {
+          kern::gpu::plane_row(static_cast<std::uint32_t>(r.t), r.base + rr * r.rb, row.data(), r.rb);
+          host.insert(host.end(), row.begin(), row.begin() + static_cast<std::ptrdiff_t>(pf));
+        }
+      }
+      if (!g::to_device(base + off, host.data(), host.size())) return gfail("engine: bank upload (planes)");
+      for (int pj = 0; pj < 3; ++pj) D.bank_at[z(pj)][z(e)] = base + off + moff[pj];
+      off += al(host.size());
+    }
+    return Status::good();
   }
   // the bank of one layer from its hot flags: per projection one stack per type, with an expert map
   Status build_bank(const Qwen35MoeLayer& l, Layer& D) {
@@ -1655,6 +1719,7 @@ struct GpuEngine::Impl {
       struct PJob {
         const std::uint8_t* src;
         std::uint64_t off, rb, rows;
+        std::uint32_t t;
       };
       std::vector<PJob> jobs;
       for (std::uint32_t il = 0; il < s.n_layer; ++il) {
@@ -1663,10 +1728,10 @@ struct GpuEngine::Impl {
           for (int64_t ex = 0; ex < ne; ++ex) {
             if (L[il].hot[z(ex)] || L[il].light[z(ex)]) continue;
             const ExpRows r = exp_rows(*vv[pj], static_cast<int>(ex));
-            if (r.t != quant::Type::q4_tg2 || r.rb % 144 != 0) continue;
+            if (!planed_type(r.t, r.rb)) continue;  // v54c: Q4_TG2 and Q5_K
             const std::uint64_t rows = static_cast<std::uint64_t>(vv[pj]->ne[1]), b = r.rb * rows;
             poff[z((static_cast<int64_t>(il) * 3 + pj) * ne + ex)] = tot + 1;
-            jobs.push_back({r.base, tot, r.rb, rows});
+            jobs.push_back({r.base, tot, r.rb, rows, static_cast<std::uint32_t>(r.t)});
             tot += (b + 255) / 256 * 256;  // each matrix 256-byte aligned
           }
       }
@@ -1687,13 +1752,12 @@ struct GpuEngine::Impl {
           th.emplace_back([&]() {
             for (std::size_t i = next.fetch_add(1); i < jobs.size(); i = next.fetch_add(1)) {
               const PJob& J = jobs[i];
-              const int nB = static_cast<int>(J.rb / 144);
-              for (std::uint64_t rr = 0; rr < J.rows; ++rr) kern::gpu::tg2p_plane_row(J.src + rr * J.rb, ph + J.off + rr * J.rb, nB);
+              for (std::uint64_t rr = 0; rr < J.rows; ++rr) kern::gpu::plane_row(J.t, J.src + rr * J.rb, ph + J.off + rr * J.rb, J.rb);
             }
           });
         for (auto& t : th) t.join();
         char pb[200];
-        std::snprintf(pb, sizeof pb, "; bit planes: %zu Q4_TG2 matrices, %.2f GB pinned, built in %.2f s; every pick read with %d bits, slots sized for them",
+        std::snprintf(pb, sizeof pb, "; bit planes: %zu Q4_TG2 / Q5_K matrices outside the bank, %.2f GB pinned, built in %.2f s; every pick read with %d bits (at most each matrix's own), bank and slots sized for them",
                       jobs.size(), static_cast<double>(tot) / 1e9, since(tp), o.plane_bits);
         planes_note = pb;
       }
@@ -1764,7 +1828,11 @@ struct GpuEngine::Impl {
           if (bank) X.vram = 1;
           if (!bank && !poff.empty() && poff[z((static_cast<int64_t>(il) * 3 + pj) * ne + ex)]) {  // v54: from the bit planes
             X.w[pj] = static_cast<const std::uint8_t*>(planes_dev) + (poff[z((static_cast<int64_t>(il) * 3 + pj) * ne + ex)] - 1);
-            X.type[pj] = kern::gpu::g_q4_tg2p;
+            X.type[pj] = planed_type(r.t, r.rb);
+          }
+          if (bank && planed_type(r.t, r.rb)) {  // v54c: the planed bank holds the slider's prefix of each row
+            X.type[pj] = planed_type(r.t, r.rb);
+            X.rb[pj] = kern::gpu::plane_prefix(X.type[pj], r.rb, o.plane_bits);
           }
         }
       }
@@ -1899,8 +1967,8 @@ struct GpuEngine::Impl {
             for (const WeightView* v : {&l.gate_exps, &l.up_exps, &l.down_exps}) {
               const ExpRows r = exp_rows(*v, ex);
               // v54b: a matrix held in bit planes takes the slider's prefix of each row in its slot (as rd3_group_one lays it)
-              const bool pl = o.plane_bits > 0 && !L[il].light[z(ex)] && r.t == quant::Type::q4_tg2 && r.rb % 144 == 0;
-              b += (pl ? kern::gpu::tg2p_prefix(r.rb / 144, o.plane_bits) : r.rb) * static_cast<std::uint64_t>(v->ne[1]);
+              const std::uint32_t pt = L[il].light[z(ex)] ? 0u : planed_type(r.t, r.rb);
+              b += (pt ? kern::gpu::plane_prefix(pt, r.rb, o.plane_bits) : r.rb) * static_cast<std::uint64_t>(v->ne[1]);
             }
             esz[z(ex)] = (b + 255) & ~std::uint64_t{255};
             const double cn = il < o.hot_count.size() && z(ex) < o.hot_count[il].size() ? static_cast<double>(o.hot_count[il][z(ex)]) : 0.0;
@@ -2615,7 +2683,15 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
     if (o.auto_vram) {  // v54b VRAM probe: the free bytes after the dense weights split cache_share / the rest
       const std::uint64_t slack = (3 * 4 * (2048 + 256 * 4) + 64 * 1024) * static_cast<std::uint64_t>(s.n_layer);
       const std::uint64_t ex_b = left > slack ? left - slack : 0;
-      I.rc_eff = static_cast<int>(static_cast<double>(ex_b) * o.cache_share / static_cast<double>(slot_b * s.n_layer));
+      // the cache share, capped so bank + cache never ask for more than every expert's bytes (a model whose experts all fit
+      // in the bank gets no cache)
+      std::uint64_t all_b = 0;
+      for (std::uint32_t il = 0; il < s.n_layer; ++il)
+        for (int ex = 0; ex < static_cast<int>(ne); ++ex) all_b += I.expert_bytes(w.layers[il], ex);
+      double cache_b = static_cast<double>(ex_b) * o.cache_share;
+      if (static_cast<double>(all_b) <= static_cast<double>(ex_b)) cache_b = 0.0;
+      else cache_b = std::min(cache_b, static_cast<double>(all_b) - static_cast<double>(ex_b) * (1.0 - o.cache_share));
+      I.rc_eff = static_cast<int>(cache_b / static_cast<double>(slot_b * s.n_layer));
       hot_cap = static_cast<int>(ne);
       char pn[240];
       std::snprintf(pn, sizeof pn, "; VRAM probe: %.2f GB free after the dense weights (reserve %.2f GB kept), %.2f GB for experts: cache %.1f %% = %d slots of %.2f MB per layer, the bank the rest",
@@ -2650,16 +2726,16 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
         ++I.bank_count;
       }
     for (std::uint32_t il = 0; il < s.n_layer; ++il) {
-      const Status st = I.build_bank(w.layers[il], I.L[il]);
+      const Status st = o.plane_bits > 0 ? I.build_bank_planes(w.layers[il], I.L[il]) : I.build_bank(w.layers[il], I.L[il]);  // v54c
       if (!st) return R::fail(st);
     }
   }
   if (o.plane_bits != 0) {  // v54b: only the R3 expert stage reads the planes; misses fill their slots through staging
-    if (o.plane_bits < 2 || o.plane_bits > 4) return R::fail(Status::fail(Code::invalid_argument, "engine: --plane-bits 2, 3 or 4"));
-    if (!o.cold_on_gpu || !o.r3_experts || o.rx_load < 1 || o.prefetch || o.cpu_light || o.plane_tail != 0)
+    if (o.plane_bits < 2 || o.plane_bits > 5) return R::fail(Status::fail(Code::invalid_argument, "engine: --plane-bits 2, 3, 4 or 5 (5: every code as stored)"));
+    if (!o.cold_on_gpu || !o.r3_experts || o.rx_load < 1 || o.prefetch || o.cpu_light || o.plane_tail != 0 || !o.gpu_prompt)
       return R::fail(Status::fail(Code::invalid_argument,
                                   "engine: --plane-bits needs the R3 expert stage with staged loads (--cold-on-gpu --r3-experts --rx-load miss|all), "
-                                  "no --prefetch, --cpu-light or --plane-tail"));
+                                  "no --prefetch, --cpu-light, --plane-tail or --cpu-prompt"));
   }
   if (o.cold_on_gpu) I.setup_reader();  // v24
   if (o.plane_bits > 0 && !I.rx_ok)  // (no plane matrices at all is fine: every expert in the bank)
