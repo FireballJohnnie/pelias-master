@@ -620,8 +620,10 @@ struct GpuEngine::Impl {
     }
     return b;
   }
-  std::size_t expert_bytes(const Qwen35MoeLayer& l, int e) const {
-    if (o.plane_bits > 0) return al(planed_bytes(l, e));  // v54c: the planed bank holds the matrices alone
+  // v56: planed false for the MTP block's bank, which build_bank fills in the stored types with their int8 tables whatever
+  // the slider (v56 M1-M3 MEASURED: "the MTP bank arena is too small" when its arena was sized with the planed bytes)
+  std::size_t expert_bytes(const Qwen35MoeLayer& l, int e, bool planed = true) const {
+    if (planed && o.plane_bits > 0) return al(planed_bytes(l, e));  // v54c: the planed bank holds the matrices alone
     std::size_t b = 0;
     for (const WeightView* v : {&l.gate_exps, &l.up_exps, &l.down_exps}) {
       const std::uint32_t t = exp_type(*v, e);
@@ -2904,7 +2906,7 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
     int bankable_n = 0;
     for (int ex = 0; ex < static_cast<int>(ne); ++ex)
       if (I.bankable(ml, ex)) {
-        eb = std::max<std::uint64_t>(eb, I.expert_bytes(ml, ex));
+        eb = std::max<std::uint64_t>(eb, I.expert_bytes(ml, ex, false));
         ++bankable_n;
       }
     int k = o.mtp_bank;
@@ -3585,7 +3587,7 @@ Result<int> GpuEngine::mtp_promote() {
   int count = 0;
   for (const int e : order) {
     if (count >= M.bank_slots) break;
-    const std::uint64_t b = I.expert_bytes(ml, e);
+    const std::uint64_t b = I.expert_bytes(ml, e, false);
     if (used + b > M.bank_cap - 12 * (al(static_cast<std::size_t>(ne) * sizeof(int)) + 1024) - 3 * 4 * 4096) continue;
     used += b;
     want[static_cast<std::size_t>(e)] = 1;
