@@ -1905,8 +1905,10 @@ __device__ PG_NOINL void dn_stage2_unit(const DnHalfArgs& A, int u, float* sm, d
   __syncthreads();  // the shared arrays are reused by the next unit
 }
 
+// v55g2 (build55g listing, MEASURED: 213-215 registers without a bound = 1 block of 256 per SM, so the dense stream stages
+// ran on 8 warps per SM; the lean Q8_0 GEMV needed ~6 blocks per SM for 503 GB/s): bound to 2 blocks per SM (128 registers)
 template <int ONLY, int NJ>
-__global__ void __launch_bounds__(256) k_dn_half(const __grid_constant__ DnHalfArgs A, const DJob* __restrict__ j1, int nj1, long long nt1,
+__global__ void __launch_bounds__(256, 2) k_dn_half(const __grid_constant__ DnHalfArgs A, const DJob* __restrict__ j1, int nj1, long long nt1,
                                                  const DJob* __restrict__ j2, int nj2, long long nt2) {
   namespace cg = cooperative_groups;
   cg::grid_group grid = cg::this_grid();
