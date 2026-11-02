@@ -2434,7 +2434,7 @@ int cmd_engine_check(const Args& a) {
                  "                           [--text FILE [--skip-tokens N]] [--timeline] [--dump-top OUT.tsv] [--dump-router OUT.tsv] [--dump-draft OUT.tsv] [--dump-split [--split-sizes 2,3,4] [--split-step]]\n"
                  "                           [--no-doorbell] [--timeline-ops] [--split-ref] [--bank-selftest MIXES] [--probe-pos P]\n"
                  "                           [--router-tie BAND] [--cold-on-gpu] [--trace OUT.tsv] [--reader-v25] [--reader-cache K] [--fold-shared]\n"
-                 "                           [--batch-identical] [--graph] [--prefetch] [--plane-tail N] [--cpu-light] [--reader-rpw 1|2] [--r3-experts] [--rx-load lane|miss|all] [--cpu-prompt]\n"
+                 "                           [--batch-identical] [--graph] [--prefetch] [--plane-tail N] [--cpu-light] [--reader-rpw 1|2] [--r3-experts] [--rx-load lane|miss|all] [--gpu-prompt [--prompt-batched]] [--cpu-prompt]\n"
                  "                           [--pin-gap-kib K] [--pin-huge-ok] [--cpu-up-rows N] [--cpu-down2] [--cpu-gu2] [--cpu-tile] [--spin-pause] [--cpu-prefetch] [--cpu-check] [--host-wait auto|spin|yield|block] [--pin-cpus 0,2,4,...] [--pin-host N] [--ref-threads N] [--no-cpu-light] [--split-slow] [--preload-light]\n");
     return 1;
   }
@@ -2520,7 +2520,8 @@ int cmd_engine_check(const Args& a) {
   eo.reader_v3 = !a.has("reader-v25");
   eo.fold_shared = a.has("fold-shared");
   eo.r3_experts = a.has("r3-experts");  // v46a-1
-  eo.gpu_prompt = !a.has("cpu-prompt");  // v48: the prompt on the GPU-only path unless asked
+  eo.gpu_prompt = a.has("gpu-prompt") && !a.has("cpu-prompt");  // v49d: the GPU prompt only when asked (v48-v49 default; fails W2's gate)
+  eo.prompt_r3 = !a.has("prompt-batched");                       // v49d: the GPU prompt's steps on the batched kernels
   if (a.has("rx-load")) {  // v46a-2
     const std::string rxl = a.get("rx-load");
     if (rxl == "lane") eo.rx_load = 0;
@@ -3236,8 +3237,9 @@ int cmd_engine_check(const Args& a) {
           std::fprintf(stderr, "pelias: cannot write %s\n", dump_top.c_str());
           return 1;
         }
-        std::fprintf(fo, "pos\tinput\teng1\teng2\teng_margin\tcpu1\tcpu2\tcpu_margin\tflt1\tflt2\tflt_margin\n");
+        std::fprintf(fo, "pos\tinput\teng1\teng2\teng_margin\tcpu1\tcpu2\tcpu_margin\tflt1\tflt2\tflt_margin\teng_kl\tcpu_kl\n");  // v49d: per-row KL vs float
       }
+      double klp[2] = {0.0, 0.0}, kld[2] = {0.0, 0.0};  // v49d: KL vs float summed over the prompt rows / the decode rows (engine, CPU)
       for (int t2 = 0; t2 < n; ++t2) {
         const std::size_t off = static_cast<std::size_t>(t2) * nv;
         const Top2 te = top2(lg.data() + off, nv), tc = top2(ref.data() + off, nv), tf = top2(lf.data() + off, nv);
@@ -3252,11 +3254,19 @@ int cmd_engine_check(const Args& a) {
         ne += eok ? 0 : 1;
         nc += cok ? 0 : 1;
         nec += te.i1 != tc.i1 ? 1 : 0;
+        const double ke = kl_rows(lf.data() + off, lg.data() + off, nv), kc = kl_rows(lf.data() + off, ref.data() + off, nv);
+        (t2 < static_cast<int>(npre) ? klp : kld)[0] += ke;
+        (t2 < static_cast<int>(npre) ? klp : kld)[1] += kc;
         if (fo)
-          std::fprintf(fo, "%d\t%d\t%zu\t%zu\t%.6f\t%zu\t%zu\t%.6f\t%zu\t%zu\t%.6f\n", t2, ids[static_cast<std::size_t>(t2)], te.i1, te.i2, te.margin, tc.i1, tc.i2,
-                       tc.margin, tf.i1, tf.i2, tf.margin);
+          std::fprintf(fo, "%d\t%d\t%zu\t%zu\t%.6f\t%zu\t%zu\t%.6f\t%zu\t%zu\t%.6f\t%.6e\t%.6e\n", t2, ids[static_cast<std::size_t>(t2)], te.i1, te.i2, te.margin, tc.i1,
+                       tc.i2, tc.margin, tf.i1, tf.i2, tf.margin, ke, kc);
       }
       if (fo) std::fclose(fo);
+      {
+        const double np2 = static_cast<double>(std::min<std::uint64_t>(npre, static_cast<std::uint64_t>(n))), nd2 = static_cast<double>(n) - np2;
+        std::printf("  KL vs float by rows: prompt rows (%.0f) engine %.3e, CPU %.3e; decode rows (%.0f) engine %.3e, CPU %.3e\n", np2, np2 > 0 ? klp[0] / np2 : 0.0,
+                    np2 > 0 ? klp[1] / np2 : 0.0, nd2, nd2 > 0 ? kld[0] / nd2 : 0.0, nd2 > 0 ? kld[1] / nd2 : 0.0);
+      }
       std::printf("  top-1 paired vs float: engine right / CPU wrong %d, engine wrong / CPU right %d, McNemar exact p %.3f\n", b, c, mcnemar_p(b, c));
       std::printf("  float's top-2 margin (logits) where the engine misses float: < 0.1 %d, < 0.5 %d, < 1.0 %d of %d; where the CPU misses: %d, %d, %d of %d; "
                   "CPU's margin where engine and CPU differ: %d, %d, %d of %d%s%s\n",

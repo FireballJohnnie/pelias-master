@@ -2561,7 +2561,7 @@ Status GpuEngine::Impl::run(const std::int32_t* tokens, int n, float* logits, bo
   const bool rd = I.reader && n <= Impl::kReaderMax;  // v24: the reader's steps use no doorbell
   const bool bl = I.bell && !rd;
   const bool cl = rd && I.split_ok;  // v28: a reader step whose light picks the CPU computes
-  I.bi_now = rd && (I.o.batch_identical || I.in_prompt);  // v26 option B; v48b: the GPU prompt's steps too (MEASURED v48: 99.0 vs 49.9 tok/s)
+  I.bi_now = rd && (I.o.batch_identical || (I.in_prompt && I.o.prompt_r3));  // v26 option B; v48b: the GPU prompt's steps too (MEASURED v48: 99.0 vs 49.9 tok/s)
   struct BiReset {
     bool& f;
     ~BiReset() { f = false; }

@@ -126,7 +126,9 @@ struct EngineOptions {
   // steps of up to 4 on the GPU-only path (reader / R3), so no expert pick of the prompt goes to the CPU; false = the
   // prompt's batches take the bank + CPU cold path as before (--cpu-prompt). v48b: the prompt's steps use R3 (weights once
   // for the step's tokens, each token in its one-token order) whether or not batch_identical is set
-  bool gpu_prompt = true;
+  bool gpu_prompt = false;  // v49d: off by default again (author 21:08 "keep the better": the GPU prompt fails W2's gate; --gpu-prompt)
+  // v49d: the GPU prompt's steps on R3 (true, v48b) or on the batched kernels (false, v48's plain path; --prompt-batched)
+  bool prompt_r3 = true;
   // v28: gate / up rows per warp in the reader v3 kernels (1 or 2; 2 = v26's shape)
   int reader_rows_per_warp = 2;
   // v28: pinned ranges are merged across gaps smaller than this (bytes; v27 used 8 MiB; 0 = exact ranges, one per matrix
