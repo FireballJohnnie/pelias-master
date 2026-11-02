@@ -143,7 +143,12 @@ struct MoeHalfArgs {
   int max_picks = 0, load_mode = 0;
   float* y = nullptr;              // n x H the MoE output (as moe_r3's y)
   unsigned long long* ph = nullptr;  // v55b: null, or 5 GPU-clock stamps by block 0 (start, after phases A, B, C, end)
+  // v55e3 diagnosis (temporary): null, or kRxStatN device counters the one-token expert stage adds to (a counting kernel):
+  // 0 warp cycles waiting for a group, 1 cycles running tasks, 2 tasks, 3 the warps' loop spans, 4 warps, 5 staged tasks,
+  // 6 filling tasks, 7 cycles of staged tasks, 8 + f cycles of format f (DJob fmt 0..10, 11 other), 20 + f tasks of format f
+  unsigned long long* st = nullptr;
 };
+constexpr int kRxStatN = 32;
 bool moe_half(const MoeHalfArgs& args, Stream s = nullptr);
 // v55b: the expert stage holds one Q4_TG2 grid in shared memory (8 KB instead of 24 KB, so more blocks fit per SM): the grid
 // of the bits every Q4_TG2 job of the engine reads (4: stored or 4 / 5 planes; 3 or 2: the plane slider's base grid). Set

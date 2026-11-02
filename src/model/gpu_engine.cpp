@@ -402,6 +402,7 @@ struct GpuEngine::Impl {
   int rx_maxp = 0;
   bool rx_ok = false;
   unsigned long long *ph_h = nullptr, *ph_d = nullptr;  // v55b: n_layer x 5 phase stamps of the fused MoE half (verbose_gpu)
+  unsigned long long* rst_d = nullptr;                    // v55e3 diagnosis: the expert stage's counters (g::kRxStatN, verbose_gpu)
   double ph_sum[4] = {0, 0, 0, 0};
   std::uint64_t ph_steps = 0, ph_layers = 0;
   std::string rx_note = "off";
@@ -1575,6 +1576,7 @@ struct GpuEngine::Impl {
     A.load_mode = o.rx_load;
     A.y = y;
     A.ph = ph_d ? ph_d + static_cast<int64_t>(il) * 5 : nullptr;  // v55b
+    A.st = rst_d;                                                 // v55e3
     if (!g::moe_half(A)) return Status::fail(Code::internal, std::string("engine: fused MoE half: ") + g::stream_last_error());
     return Status::good();
   }
@@ -2188,6 +2190,11 @@ struct GpuEngine::Impl {
             ph_h = static_cast<unsigned long long*>(g::host_alloc_mapped(static_cast<std::size_t>(s.n_layer) * 5 * sizeof(unsigned long long), &phd));
             ph_d = static_cast<unsigned long long*>(phd);
             if (!ph_h || !ph_d) ph_h = ph_d = nullptr;
+            rst_d = static_cast<unsigned long long*>(g::dalloc(g::kRxStatN * sizeof(unsigned long long)));  // v55e3
+            if (rst_d && !g::dzero(rst_d, g::kRxStatN * sizeof(unsigned long long))) {
+              g::dfree(rst_d);
+              rst_d = nullptr;
+            }
           }
         } else {
           rx_note = "off (device memory)";
@@ -2293,6 +2300,7 @@ GpuEngine::~GpuEngine() {
   g::host_free(p_->trc_hv);
   g::host_free(p_->planes_h);  // v54
   g::host_free(p_->ph_h);  // v55b
+  g::dfree(p_->rst_d);      // v55e3
   g::host_free(p_->rlg_h);  // v49
   g::dfree(p_->probe_bd);
   g::dfree(p_->probe_ld);
@@ -2391,7 +2399,32 @@ std::string GpuEngine::moe_phase_report() const {  // v55b
                 "B picks + grouping + plan (block 0) %.3f, C expert stage %.3f, D combine + residual %.3f; total %.3f",
                 static_cast<unsigned long long>(I.ph_steps), static_cast<double>(I.ph_layers) / st, I.ph_sum[0] / st, I.ph_sum[1] / st, I.ph_sum[2] / st,
                 I.ph_sum[3] / st, (I.ph_sum[0] + I.ph_sum[1] + I.ph_sum[2] + I.ph_sum[3]) / st);
-  return b;
+  std::string r = b;
+  if (I.rst_d) {  // v55e3 diagnosis: the one-token expert stage's counters (SM cycles; every one-token step since open)
+    unsigned long long c[g::kRxStatN] = {};
+    if (g::sync() && g::to_host(c, I.rst_d, sizeof c)) {
+      const double wt = static_cast<double>(c[0]), wk = static_cast<double>(c[1]), sp = static_cast<double>(c[3]);
+      const double tk = static_cast<double>(c[2]), wp = static_cast<double>(c[4]);
+      char e[600];
+      std::snprintf(e, sizeof e,
+                    "\nexpert stage counters (one-token launches, SM cycles summed over warps): warps %llu, tasks %llu (%.1f per warp), loop span %.0f cycles "
+                    "per warp: running tasks %.1f %%, waiting for a group %.1f %%, rest (job lookup, signals) %.1f %%; %.0f cycles per task; staged tasks (host "
+                    "RAM over PCIe) %llu at %.0f cycles each = %.1f %% of task cycles (VRAM tasks %.0f cycles each); filling tasks %llu",
+                    c[4], c[2], wp > 0 ? tk / wp : 0.0, wp > 0 ? sp / wp : 0.0, sp > 0 ? 100.0 * wk / sp : 0.0, sp > 0 ? 100.0 * wt / sp : 0.0,
+                    sp > 0 ? 100.0 * (sp - wk - wt) / sp : 0.0, tk > 0 ? wk / tk : 0.0, c[5], c[5] ? static_cast<double>(c[7]) / static_cast<double>(c[5]) : 0.0,
+                    wk > 0 ? 100.0 * static_cast<double>(c[7]) / wk : 0.0, tk > static_cast<double>(c[5]) ? (wk - static_cast<double>(c[7])) / (tk - static_cast<double>(c[5])) : 0.0,
+                    c[6]);
+      r += e;
+      static const char* fn[12] = {"Q7_ZT", "Q4_TG2", "Q5_K", "Q6_K dense", "Q8_0", "Q4_K", "IQ4_XS", "Q6_K", "silu x up", "Q4_TG2 planes", "Q5_K planes", "other"};
+      for (int f = 0; f < 12; ++f) {
+        if (c[20 + f] == 0) continue;
+        std::snprintf(e, sizeof e, "\n  %-13s tasks %10llu, %8.0f cycles per task, %5.1f %% of task cycles", fn[f], c[20 + f],
+                      static_cast<double>(c[8 + f]) / static_cast<double>(c[20 + f]), wk > 0 ? 100.0 * static_cast<double>(c[8 + f]) / wk : 0.0);
+        r += e;
+      }
+    }
+  }
+  return r;
 }
 std::string GpuEngine::graph_report() const {
   return p_->graph_note + "; captures " + std::to_string(p_->graph_captures) + ", replays " + std::to_string(p_->graph_replays);

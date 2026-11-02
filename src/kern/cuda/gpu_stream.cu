@@ -69,7 +69,7 @@ __constant__ float c_grid[4][16];  // the Q4_TG2 grids (quant::q4_tg_grid(tag, 2
 __constant__ float c_grid3[4][16];  // v54: the 3-bit and 2-bit base grids (tg2p_base_grid of c_grid), uploaded once
 __constant__ float c_grid2[4][16];
 __constant__ int c_rx_bits;
-bool g_lean_dense = true;  // v55e experiment switch (--no-lean-dense): v55d's lean one-format dense kernels on / off; removed once measured  // v55b: the one grid the expert stage loads (4, 3 or 2; 0 = 4)
+bool g_lean_dense = false;  // v55e experiment switch (--lean-dense since v55e3): v55d's lean one-format dense kernels; off (v55e2: +1.1 ms per token, MEASURED); removed once understood  // v55b: the one grid the expert stage loads (4, 3 or 2; 0 = 4)
 __device__ __forceinline__ unsigned long long gtimer_s() {  // v55b: the GPU's global nanosecond clock (as gpu_ops.cu's gtimer)
   unsigned long long t;
   asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
@@ -1093,8 +1093,11 @@ __device__ __forceinline__ void rx_rows_staged(const DJob& J, long long t, std::
 // a signalling job adds 1 (release). All blocks are resident (cooperative launch), and a job waits only for groups of
 // jobs before it, so the lowest unfinished task can always run: no deadlock.
 // v52: the task loop (after lut_setup) for k_rx and the fused MoE half
-template <bool kMT, int ONLY = kOnlyRx>
-__device__ __forceinline__ void rx_body(const std::uint8_t* __restrict__ plan, int maxp, int sbytes) {
+// v55e3 diagnosis (temporary; kStat, the verbose kernel only): per warp, SM cycles waiting for a group (dep) vs running
+// tasks, tasks, the loop's span; per format (J.fmt 0..10) the cycles and tasks; staged and filling tasks (st layout:
+// gpu_stream.h kRxStatN)
+template <bool kMT, int ONLY = kOnlyRx, bool kStat = false>
+__device__ __forceinline__ void rx_body(const std::uint8_t* __restrict__ plan, int maxp, int sbytes, unsigned long long* st = nullptr) {
   std::uint8_t* sbuf = reinterpret_cast<std::uint8_t*>(s_lut) + kLutRxBytes + static_cast<long long>(threadIdx.x / 32) * sbytes;  // v46a-2, v54
   const RxLayout Lo = rx_layout(maxp);
   const auto* hd = reinterpret_cast<const RxHdr*>(plan);
@@ -1109,7 +1112,11 @@ __device__ __forceinline__ void rx_body(const std::uint8_t* __restrict__ plan, i
   const long long w0 = static_cast<long long>(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32;
   const int lane = static_cast<int>(threadIdx.x & 31);
   int j = 0;
+  long long c_wait = 0, c_work = 0, c_beg = 0, ntk = 0;
+  if constexpr (kStat) c_beg = clock64();
   for (long long t = w0; t < end; t += warps) {
+    long long ca = 0, cb = 0;
+    if constexpr (kStat) ca = clock64();
     while (j + 1 < njobs && jobs[j + 1].task0 <= t) ++j;
     const int dg = dep[j];
     if (dg >= 0) {
@@ -1119,15 +1126,42 @@ __device__ __forceinline__ void rx_body(const std::uint8_t* __restrict__ plan, i
       }
       __syncwarp();
     }
+    if constexpr (kStat) cb = clock64();
     const DJob& J = jobs[j];
     if (J.fmt == kEpi) rx_epi(J);
     else if (J.stg) rx_rows_staged<kMT, ONLY>(J, t, sbuf);
     else if (J.fd) rx_rows<2, kMT, ONLY>(J, t);
     else rx_rows<1, kMT, ONLY>(J, t);
+    if constexpr (kStat) {
+      __syncwarp();
+      const long long cc = clock64();
+      c_wait += cb - ca;
+      c_work += cc - cb;
+      ++ntk;
+      if (lane == 0) {
+        const int f = J.fmt >= 0 && J.fmt <= 10 ? J.fmt : 11;
+        atomicAdd(st + 8 + f, static_cast<unsigned long long>(cc - cb));
+        atomicAdd(st + 20 + f, 1ull);
+        if (J.stg) {  // staged = read from host RAM over PCIe (rx-load miss: the experts not in VRAM)
+          atomicAdd(st + 5, 1ull);
+          atomicAdd(st + 7, static_cast<unsigned long long>(cc - cb));
+        }
+        if (J.fd) atomicAdd(st + 6, 1ull);
+      }
+    }
     const int sg = sig[j];
     if (sg >= 0) {
       __syncwarp();
       if (lane == 0) red_release_add(gd + sg, 1ull);
+    }
+  }
+  if constexpr (kStat) {
+    if (lane == 0) {
+      atomicAdd(st + 0, static_cast<unsigned long long>(c_wait));
+      atomicAdd(st + 1, static_cast<unsigned long long>(c_work));
+      atomicAdd(st + 2, static_cast<unsigned long long>(ntk));
+      atomicAdd(st + 3, static_cast<unsigned long long>(clock64() - c_beg));
+      atomicAdd(st + 4, 1ull);
     }
   }
 }
@@ -1151,7 +1185,7 @@ __global__ void __launch_bounds__(256) k_rx_probe(const std::uint8_t* __restrict
 //  C every block: the R3 expert stage (rx_body, k_rx's task loop)
 //  D every thread: the combine (md::rd3_combine_one) into y and the residual x = (x + a) + y
 // A grid barrier between phases. The values and their order are the separate kernels', so the bits are theirs.
-template <bool kMT, int NJ>
+template <bool kMT, int NJ, bool kStat = false>
 __global__ void __launch_bounds__(256) k_moe_half(const MoeHalfArgs A, int sbytes) {
   namespace cg = cooperative_groups;
   cg::grid_group grid = cg::this_grid();
@@ -1215,7 +1249,7 @@ __global__ void __launch_bounds__(256) k_moe_half(const MoeHalfArgs A, int sbyte
   if (phs) A.ph[2] = gtimer_s();
   // ---- C
   lut_setup_rx();
-  rx_body<kMT>(static_cast<const std::uint8_t*>(A.plan), A.max_picks, sbytes);
+  rx_body<kMT, kOnlyRx, kStat>(static_cast<const std::uint8_t*>(A.plan), A.max_picks, sbytes, A.st);
   grid.sync();
   if (phs) A.ph[3] = gtimer_s();
   // ---- D
@@ -1612,13 +1646,16 @@ bool moe_half(const MoeHalfArgs& A, Stream s) {
   const int sm_stage = 4 * nsub * md::kGvPad * 4, sm_router = 2 * md::kRouterMaxExperts * 4 + md::kRouterMaxExperts, sm_rx = kLutRxBytes + 8 * sbytes;
   const int smem = std::max(sm_stage, std::max(sm_router, sm_rx));
   const bool mt = A.n > 1;
+  const bool stat = !mt && A.st != nullptr;  // v55e3 diagnosis: the counting kernel (verbose runs only)
   const int nj = nsub <= 32 ? 1 : nsub / 32;
   void* fn = nullptr;
-  if (nj == 1) fn = mt ? reinterpret_cast<void*>(k_moe_half<true, 1>) : reinterpret_cast<void*>(k_moe_half<false, 1>);
+  if (stat) fn = nj == 1 ? reinterpret_cast<void*>(k_moe_half<false, 1, true>) : nj == 2 ? reinterpret_cast<void*>(k_moe_half<false, 2, true>)
+                                                                                        : reinterpret_cast<void*>(k_moe_half<false, 4, true>);
+  else if (nj == 1) fn = mt ? reinterpret_cast<void*>(k_moe_half<true, 1>) : reinterpret_cast<void*>(k_moe_half<false, 1>);
   else if (nj == 2) fn = mt ? reinterpret_cast<void*>(k_moe_half<true, 2>) : reinterpret_cast<void*>(k_moe_half<false, 2>);
   else fn = mt ? reinterpret_cast<void*>(k_moe_half<true, 4>) : reinterpret_cast<void*>(k_moe_half<false, 4>);
-  static int grids[2][3][3] = {};
-  int& grid = grids[mt ? 1 : 0][nj == 1 ? 0 : (nj == 2 ? 1 : 2)][A.load_mode];
+  static int grids[2][3][3][2] = {};
+  int& grid = grids[mt ? 1 : 0][nj == 1 ? 0 : (nj == 2 ? 1 : 2)][A.load_mode][stat ? 1 : 0];
   if (!grid) {
     int dev = 0, sms = 0, occ = 0, coop = 0;
     if (!sck(cudaGetDevice(&dev), "cudaGetDevice") || !sck(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev), "SM count") ||
@@ -1632,8 +1669,8 @@ bool moe_half(const MoeHalfArgs& A, Stream s) {
     int occ_rx = 0;  // v52 diagnosis: the separate expert stage's blocks per SM at its own shared memory, for comparison
     (void)cudaFuncSetAttribute(reinterpret_cast<const void*>(mt ? k_rx<true> : k_rx<false>), cudaFuncAttributeMaxDynamicSharedMemorySize, sm_rx);
     (void)cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ_rx, mt ? k_rx<true> : k_rx<false>, 256, static_cast<std::size_t>(sm_rx));
-    std::fprintf(stderr, "moe_half: %s tokens, H %d: grid %d (%d SMs x %d blocks), shared memory %d B; k_rx alone %d blocks per SM\n", mt ? "2-4" : "1",
-                 A.H, grid, sms, occ, smem, occ_rx);
+    std::fprintf(stderr, "moe_half: %s tokens%s, H %d: grid %d (%d SMs x %d blocks), shared memory %d B; k_rx alone %d blocks per SM\n", mt ? "2-4" : "1",
+                 stat ? " (counting kernel)" : "", A.H, grid, sms, occ, smem, occ_rx);
   }
   MoeHalfArgs a = A;
   int sb = sbytes;
@@ -1659,6 +1696,7 @@ void stream_kernel_report() {  // v55b: registers, local memory and blocks per S
   const int sm_moe = std::max(4 * 64 * md::kGvPad * 4, std::max(2 * md::kRouterMaxExperts * 4 + md::kRouterMaxExperts, kLutRxBytes + 8 * sb));
   const K ks[] = {{reinterpret_cast<const void*>(k_moe_half<false, 1>), "k_moe_half<1 token>", sm_moe},
                   {reinterpret_cast<const void*>(k_moe_half<true, 1>), "k_moe_half<2-4 tokens>", sm_moe},
+                  {reinterpret_cast<const void*>(k_moe_half<false, 2, true>), "k_moe_half<1, counting>", sm_moe},
                   {reinterpret_cast<const void*>(k_rx<false>), "k_rx<1 token>", kLutRxBytes + 8 * sb},
                   {reinterpret_cast<const void*>(k_rx<true>), "k_rx<2-4 tokens>", kLutRxBytes + 8 * sb},
                   {reinterpret_cast<const void*>(k_stream<false>), "k_stream<1 token>", kLutBytes},

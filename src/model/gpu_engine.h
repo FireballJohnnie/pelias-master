@@ -49,8 +49,8 @@ struct EngineOptions {
   bool cache_pools = true;
   // v52: the F32 products of 1-4 tokens (router, shared gate) on k_gemv_f32; same bits (--no-fast-f32, temporary)
   bool fast_f32 = true;
-  // v55e: v55d's lean one-format dense kernels (--no-lean-dense, temporary: the control for the v55d slowdown); same bits
-  bool lean_dense = true;
+  // v55e: v55d's lean one-format dense kernels (--lean-dense, temporary; off since v55e2 measured +1.1 ms per token); same bits
+  bool lean_dense = false;
   // v52: the MoE half of each layer (residual, post norm, rounding, router, shared gate, picks, grouping, plan, R3 expert
   // stage, combine, residual) in one cooperative launch (g::moe_half); same bits (--no-fused-moe, temporary)
   bool fused_moe = true;
