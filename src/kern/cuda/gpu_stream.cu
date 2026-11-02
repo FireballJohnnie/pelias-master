@@ -959,35 +959,47 @@ __global__ void __launch_bounds__(128) k_rx_plan(const int* __restrict__ grp, co
                                                  std::int8_t* hq, float* hs, int* hsum, float* yd, std::uint8_t* plan, int maxp, int load_mode) {
   rx_plan_body(grp, gsrc, gfill, tokens, nu, H, F, xq, xs, xsum, gu, hq, hs, hsum, yd, plan, maxp, load_mode);
 }
+// v55f2 (v55f: the silu step 25.8k -> 37.5k cycles per task and phase A 0.50 -> 0.75 ms once one thread per 32 values
+// also built the bit planes): one 32-value block rounded by a warp, lane l holding value l. md::round32's operations per
+// value; the block's max and sum reduced across the lanes (both independent of order, so the same bits); the 8 bit planes
+// of u = q + 128 by ballot (bit l = lane l, as act_bits32), lane k storing plane k
+__device__ __forceinline__ void round32_lanes(float v, int lane, float* xr, std::int8_t* q, float* scp, int* sump, std::uint32_t* bits) {
+  float a = fabsf(v);
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
+  const float sc = a > 0.0f ? quo(a, 127.0f) : 1.0f;
+  const float inv = quo(1.0f, sc);
+  const float qv = fminf(127.0f, fmaxf(-127.0f, rintf(mul(v, inv))));
+  if (xr) xr[lane] = mul(sc, qv);
+  q[lane] = static_cast<std::int8_t>(qv);
+  int sm = static_cast<int>(qv);
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) sm += __shfl_xor_sync(0xffffffffu, sm, o);
+  if (lane == 0) {
+    *scp = sc;
+    *sump = sm;
+  }
+  if (bits) {
+    const unsigned u = static_cast<unsigned>(static_cast<int>(qv) + 128);
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+      const unsigned w = __ballot_sync(0xffffffffu, (u >> k) & 1u);
+      if (lane == k) bits[k] = w;
+    }
+  }
+}
 // silu(g) x u of each pick of the group, rounded to int8 per 32: the reader's k_rd_silu_round and act_q8x32, operation for
-// operation (the down projection's inputs are the same numbers the reader used, as int8 and scale)
+// operation per value (v55f2: a warp per 32 values, round32_lanes; with the bit planes for the 1-bit route)
 __device__ __forceinline__ void rx_epi(const DJob& J) {
   const int lane = static_cast<int>(threadIdx.x & 31), F = J.K, nb = F / 32;
   for (int c = 0; c < J.ntok; ++c) {
     const long long pk = J.ypk[c];
     const float* g = J.gu + pk * 2 * F;
     const float* u = g + F;
-    for (int b = lane; b < nb; b += 32) {
-      float v[32];
-      float a = 0.0f;
-#pragma unroll
-      for (int i = 0; i < 32; ++i) {
-        const float x = ld_cgf(g + 32 * b + i);
-        v[i] = mul(quo(x, add(1.0f, expf(-x))), ld_cgf(u + 32 * b + i));
-        a = fmaxf(a, fabsf(v[i]));
-      }
-      const float sc = a > 0.0f ? quo(a, 127.0f) : 1.0f;
-      const float inv = quo(1.0f, sc);
-      int sm = 0;
-#pragma unroll
-      for (int i = 0; i < 32; ++i) {
-        const float qv = fminf(127.0f, fmaxf(-127.0f, rintf(mul(v[i], inv))));
-        J.hq[pk * F + 32 * b + i] = static_cast<std::int8_t>(qv);
-        sm += static_cast<int>(qv);
-      }
-      J.hs[pk * nb + b] = sc;
-      J.hsum[pk * nb + b] = sm;
-      if (J.hbo) act_bits32(J.hq + pk * F + 32 * b, J.hbo + (pk * F + 32 * b) / 4);  // v55f: the down inputs' bit planes
+    for (int b = 0; b < nb; ++b) {
+      const float x = ld_cgf(g + 32 * b + lane);
+      const float v = mul(quo(x, add(1.0f, expf(-x))), ld_cgf(u + 32 * b + lane));
+      round32_lanes(v, lane, nullptr, J.hq + pk * F + 32 * b, J.hs + pk * nb + b, J.hsum + pk * nb + b, J.hbo ? J.hbo + (pk * F + 32 * b) / 4 : nullptr);
     }
   }
 }
@@ -1235,15 +1247,18 @@ __device__ PG_NOINL void mh_phase_a(const MoeHalfArgs& A, float* stg, double* s_
                      A.post_w, H, A.eps, 0, s_sh);
   }
   __syncthreads();
-  if (blockIdx.x == 0)
-    for (int id = tid; id < n * nsub; id += static_cast<int>(blockDim.x)) {
+  {  // v55f2: the 8-bit rounding (and the bit planes) by every block's warps, a warp per 32 values: every block holds the
+     // normalized rows in its own staging (the same norm, the same bits), so any warp can round any 32 (was block 0's
+     // threads one 32 each, v55f 0.75 ms of phase A)
+    const int lane = tid & 31;
+    const int nw = static_cast<int>(gridDim.x) * (static_cast<int>(blockDim.x) / 32);
+    for (int id = static_cast<int>(blockIdx.x) * (static_cast<int>(blockDim.x) / 32) + tid / 32; id < n * nsub; id += nw) {
       const int t = id / nsub, b = id - t * nsub;
-      float v[32];
-      const float* sb = stg + (t * nsub + b) * md::kGvPad;
-      for (int i = 0; i < 32; ++i) v[i] = sb[i];
-      md::round32<false>(v, t, b, H, n, 0, 0.0f, A.xr, H, A.xq, A.xs, A.xsum);
-      if (A.xb) act_bits32(A.xq + t * H + 32 * b, A.xb + (t * H + 32 * b) / 4);  // v55f: the expert inputs' bit planes (this thread's values)
+      const float v = stg[(t * nsub + b) * md::kGvPad + lane];
+      const long long o = static_cast<long long>(t) * H + 32 * b;
+      round32_lanes(v, lane, A.xr + o, A.xq + o, A.xs + t * nsub + b, A.xsum + t * nsub + b, A.xb ? A.xb + o / 4 : nullptr);
     }
+  }
   {
     const long long rows = A.ne + (A.wsh ? 1 : 0);
     const long long warps = static_cast<long long>(gridDim.x) * (blockDim.x / 32);
