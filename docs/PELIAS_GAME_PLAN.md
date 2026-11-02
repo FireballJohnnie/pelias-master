@@ -49,6 +49,7 @@ What the v46a-2 options say (MEASURED): contiguous staging only where the bytes 
 - **MTP** through the same program (1-4 tokens). **Native Windows** build of the same code.
 - **Build rule:** the token kernel is the final architecture from its first commit; an op not yet moved inside splits the program at that point (a launch boundary), so every commit runs end to end and each moved op removes a boundary. Measured each run: launches per token, ms per token, the gate.
 - **Expected (DERIVED, model49):** 7.5-8.6 ms (116-134 tok/s) before MTP; with MTP 139-184 tok/s at 85-90 % efficiency.
+- **MSI step (author 19:18, tagged for later):** the memory overclock in MSI Afterburner above today's +1000 (11,501 MHz under load = 552 GB/s), raised by the author in +100 steps; at each step the read-rate probe (~30 s, GB/s), stopping at the first step where GB/s stops rising (GDDR6X retries errors instead of crashing, so stability alone proves nothing); then one WikiText gate at the chosen offset. With it: NVIDIA Profile Inspector "CUDA - Force P2 State" = Off (v18 sat in P2, 11,251 vs 11,501 MHz, ~2 %; UNMEASURED here). Pays most once the token kernel is byte bound (~-0.4 to -0.5 ms per +10 % memory clock, ESTIMATE).
 - **Point predictions on record (2026-11-01 19:13):** author: 112.3 tok/s without MTP, 157.4 with MTP. Claude (ESTIMATE): 108.7 without MTP, 141.3 with MTP.
 
 **Next step, proposed 18:5x (author 18:47 "plan out the next step with these considerations"; waiting on the go):**
