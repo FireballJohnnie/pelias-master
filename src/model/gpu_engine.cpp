@@ -1413,6 +1413,61 @@ struct GpuEngine::Impl {
 
   // v24: the MoE block of a 1-4 token step with the picked-expert reader: router, rounding, every routed expert on the GPU
   // (bank experts from VRAM, the rest from the registered file mapping), then the shared expert; nothing waits on the CPU
+  // v52: whether this layer's MoE half can run as one launch (g::moe_half): the R3 expert stage with the shared expert folded
+  // in, an F32 router, the shared-memory picks; none of the side outputs the separate kernels feed (router margins, op
+  // stamps, traces, probes, the CPU split, the plane tail, prefetch, the halves)
+  bool fused_ok(const Layer& D, int64_t n, bool probe_row) const {
+    const int64_t e = s.n_embd;
+    auto k_ok = [](int64_t k) { return k == 256 || k == 512 || k == 1024 || k == 2048 || k == 4096; };
+    return o.fused_moe && k_ok(e) && k_ok(s.n_ff_exp) && s.n_expert <= 1024 && s.n_expert_used <= 8 && rx_ok && fold_ok && !split_ok && !pf_ok && o.plane_tail == 0 && !halves_now && !rlg_d && !cur_ops && !trc_src_d &&
+           !trc_sel_d && !probe_row && n >= 1 && n <= 4 && D.gate_inp.v && !D.gate_inp.v->rot32 &&
+           D.gate_inp.dtype == static_cast<std::uint32_t>(quant::Type::f32) && D.gate_inp.drb == static_cast<std::uint64_t>(e) * sizeof(float) &&
+           D.gate_inp_sh && D.post_norm && (reinterpret_cast<std::uintptr_t>(D.gate_inp.d) & 15u) == 0 &&
+           (reinterpret_cast<std::uintptr_t>(D.gate_inp_sh) & 15u) == 0 && g::router_fast_for(s.n_expert, o.router_tie);
+  }
+  // v52: x += y (the block's output, in y), then the MoE half, then x += y, in one launch
+  Status moe_half_fused(Layer& D, int64_t n, std::uint32_t il) {
+    g::MoeHalfArgs A;
+    A.x = x;
+    A.a = y;
+    A.post_w = D.post_norm;
+    A.eps = s.rms_eps;
+    A.n = static_cast<int>(n);
+    A.H = static_cast<int>(s.n_embd);
+    A.F = static_cast<int>(s.n_ff_exp);
+    A.ne = static_cast<int>(s.n_expert);
+    A.nu = static_cast<int>(s.n_expert_used);
+    A.xn = xn;
+    A.xr = xr;
+    A.xq = q;
+    A.xs = scale;
+    A.xsum = sum;
+    A.wr = static_cast<const float*>(D.gate_inp.d);
+    A.logits = logits_r;
+    A.wsh = D.gate_inp_sh;
+    A.gsh = gsh;
+    A.wscale = s.expert_weights_scale;
+    A.band = o.router_tie;
+    A.sel = sel;
+    A.wsel = wsel;
+    A.tab = rtab + static_cast<int64_t>(il) * s.n_expert;
+    A.shx = rshx + il;
+    if (!rcache.empty()) A.cache = rcache[il];
+    A.grp = rgrp;
+    A.gsrc = rgsrc;
+    A.gfill = rgfill;
+    A.gu = rgu;
+    A.hq = rhq;
+    A.hs = rhs;
+    A.hsum = rhsum;
+    A.yd = ryd;
+    A.plan = rxplan;
+    A.max_picks = rx_maxp;
+    A.load_mode = o.rx_load;
+    A.y = y;
+    if (!g::moe_half(A)) return Status::fail(Code::internal, std::string("engine: fused MoE half: ") + g::stream_last_error());
+    return Status::good();
+  }
   Status moe_block_reader(Layer& D, int64_t n, std::uint32_t il) {
     const int64_t e = s.n_embd, ne = s.n_expert, nu = s.n_expert_used, ffs = s.n_ff_shexp;
     Status st;
@@ -2279,6 +2334,7 @@ std::string GpuEngine::summary() const {
   std::string r = b;
   if (I.reader) r += I.o.gpu_prompt ? "; prompt on the GPU in steps of 1-4 tokens" : "; prompt batches on the bank + CPU cold path";  // v48
   if (I.o.r3_experts) r += "; R3 expert stage " + I.rx_note + (I.o.rx_load == 2 ? ", rows staged for every expert" : I.o.rx_load == 1 ? ", rows staged for experts read from RAM" : ", lane loads");  // v46a-1 / v46a-2
+  if (I.o.fused_moe && I.rx_ok && I.fold_ok) r += "; MoE half fused (one launch per layer where no side output needs the separate kernels)";  // v52
   if (!I.o.pin_pool.empty() || I.o.pin_host >= 0) {  // v43
     char c[256];
     std::snprintf(c, sizeof c, "; pinned: %d of %zu workers, doorbell %s, host %s", I.pool ? I.pool->pinned() : 0, I.o.pin_pool.empty() ? std::size_t{0} : I.o.pin_pool.size() - 1,
@@ -2759,17 +2815,22 @@ Status GpuEngine::Impl::run(const std::int32_t* tokens, int n, float* logits, bo
     if (!(st = l.recurrent ? I.deltanet_block(D, n) : I.attention_block(D, n, I.pos))) return st;
     const bool probe_row = I.probe_pos >= I.pos && I.probe_pos < I.pos + n && I.probe_bd;
     if (probe_row && !g::dcopy(I.probe_bd + static_cast<int64_t>(il) * e, I.y + (I.probe_pos - I.pos) * e, z(e) * sizeof(float))) return gfail("engine: probe copy");
+    const bool fused = rd && I.fused_ok(D, n, probe_row);  // v52: residual + MoE half + residual in one launch
+    if (fused) {
+      if (!(st = I.moe_half_fused(D, n, il))) return st;
+    } else {
     if (!g::add_rows(I.x, e, I.y, e, nullptr, e, n)) return gfail("engine: residual");
     if (!g::rms_norm(I.x, D.post_norm, I.xn, e, 1, e, e, n, s.rms_eps)) return gfail("engine: post norm");
     if (!I.opstamp(7)) return gfail("engine: stamp");
     if (!(st = rd ? I.moe_block_reader(D, n, il) : bl ? I.moe_block_bell(D, n, g0 + il, I.ts_d ? I.ts_d + 4 * il : nullptr) : I.moe_block(l, D, n, es))) return st;
+    }
     if (probe_row) {
       const int64_t pr = I.probe_pos - I.pos, ne2 = s.n_expert;
       if (!g::dcopy(I.probe_md + static_cast<int64_t>(il) * e, I.y + pr * e, z(e) * sizeof(float)) ||
           !g::dcopy(I.probe_ld + static_cast<int64_t>(il) * ne2, I.logits_r + pr * ne2, z(ne2) * sizeof(float)))
         return gfail("engine: probe copy");
     }
-    if (!g::add_rows(I.x, e, I.y, e, nullptr, e, n)) return gfail("engine: residual");
+    if (!fused && !g::add_rows(I.x, e, I.y, e, nullptr, e, n)) return gfail("engine: residual");
     if (rd && I.pf_ok && il + 1 < s.n_layer) {  // v26: predict the next layer's picks, prefetch its file experts on the side stream
       Layer& Dn = I.L[il + 1];
       const int64_t nuq = s.n_expert_used;

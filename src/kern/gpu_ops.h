@@ -40,6 +40,8 @@ bool mem_info(std::size_t* free_bytes, std::size_t* total_bytes);
 
 // ---- products straight from GGUF storage (gemm_gguf)
 // y[t * ldy + r] = sum_i W[r][i] * x[t * ldx + i] for r < n_out, t < n_tok; W in one of the types of gpu_decode.h
+// v52: whether router_topk(n_expert, ..., tie_band) runs the shared-memory kernel (the one the fused MoE half reproduces)
+bool router_fast_for(std::int64_t n_expert, float tie_band);
 // v52 experiment switch: the F32 product of 1-4 tokens on k_gemv_f32 (default) or the general kernel; same bits either way
 void set_fast_f32(bool on);
 bool matmul(std::uint32_t type, const void* w, std::uint64_t row_bytes, std::int64_t n_out, std::int64_t k, const float* x,

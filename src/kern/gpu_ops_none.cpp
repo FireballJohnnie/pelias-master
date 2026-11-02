@@ -84,6 +84,7 @@ bool moe_matmul(std::uint32_t, const void*, std::uint64_t, std::uint64_t, std::i
 bool gather_rows(std::uint32_t, const void*, std::uint64_t, std::int64_t, const std::int32_t*, std::int64_t, float*, Stream) { return false; }
 bool act_q8x32_halves(const float*, std::int64_t, std::int64_t, std::int64_t, bool, float*, std::int64_t, std::int8_t*, float*, int*, Stream) { return false; }
 void set_fast_f32(bool) {}
+bool router_fast_for(std::int64_t, float) { return false; }
 bool act_q8x32(const float*, std::int64_t, std::int64_t, std::int64_t, bool, float*, std::int64_t, std::int8_t*, float*, int*, Stream) {
   return false;
 }
@@ -149,6 +150,7 @@ bool StreamPlan::run_unstaged(Stream) { return false; }
 bool StreamPlan::run_reset(Stream) { return false; }
 bool rx_type_ok(std::uint32_t, std::int64_t) { return false; }
 std::uint64_t rx_scratch_bytes(int) { return 0; }
+bool moe_half(const MoeHalfArgs&, Stream) { return false; }
 bool moe_r3(const ExpertPtr*, const ExpertPtr*, const std::int32_t*, const float*, const float*, int, const std::int8_t*, const float*, const int*,
             std::int64_t, std::int64_t, std::int64_t, const ReaderCache*, float*, std::int8_t*, float*, int*, float*, int*, ExpertPtr*, ExpertPtr*, void*,
             int, float*, unsigned long long*, Stream, int) {

@@ -18,6 +18,7 @@
 #include <utility>
 #include <vector>
 
+#include "kern/cuda/moe_dev.cuh"
 #include "kern/gpu_decode.h"
 #include "kern/gpu_ops.h"
 #include "quant/iq_tables.h"
@@ -45,49 +46,12 @@ cudaStream_t st(Stream s) { return s ? static_cast<cudaStream_t>(s) : g_cur_stre
 
 unsigned blocks_for(std::int64_t n, int per) { return static_cast<unsigned>((n + per - 1) / per); }
 
-__device__ __forceinline__ float warp_sum(float v) {
-  for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
-  return v;
-}
-
-// block-wide double sum (blockDim.x a multiple of 32, at most 1024); every thread gets the result
-__device__ double block_sum_d(double v, double* sh) {
-  for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
-  const int w = static_cast<int>(threadIdx.x) >> 5, lane = static_cast<int>(threadIdx.x) & 31;
-  if (lane == 0) sh[w] = v;
-  __syncthreads();
-  const int nw = static_cast<int>(blockDim.x) >> 5;
-  double r = 0.0;
-  if (threadIdx.x < 32) {
-    r = static_cast<int>(threadIdx.x) < nw ? sh[threadIdx.x] : 0.0;
-    for (int o = 16; o > 0; o >>= 1) r += __shfl_xor_sync(0xffffffffu, r, o);
-    if (threadIdx.x == 0) sh[32] = r;
-  }
-  __syncthreads();
-  r = sh[32];
-  __syncthreads();
-  return r;
-}
-
-__device__ float block_max_f(float v, float* sh) {
-  for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
-  const int w = static_cast<int>(threadIdx.x) >> 5, lane = static_cast<int>(threadIdx.x) & 31;
-  if (lane == 0) sh[w] = v;
-  __syncthreads();
-  const int nw = static_cast<int>(blockDim.x) >> 5;
-  if (threadIdx.x < 32) {
-    float r = static_cast<int>(threadIdx.x) < nw ? sh[threadIdx.x] : -INFINITY;
-    for (int o = 16; o > 0; o >>= 1) r = fmaxf(r, __shfl_xor_sync(0xffffffffu, r, o));
-    if (threadIdx.x == 0) sh[32] = r;
-  }
-  __syncthreads();
-  const float r = sh[32];
-  __syncthreads();
-  return r;
-}
-
-__device__ __forceinline__ float silu_d(float x) { return quo(x, add(1.0f, expf(-x))); }
-__device__ __forceinline__ float sigmoid_d(float x) { return quo(1.0f, add(1.0f, expf(-x))); }
+// v52: the shared helpers live in moe_dev.cuh (the fused MoE half runs the same source)
+using md::block_max_f;
+using md::block_sum_d;
+using md::sigmoid_d;
+using md::silu_d;
+using md::warp_sum;
 
 // ------------------------------------------------------------------------------------------------ gemm_gguf
 
@@ -144,7 +108,7 @@ __global__ void __launch_bounds__(128) k_matmul(std::uint32_t type, const std::u
 // same bits. What changes is only where the values come from: x staged once per block in shared memory (rows of 32 padded
 // to 36 floats: the lanes' float4 reads hit distinct banks), every weight load of the lane issued before the first sum,
 // and two rows per block so the 256 router rows spread over 128 SMs.
-constexpr int kGvPad = 36;
+using md::kGvPad;
 template <int NJ>
 __global__ void __launch_bounds__(64) k_gemv_f32(const float* __restrict__ w, std::uint64_t rb, std::int64_t n_out, std::int64_t k,
                                                  const float* __restrict__ x, int n_tok, std::int64_t ldx, float* __restrict__ y,
@@ -152,47 +116,11 @@ __global__ void __launch_bounds__(64) k_gemv_f32(const float* __restrict__ w, st
   extern __shared__ float4 s_gv4[];
   float* xs = reinterpret_cast<float*>(s_gv4);
   const int nsub = static_cast<int>(k / 32);
-  for (int idx = static_cast<int>(threadIdx.x); idx < n_tok * nsub * 8; idx += static_cast<int>(blockDim.x)) {
-    const int t = idx / (nsub * 8), rem = idx - t * nsub * 8, j = rem >> 3, q4 = rem & 7;
-    const float4 v = *reinterpret_cast<const float4*>(x + t * ldx + 32 * j + 4 * q4);
-    *reinterpret_cast<float4*>(xs + (t * nsub + j) * kGvPad + 4 * q4) = v;
-  }
+  md::gemv_stage(x, n_tok, nsub, ldx, xs);
   __syncthreads();
   const std::int64_t r = static_cast<std::int64_t>(blockIdx.x) * 2 + threadIdx.x / 32;
-  const int lane = static_cast<int>(threadIdx.x & 31);
   if (r >= n_out) return;
-  const float4* p4 = reinterpret_cast<const float4*>(reinterpret_cast<const std::uint8_t*>(w) + static_cast<std::uint64_t>(r) * rb);
-  float4 wv[NJ][8];
-#pragma unroll
-  for (int jj = 0; jj < NJ; ++jj)
-#pragma unroll
-    for (int i4 = 0; i4 < 8; ++i4) wv[jj][i4] = p4[8 * (lane + 32 * jj) + i4];
-  float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-#pragma unroll
-  for (int jj = 0; jj < NJ; ++jj) {
-    const int j = lane + 32 * jj;
-#pragma unroll
-    for (int tt = 0; tt < 4; ++tt) {
-      if (tt >= n_tok) break;
-      const float4* xr = reinterpret_cast<const float4*>(xs + (tt * nsub + j) * kGvPad);
-      float s = 0.0f;
-#pragma unroll
-      for (int i4 = 0; i4 < 8; ++i4) {
-        const float4 a = wv[jj][i4], b = xr[i4];
-        s += a.x * b.x;
-        s += a.y * b.y;
-        s += a.z * b.z;
-        s += a.w * b.w;
-      }
-      acc[tt] += s;
-    }
-  }
-#pragma unroll
-  for (int tt = 0; tt < 4; ++tt) {
-    if (tt >= n_tok) break;
-    const float v = warp_sum(acc[tt]);
-    if (lane == 0) y[tt * ldy + r] = v;
-  }
+  md::gemv_row<NJ>(w, rb, r, xs, nsub, n_tok, y, ldy);
 }
 
 bool g_fast_f32 = true;  // v52 experiment switch (--no-fast-f32): removed once measured
@@ -260,41 +188,7 @@ __global__ void k_act_q8x32(const float* __restrict__ x, std::int64_t n, std::in
   const std::int64_t t = id / nb, b = id % nb;
   float v[32];
   for (int i = 0; i < 32; ++i) v[i] = x[t * ldx + 32 * b + i];
-  if (rot) {
-    for (int h = 1; h < 32; h *= 2)
-      for (int i = 0; i < 32; i += 2 * h)
-        for (int j = i; j < i + h; ++j) {
-          const float a = v[j], d = v[j + h];
-          v[j] = add(a, d);
-          v[j + h] = sub(a, d);
-        }
-    for (int j = 0; j < 32; ++j) v[j] = mul(v[j], norm);
-  }
-  float a = 0.0f;
-  for (int j = 0; j < 32; ++j) a = fmaxf(a, fabsf(v[j]));
-  const float sc = a > 0.0f ? quo(a, 127.0f) : 1.0f;
-  const float inv = quo(1.0f, sc);
-  int s = 0;
-  for (int j = 0; j < 32; ++j) {
-    const float qv = fminf(127.0f, fmaxf(-127.0f, rintf(mul(v[j], inv))));
-    xr[t * ldr + 32 * b + j] = mul(sc, qv);
-    if (q) q[t * n + 32 * b + j] = static_cast<std::int8_t>(qv);
-    s += static_cast<int>(qv);
-    if constexpr (kHalves) v[j] = sub(v[j], mul(sc, qv));  // the leftover, rounded below at sc / 256
-  }
-  if (scale) scale[t * nb + b] = sc;
-  if (sum) sum[t * nb + b] = s;
-  if constexpr (kHalves) {
-    const float sl = quo(sc, 256.0f), il = quo(1.0f, sl);
-    int s2 = 0;
-    for (int j = 0; j < 32; ++j) {
-      const float qv = fminf(127.0f, fmaxf(-127.0f, rintf(mul(v[j], il))));
-      q[(t + rows) * n + 32 * b + j] = static_cast<std::int8_t>(qv);
-      s2 += static_cast<int>(qv);
-    }
-    scale[(t + rows) * nb + b] = sl;
-    sum[(t + rows) * nb + b] = s2;
-  }
+  md::round32<kHalves>(v, t, b, n, rows, rot, norm, xr, ldr, q, scale, sum);
 }
 
 // ------------------------------------------------------------------------------------------------ elementwise
@@ -306,19 +200,7 @@ __global__ void __launch_bounds__(256) k_rms_norm(const float* x, const float* _
   const std::int64_t t = blockIdx.x / n_seg, g = blockIdx.x % n_seg;
   const float* xs = x + t * ld + g * stride;
   float* ys = y + t * ld + g * stride;
-  double part = 0.0;
-  for (std::int64_t i = threadIdx.x; i < n; i += blockDim.x) part += static_cast<double>(mul(xs[i], xs[i]));
-  const double sum = block_sum_d(part, sh);
-  const float nf = static_cast<float>(n);
-  const float mean = static_cast<float>(sum / static_cast<double>(n));
-  if (l2) {
-    const float scale = quo(1.0f, sqrtf(add(mean, quo(eps, nf))));
-    const float post = quo(1.0f, sqrtf(nf));
-    for (std::int64_t i = threadIdx.x; i < n; i += blockDim.x) ys[i] = mul(mul(xs[i], scale), post);
-  } else {
-    const float scale = quo(1.0f, sqrtf(add(mean, eps)));
-    for (std::int64_t i = threadIdx.x; i < n; i += blockDim.x) ys[i] = w ? mul(mul(xs[i], scale), w[i]) : mul(xs[i], scale);
-  }
+  md::rms_norm_seg([xs](std::int64_t i) { return xs[i]; }, [ys](std::int64_t i, float v) { ys[i] = v; }, w, n, eps, l2, sh);
 }
 
 // rms_norm + act_q8x32 fused: one block (256 threads) per row. The sum of squares exactly as k_rms_norm (same partial
@@ -464,7 +346,7 @@ __global__ void k_router(const float* __restrict__ logits, std::int64_t ne, int 
 // the block. The softmax is element for element the reference's (block max, exp of the difference, the sum in double in
 // index order by one thread, one multiply per element); a pick is the highest probability, the lower index on a tie, not
 // picked before (the serial loop's rule); the weights and their sum in pick order as before. Same values bit for bit.
-constexpr int kRouterMaxExperts = 1024;
+using md::kRouterMaxExperts;
 __global__ void __launch_bounds__(256) k_router_fast(const float* __restrict__ logits, std::int64_t ne, int nu, float wscale,
                                                      std::int32_t* __restrict__ sel, float* __restrict__ wsel, float band) {
   __shared__ float shm[33];
@@ -475,76 +357,8 @@ __global__ void __launch_bounds__(256) k_router_fast(const float* __restrict__ l
   __shared__ float bv[8];
   __shared__ int bi[8];
   const std::int64_t t = blockIdx.x;
-  const float* l = logits + t * ne;
-  const int tid = static_cast<int>(threadIdx.x), nth = static_cast<int>(blockDim.x);
-  float m = -INFINITY;
-  for (std::int64_t i = tid; i < ne; i += nth) m = fmaxf(m, l[i]);
-  const float mx = block_max_f(m, shm);
-  for (std::int64_t i = tid; i < ne; i += nth) {
-    const float dl = sub(l[i], mx);
-    p[i] = expf(dl);
-    key[i] = band > 0.0f ? floorf(quo(dl, band)) : 0.0f;
-    taken[i] = 0;
-  }
-  __syncthreads();
-  if (tid == 0) {
-    double sum = 0.0;
-    for (std::int64_t i = 0; i < ne; ++i) sum += static_cast<double>(p[i]);
-    inv_s = static_cast<float>(1.0 / sum);
-  }
-  __syncthreads();
-  const float inv = inv_s;
-  for (std::int64_t i = tid; i < ne; i += nth) p[i] = mul(p[i], inv);
-  __syncthreads();
-  float tot = 0.0f;
-  for (int kk = 0; kk < nu; ++kk) {
-    float v = -INFINITY;
-    int ix = 0x7fffffff;
-    // v24 tie rule (author 18:19): with band > 0 the order is by key = floor((logit - max) / band), so logits within the
-    // same band of width `band` tie and the lower index wins; every path (one token, a batch, the CPU reference with the
-    // same band) then picks the same experts unless their logits straddle a band edge. band == 0: by probability.
-    for (std::int64_t i = tid; i < ne; i += nth) {
-      const float c = band > 0.0f ? key[i] : p[i];
-      if (!taken[i] && (ix == 0x7fffffff || c > v)) {  // ascending i per thread: strict > keeps the lower index on a tie
-        v = c;
-        ix = static_cast<int>(i);
-      }
-    }
-    for (int o = 16; o > 0; o >>= 1) {
-      const float v2 = __shfl_xor_sync(0xffffffffu, v, o);
-      const int i2 = __shfl_xor_sync(0xffffffffu, ix, o);
-      if (i2 != 0x7fffffff && (ix == 0x7fffffff || v2 > v || (v2 == v && i2 < ix))) {
-        v = v2;
-        ix = i2;
-      }
-    }
-    if ((tid & 31) == 0) {
-      bv[tid >> 5] = v;
-      bi[tid >> 5] = ix;
-    }
-    __syncthreads();
-    if (tid == 0) {
-      float bvv = bv[0];
-      int bix = bi[0];
-      for (int w = 1; w < (nth >> 5); ++w)
-        if (bi[w] != 0x7fffffff && (bix == 0x7fffffff || bv[w] > bvv || (bv[w] == bvv && bi[w] < bix))) {
-          bvv = bv[w];
-          bix = bi[w];
-        }
-      sel[t * nu + kk] = bix;
-      wsel[t * nu + kk] = p[bix];
-      tot = add(tot, p[bix]);
-      taken[bix] = 1;
-    }
-    __syncthreads();
-  }
-  if (tid != 0) return;
-  tot = fmaxf(tot, 6.103515625e-5f);
-  for (int kk = 0; kk < nu; ++kk) {
-    float w = quo(wsel[t * nu + kk], tot);
-    if (wscale != 0.0f && wscale != 1.0f) w = mul(w, wscale);
-    wsel[t * nu + kk] = w;
-  }
+  const md::RouterSmem S{p, key, taken, shm, &inv_s, bv, bi};
+  md::router_row(logits + t * ne, ne, nu, wscale, sel + t * nu, wsel + t * nu, band, S);
 }
 
 // ------------------------------------------------------------------------------------------------ attention
@@ -1418,92 +1232,12 @@ bool moe_reader(const ExpertPtr* tab, const std::int32_t* sel, const float* wsel
 }
 
 // ------------------------------------------------------------------------------------------------ v26 reader v3
-// v51: the slot range of the pool expert e is cached in, its slot size and the pool's byte offset (np 0: one pool, v26)
-__device__ __forceinline__ void rc_pool(const ReaderCache& c, int e, int* k0, int* k1, std::uint64_t* sb, std::uint64_t* boff) {
-  if (c.np <= 0) {
-    *k0 = 0;
-    *k1 = c.K;
-    *sb = c.slot_bytes;
-    *boff = 0;
-    return;
-  }
-  const int p = c.pool_of ? static_cast<int>(c.pool_of[e]) : -1;
-  if (p < 0 || p >= c.np) {
-    *k0 = 0;
-    *k1 = 0;
-    *sb = 0;
-    *boff = 0;
-    return;
-  }
-  *k0 = c.pk0[p];
-  *k1 = c.pk0[p + 1];
-  *sb = c.pbytes[p];
-  *boff = c.pboff[p];
-}
-// one thread: group the routed picks by expert (first appearance), then the shared expert as one more group over every
-// token; per group the source (bank / cache slot / file) and, on a cache miss, the slot its rows are written into
+using md::rc_pool;
 __global__ void k_rd3_group(const ExpertPtr* __restrict__ tab, const ExpertPtr* __restrict__ shx, const std::int32_t* __restrict__ sel, int tokens,
                             int nu, ReaderCache c, std::int64_t H, std::int64_t F, int* __restrict__ grp, ExpertPtr* __restrict__ gsrc,
                             ExpertPtr* __restrict__ gfill, const std::uint8_t* __restrict__ cmask) {
   if (threadIdx.x != 0 || blockIdx.x != 0) return;
-  const int picks = tokens * nu;
-  const unsigned stamp = c.K > 0 ? ++(*c.stamp) : 0u;
-  int U = 0;
-  for (int pi = 0; pi < picks; ++pi) {
-    const int e = sel[pi];
-    if (cmask && cmask[e]) continue;  // v28: the CPU's pick
-    int u = 0;
-    while (u < U && grp[1 + 6 * u] != e) ++u;
-    if (u == U) {
-      grp[1 + 6 * u] = e;
-      grp[2 + 6 * u] = 0;
-      ExpertPtr src = tab[e], fill;
-      if (c.K > 0 && !src.vram) {
-        int hit = -1, victim = -1, k0 = 0, k1 = 0;
-        std::uint64_t pslot = 0, poff = 0;
-        rc_pool(c, e, &k0, &k1, &pslot, &poff);
-        unsigned best = 0xffffffffu;
-        for (int k = k0; k < k1; ++k) {
-          if (c.tag[k] == e) hit = k;
-          if (c.use[k] != stamp && c.use[k] < best) {
-            best = c.use[k];
-            victim = k;
-          }
-        }
-        const int slot = hit >= 0 ? hit : victim;
-        if (slot >= 0) {
-          std::uint8_t* sb = c.base + poff + static_cast<std::uint64_t>(slot - k0) * pslot;
-          ExpertPtr at = src;
-          at.w[0] = sb;
-          at.w[1] = sb + src.rb[0] * static_cast<std::uint64_t>(F);
-          at.w[2] = sb + (src.rb[0] + src.rb[1]) * static_cast<std::uint64_t>(F);
-          at.vram = 1;
-          c.use[slot] = stamp;
-          if (hit >= 0) {
-            src = at;
-          } else {
-            c.tag[slot] = e;
-            fill = at;
-          }
-        }
-      }
-      gsrc[u] = src;
-      gfill[u] = fill;
-      ++U;
-    }
-    const int cn = grp[2 + 6 * u];
-    grp[3 + 6 * u + cn] = pi;
-    grp[2 + 6 * u] = cn + 1;
-  }
-  if (shx) {  // the shared expert: picks picks .. picks + tokens - 1
-    grp[1 + 6 * U] = -1;
-    grp[2 + 6 * U] = tokens;
-    for (int t = 0; t < tokens; ++t) grp[3 + 6 * U + t] = picks + t;
-    gsrc[U] = *shx;
-    gfill[U] = ExpertPtr{};
-    ++U;
-  }
-  grp[0] = U;
+  md::rd3_group_one(tab, shx, sel, tokens, nu, c, F, grp, gsrc, gfill, cmask);
   (void)H;
 }
 // a group of `glanes` lanes (lane index gl within it) copies n bytes from src into a 16-byte aligned buffer (alignment of
@@ -1725,14 +1459,7 @@ __global__ void k_rd3_combine(const float* __restrict__ yd, const float* __restr
                               std::int64_t H, float* __restrict__ y, const std::int32_t* __restrict__ sel, const std::uint8_t* __restrict__ cmask) {
   const std::int64_t id = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (id >= tokens * H) return;
-  const std::int64_t t = id / H, r = id % H;
-  float tot = 0.0f;
-  for (int j = 0; j < nu; ++j) {
-    if (cmask && cmask[sel[t * nu + j]]) continue;  // v28: the CPU's pick, added by the caller
-    tot = add(tot, mul(wsel[t * nu + j], yd[(t * nu + j) * H + r]));
-  }
-  if (gsh) tot = add(tot, mul(gsh[t], yd[(tokens * nu + t) * H + r]));
-  y[id] = tot;
+  y[id] = md::rd3_combine_one(yd, wsel, gsh, nu, tokens, H, id / H, id % H, sel, cmask);
 }
 bool moe_reader3(const ExpertPtr* tab, const ExpertPtr* shx, const std::int32_t* sel, const float* wsel, const float* gsh, int n_used, const float* xr,
                  std::int64_t tokens, std::int64_t H, std::int64_t F, std::uint64_t row_max, const ReaderCache* cache, float* gu, float* h, float* yd,
@@ -1884,12 +1611,12 @@ bool matmul(std::uint32_t type, const void* w, std::uint64_t row_bytes, std::int
   Tables tb;
   if (!device_tables(&tb)) return false;
   const int nsub = static_cast<int>(k / 32);
-  if (g_fast_f32 && type == g_f32 && n_tok <= 4 && (nsub == 32 || nsub == 64 || nsub == 128) && n_tok * nsub * kGvPad * 4 <= 48 * 1024 && row_bytes % 16 == 0 &&
+  if (g_fast_f32 && type == g_f32 && n_tok <= 4 && (nsub == 8 || nsub == 16 || nsub == 32 || nsub == 64 || nsub == 128) && n_tok * nsub * kGvPad * 4 <= 48 * 1024 && row_bytes % 16 == 0 &&
       ldx % 4 == 0 && (reinterpret_cast<std::uintptr_t>(w) & 15u) == 0 && (reinterpret_cast<std::uintptr_t>(x) & 15u) == 0) {
     const std::size_t sm = static_cast<std::size_t>(n_tok) * nsub * kGvPad * sizeof(float);  // at most 48 KB (the default limit)
     const float* wf = static_cast<const float*>(w);
     const unsigned nb = blocks_for(n_out, 2);
-    if (nsub == 32) k_gemv_f32<1><<<nb, 64, sm, st(s)>>>(wf, row_bytes, n_out, k, x, static_cast<int>(n_tok), ldx, y, ldy);
+    if (nsub <= 32) k_gemv_f32<1><<<nb, 64, sm, st(s)>>>(wf, row_bytes, n_out, k, x, static_cast<int>(n_tok), ldx, y, ldy);
     else if (nsub == 64) k_gemv_f32<2><<<nb, 64, sm, st(s)>>>(wf, row_bytes, n_out, k, x, static_cast<int>(n_tok), ldx, y, ldy);
     else k_gemv_f32<4><<<nb, 64, sm, st(s)>>>(wf, row_bytes, n_out, k, x, static_cast<int>(n_tok), ldx, y, ldy);
     return launched("matmul f32");
@@ -1996,6 +1723,7 @@ bool add_rows(float* y, std::int64_t ldy, const float* x, std::int64_t ldx, cons
 
 bool g_router_serial = false;  // tests only: the serial kernel (the v22 kernel is checked against it bit for bit)
 void router_topk_serial_for_tests(bool on) { g_router_serial = on; }
+bool router_fast_for(std::int64_t n_expert, float tie_band) { return n_expert <= kRouterMaxExperts && (!g_router_serial || tie_band > 0.0f); }
 bool router_topk(const float* logits, std::int64_t n_expert, std::int64_t rows, int n_used, float weights_scale, std::int32_t* sel, float* wsel,
                  Stream s, float tie_band) {
   if (n_expert <= 0 || n_used <= 0 || n_used > n_expert || !logits || !sel || !wsel) return fail("router_topk: bad shape");

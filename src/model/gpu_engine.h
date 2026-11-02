@@ -49,6 +49,9 @@ struct EngineOptions {
   bool cache_pools = true;
   // v52: the F32 products of 1-4 tokens (router, shared gate) on k_gemv_f32; same bits (--no-fast-f32, temporary)
   bool fast_f32 = true;
+  // v52: the MoE half of each layer (residual, post norm, rounding, router, shared gate, picks, grouping, plan, R3 expert
+  // stage, combine, residual) in one cooperative launch (g::moe_half); same bits (--no-fused-moe, temporary)
+  bool fused_moe = true;
   int max_hot_per_layer = 256;
   int cpu_threads = 0;  // workers for the cold experts (0: hardware threads)
   // GP3-14 stage 3 (MTP drafting): the largest verify batch (1 + drafts); 0 = no rollback buffers. Needs the DeltaNet

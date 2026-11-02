@@ -6,14 +6,18 @@
 // (item 7: per-expert counters inside a stage, a counter barrier per warp between stages). What changed in moving: the
 // template parameters fixed at the measured choices, the job struct's pointers typed for the engine, the counters and the
 // table in one device buffer per plan, the launch and its checks on the host side.
+#include <cooperative_groups.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
 
+#include "kern/cuda/moe_dev.cuh"
 #include "kern/gpu_decode.h"
 #include "kern/gpu_stream.h"
 #include "quant/block_types.h"
@@ -1037,9 +1041,10 @@ __host__ __device__ inline RxLayout rx_layout(int maxp) {
 // one thread per job: the groups of moe_reader3's grouping kernel (grp: count, then per group expert, picks, pick list;
 // gsrc / gfill: where each group's rows are read from and, on a cache miss, the slot they are copied into). Every expert
 // has the shape (F x H gate and up, H x F down), so each job's first task follows from its index alone.
-__global__ void __launch_bounds__(128) k_rx_plan(const int* __restrict__ grp, const ExpertPtr* __restrict__ gsrc, const ExpertPtr* __restrict__ gfill,
-                                                 int tokens, int nu, int H, int F, const std::int8_t* xq, const float* xs, const int* xsum, float* gu,
-                                                 std::int8_t* hq, float* hs, int* hsum, float* yd, std::uint8_t* plan, int maxp, int load_mode) {
+// v52: the planning body (the whole block; any block size) for k_rx_plan and the fused MoE half
+__device__ __forceinline__ void rx_plan_body(const int* __restrict__ grp, const ExpertPtr* __restrict__ gsrc, const ExpertPtr* __restrict__ gfill,
+                                             int tokens, int nu, int H, int F, const std::int8_t* xq, const float* xs, const int* xsum, float* gu,
+                                             std::int8_t* hq, float* hs, int* hsum, float* yd, std::uint8_t* plan, int maxp, int load_mode) {
   const RxLayout Lo = rx_layout(maxp);
   auto* hd = reinterpret_cast<RxHdr*>(plan);
   auto* jobs = reinterpret_cast<DJob*>(plan + Lo.jobs);
@@ -1128,6 +1133,11 @@ __global__ void __launch_bounds__(128) k_rx_plan(const int* __restrict__ grp, co
     hd->ngroups = 2 * U;
     hd->ntasks = s_err ? 0 : 2LL * U * nt_gu + U + static_cast<long long>(U) * nt_dn;
   }
+}
+__global__ void __launch_bounds__(128) k_rx_plan(const int* __restrict__ grp, const ExpertPtr* __restrict__ gsrc, const ExpertPtr* __restrict__ gfill,
+                                                 int tokens, int nu, int H, int F, const std::int8_t* xq, const float* xs, const int* xsum, float* gu,
+                                                 std::int8_t* hq, float* hs, int* hsum, float* yd, std::uint8_t* plan, int maxp, int load_mode) {
+  rx_plan_body(grp, gsrc, gfill, tokens, nu, H, F, xq, xs, xsum, gu, hq, hs, hsum, yd, plan, maxp, load_mode);
 }
 // silu(g) x u of each pick of the group, rounded to int8 per 32: the reader's k_rd_silu_round and act_q8x32, operation for
 // operation (the down projection's inputs are the same numbers the reader used, as int8 and scale)
@@ -1274,9 +1284,9 @@ __device__ __forceinline__ void rx_rows_staged(const DJob& J, long long t, std::
 // then the downs); a task whose job waits for a group starts once the group's count is complete (acquire), and a task of
 // a signalling job adds 1 (release). All blocks are resident (cooperative launch), and a job waits only for groups of
 // jobs before it, so the lowest unfinished task can always run: no deadlock.
+// v52: the task loop (after lut_setup) for k_rx and the fused MoE half
 template <bool kMT>
-__global__ void __launch_bounds__(256) k_rx(const std::uint8_t* __restrict__ plan, int maxp, int sbytes) {
-  lut_setup();
+__device__ __forceinline__ void rx_body(const std::uint8_t* __restrict__ plan, int maxp, int sbytes) {
   std::uint8_t* sbuf = reinterpret_cast<std::uint8_t*>(s_lut) + kLutBytes + static_cast<long long>(threadIdx.x / 32) * sbytes;  // v46a-2
   const RxLayout Lo = rx_layout(maxp);
   const auto* hd = reinterpret_cast<const RxHdr*>(plan);
@@ -1311,6 +1321,91 @@ __global__ void __launch_bounds__(256) k_rx(const std::uint8_t* __restrict__ pla
       __syncwarp();
       if (lane == 0) red_release_add(gd + sg, 1ull);
     }
+  }
+}
+template <bool kMT>
+__global__ void __launch_bounds__(256) k_rx(const std::uint8_t* __restrict__ plan, int maxp, int sbytes) {
+  lut_setup();
+  rx_body<kMT>(plan, maxp, sbytes);
+}
+
+// v52 (token kernel 3a): the MoE half of a layer, one cooperative launch (moe_half in gpu_stream.h). Phases:
+//  A every block: x + a normalized per row into its shared-memory staging (reads only; block 0 also writes xn and the
+//    8-bit rounding), then its warps' share of the router rows and the shared gate row (md::gemv_row, k_gemv_f32's sums)
+//  B block 0: each token's picks (md::router_row), the shared gate's sigmoid, the grouping (md::rd3_group_one), the plan
+//  C every block: the R3 expert stage (rx_body, k_rx's task loop)
+//  D every thread: the combine (md::rd3_combine_one) into y and the residual x = (x + a) + y
+// A grid barrier between phases. The values and their order are the separate kernels', so the bits are theirs.
+template <bool kMT, int NJ>
+__global__ void __launch_bounds__(256) k_moe_half(const MoeHalfArgs A, int sbytes) {
+  namespace cg = cooperative_groups;
+  cg::grid_group grid = cg::this_grid();
+  __shared__ double s_sh[33];
+  __shared__ float s_rsh[33];
+  __shared__ float s_inv;
+  __shared__ float s_bv[8];
+  __shared__ int s_bi[8];
+  float* stg = s_lut;  // the dynamic shared memory: staging (A), the router's arrays (B), the LUT + warp buffers (C)
+  const int H = A.H, n = A.n, nsub = H / 32;
+  const int tid = static_cast<int>(threadIdx.x);
+  // ---- A
+  for (int t = 0; t < n; ++t) {
+    const float* xt = A.x + static_cast<long long>(t) * H;
+    const float* at = A.a + static_cast<long long>(t) * H;
+    float* st = stg + t * nsub * md::kGvPad;
+    float* xnt = A.xn + static_cast<long long>(t) * H;
+    const bool b0 = blockIdx.x == 0;
+    md::rms_norm_seg([xt, at](std::int64_t i) { return add(xt[i], at[i]); },
+                     [st, xnt, b0](std::int64_t i, float v) {
+                       st[(i >> 5) * md::kGvPad + (i & 31)] = v;
+                       if (b0) xnt[i] = v;
+                     },
+                     A.post_w, H, A.eps, 0, s_sh);
+  }
+  __syncthreads();
+  if (blockIdx.x == 0)
+    for (int id = tid; id < n * nsub; id += static_cast<int>(blockDim.x)) {
+      const int t = id / nsub, b = id - t * nsub;
+      float v[32];
+      const float* sb = stg + (t * nsub + b) * md::kGvPad;
+      for (int i = 0; i < 32; ++i) v[i] = sb[i];
+      md::round32<false>(v, t, b, H, n, 0, 0.0f, A.xr, H, A.xq, A.xs, A.xsum);
+    }
+  {
+    const long long rows = A.ne + (A.wsh ? 1 : 0);
+    const long long warps = static_cast<long long>(gridDim.x) * (blockDim.x / 32);
+    for (long long r = static_cast<long long>(blockIdx.x) * (blockDim.x / 32) + tid / 32; r < rows; r += warps) {
+      if (r < A.ne) md::gemv_row<NJ>(A.wr, static_cast<std::uint64_t>(H) * 4u, r, stg, nsub, n, A.logits, A.ne);
+      else md::gemv_row<NJ>(A.wsh, static_cast<std::uint64_t>(H) * 4u, 0, stg, nsub, n, A.gsh, 1);
+    }
+  }
+  grid.sync();
+  // ---- B
+  if (blockIdx.x == 0) {
+    const md::RouterSmem S{stg, stg + md::kRouterMaxExperts, reinterpret_cast<unsigned char*>(stg + 2 * md::kRouterMaxExperts), s_rsh, &s_inv, s_bv, s_bi};
+    for (int t = 0; t < n; ++t) {
+      md::router_row(A.logits + static_cast<long long>(t) * A.ne, A.ne, A.nu, A.wscale, A.sel + t * A.nu, A.wsel + t * A.nu, A.band, S);
+      __syncthreads();
+    }
+    if (A.wsh && tid < n) A.gsh[tid] = md::sigmoid_d(A.gsh[tid]);  // deltanet_gates(gsh, ...) with one head: beta = sigmoid(beta)
+    if (tid == 0) md::rd3_group_one(A.tab, A.wsh ? A.shx : nullptr, A.sel, n, A.nu, A.cache, A.F, A.grp, A.gsrc, A.gfill, nullptr);
+    __syncthreads();
+    rx_plan_body(A.grp, A.gsrc, A.gfill, n, A.nu, H, A.F, A.xq, A.xs, A.xsum, A.gu, A.hq, A.hs, A.hsum, A.yd, static_cast<std::uint8_t*>(A.plan),
+                 A.max_picks, A.load_mode);
+  }
+  grid.sync();
+  // ---- C
+  lut_setup();
+  rx_body<kMT>(static_cast<const std::uint8_t*>(A.plan), A.max_picks, sbytes);
+  grid.sync();
+  // ---- D
+  const long long tot = static_cast<long long>(n) * H, step = static_cast<long long>(gridDim.x) * blockDim.x;
+  for (long long id = static_cast<long long>(blockIdx.x) * blockDim.x + tid; id < tot; id += step) {
+    const long long t = id / H, r = id - t * H;
+    const float yv = md::rd3_combine_one(A.yd, A.wsel, A.wsh ? A.gsh : nullptr, A.nu, n, H, t, r, A.sel, nullptr);
+    const float x1 = add(A.x[id], A.a[id]);  // k_add_rows of the attention's output
+    A.y[id] = yv;
+    A.x[id] = add(x1, yv);  // k_add_rows of the MoE output
   }
 }
 
@@ -1639,6 +1734,57 @@ bool moe_r3(const ExpertPtr* tab, const ExpertPtr* shx, const std::int32_t* sel,
   if (!rd3_combine_launch(yd, wsel, shx ? gsh : nullptr, n_used, tokens, H, y, sel, s)) return sfail("moe_r3: combine launch");
   if (ts) stamp_launch(ts + 5, s);
   return true;
+}
+
+bool moe_half(const MoeHalfArgs& A, Stream s) {
+  if (A.load_mode < 0 || A.load_mode > 2) return sfail("moe_half: load_mode 0, 1 or 2");
+  if (!A.x || !A.a || !A.post_w || !A.xn || !A.xr || !A.xq || !A.xs || !A.xsum || !A.wr || !A.logits || !A.sel || !A.wsel || !A.tab || !A.grp ||
+      !A.gsrc || !A.gfill || !A.gu || !A.hq || !A.hs || !A.hsum || !A.yd || !A.plan || !A.y || (A.wsh && (!A.gsh || !A.shx)))
+    return sfail("moe_half: bad pointer");
+  if (A.n <= 0) return true;
+  if (A.n > 4) return sfail("moe_half: at most 4 tokens");
+  if (A.nu <= 0 || A.nu > 8 || A.ne <= 0 || A.ne > md::kRouterMaxExperts) return sfail("moe_half: n_used 1-8, n_expert 1-1024");
+  const int nsub = A.H / 32;
+  auto k_ok = [](std::int64_t k) { return k == 256 || k == 512 || k == 1024 || k == 2048 || k == 4096; };
+  if (!k_ok(A.H) || !k_ok(A.F)) return sfail("moe_half: H and F must be 256, 512, 1024, 2048 or 4096");
+  const std::int64_t picks = static_cast<std::int64_t>(A.n) * A.nu + (A.wsh ? A.n : 0);
+  if (picks > A.max_picks) return sfail("moe_half: more picks than the plan buffer holds");
+  if ((reinterpret_cast<std::uintptr_t>(A.wr) & 15u) || (A.wsh && (reinterpret_cast<std::uintptr_t>(A.wsh) & 15u)) ||
+      reinterpret_cast<std::uintptr_t>(A.xq) % 16 != 0 || reinterpret_cast<std::uintptr_t>(A.hq) % 16 != 0)
+    return sfail("moe_half: wr / wsh / xq / hq must be 16-byte aligned");
+  if (!grid_ready()) return false;
+  const int sbytes = A.load_mode ? 16 * 272 + 32 : 0;
+  // dynamic shared memory: the largest of the phases' uses (at most 4 x 128 x 144 B staging = 72 KB: opt in past 48 KB)
+  const int sm_stage = 4 * nsub * md::kGvPad * 4, sm_router = 2 * md::kRouterMaxExperts * 4 + md::kRouterMaxExperts, sm_rx = kLutBytes + 8 * sbytes;
+  const int smem = std::max(sm_stage, std::max(sm_router, sm_rx));
+  const bool mt = A.n > 1;
+  const int nj = nsub <= 32 ? 1 : nsub / 32;
+  void* fn = nullptr;
+  if (nj == 1) fn = mt ? reinterpret_cast<void*>(k_moe_half<true, 1>) : reinterpret_cast<void*>(k_moe_half<false, 1>);
+  else if (nj == 2) fn = mt ? reinterpret_cast<void*>(k_moe_half<true, 2>) : reinterpret_cast<void*>(k_moe_half<false, 2>);
+  else fn = mt ? reinterpret_cast<void*>(k_moe_half<true, 4>) : reinterpret_cast<void*>(k_moe_half<false, 4>);
+  static int grids[2][3][3] = {};
+  int& grid = grids[mt ? 1 : 0][nj == 1 ? 0 : (nj == 2 ? 1 : 2)][A.load_mode];
+  if (!grid) {
+    int dev = 0, sms = 0, occ = 0, coop = 0;
+    if (!sck(cudaGetDevice(&dev), "cudaGetDevice") || !sck(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev), "SM count") ||
+        !sck(cudaDeviceGetAttribute(&coop, cudaDevAttrCooperativeLaunch, dev), "cooperative launch attribute") ||
+        !sck(cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem), "moe_half: shared memory opt-in") ||
+        !sck(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, fn, 256, static_cast<std::size_t>(smem)), "occupancy (MoE half)"))
+      return false;
+    if (!coop) return sfail("moe_half: the device has no cooperative launch");
+    if (occ < 1) return sfail("moe_half: the kernel does not fit on an SM");
+    grid = sms * occ;
+    int occ_rx = 0;  // v52 diagnosis: the separate expert stage's blocks per SM at its own shared memory, for comparison
+    (void)cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ_rx, mt ? k_rx<true> : k_rx<false>, 256, static_cast<std::size_t>(sm_rx));
+    std::fprintf(stderr, "moe_half: %s tokens, H %d: grid %d (%d SMs x %d blocks), shared memory %d B; k_rx alone %d blocks per SM\n", mt ? "2-4" : "1",
+                 A.H, grid, sms, occ, smem, occ_rx);
+  }
+  MoeHalfArgs a = A;
+  int sb = sbytes;
+  void* args[] = {&a, &sb};
+  return sck(cudaLaunchCooperativeKernel(fn, dim3(static_cast<unsigned>(grid)), dim3(256), args, static_cast<std::size_t>(smem), sst(s)),
+             "moe_half: cooperative launch");
 }
 
 }  // namespace pelias::kern::gpu

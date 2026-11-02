@@ -505,6 +505,71 @@ TEST(rung4_engine_batch_identical_and_graph) {
               plain_split ? "differ (the split)" : "equal", bi_eq ? "bit for bit" : "DIFFER", gr_eq ? "bit for bit" : "DIFFER");
 }
 
+// v52 (token kernel 3a): the fused MoE half (one cooperative launch per layer: residual, post norm, rounding, router, shared
+// gate, picks, grouping with the reader cache, plan, R3 expert stage, combine, residual) against the separate kernels: the
+// prompt (GPU steps of up to 4 tokens), one-token decode and verify batches of 4, with the graph, logits bit for bit
+TEST(rung4_engine_fused_moe_half) {
+  if (!g::available()) return;
+  Small sm;
+  small_model(sm);
+  CHECK(sm.ok);
+  if (!sm.ok) return;
+  const m::Qwen35MoeSpec& s = sm.spec;
+  const int nv = static_cast<int>(s.n_vocab), npre = 16, ndec = 12;
+  const std::size_t row = static_cast<std::size_t>(nv);
+  std::vector<std::int32_t> tok(static_cast<std::size_t>(npre + ndec));
+  for (std::size_t i = 0; i < tok.size(); ++i) tok[i] = static_cast<std::int32_t>((i * 41 + 3) % 1000);
+  std::vector<float> out[2];
+  std::string summ[2];
+  for (int fz = 0; fz < 2; ++fz) {
+    m::EngineOptions eo;
+    eo.max_ctx = 128;
+    eo.max_batch = 16;
+    eo.max_verify = 4;
+    eo.cpu_threads = 4;
+    eo.cold_on_gpu = true;
+    eo.hot_order.assign(s.n_layer, {});
+    for (auto& v : eo.hot_order)
+      for (int e = 0; e < static_cast<int>(s.n_expert); ++e) v.push_back(e);
+    eo.max_hot_per_layer = 2;
+    eo.reader_cache = 3;
+    eo.fold_shared = true;
+    eo.batch_identical = true;
+    eo.graph = true;
+    eo.r3_experts = true;
+    eo.rx_load = 1;
+    eo.router_tie = 0.01f;
+    eo.fused_moe = fz == 1;
+    auto f = m::GpuEngine::open(s, sm.w, eo);
+    CHECK(f.ok());
+    if (!f.ok()) {
+      std::printf("    fused MoE half: open failed: %s\n", f.status.text().c_str());
+      return;
+    }
+    m::GpuEngine& E = *f.value;
+    std::vector<float>& o = out[fz];
+    o.assign(static_cast<std::size_t>(npre + 2 * ndec) * row, 0.0f);
+    CHECK(E.reset().ok());
+    CHECK(E.step(tok.data(), npre, o.data(), false).ok());
+    for (int i = 0; i < ndec; ++i) CHECK(E.step(tok.data() + npre + i, 1, o.data() + static_cast<std::size_t>(npre + i) * row, false).ok());
+    CHECK(E.reset().ok());
+    std::vector<float> pre(static_cast<std::size_t>(npre) * row);
+    CHECK(E.step(tok.data(), npre, pre.data(), false).ok());
+    std::vector<float> bh(4 * static_cast<std::size_t>(s.n_embd));
+    for (int b = 0; b < ndec / 4; ++b) {
+      CHECK(E.verify(tok.data() + npre + 4 * b, 4, o.data() + static_cast<std::size_t>(npre + ndec + 4 * b) * row, bh.data()).ok());
+      CHECK(E.keep(4).ok());
+    }
+    summ[fz] = E.summary();
+  }
+  const bool noted = summ[1].find("MoE half fused") != std::string::npos && summ[0].find("MoE half fused") == std::string::npos;
+  const bool eq = out[0].size() == out[1].size() && std::memcmp(out[0].data(), out[1].data(), out[0].size() * sizeof(float)) == 0;
+  CHECK(noted);
+  CHECK(eq);
+  std::printf("    fused MoE half vs separate kernels (prompt 16 in GPU steps, 12 one-token steps, 3 verify batches of 4, graph): logits %s; summary %s\n",
+              eq ? "bit for bit" : "DIFFER", noted ? "names the fused path" : "MISSING the fused note");
+}
+
 TEST(rung4_engine_verify_and_keep) {
   if (!g::available()) return;
   Small sm;

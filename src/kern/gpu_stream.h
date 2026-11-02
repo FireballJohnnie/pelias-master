@@ -103,6 +103,45 @@ bool moe_r3(const ExpertPtr* tab, const ExpertPtr* shx, const std::int32_t* sel,
             const std::int8_t* xq, const float* xs, const int* xsum, std::int64_t tokens, std::int64_t H, std::int64_t F, const ReaderCache* cache,
             float* gu, std::int8_t* hq, float* hs, int* hsum, float* yd, int* grp, ExpertPtr* gsrc, ExpertPtr* gfill, void* plan, int max_picks,
             float* y, unsigned long long* ts, Stream s = nullptr, int load_mode = 0);
+// v52 (token kernel 3a): the MoE half of a layer in one cooperative launch, the same operations and order as the separate
+// kernels it replaces, so the same bits: x += a (residual), post rms_norm, the 8-bit rounding (act_q8x32), the router's and
+// the shared gate's F32 products, the router's picks (k_router_fast), the shared gate's sigmoid, the grouping with the reader
+// cache, the plan, the R3 expert stage, the combine into y, x += y. Three grid barriers instead of twelve launches. Every
+// block normalizes the rows itself (reads only) for its share of the products; x is written once, at the end.
+struct MoeHalfArgs {
+  float* x = nullptr;              // n x H residual stream (in: before the attention's output is added; out: after the layer)
+  const float* a = nullptr;        // n x H the attention / DeltaNet block's output (may alias y)
+  const float* post_w = nullptr;   // H post-attention norm weight
+  float eps = 0.0f;
+  int n = 0, H = 0, F = 0, ne = 0, nu = 0;
+  float* xn = nullptr;             // n x H normalized rows (written for later readers)
+  float* xr = nullptr;             // n x H rounded floats, as act_q8x32
+  std::int8_t* xq = nullptr;       // n x H
+  float* xs = nullptr;             // n x H / 32
+  int* xsum = nullptr;             // n x H / 32
+  const float* wr = nullptr;       // ne x H router (F32, rows of H x 4 bytes, 16-byte aligned)
+  float* logits = nullptr;         // n x ne
+  const float* wsh = nullptr;      // H shared-expert gate (F32); null: no shared expert folded in
+  float* gsh = nullptr;            // n
+  float wscale = 0.0f, band = 0.0f;
+  std::int32_t* sel = nullptr;     // n x nu
+  float* wsel = nullptr;           // n x nu
+  const ExpertPtr* tab = nullptr;  // ne
+  const ExpertPtr* shx = nullptr;  // the shared expert (with wsh)
+  ReaderCache cache;               // K 0: none
+  int* grp = nullptr;
+  ExpertPtr* gsrc = nullptr;
+  ExpertPtr* gfill = nullptr;
+  float* gu = nullptr;
+  std::int8_t* hq = nullptr;
+  float* hs = nullptr;
+  int* hsum = nullptr;
+  float* yd = nullptr;
+  void* plan = nullptr;
+  int max_picks = 0, load_mode = 0;
+  float* y = nullptr;              // n x H the MoE output (as moe_r3's y)
+};
+bool moe_half(const MoeHalfArgs& args, Stream s = nullptr);
 // v46a-2 load_mode: 0 each lane loads its own 16-byte pieces (v46a-1); 1 a warp first copies its task's rows contiguously into
 // shared memory for experts read from RAM (every 32-byte sector over PCIe once; the slot filled by the same copy); 2 the same
 // for every expert. The arithmetic is the same in all three, so the outputs are equal bit for bit.
