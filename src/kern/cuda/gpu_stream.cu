@@ -1282,8 +1282,13 @@ __device__ PG_NOINL void mh_phase_b(const MoeHalfArgs& A, float* stg, float* s_r
   rx_plan_body(A.grp, A.gsrc, A.gfill, n, A.nu, A.H, A.F, A.xq, A.xs, A.xsum, A.gu, A.hq, A.hs, A.hsum, A.yd, static_cast<std::uint8_t*>(A.plan),
                A.max_picks, A.load_mode, A.xb, A.hb);
 }
+// v55f3 (author 06:41, the v55f2 listing): without a bound the compiler squeezed the one-token kernel to 128 registers for
+// 2 blocks per SM and spilled 168 B in the kernel body (the expert loop; the out-of-line phases A / B: 0 spill), while
+// it gave the counting copy of the same code 173 registers, 1 block, 0 spill. Measured so far: 1 block with no spill
+// (v55d stage 5.80 ms at 3 bits) beat 2 blocks with spills (v55e2 6.39 ms). So the bound says 1 block: the natural
+// registers, no spill
 template <bool kMT, int NJ, bool kStat = false>
-__global__ void __launch_bounds__(256) k_moe_half(const __grid_constant__ MoeHalfArgs A, int sbytes) {
+__global__ void __launch_bounds__(256, 1) k_moe_half(const __grid_constant__ MoeHalfArgs A, int sbytes) {
   namespace cg = cooperative_groups;
   cg::grid_group grid = cg::this_grid();
   __shared__ double s_sh[33];
