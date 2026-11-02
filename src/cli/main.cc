@@ -2202,7 +2202,7 @@ double kl_rows(const float* ra, const float* rb, std::size_t nv) {
 int cmd_pin_probe(const Args& a) {
   const std::string path = a.get("model");
   if (path.empty()) {
-    std::fprintf(stderr, "usage: pelias pin-probe --model FILE [--mb 1024] [--joint]\n");
+    std::fprintf(stderr, "usage: pelias pin-probe --model FILE [--mb 1024] [--joint] [--small] [--arena]\n");
     return 1;
   }
   std::uint64_t mb = 1024;
@@ -2240,37 +2240,44 @@ int cmd_pin_probe(const Args& a) {
       std::printf("  %s: read %llu MiB in %.4f s = %.2f GB/s\n", what, static_cast<unsigned long long>(mb), sec, static_cast<double>(bytes) / sec / 1e9);
     }
   };
+  // v24: scattered expert-sized reads in a registered region (one block per chunk, offsets from a fixed LCG, 4 KiB
+  // aligned), as the reader's routed experts would be read
+  auto scattered = [&](void* dev, const char* tag) {
+    for (const std::size_t kb : {std::size_t{256}, std::size_t{1024}, std::size_t{2048}}) {
+      const std::size_t chunk = kb << 10;
+      if (chunk * 2 > bytes) continue;
+      for (const int nchunks : {80, 320}) {
+        std::vector<std::uint64_t> offs(static_cast<std::size_t>(nchunks));
+        std::uint64_t st = 0x9e3779b97f4a7c15ull ^ (kb * 131 + static_cast<std::uint64_t>(nchunks));
+        for (auto& of : offs) {
+          st = st * 6364136223846793005ull + 1442695040888963407ull;
+          of = ((st >> 17) % ((bytes - chunk) / 4096)) * 4096;
+        }
+        for (int rep = 0; rep < 2; ++rep) {
+          double sec = 0.0;
+          if (!kern::gpu::read_chunks_rate(dev, offs.data(), nchunks, chunk, &sec)) {
+            std::printf("  %s scattered read failed: %s\n", tag, kern::gpu::last_error());
+            return;
+          }
+          std::printf("  %s scattered: %d chunks of %zu KiB in %.4f s = %.2f GB/s\n", tag, nchunks, kb, sec, static_cast<double>(chunk) * nchunks / sec / 1e9);
+        }
+      }
+    }
+  };
+  // v46 (author 19:34 "probe it"): --small asks for 4 KB pages on the region first, as the engine does for its registered
+  // ranges since v34 (hal::advise_small_pages), so (1) measures the engine's own case
+  if (a.has("small")) std::printf("  small-page advice on the file region: %s\n", hal::advise_small_pages(region, bytes) ? "taken" : "refused");
   {  // (1) the file mapping itself
     void* dev = nullptr;
     std::string why;
     Timer tr;
     const bool ok = kern::gpu::host_register(region, bytes, &dev, &why);
-    std::printf("  (1) register the read-only file mapping: %s (%.3f s)%s%s\n", ok ? "OK" : "REFUSED", tr.seconds(), ok ? "" : ": ", why.c_str());
+    const double reg_s = tr.seconds();
+    std::printf("  (1) register the read-only file mapping: %s (%.3f s = %.3f s/GiB)%s%s\n", ok ? "OK" : "REFUSED", reg_s, reg_s * 1024.0 / static_cast<double>(mb),
+                ok ? "" : ": ", why.c_str());
     if (ok) {
       rate(dev, "(1) GPU reads the file mapping");
-      // v24: scattered expert-sized reads in the registered region (one block per chunk, offsets from a fixed LCG,
-      // 4 KiB aligned), as the reader's routed experts would be read
-      for (const std::size_t kb : {std::size_t{256}, std::size_t{1024}, std::size_t{2048}}) {
-        const std::size_t chunk = kb << 10;
-        if (chunk * 2 > bytes) continue;
-        for (const int nchunks : {80, 320}) {
-          std::vector<std::uint64_t> offs(static_cast<std::size_t>(nchunks));
-          std::uint64_t st = 0x9e3779b97f4a7c15ull ^ (kb * 131 + static_cast<std::uint64_t>(nchunks));
-          for (auto& of : offs) {
-            st = st * 6364136223846793005ull + 1442695040888963407ull;
-            of = ((st >> 17) % ((bytes - chunk) / 4096)) * 4096;
-          }
-          for (int rep = 0; rep < 2; ++rep) {
-            double sec = 0.0;
-            if (!kern::gpu::read_chunks_rate(dev, offs.data(), nchunks, chunk, &sec)) {
-              std::printf("  (1s) scattered read failed: %s\n", kern::gpu::last_error());
-              break;
-            }
-            std::printf("  (1s) scattered: %d chunks of %zu KiB in %.4f s = %.2f GB/s\n", nchunks, kb, sec,
-                        static_cast<double>(chunk) * nchunks / sec / 1e9);
-          }
-        }
-      }
+      scattered(dev, "(1s)");
       if (a.has("joint")) {
         // v28 joint read test (author 22:18 "roll it"): the GPU reads expert-sized chunks of the registered region while
         // CPU threads stream a second, unregistered region of the same file mapping (the light experts' path), each
@@ -2360,6 +2367,31 @@ int cmd_pin_probe(const Args& a) {
         }
       }
       kern::gpu::host_unregister(region);
+    }
+  }
+  if (a.has("arena")) {  // (4) v46: the same bytes in a 2 MB-page anonymous arena filled by direct reads (one copy in RAM)
+    bool direct = false;
+    std::string why;
+    Timer tf;
+    void* ar = hal::huge_arena_from_file(path.c_str(), off, bytes, &direct, &why);
+    if (!ar) {
+      std::printf("  (4) arena: FAILED: %s\n", why.c_str());
+    } else {
+      std::printf("  (4) 2 MB arena filled from the file (%s) in %.2f s; %s\n", direct ? "O_DIRECT: no page-cache copy" : "read through the page cache",
+                  tf.seconds(), hal::smaps_rollup_line("AnonHugePages:").c_str());
+      void* dev = nullptr;
+      std::string why2;
+      Timer tr;
+      const bool ok = kern::gpu::host_register(ar, bytes, &dev, &why2);
+      const double reg_s = tr.seconds();
+      std::printf("  (4) register the arena: %s (%.3f s = %.3f s/GiB)%s%s; %s\n", ok ? "OK" : "REFUSED", reg_s, reg_s * 1024.0 / static_cast<double>(mb),
+                  ok ? "" : ": ", why2.c_str(), hal::smaps_rollup_line("AnonHugePages:").c_str());
+      if (ok) {
+        rate(dev, "(4) GPU reads the 2 MB arena");
+        scattered(dev, "(4s)");
+        kern::gpu::host_unregister(ar);
+      }
+      hal::huge_arena_free(ar, bytes);
     }
   }
   {  // (2) a private copy
