@@ -1517,9 +1517,9 @@ bool moe_reader3(const ExpertPtr* tab, const ExpertPtr* shx, const std::int32_t*
 bool rd3_group_launch(const ExpertPtr* tab, const ExpertPtr* shx, const std::int32_t* sel, int tokens, int nu, const ReaderCache* cache, std::int64_t H,
                       std::int64_t F, int* grp, ExpertPtr* gsrc, ExpertPtr* gfill, Stream s) {
   ReaderCache c;
-  if (cache && cache->K > 0) {
+  if (cache) {  // v54b: also with no slots (K 0): it carries the bit-plane slider
     c = *cache;
-    if (!c.tag || !c.use || !c.stamp || !c.base || c.slot_bytes == 0) return fail("rd3_group_launch: incomplete cache");
+    if (c.K > 0 && (!c.tag || !c.use || !c.stamp || !c.base || c.slot_bytes == 0)) return fail("rd3_group_launch: incomplete cache");
   }
   k_rd3_group<<<1, 32, 0, st(s)>>>(tab, shx, sel, tokens, nu, c, H, F, grp, gsrc, gfill, nullptr);
   return launched("rd3 group");

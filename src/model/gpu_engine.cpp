@@ -387,6 +387,8 @@ struct GpuEngine::Impl {
   std::uint64_t preload_b = 0;
   bool preload_on = false;
   std::uint64_t cache_reserved = 0, cslot = 0;
+  int rc_eff = 0;      // v54b: the reader cache's slots per layer (--reader-cache, or the VRAM probe's)
+  std::string probe_note;
   void* cache_mem = nullptr;
   void* cache_meta = nullptr;
   std::vector<g::ReaderCache> rcache;
@@ -1647,7 +1649,7 @@ struct GpuEngine::Impl {
     // plane layout, in pinned mapped memory; those matrices' file bytes are then not registered
     std::vector<std::uint64_t> poff;  // per (layer, matrix, expert): offset in planes_h + 1 (0: not in planes)
     void* planes_dev = nullptr;
-    if (o.bit_planes) {
+    if (o.plane_bits > 0) {
       poff.assign(z(static_cast<int64_t>(s.n_layer) * 3 * ne), 0);
       std::uint64_t tot = 0;
       struct PJob {
@@ -1691,8 +1693,8 @@ struct GpuEngine::Impl {
           });
         for (auto& t : th) t.join();
         char pb[200];
-        std::snprintf(pb, sizeof pb, "; bit planes: %zu Q4_TG2 matrices, %.2f GB pinned, built in %.2f s; base %d bits for the %d lowest-ranked picks",
-                      jobs.size(), static_cast<double>(tot) / 1e9, since(tp), o.base_bits, o.base_picks);
+        std::snprintf(pb, sizeof pb, "; bit planes: %zu Q4_TG2 matrices, %.2f GB pinned, built in %.2f s; every pick read with %d bits, slots sized for them",
+                      jobs.size(), static_cast<double>(tot) / 1e9, since(tp), o.plane_bits);
         planes_note = pb;
       }
     }
@@ -1876,9 +1878,9 @@ struct GpuEngine::Impl {
     // v26 cache: the bytes reserved before the bank was filled
     std::string cache_note;
     if (cache_reserved > 0 && o.reader_v3) {
-      int K = o.reader_cache;
+      int K = rc_eff;
       const std::size_t nl = s.n_layer;
-      const std::uint64_t budget = cslot * static_cast<std::uint64_t>(o.reader_cache);  // per layer, as before
+      const std::uint64_t budget = cslot * static_cast<std::uint64_t>(rc_eff);  // per layer, as before (v54b: rc_eff, the probe's or --reader-cache)
       // v51 size pools: per layer the file experts (not in the bank) by real size; each size's share of the budget follows
       // its experts' routes counts x size (counts + 1); at most kMaxPools sizes (the smallest-demand size merges upward)
       std::vector<g::ReaderCache> pc(nl);
@@ -1894,7 +1896,12 @@ struct GpuEngine::Impl {
           for (int ex = 0; ex < static_cast<int>(ne); ++ex) {
             if (L[il].hot[z(ex)]) continue;
             std::uint64_t b = 0;
-            for (const WeightView* v : {&l.gate_exps, &l.up_exps, &l.down_exps}) b += exp_rows(*v, ex).rb * v->ne[1];
+            for (const WeightView* v : {&l.gate_exps, &l.up_exps, &l.down_exps}) {
+              const ExpRows r = exp_rows(*v, ex);
+              // v54b: a matrix held in bit planes takes the slider's prefix of each row in its slot (as rd3_group_one lays it)
+              const bool pl = o.plane_bits > 0 && !L[il].light[z(ex)] && r.t == quant::Type::q4_tg2 && r.rb % 144 == 0;
+              b += (pl ? kern::gpu::tg2p_prefix(r.rb / 144, o.plane_bits) : r.rb) * static_cast<std::uint64_t>(v->ne[1]);
+            }
             esz[z(ex)] = (b + 255) & ~std::uint64_t{255};
             const double cn = il < o.hot_count.size() && z(ex) < o.hot_count[il].size() ? static_cast<double>(o.hot_count[il][z(ex)]) : 0.0;
             dem[esz[z(ex)]] += (cn + 1.0) * static_cast<double>(esz[z(ex)]);
@@ -1976,13 +1983,12 @@ struct GpuEngine::Impl {
         }
         K = kpool_max;
         if (!pools_ok) {  // v51b: fall back to the fixed slots rather than run past a layer's budget
-          K = o.reader_cache;
+          K = rc_eff;
           pc.assign(nl, g::ReaderCache{});
         }
       }
       const bool use_pools = o.cache_pools && pools_ok;
-      const std::size_t meta_b0 = nl * (static_cast<std::size_t>(K) * 8 + 16) + (use_pools ? nl * z(ne) : 0);
-      const std::size_t meta_b = meta_b0 + (o.bit_planes ? nl * static_cast<std::size_t>(K) : 0);  // v54: the bits each slot holds
+      const std::size_t meta_b = nl * (static_cast<std::size_t>(K) * 8 + 16) + (use_pools ? nl * z(ne) : 0);
       cache_mem = g::dalloc(cache_reserved);
       cache_meta = g::dalloc(meta_b);
       if (cache_mem && cache_meta) {
@@ -2002,11 +2008,7 @@ struct GpuEngine::Impl {
             c.base = static_cast<std::uint8_t*>(cache_mem) + il * budget;
             c.slot_bytes = cslot;
             if (use_pools) c.pool_of = reinterpret_cast<const signed char*>(mb + nl * (static_cast<std::size_t>(K) * 8 + 16)) + il * z(ne);
-            if (o.bit_planes) {  // v54
-              c.sbits = mb + meta_b0 + il * static_cast<std::size_t>(K);
-              c.plane_bits = o.base_bits;
-              c.plane_picks = o.base_picks;
-            }
+            if (o.plane_bits > 0) c.plane_bits = o.plane_bits;  // v54b
             kmin = std::min(kmin, c.K);
             kall += c.K;
             rcache.push_back(c);
@@ -2015,7 +2017,7 @@ struct GpuEngine::Impl {
           char cb[200];
           if (use_pools)
             std::snprintf(cb, sizeof cb, "; cache %.2f GB in size pools (%d slots of %d before; %d-%d slots per layer, %.1f average)", static_cast<double>(cache_reserved) / 1e9,
-                          o.reader_cache, o.reader_cache, kmin, K, static_cast<double>(kall) / static_cast<double>(nl));
+                          rc_eff, rc_eff, kmin, K, static_cast<double>(kall) / static_cast<double>(nl));
           else
             std::snprintf(cb, sizeof cb, "; cache %d slots per layer, %.2f GB%s", K, static_cast<double>(cache_reserved) / 1e9,
                           o.cache_pools ? " (size pools off: layout over budget)" : "");
@@ -2023,6 +2025,11 @@ struct GpuEngine::Impl {
         }
       }
       if (rcache.empty()) cache_note = "; cache off (device memory)";
+    }
+    if (o.plane_bits > 0 && rcache.empty()) {  // v54b: no slots, but the grouping still needs the slider
+      g::ReaderCache c0;
+      c0.plane_bits = o.plane_bits;
+      rcache.assign(s.n_layer, c0);
     }
     rtab_h = tab;
     // v46a-1: the R3 expert stage. It reads the experts as stored (Q4_TG2 / Q5_K / Q4_K with 16-byte aligned rows, Q6_K
@@ -2405,6 +2412,7 @@ std::string GpuEngine::summary() const {
   if (I.reader) r += I.o.gpu_prompt ? "; prompt on the GPU in steps of 1-4 tokens" : "; prompt batches on the bank + CPU cold path";  // v48
   if (I.o.r3_experts) r += "; R3 expert stage " + I.rx_note + (I.o.rx_load == 2 ? ", rows staged for every expert" : I.o.rx_load == 1 ? ", rows staged for experts read from RAM" : ", lane loads");  // v46a-1 / v46a-2
   r += I.planes_note;  // v54
+  r += I.probe_note;   // v54b
   if (I.o.fused_moe && I.rx_ok && I.fold_ok) r += "; MoE half fused (one launch per layer where no side output needs the separate kernels)";  // v52
   if (!I.o.pin_pool.empty() || I.o.pin_host >= 0) {  // v43
     char c[256];
@@ -2593,7 +2601,9 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
     }
   }
   if (o.mtp) I.M.picks.assign(z(ne), 0);
-  if (o.cold_on_gpu && o.reader_v3 && o.reader_cache > 0) {  // v26: the reader cache's bytes before the bank takes its share
+  I.rc_eff = o.reader_cache;
+  int hot_cap = o.max_hot_per_layer;
+  if (o.cold_on_gpu && o.reader_v3 && (o.reader_cache > 0 || o.auto_vram)) {  // v26: the reader cache's bytes before the bank takes its share
     std::uint64_t mx = 0;
     for (std::uint32_t il = 0; il < s.n_layer; ++il)
       for (int ex = 0; ex < static_cast<int>(ne); ++ex) {
@@ -2602,7 +2612,18 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
         mx = std::max(mx, b);
       }
     const std::uint64_t slot_b = (mx + 255) & ~std::uint64_t{255};
-    const std::uint64_t need = slot_b * static_cast<std::uint64_t>(o.reader_cache) * s.n_layer;
+    if (o.auto_vram) {  // v54b VRAM probe: the free bytes after the dense weights split cache_share / the rest
+      const std::uint64_t slack = (3 * 4 * (2048 + 256 * 4) + 64 * 1024) * static_cast<std::uint64_t>(s.n_layer);
+      const std::uint64_t ex_b = left > slack ? left - slack : 0;
+      I.rc_eff = static_cast<int>(static_cast<double>(ex_b) * o.cache_share / static_cast<double>(slot_b * s.n_layer));
+      hot_cap = static_cast<int>(ne);
+      char pn[240];
+      std::snprintf(pn, sizeof pn, "; VRAM probe: %.2f GB free after the dense weights (reserve %.2f GB kept), %.2f GB for experts: cache %.1f %% = %d slots of %.2f MB per layer, the bank the rest",
+                    static_cast<double>(free_b) / 1e9, static_cast<double>(o.vram_reserve) / 1e9, static_cast<double>(ex_b) / 1e9, 100.0 * o.cache_share, I.rc_eff,
+                    static_cast<double>(slot_b) / 1e6);
+      I.probe_note = pn;
+    }
+    const std::uint64_t need = slot_b * static_cast<std::uint64_t>(I.rc_eff) * s.n_layer;
     if (need < left) {
       left -= need;
       I.cache_reserved = need;
@@ -2615,7 +2636,7 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
     left = left > per_layer_slack * s.n_layer ? left - per_layer_slack * s.n_layer : 0;
     std::size_t max_rank = 0;
     for (const auto& v : o.hot_order) max_rank = std::max(max_rank, v.size());
-    const std::size_t cap = std::min<std::size_t>(max_rank, static_cast<std::size_t>(std::max(0, o.max_hot_per_layer)));
+    const std::size_t cap = std::min<std::size_t>(max_rank, static_cast<std::size_t>(std::max(0, hot_cap)));  // v54b: the probe lifts the cap
     for (std::size_t r = 0; r < cap && left > 0; ++r)
       for (std::uint32_t il = 0; il < s.n_layer; ++il) {
         if (r >= o.hot_order[il].size()) continue;
@@ -2633,17 +2654,15 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
       if (!st) return R::fail(st);
     }
   }
-  if (o.bit_planes || o.base_bits != 4 || o.base_picks != 0) {  // v54: only the R3 expert stage reads the planes
-    if (!o.bit_planes) return R::fail(Status::fail(Code::invalid_argument, "engine: --base-bits / --base-picks need --bit-planes"));
-    if (o.base_bits < 2 || o.base_bits > 4 || o.base_picks < 0 || o.base_picks > static_cast<int>(s.n_expert_used))
-      return R::fail(Status::fail(Code::invalid_argument, "engine: --base-bits 2, 3 or 4; --base-picks 0 .. n_expert_used"));
-    if (!o.cold_on_gpu || !o.r3_experts || o.prefetch || o.cpu_light || o.plane_tail != 0 || (o.base_bits < 4 && o.base_picks > 0 && o.reader_cache <= 0))
+  if (o.plane_bits != 0) {  // v54b: only the R3 expert stage reads the planes; misses fill their slots through staging
+    if (o.plane_bits < 2 || o.plane_bits > 4) return R::fail(Status::fail(Code::invalid_argument, "engine: --plane-bits 2, 3 or 4"));
+    if (!o.cold_on_gpu || !o.r3_experts || o.rx_load < 1 || o.prefetch || o.cpu_light || o.plane_tail != 0)
       return R::fail(Status::fail(Code::invalid_argument,
-                                  "engine: --bit-planes needs the R3 expert stage (--cold-on-gpu --r3-experts), no --prefetch, --cpu-light or "
-                                  "--plane-tail, and a reader cache for a base below 4 bits"));
+                                  "engine: --plane-bits needs the R3 expert stage with staged loads (--cold-on-gpu --r3-experts --rx-load miss|all), "
+                                  "no --prefetch, --cpu-light or --plane-tail"));
   }
   if (o.cold_on_gpu) I.setup_reader();  // v24
-  if (o.bit_planes && (!I.rx_ok || !I.planes_h))
+  if (o.plane_bits > 0 && !I.rx_ok)  // (no plane matrices at all is fine: every expert in the bank)
     return R::fail(Status::fail(Code::internal, "engine: the bit planes need the R3 expert stage on (" + I.rx_note + "; reader " + I.reader_note + ")"));
   // the host side of the cold path
   const int threads = o.cpu_threads > 0 ? o.cpu_threads : static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));

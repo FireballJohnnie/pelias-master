@@ -570,10 +570,10 @@ TEST(rung4_engine_fused_moe_half) {
               eq ? "bit for bit" : "DIFFER", noted ? "names the fused path" : "MISSING the fused note");
 }
 
-// v54: the sliding bit planes (kern/tg2_planes.h) in the R3 expert stage. 4 bits through the planes = the stored layout bit
-// for bit; a 2- or 3-bit base changes the logits (finite), is the same one token at a time and in verify batches of 4, and
-// does not depend on the cache (1 or 4 slots: slots promoted in place A -> A+B+C with only the missing planes read) or on
-// how rows are loaded (lanes / staged)
+// v54b: the sliding bit planes (kern/tg2_planes.h) in the R3 expert stage, one slider for every pick (--plane-bits). 4 bits
+// through the planes = the stored layout bit for bit; 2 / 3 bits change the logits (finite), one token = verify batches of 4;
+// the slots hold the slider's prefix (packed rows): no cache, 1 slot or 4 slots, staged misses or every expert staged give
+// the same bits; the VRAM probe (--auto-vram) runs and, at 4 bits, changes nothing
 TEST(rung4_engine_bit_planes) {
   if (!g::available()) return;
   Small sm;
@@ -586,8 +586,8 @@ TEST(rung4_engine_bit_planes) {
   std::vector<std::int32_t> tok(static_cast<std::size_t>(npre + ndec));
   for (std::size_t i = 0; i < tok.size(); ++i) tok[i] = static_cast<std::int32_t>((i * 29 + 5) % 1000);
   struct Cfg {
-    bool planes;
-    int bits, picks, cache, load;
+    int bits, cache, load;
+    bool probe;
   };
   auto run = [&](const Cfg& c, std::string* summ) {
     m::EngineOptions eo;
@@ -607,9 +607,8 @@ TEST(rung4_engine_bit_planes) {
     eo.r3_experts = true;
     eo.rx_load = c.load;
     eo.router_tie = 0.01f;
-    eo.bit_planes = c.planes;
-    eo.base_bits = c.bits;
-    eo.base_picks = c.picks;
+    eo.plane_bits = c.bits;
+    eo.auto_vram = c.probe;
     std::vector<float> o;
     auto f = m::GpuEngine::open(s, sm.w, eo);
     CHECK(f.ok());
@@ -640,31 +639,33 @@ TEST(rung4_engine_bit_planes) {
       if (!std::isfinite(x)) return false;
     return !a.empty();
   };
-  // one-token decode rows vs the verify rows of the same tokens
   auto one_vs_ver = [&](const std::vector<float>& a) {
     return !a.empty() && std::memcmp(a.data() + static_cast<std::size_t>(npre) * row, a.data() + static_cast<std::size_t>(npre + ndec) * row,
                                      static_cast<std::size_t>(ndec) * row * sizeof(float)) == 0;
   };
-  std::string summ;
-  const std::vector<float> base = run({false, 4, 0, 3, 1}, nullptr);
-  const std::vector<float> p4 = run({true, 4, 0, 3, 1}, &summ);
+  std::string summ, summp;
+  const std::vector<float> base = run({0, 3, 1, false}, nullptr);
+  const std::vector<float> p4 = run({4, 3, 1, false}, &summ);
   const bool full_eq = same(base, p4);
   CHECK(full_eq);
   CHECK(summ.find("bit planes:") != std::string::npos);
-  const std::vector<float> p2 = run({true, 2, 2, 3, 1}, nullptr), p3 = run({true, 3, 2, 3, 1}, nullptr);
+  const std::vector<float> p2 = run({2, 3, 1, false}, nullptr), p3 = run({3, 3, 1, false}, nullptr);
   const bool lossy = !same(p2, base) && !same(p3, base) && !same(p2, p3) && finite(p2) && finite(p3);
   CHECK(lossy);
   const bool det = one_vs_ver(p2) && one_vs_ver(p3);
   CHECK(det);
-  // rank 1 of 2 on the base: slots move between 2 bits and 4 (promotions); the cache size and the load mode change nothing
-  const std::vector<float> q1 = run({true, 2, 1, 1, 1}, nullptr), q4 = run({true, 2, 1, 4, 1}, nullptr), q0 = run({true, 2, 1, 1, 0}, nullptr);
-  const bool cache_free = same(q1, q4) && same(q1, q0) && !same(q1, base) && !same(q1, p2) && one_vs_ver(q1);
+  const std::vector<float> c0 = run({2, 0, 1, false}, nullptr), c1 = run({2, 1, 1, false}, nullptr), c4 = run({2, 4, 1, false}, nullptr),
+                           l2 = run({2, 3, 2, false}, nullptr);
+  const bool cache_free = same(p2, c0) && same(p2, c1) && same(p2, c4) && same(p2, l2);
   CHECK(cache_free);
-  std::printf("    bit planes: 4 bits = stored layout %s; 2 / 3-bit base on both picks changes the logits %s, one token = verify batches %s; "
-              "base on the lower pick: cache 1 = cache 4 = lane loads %s\n",
+  const std::vector<float> pr = run({4, 3, 1, true}, &summp);
+  const bool probe = same(base, pr) && summp.find("VRAM probe:") != std::string::npos;
+  CHECK(probe);
+  std::printf("    bit planes: 4 bits = stored layout %s; 2 / 3 bits change the logits %s, one token = verify batches %s; "
+              "2 bits with no cache / 1 / 3 / 4 slots / every expert staged %s; VRAM probe %s\n",
               full_eq ? "bit for bit" : "DIFFER", lossy ? "(finite)" : "NOT AS EXPECTED", det ? "bit for bit" : "DIFFER",
-              cache_free ? "bit for bit" : "DIFFER");
-  std::printf("      %s\n", summ.c_str());
+              cache_free ? "bit for bit" : "DIFFER", probe ? "runs, same bits at 4" : "WRONG");
+  std::printf("      %s\n", summp.c_str());
 }
 
 TEST(rung4_engine_verify_and_keep) {

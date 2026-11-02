@@ -52,14 +52,19 @@ struct EngineOptions {
   // v52: the MoE half of each layer (residual, post norm, rounding, router, shared gate, picks, grouping, plan, R3 expert
   // stage, combine, residual) in one cooperative launch (g::moe_half); same bits (--no-fused-moe, temporary)
   bool fused_moe = true;
-  // v54 sliding bit planes (endgame, author 23:14): the RAM experts' Q4_TG2 matrices held as bit planes (kern/tg2_planes.h,
-  // copied into pinned memory at open; the file's bytes for them are not registered), read by the R3 expert stage with
-  // base_bits code bits (2, 3 or 4) for each token's base_picks lowest-ranked picks and all 4 for the rest. 4 bits read the
-  // stored codes exactly. Needs the R3 expert stage; not with the split, prefetch or the plane test (--bit-planes,
-  // --base-bits, --base-picks; temporary flags until measured)
-  bool bit_planes = false;
-  int base_bits = 4;
-  int base_picks = 0;
+  // v54b sliding bit planes (endgame; author 23:14, 23:54 "a slider ... 2, 3 or 4 bit", 23:56): plane_bits 2, 3 or 4 puts
+  // the RAM experts' Q4_TG2 matrices in bit planes (kern/tg2_planes.h; pinned at open, their file bytes not registered) and
+  // the R3 expert stage reads every pick with that many code bits; the cache's slots hold exactly those bits, so their size
+  // follows the slider (2-bit -27 %, 3-bit -14 % of an average expert, DERIVED) and more experts fit. 4 = the stored codes
+  // bit for bit. 0: off (the stored layout). Needs the R3 expert stage with staged loads; not with the split, prefetch or
+  // the plane test. (--plane-bits)
+  int plane_bits = 0;
+  // v54b VRAM probe (author 23:55: any system, any MoE): after the dense weights, the free VRAM (minus vram_reserve) is split
+  // between the reader cache (cache_share of it, as whole slots of the largest expert) and the bank (the rest, no per-layer
+  // cap) instead of reader_cache / max_hot_per_layer. cache_share 0.435 = this machine's measured best (bank 4.43 GB,
+  // cache 3.41 GB: bank 40 + cache 33, v46 step 1 / v51b). (--auto-vram [--cache-share F])
+  bool auto_vram = false;
+  double cache_share = 0.435;
   int max_hot_per_layer = 256;
   int cpu_threads = 0;  // workers for the cold experts (0: hardware threads)
   // GP3-14 stage 3 (MTP drafting): the largest verify batch (1 + drafts); 0 = no rollback buffers. Needs the DeltaNet

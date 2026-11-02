@@ -2434,7 +2434,7 @@ int cmd_engine_check(const Args& a) {
                  "                           [--text FILE [--skip-tokens N]] [--timeline] [--dump-top OUT.tsv] [--dump-router OUT.tsv] [--dump-draft OUT.tsv] [--dump-split [--split-sizes 2,3,4] [--split-step]]\n"
                  "                           [--no-doorbell] [--timeline-ops] [--split-ref] [--bank-selftest MIXES] [--probe-pos P]\n"
                  "                           [--router-tie BAND] [--cold-on-gpu] [--trace OUT.tsv] [--reader-v25] [--reader-cache K] [--fold-shared]\n"
-                 "                           [--batch-identical] [--graph] [--prefetch] [--plane-tail N] [--cpu-light] [--reader-rpw 1|2] [--r3-experts] [--rx-load lane|miss|all] [--prompt-batched] [--prompt-halves] [--cpu-prompt] [--no-cache-pools] [--no-fast-f32] [--no-fused-moe] [--bit-planes [--base-bits 2|3|4] [--base-picks N]]\n"
+                 "                           [--batch-identical] [--graph] [--prefetch] [--plane-tail N] [--cpu-light] [--reader-rpw 1|2] [--r3-experts] [--rx-load lane|miss|all] [--prompt-batched] [--prompt-halves] [--cpu-prompt] [--no-cache-pools] [--no-fast-f32] [--no-fused-moe] [--plane-bits 2|3|4] [--auto-vram [--cache-share F]]\n"
                  "                           [--pin-gap-kib K] [--pin-huge-ok] [--cpu-up-rows N] [--cpu-down2] [--cpu-gu2] [--cpu-tile] [--spin-pause] [--cpu-prefetch] [--cpu-check] [--host-wait auto|spin|yield|block] [--pin-cpus 0,2,4,...] [--pin-host N] [--ref-threads N] [--no-cpu-light] [--split-slow] [--preload-light]\n");
     return 1;
   }
@@ -2652,16 +2652,24 @@ int cmd_engine_check(const Args& a) {
   eo.cache_pools = !a.has("no-cache-pools");  // v51 (temporary switch)
   eo.fast_f32 = !a.has("no-fast-f32");        // v52 (temporary switch)
   eo.fused_moe = !a.has("no-fused-moe");      // v52 (temporary switch)
-  eo.bit_planes = a.has("bit-planes");        // v54 (temporary switches until measured)
-  if (a.has("base-bits") || a.has("base-picks")) {
-    const Result<std::uint64_t> bb = io::parse_whole(a.has("base-bits") ? a.get("base-bits") : std::string("4"), 4);
-    const Result<std::uint64_t> bp = io::parse_whole(a.has("base-picks") ? a.get("base-picks") : std::string("0"), 64);
-    if (!bb.ok() || !bp.ok() || bb.value < 2) {
-      std::fprintf(stderr, "pelias: --base-bits 2, 3 or 4; --base-picks a count of picks\n");
+  if (a.has("plane-bits")) {  // v54b
+    const Result<std::uint64_t> pb = io::parse_whole(a.get("plane-bits"), 4);
+    if (!pb.ok() || pb.value < 2) {
+      std::fprintf(stderr, "pelias: --plane-bits 2, 3 or 4\n");
       return 1;
     }
-    eo.base_bits = static_cast<int>(bb.value);
-    eo.base_picks = static_cast<int>(bp.value);
+    eo.plane_bits = static_cast<int>(pb.value);
+  }
+  eo.auto_vram = a.has("auto-vram");  // v54b
+  if (a.has("cache-share")) {
+    char* end = nullptr;
+    const std::string cs = a.get("cache-share");
+    const double v = std::strtod(cs.c_str(), &end);
+    if (!end || *end != 0 || !(v > 0.0 && v < 1.0)) {
+      std::fprintf(stderr, "pelias: --cache-share takes a fraction between 0 and 1\n");
+      return 1;
+    }
+    eo.cache_share = v;
   }
   Timer topen;
   auto eng = model::GpuEngine::open(s, w.value, eo);
