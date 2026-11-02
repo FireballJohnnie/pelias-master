@@ -1764,6 +1764,7 @@ struct GpuEngine::Impl {
       // v51 size pools: per layer the file experts (not in the bank) by real size; each size's share of the budget follows
       // its experts' routes counts x size (counts + 1); at most kMaxPools sizes (the smallest-demand size merges upward)
       std::vector<g::ReaderCache> pc(nl);
+      bool pools_ok = true;  // v51b
       std::vector<signed char> pool_h(nl * z(ne), -1);
       int kpool_max = K;
       if (o.cache_pools) {
@@ -1791,41 +1792,59 @@ struct GpuEngine::Impl {
           }
           double tot = 0.0;
           for (const auto& kv : dem) tot += kv.second;
-          g::ReaderCache& c = pc[il];
-          std::uint64_t used = 0;
-          int p = 0, k = 0;
+          // v51b: slot counts first, then the layout. Each size gets floor(budget x share / size) slots (at least 1 while it
+          // fits); if the forced ones push the layer past its budget, the size with the most slots gives one back until it fits
+          // (v51 laid the pools out as it went and could run past the budget into the next layer's region: G51's garbage)
+          std::vector<std::uint64_t> szs;
+          std::vector<double> dms;
+          std::vector<int> cnt;
           for (const auto& kv : dem) {
-            int n = tot > 0 ? static_cast<int>(static_cast<double>(budget) * kv.second / tot / static_cast<double>(kv.first)) : 0;
-            if (n < 1 && used + kv.first <= budget) n = 1;
-            c.pbytes[p] = kv.first;
-            c.pboff[p] = used;
-            c.pk0[p] = k;
-            used += static_cast<std::uint64_t>(n) * kv.first;
-            k += n;
-            ++p;
+            szs.push_back(kv.first);
+            dms.push_back(kv.second);
+            cnt.push_back(tot > 0 ? static_cast<int>(static_cast<double>(budget) * kv.second / tot / static_cast<double>(kv.first)) : 0);
           }
-          c.np = p;
-          c.pk0[p] = k;
-          // leftover bytes: one more slot at a time to the pool of most demand per byte that still fits (pools stay back to back)
+          auto total = [&]() {
+            std::uint64_t u = 0;
+            for (std::size_t pi = 0; pi < szs.size(); ++pi) u += static_cast<std::uint64_t>(cnt[pi]) * szs[pi];
+            return u;
+          };
+          for (std::size_t pi = 0; pi < szs.size(); ++pi)
+            if (cnt[pi] < 1 && total() + szs[pi] <= budget) cnt[pi] = 1;
+          while (total() > budget) {
+            std::size_t mx = 0;
+            for (std::size_t pi = 1; pi < szs.size(); ++pi)
+              if (cnt[pi] > cnt[mx]) mx = pi;
+            if (cnt[mx] == 0) break;
+            --cnt[mx];
+          }
+          // leftover bytes: one more slot at a time to the size of most demand per byte per slot that still fits
           for (bool more = true; more;) {
             more = false;
             int best = -1;
             double bd = -1.0;
-            std::size_t i = 0;
-            for (const auto& kv : dem) {
-              if (used + kv.first <= budget && kv.second / static_cast<double>(kv.first) / (c.pk0[i + 1] - c.pk0[i] + 1) > bd) {
-                bd = kv.second / static_cast<double>(kv.first) / (c.pk0[i + 1] - c.pk0[i] + 1);
-                best = static_cast<int>(i);
+            for (std::size_t pi = 0; pi < szs.size(); ++pi)
+              if (total() + szs[pi] <= budget && dms[pi] / static_cast<double>(szs[pi]) / (cnt[pi] + 1) > bd) {
+                bd = dms[pi] / static_cast<double>(szs[pi]) / (cnt[pi] + 1);
+                best = static_cast<int>(pi);
               }
-              ++i;
-            }
             if (best >= 0) {
-              for (int pq = best + 1; pq <= c.np; ++pq) ++c.pk0[pq];
-              for (int pq = best + 1; pq < c.np; ++pq) c.pboff[pq] += c.pbytes[best];
-              used += c.pbytes[best];
+              ++cnt[static_cast<std::size_t>(best)];
               more = true;
             }
           }
+          g::ReaderCache& c = pc[il];
+          std::uint64_t used = 0;
+          int k = 0;
+          for (std::size_t pi = 0; pi < szs.size(); ++pi) {
+            c.pbytes[pi] = szs[pi];
+            c.pboff[pi] = used;
+            c.pk0[pi] = k;
+            used += static_cast<std::uint64_t>(cnt[pi]) * szs[pi];
+            k += cnt[pi];
+          }
+          c.np = static_cast<int>(szs.size());
+          c.pk0[c.np] = k;
+          if (used > budget) pools_ok = false;  // never expected after the loop above; checked, not assumed
           c.K = c.pk0[c.np];
           kpool_max = std::max(kpool_max, c.K);
           for (int ex = 0; ex < static_cast<int>(ne); ++ex) {
@@ -1838,38 +1857,44 @@ struct GpuEngine::Impl {
           }
         }
         K = kpool_max;
+        if (!pools_ok) {  // v51b: fall back to the fixed slots rather than run past a layer's budget
+          K = o.reader_cache;
+          pc.assign(nl, g::ReaderCache{});
+        }
       }
-      const std::size_t meta_b = nl * (static_cast<std::size_t>(K) * 8 + 16) + (o.cache_pools ? nl * z(ne) : 0);
+      const bool use_pools = o.cache_pools && pools_ok;
+      const std::size_t meta_b = nl * (static_cast<std::size_t>(K) * 8 + 16) + (use_pools ? nl * z(ne) : 0);
       cache_mem = g::dalloc(cache_reserved);
       cache_meta = g::dalloc(meta_b);
       if (cache_mem && cache_meta) {
         std::vector<std::uint8_t> init(meta_b, 0);
         auto* ip = reinterpret_cast<int*>(init.data());
         for (std::size_t i = 0; i < nl * static_cast<std::size_t>(K); ++i) ip[i] = -1;  // tags: empty
-        if (o.cache_pools) std::memcpy(init.data() + nl * (static_cast<std::size_t>(K) * 8 + 16), pool_h.data(), pool_h.size());
+        if (use_pools) std::memcpy(init.data() + nl * (static_cast<std::size_t>(K) * 8 + 16), pool_h.data(), pool_h.size());
         if (g::to_device(cache_meta, init.data(), meta_b)) {
           auto* mb = static_cast<std::uint8_t*>(cache_meta);
           int kmin = K, kall = 0;
           for (std::size_t il = 0; il < nl; ++il) {
-            g::ReaderCache c = o.cache_pools ? pc[il] : g::ReaderCache{};
-            if (!o.cache_pools) c.K = K;
+            g::ReaderCache c = use_pools ? pc[il] : g::ReaderCache{};
+            if (!use_pools) c.K = K;
             c.tag = reinterpret_cast<int*>(mb) + il * static_cast<std::size_t>(K);
             c.use = reinterpret_cast<unsigned*>(mb + nl * static_cast<std::size_t>(K) * 4) + il * static_cast<std::size_t>(K);
             c.stamp = reinterpret_cast<unsigned*>(mb + nl * static_cast<std::size_t>(K) * 8) + il;
             c.base = static_cast<std::uint8_t*>(cache_mem) + il * budget;
             c.slot_bytes = cslot;
-            if (o.cache_pools) c.pool_of = reinterpret_cast<const signed char*>(mb + nl * (static_cast<std::size_t>(K) * 8 + 16)) + il * z(ne);
+            if (use_pools) c.pool_of = reinterpret_cast<const signed char*>(mb + nl * (static_cast<std::size_t>(K) * 8 + 16)) + il * z(ne);
             kmin = std::min(kmin, c.K);
             kall += c.K;
             rcache.push_back(c);
           }
           dev_bytes += cache_reserved + meta_b;
           char cb[200];
-          if (o.cache_pools)
+          if (use_pools)
             std::snprintf(cb, sizeof cb, "; cache %.2f GB in size pools (%d slots of %d before; %d-%d slots per layer, %.1f average)", static_cast<double>(cache_reserved) / 1e9,
                           o.reader_cache, o.reader_cache, kmin, K, static_cast<double>(kall) / static_cast<double>(nl));
           else
-            std::snprintf(cb, sizeof cb, "; cache %d slots per layer, %.2f GB", K, static_cast<double>(cache_reserved) / 1e9);
+            std::snprintf(cb, sizeof cb, "; cache %d slots per layer, %.2f GB%s", K, static_cast<double>(cache_reserved) / 1e9,
+                          o.cache_pools ? " (size pools off: layout over budget)" : "");
           cache_note = cb;
         }
       }
