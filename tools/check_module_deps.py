@@ -37,7 +37,7 @@ ALLOWED = {
 OS_HEADERS = {'windows.h', 'winsock2.h', 'dlfcn.h', 'fcntl.h', 'unistd.h', 'sys/mman.h', 'sys/stat.h', 'sys/types.h', 'sys/resource.h',
               'pthread.h', 'malloc.h', 'ws2tcpip.h', 'io.h', 'direct.h', 'signal.h', 'setjmp.h', 'sched.h', 'sys/socket.h', 'netinet/in.h',
               'arpa/inet.h', 'netdb.h', 'poll.h', 'sys/epoll.h', 'sys/uio.h', 'sys/time.h', 'time.h'}
-GPU_HEADERS = {'cuda_runtime.h', 'cuda.h', 'cuda_bf16.h', 'cuda_fp16.h', 'cuda_fp8.h', 'device_launch_parameters.h', 'vulkan/vulkan.h', 'nvml.h'}
+GPU_HEADERS = {'cuda_runtime.h', 'cuda.h', 'cuda_bf16.h', 'cuda_fp16.h', 'cuda_fp8.h', 'cooperative_groups.h', 'device_launch_parameters.h', 'vulkan/vulkan.h', 'nvml.h'}
 INTRINSICS = {'immintrin.h', 'emmintrin.h', 'xmmintrin.h', 'arm_neon.h', 'intrin.h', 'x86intrin.h'}
 STD_RE = re.compile(r'^[a-z_0-9]+$')  # <vector>, <cstdint>, <string_view> ...
 INC_RE = re.compile(r'^\s*#\s*include\s*([<"])([^>"]+)[>"]')
