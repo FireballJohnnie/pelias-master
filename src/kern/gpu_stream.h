@@ -158,6 +158,7 @@ struct MoeHalfArgs {
   // 6 filling tasks, 7 cycles of staged tasks, 8 + f cycles of format f (DJob fmt 0..10, 11 other), 20 + f tasks of format f
   unsigned long long* st = nullptr;
   int l2pf = 0;  // v56: each warp prefetches its expert-stage rows into L2 before running its tasks (EngineOptions::l2_prefetch)
+  int pipe = 0;  // v57: the expert stage's copy pipeline (each warp's next task's rows by cp.async while it computes; needs load_mode 1 or 2)
 };
 constexpr int kRxStatN = 32;
 bool moe_half(const MoeHalfArgs& args, Stream s = nullptr);

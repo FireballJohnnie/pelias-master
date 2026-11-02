@@ -1668,6 +1668,7 @@ struct GpuEngine::Impl {
     A.y = y;
     A.ph = ph_d ? ph_d + static_cast<int64_t>(il) * 5 : nullptr;  // v55b
     A.l2pf = o.l2_prefetch ? 1 : 0;  // v56
+    A.pipe = o.rx_pipe && o.rx_load > 0 ? 1 : 0;  // v57
     A.st = rst_d;                                                 // v55e3
     // v55f / v55f2: the bit planes only feed planed experts' 1-bit route; with no planes (--plane-bits 0) nothing reads
     // them, so they are not built (v55f2 S0 +0.33 ms vs g55e3, MEASURED)
@@ -2294,8 +2295,8 @@ struct GpuEngine::Impl {
               for (int pj = 0; pj < 3; ++pj) mb = std::max(mb, g::rx_stage_block_bytes(X.type[pj], o.plane_bits));
             };
             for (const g::ExpertPtr& X : tab)
-              if (o.rx_load == 2 || !X.vram) take(X);
-            if (o.rx_load == 2)
+              if (o.rx_load == 2 || o.rx_pipe || !X.vram) take(X);  // v57: the pipeline stages every expert
+            if (o.rx_load == 2 || o.rx_pipe)
               for (const g::ExpertPtr& X : shx_h) take(X);
             g::rx_set_stage_bytes(mb);
           }

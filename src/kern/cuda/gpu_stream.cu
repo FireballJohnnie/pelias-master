@@ -1049,6 +1049,39 @@ __device__ __forceinline__ void rx_rows(const DJob& J, long long t) {
 __host__ __device__ inline int rx_blk(int fmt) {
   return fmt == kQ5K || fmt == kQ5KP ? 176 : fmt == kQ6KS ? 210 : fmt == kQ8_0 ? 272 : 144;  // Q4_TG2(P), Q4_K: 144
 }
+// v57 (author 13:02 "fix the kernel. Properly."): the expert stage's copy pipeline. v55f3 / v56 MEASURED: the stage reads
+// ~0.46 GB per token in ~5.58 ms (~80 GB/s DERIVED) at 1 block of 8 warps per SM (188 registers): each warp loaded its task's
+// rows, waited, computed, then asked for the next, so few bytes were ever in flight. Now each warp copies its NEXT task's
+// rows into its second shared buffer with cp.async (no registers held) while it computes the current one from the first;
+// weights never depend on earlier tasks, so a task that must wait for its group's inputs still has its rows fetched early.
+// The compute is the staged path (lane_part M = 3), bit for bit the lane path's (v46a-2). A miss's slot is filled from the
+// buffer after the copy lands, with rx_stage's byte pattern (head bytes, 16-byte middle, tail bytes at the same offsets).
+__device__ __forceinline__ void rxp_cp16(void* smem, const void* gmem) {
+  const unsigned sa = static_cast<unsigned>(__cvta_generic_to_shared(smem));
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(sa), "l"(gmem) : "memory");
+}
+__device__ __forceinline__ void rxp_commit() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
+__device__ __forceinline__ void rxp_wait1() { asm volatile("cp.async.wait_group 1;\n" ::: "memory"); }
+// n bytes from src into buf so that buf + (src & 15) holds src[0]: the 16-byte chunks covering [src, src + n) (a chunk never
+// crosses a page, so the bytes before src / after its end in the first / last chunk are readable)
+__device__ __forceinline__ void rxp_issue_range(const std::uint8_t* src, long long n, std::uint8_t* buf, int lane) {
+  const std::uintptr_t a = reinterpret_cast<std::uintptr_t>(src);
+  const std::uint8_t* s0 = reinterpret_cast<const std::uint8_t*>(a & ~static_cast<std::uintptr_t>(15));
+  const long long chunks = (static_cast<long long>(a & 15u) + n + 15) / 16;
+  for (long long i = lane; i < chunks; i += 32) rxp_cp16(buf + 16 * i, s0 + 16 * i);
+}
+// the shared copy (buf + phase) of n bytes back to dst (same 16-byte phase as the source): rx_stage's fill pattern
+__device__ __forceinline__ void rxp_fill(std::uint8_t* dst, const std::uint8_t* sb, long long n, int lane) {
+  const unsigned mis = static_cast<unsigned>(reinterpret_cast<std::uintptr_t>(dst) & 15u);
+  long long head = static_cast<long long>((16u - mis) & 15u);
+  if (head > n) head = n;
+  for (long long i = lane; i < head; i += 32) dst[i] = sb[i];
+  const long long n4 = (n - head) / 16;
+  const int4* s4 = reinterpret_cast<const int4*>(sb + head);
+  int4* d4 = reinterpret_cast<int4*>(dst + head);
+  for (long long i = lane; i < n4; i += 32) d4[i] = s4[i];
+  for (long long i = head + n4 * 16 + lane; i < n; i += 32) dst[i] = sb[i];
+}
 // a warp copies n contiguous bytes from src into its shared buffer, keeping src's 16-byte phase (32 lanes x 16 bytes per
 // instruction: every 32-byte sector requested once, as the reader's staging) and, with fill, into the cache slot at the
 // same offset; returns where the copy of src[0] is
@@ -1160,6 +1193,79 @@ __device__ __forceinline__ void rx_prefetch_tasks(const DJob* __restrict__ jobs,
     }
   }
 }
+// v57: task t's rows of job J as rx_rows_staged stages them, issued as cp.async into buf (planes: each row's prefix at
+// buf + rr x pf, every row 16-byte aligned; others: the task's one range, phase kept)
+__device__ __forceinline__ void rxp_issue(const DJob& J, long long t, std::uint8_t* buf, int lane) {
+  const int rpw = 32 / J.lpr, nB = J.K / 256;
+  const int r0 = static_cast<int>((t - J.task0) * rpw);
+  const int nr = J.n - r0 < rpw ? J.n - r0 : rpw;
+  if (nr <= 0) return;
+  if (J.fmt == kQ4TG2P || J.fmt == kQ5KP) {
+    const long long pf = static_cast<long long>(plane_prefix(J.fmt == kQ4TG2P ? g_q4_tg2p : g_q5_kp,
+                                                             static_cast<std::uint64_t>(nB) * (J.fmt == kQ4TG2P ? 144u : 176u), J.pb));
+    for (int rr = 0; rr < nr; ++rr) rxp_issue_range(J.w + (r0 + rr) * J.rs, pf, buf + rr * pf, lane);
+  } else {
+    const long long rowb = static_cast<long long>(nB) * rx_blk(J.fmt);
+    rxp_issue_range(J.w + static_cast<long long>(r0) * rowb, nr * rowb, buf, lane);
+  }
+}
+// whether a task's rows can go through the pipeline: a plane row's prefix and stride must keep 16-byte alignment (the
+// packed rows of one buffer); the others any phase
+__device__ __forceinline__ bool rxp_ok(const DJob& J) {
+  if (J.fmt == kEpi) return false;
+  if (J.fmt == kQ4TG2P || J.fmt == kQ5KP)
+    return ((reinterpret_cast<std::uintptr_t>(J.w) | static_cast<std::uintptr_t>(J.rs)) & 15u) == 0;
+  return true;
+}
+// task t computed from its landed copy in buf (rx_rows_staged without the copy), the slot filled from the copy on a miss
+template <bool kMT, int ONLY = kOnlyRx>
+__device__ __forceinline__ void rxp_compute(const DJob& J, long long t, std::uint8_t* buf) {
+  const int lane = static_cast<int>(threadIdx.x & 31), rpw = 32 / J.lpr, nB = J.K / 256;
+  const int r0 = static_cast<int>((t - J.task0) * rpw);
+  const int r = r0 + lane / J.lpr, part = lane % J.lpr;
+  const int nr = J.n - r0 < rpw ? J.n - r0 : rpw;
+  const std::uint8_t* wb;
+  if (J.fmt == kQ4TG2P || J.fmt == kQ5KP) {
+    const long long pf = static_cast<long long>(plane_prefix(J.fmt == kQ4TG2P ? g_q4_tg2p : g_q5_kp,
+                                                             static_cast<std::uint64_t>(nB) * (J.fmt == kQ4TG2P ? 144u : 176u), J.pb));
+    wb = buf;
+    if (J.fw)
+      for (int rr = 0; rr < nr; ++rr) rxp_fill(J.fw + (r0 + rr) * J.frs, buf + rr * pf, pf, lane);
+  } else {
+    const long long rowb = static_cast<long long>(nB) * rx_blk(J.fmt);
+    const std::uint8_t* src = J.w + static_cast<long long>(r0) * rowb;
+    wb = buf + (reinterpret_cast<std::uintptr_t>(src) & 15u);
+    if (J.fd && nr > 0) rxp_fill(const_cast<std::uint8_t*>(src) + J.fd, wb, nr * rowb, lane);
+  }
+  if constexpr (kMT) {
+    if (J.ntok > 1) {
+      const std::int8_t* xq[4];
+      const float* xs[4];
+      const int* xsum[4];
+      long long yo[4];
+      for (int tk = 0; tk < 4; ++tk) {
+        const int u = tk < J.ntok ? tk : 0;
+        const long long xo = J.tokx[u];
+        xq[tk] = J.xq + xo * J.xqs;
+        xs[tk] = J.xs + xo * J.xss;
+        xsum[tk] = J.xsum + xo * J.xss;
+        yo[tk] = J.ypk[u] * J.ys;
+      }
+      float acc[4] = {0.f, 0.f, 0.f, 0.f};
+      if (r < J.n) lane_part_d<3, ONLY>(J, r, part, xq, xs, xsum, J.ntok, acc, wb, static_cast<long long>(r0) * nB);
+      store_rows(J, r, part, acc, J.ntok, yo);
+      return;
+    }
+  }
+  for (int tk = 0; tk < J.ntok; ++tk) {
+    const long long xo = J.tokx[tk];
+    float acc = 0.f;
+    if (r < J.n) acc = lane_part<3, ONLY>(J, r, part, J.xq + xo * J.xqs, J.xs + xo * J.xss, J.xsum + xo * J.xss, false, wb, static_cast<long long>(r0) * nB);
+    for (int o = J.lpr / 2; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+    if (r < J.n && part == 0) J.y[J.ypk[tk] * J.ys + r] = acc;
+  }
+}
+
 // the layer's experts: every warp walks the tasks in table order (gate and up of all experts first, then the roundings,
 // then the downs); a task whose job waits for a group starts once the group's count is complete (acquire), and a task of
 // a signalling job adds 1 (release). All blocks are resident (cooperative launch), and a job waits only for groups of
@@ -1169,8 +1275,10 @@ __device__ __forceinline__ void rx_prefetch_tasks(const DJob* __restrict__ jobs,
 // tasks, tasks, the loop's span; per format (J.fmt 0..10) the cycles and tasks; staged and filling tasks (st layout:
 // gpu_stream.h kRxStatN)
 template <bool kMT, int ONLY = kOnlyRx, bool kStat = false>
-__device__ __forceinline__ void rx_body(const std::uint8_t* __restrict__ plan, int maxp, int sbytes, unsigned long long* st = nullptr, int l2pf = 0) {
-  std::uint8_t* sbuf = reinterpret_cast<std::uint8_t*>(s_lut) + kLutRxBytes + static_cast<long long>(threadIdx.x / 32) * sbytes;  // v46a-2, v54
+__device__ __forceinline__ void rx_body(const std::uint8_t* __restrict__ plan, int maxp, int sbytes, unsigned long long* st = nullptr, int l2pf = 0,
+                                        int pipe = 0) {
+  // v57: with pipe, each warp has two buffers of sbytes (the copy pipeline); otherwise one (v46a-2)
+  std::uint8_t* sbuf = reinterpret_cast<std::uint8_t*>(s_lut) + kLutRxBytes + static_cast<long long>(threadIdx.x / 32) * sbytes * (pipe ? 2 : 1);
   const RxLayout Lo = rx_layout(maxp);
   const auto* hd = reinterpret_cast<const RxHdr*>(plan);
   const auto* jobs = reinterpret_cast<const DJob*>(plan + Lo.jobs);
@@ -1187,6 +1295,69 @@ __device__ __forceinline__ void rx_body(const std::uint8_t* __restrict__ plan, i
   long long c_wait = 0, c_work = 0, c_beg = 0, ntk = 0;
   if constexpr (kStat) c_beg = clock64();
   if (l2pf) rx_prefetch_tasks(jobs, njobs, w0, end, warps);  // v56
+  if (pipe) {  // v57: the copy pipeline (two buffers per warp; the next task's rows in flight while this one computes)
+    int jn = 0;
+    int cur = 0;
+    if (w0 < end) {
+      while (jn + 1 < njobs && jobs[jn + 1].task0 <= w0) ++jn;
+      if (rxp_ok(jobs[jn])) rxp_issue(jobs[jn], w0, sbuf, lane);
+    }
+    rxp_commit();
+    for (long long t = w0; t < end; t += warps) {
+      long long ca = 0, cb = 0;
+      if constexpr (kStat) ca = clock64();
+      const long long tn = t + warps;
+      if (tn < end) {  // the next task's rows into the other buffer (its previous contents were consumed last iteration)
+        while (jn + 1 < njobs && jobs[jn + 1].task0 <= tn) ++jn;
+        if (rxp_ok(jobs[jn])) rxp_issue(jobs[jn], tn, sbuf + (cur ^ 1) * sbytes, lane);
+      }
+      rxp_commit();
+      while (j + 1 < njobs && jobs[j + 1].task0 <= t) ++j;
+      const int dg = dep[j];
+      if (dg >= 0) {
+        if (lane == 0) {
+          const unsigned long long target = static_cast<unsigned long long>(gt[dg]);
+          while (ld_acquire_u64(gd + dg) < target) __nanosleep(32);
+        }
+        __syncwarp();
+      }
+      if constexpr (kStat) cb = clock64();
+      const DJob& J = jobs[j];
+      if (J.fmt == kEpi) {
+        rx_epi(J);
+      } else if (rxp_ok(J)) {
+        rxp_wait1();  // this task's copy (every group but the newest) has landed, for this lane
+        __syncwarp();  // and for the warp
+        rxp_compute<kMT, ONLY>(J, t, sbuf + cur * sbytes);
+      } else {
+        rx_rows_staged<kMT, ONLY>(J, t, sbuf + cur * sbytes);  // rows not pipelined: staged in place as before (the buffer is this task's)
+      }
+      __syncwarp();  // the buffer is free for the copy issued next iteration
+      if constexpr (kStat) {
+        const long long cc = clock64();
+        c_wait += cb - ca;
+        c_work += cc - cb;
+        ++ntk;
+        if (lane == 0) {
+          const int f = J.fmt >= 0 && J.fmt <= 10 ? J.fmt : 11;
+          atomicAdd(st + 8 + f, static_cast<unsigned long long>(cc - cb));
+          atomicAdd(st + 20 + f, 1ull);
+          if (J.stg) {
+            atomicAdd(st + 5, 1ull);
+            atomicAdd(st + 7, static_cast<unsigned long long>(cc - cb));
+          }
+          if (J.fd) atomicAdd(st + 6, 1ull);
+        }
+      }
+      const int sg = sig[j];
+      if (sg >= 0) {
+        __syncwarp();
+        if (lane == 0) red_release_add(gd + sg, 1ull);
+      }
+      cur ^= 1;
+    }
+    asm volatile("cp.async.wait_all;\n" ::: "memory");
+  } else
   for (long long t = w0; t < end; t += warps) {
     long long ca = 0, cb = 0;
     if constexpr (kStat) ca = clock64();
@@ -1398,7 +1569,7 @@ __global__ void __launch_bounds__(256, 1) k_moe_half(const __grid_constant__ Moe
   if (phs) A.ph[2] = gtimer_s();
   // ---- C
   lut_setup_rx();
-  rx_body<kMT, kOnlyRx, kStat>(static_cast<const std::uint8_t*>(A.plan), A.max_picks, sbytes, A.st, A.l2pf);
+  rx_body<kMT, kOnlyRx, kStat>(static_cast<const std::uint8_t*>(A.plan), A.max_picks, sbytes, A.st, A.l2pf, A.pipe);
   grid.sync();
   if (phs) A.ph[3] = gtimer_s();
   // ---- D
@@ -1783,6 +1954,7 @@ bool moe_r3(const ExpertPtr* tab, const ExpertPtr* shx, const std::int32_t* sel,
 
 bool moe_half(const MoeHalfArgs& A, Stream s) {
   if (A.load_mode < 0 || A.load_mode > 2) return sfail("moe_half: load_mode 0, 1 or 2");
+  if (A.pipe && A.load_mode == 0) return sfail("moe_half: the copy pipeline needs the staging buffers (load_mode 1 or 2)");
   if (!A.x || !A.a || !A.post_w || !A.xn || !A.xr || !A.xq || !A.xs || !A.xsum || !A.wr || !A.logits || !A.sel || !A.wsel || !A.tab || !A.grp ||
       !A.gsrc || !A.gfill || !A.gu || !A.hq || !A.hs || !A.hsum || !A.yd || !A.plan || !A.y || (A.wsh && (!A.gsh || !A.shx)))
     return sfail("moe_half: bad pointer");
@@ -1800,7 +1972,8 @@ bool moe_half(const MoeHalfArgs& A, Stream s) {
   if (!grid_ready()) return false;
   const int sbytes = A.load_mode ? g_stage_bytes : 0;  // v55f
   // dynamic shared memory: the largest of the phases' uses (at most 4 x 128 x 144 B staging = 72 KB: opt in past 48 KB)
-  const int sm_stage = 4 * nsub * md::kGvPad * 4, sm_router = 2 * md::kRouterMaxExperts * 4 + md::kRouterMaxExperts, sm_rx = kLutRxBytes + 8 * sbytes;
+  const int sm_stage = 4 * nsub * md::kGvPad * 4, sm_router = 2 * md::kRouterMaxExperts * 4 + md::kRouterMaxExperts,
+            sm_rx = kLutRxBytes + 8 * sbytes * (A.pipe ? 2 : 1);  // v57: two buffers per warp with the pipeline
   const int smem = std::max(sm_stage, std::max(sm_router, sm_rx));
   const bool mt = A.n > 1;
   const bool stat = !mt && A.st != nullptr;  // v55e3 diagnosis: the counting kernel (verbose runs only)
@@ -1811,8 +1984,8 @@ bool moe_half(const MoeHalfArgs& A, Stream s) {
   else if (nj == 1) fn = mt ? reinterpret_cast<void*>(k_moe_half<true, 1>) : reinterpret_cast<void*>(k_moe_half<false, 1>);
   else if (nj == 2) fn = mt ? reinterpret_cast<void*>(k_moe_half<true, 2>) : reinterpret_cast<void*>(k_moe_half<false, 2>);
   else fn = mt ? reinterpret_cast<void*>(k_moe_half<true, 4>) : reinterpret_cast<void*>(k_moe_half<false, 4>);
-  static int grids[2][3][3][2] = {};
-  int& grid = grids[mt ? 1 : 0][nj == 1 ? 0 : (nj == 2 ? 1 : 2)][A.load_mode][stat ? 1 : 0];
+  static int grids[2][3][3][2][2] = {};  // v57: [pipe]
+  int& grid = grids[mt ? 1 : 0][nj == 1 ? 0 : (nj == 2 ? 1 : 2)][A.load_mode][stat ? 1 : 0][A.pipe ? 1 : 0];
   if (!grid) {
     int dev = 0, sms = 0, occ = 0, coop = 0;
     if (!sck(cudaGetDevice(&dev), "cudaGetDevice") || !sck(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev), "SM count") ||
@@ -1826,8 +1999,8 @@ bool moe_half(const MoeHalfArgs& A, Stream s) {
     int occ_rx = 0;  // v52 diagnosis: the separate expert stage's blocks per SM at its own shared memory, for comparison
     (void)cudaFuncSetAttribute(reinterpret_cast<const void*>(mt ? k_rx<true> : k_rx<false>), cudaFuncAttributeMaxDynamicSharedMemorySize, sm_rx);
     (void)cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ_rx, mt ? k_rx<true> : k_rx<false>, 256, static_cast<std::size_t>(sm_rx));
-    std::fprintf(stderr, "moe_half: %s tokens%s, H %d: grid %d (%d SMs x %d blocks), shared memory %d B; k_rx alone %d blocks per SM\n", mt ? "2-4" : "1",
-                 stat ? " (counting kernel)" : "", A.H, grid, sms, occ, smem, occ_rx);
+    std::fprintf(stderr, "moe_half: %s tokens%s, H %d: grid %d (%d SMs x %d blocks), shared memory %d B; k_rx alone %d blocks per SM%s\n", mt ? "2-4" : "1",
+                 stat ? " (counting kernel)" : "", A.H, grid, sms, occ, smem, occ_rx, A.pipe ? "; copy pipeline (v57)" : "");
   }
   MoeHalfArgs a = A;
   int sb = sbytes;
