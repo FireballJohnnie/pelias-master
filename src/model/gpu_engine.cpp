@@ -1277,9 +1277,9 @@ struct GpuEngine::Impl {
             std::snprintf(cb, sizeof cb, "; cache %d slots per layer, %.2f GB (size pools off: layout over budget)", K, static_cast<double>(cache_reserved) / 1e9);
           cache_note = cb;
           if (use_pools && mtp_rd) {  // v60 C: the MTP row's extra cache
-            char mb[120];
-            std::snprintf(mb, sizeof mb, "; %.0f MB more for the MTP row = %d slots (v60 C)", static_cast<double>(mtp_cache_bonus) / 1048576.0, rcache.back().K);
-            cache_note += mb;
+            char mnote[120];
+            std::snprintf(mnote, sizeof mnote, "; %.0f MB more for the MTP row = %d slots (v60 C)", static_cast<double>(mtp_cache_bonus) / 1048576.0, rcache.back().K);
+            cache_note += mnote;
           }
         }
       }
