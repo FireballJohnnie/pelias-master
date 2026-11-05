@@ -5,6 +5,9 @@
 #include <chrono>
 #include <cstdio>
 #include <ctime>
+#if defined(__linux__)
+#include <sys/resource.h>
+#endif
 
 #ifndef _WIN32
 #include <fstream>
@@ -41,4 +44,25 @@ std::string platform_name() {
 #endif
 }
 
+}  // namespace pelias::os
+
+namespace pelias::os {
+bool page_faults_available() {
+#if defined(__linux__)
+  return true;
+#else
+  return false;
+#endif
+}
+PageFaults page_faults() {
+  PageFaults p;
+#if defined(__linux__)
+  struct rusage ru {};
+  if (getrusage(RUSAGE_SELF, &ru) == 0) {
+    p.major = static_cast<std::uint64_t>(ru.ru_majflt);
+    p.minor = static_cast<std::uint64_t>(ru.ru_minflt);
+  }
+#endif
+  return p;
+}
 }  // namespace pelias::os

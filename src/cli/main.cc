@@ -27,18 +27,17 @@
 #include <sstream>
 #include <string>
 #include <thread>
-#if defined(__linux__)
-#include <sys/resource.h>
-#endif
 #include <vector>
 
 #include "os/aligned_mem.h"
+#include "os/fd_capture.h"
 #include "hal/device.h"
 #include "hal/host_alloc_pages.h"
 #include "hal/vram_governor.h"
 #include "ingest/stage_a.h"
 #include "io/gguf_compare.h"
 #include "io/gguf_reader.h"
+#include "io/json.h"
 #include "io/number_text.h"
 #include "io/planes_build.h"
 #include "io/requantize.h"
@@ -48,6 +47,7 @@
 #include "os/clock.h"
 #include "os/file_map.h"
 #include "os/membw.h"
+#include "os/net_webui.h"
 #include "pelias/log.h"
 #include "pelias/timer.h"
 #include "pelias/version.h"
@@ -102,6 +102,10 @@ bool gib_option(const Args& a, const char* k, std::uint64_t& bytes) {
   }
   bytes = static_cast<std::uint64_t>(r.value * static_cast<double>(plan::kGiB));
   return true;
+}
+
+bool gui_gpu_available() {
+  return kHasCuda && hal::query_device(0).available;
 }
 
 // Reads --index as a whole number (default 0). Bad text: prints why, returns false (exit 1).
@@ -225,7 +229,7 @@ void usage() {
       "      [--temp 1.0] [--top-k 20] [--top-p 0.95] [--min-p 0] [--repeat-penalty 1] [--repeat-last-n 64]\n"
       "      [--presence-penalty 0] [--frequency-penalty 0] [--seed 20261019 | -1] [--ignore-eos] [--show-special]\n"
       "      [--ids-out FILE] [--no-nfc] [--no-special] [--act-int8 GROUPS] [--act-int8-path ...] [--act-rot h32] [--no-mmap] [--chat]\n"
-      "      [--engine [--routes ROUTES.bin] [--budget-gb G]]\n"
+      "      [--engine [--routes ROUTES.bin] [--budget-gb G] [--plane-bits 2|3|4|5]]\n"
       "                                  --engine: the GPU engine (GP3-14: resident dense weights, the hot-expert bank chosen by\n"
       "                                  the routing record's pick counts, cold experts on the CPU)\n"
       "                                  --chat wraps the prompt as one user turn in the model family's chat format\n"
@@ -2761,10 +2765,7 @@ int cmd_engine_check(const Args& a) {
       std::printf("  pre-load of the light experts: %.2f GB touched in place in %.2f s (%.2f GB/s, background from start-up)\n", static_cast<double>(plb) / 1e9, pls,
                   pls > 0 ? static_cast<double>(plb) / 1e9 / pls : 0.0);
   }
-#if defined(__linux__)
-  struct rusage ru0 {};
-  getrusage(RUSAGE_SELF, &ru0);
-#endif
+  const os::PageFaults pf0 = os::page_faults();  // v30: page faults during the decode (Linux; zeros elsewhere)
   for (; t < n; ++t) {
     model::EngineStats es;
     if (Status st = eng.value->step(ids.data() + t, 1, lg.data() + static_cast<std::size_t>(t) * nv, true, &es, hrow(t)); !st) return fail_input(st);
@@ -2841,14 +2842,11 @@ int cmd_engine_check(const Args& a) {
     std::printf("  decode %llu tokens: %.3f s = %.1f tokens/s (median step %.2f ms = %.1f tokens/s, slowest %.2f ms); picks on the GPU %.1f %%; CPU cold work %.2f ms, host waits %.2f ms per token\n",
                 static_cast<unsigned long long>(ndec), tot_dec.seconds, static_cast<double>(ndec) / tot_dec.seconds, med * 1e3, 1.0 / med, sorted.back() * 1e3,
                 share(tot_dec), tot_dec.cold_seconds * 1e3 / static_cast<double>(ndec), tot_dec.wait_seconds * 1e3 / static_cast<double>(ndec));
-#if defined(__linux__)
-    {  // v30: page faults during the decode (major: read from the file / drive; minor: mapped without reading)
-      struct rusage ru1 {};
-      getrusage(RUSAGE_SELF, &ru1);
+    if (os::page_faults_available()) {  // v30: page faults during the decode (major: read from the file / drive; minor: mapped without reading)
+      const os::PageFaults pf1 = os::page_faults();
       std::printf("  page faults in the decode: %.1f major and %.0f minor per token\n",
-                  static_cast<double>(ru1.ru_majflt - ru0.ru_majflt) / static_cast<double>(ndec), static_cast<double>(ru1.ru_minflt - ru0.ru_minflt) / static_cast<double>(ndec));
+                  static_cast<double>(pf1.major - pf0.major) / static_cast<double>(ndec), static_cast<double>(pf1.minor - pf0.minor) / static_cast<double>(ndec));
     }
-#endif
     if (tot_dec.cold_bytes > 0 && tot_dec.cold_seconds > 0.0)  // v28: the CPU's rate on its picks (bytes / its cold work time)
       std::printf("  CPU cold experts: %llu picks, %.1f MB per token, %.2f GB/s over its cold work time\n", static_cast<unsigned long long>(tot_dec.cold_picks),
                   static_cast<double>(tot_dec.cold_bytes) / 1e6 / static_cast<double>(ndec), static_cast<double>(tot_dec.cold_bytes) / tot_dec.cold_seconds / 1e9);
@@ -3390,6 +3388,10 @@ int cmd_generate(const Args& a) {
     usage();
     return 1;
   }
+  if (a.has("plane-bits") && !a.has("engine")) {
+    std::fprintf(stderr, "pelias generate: --plane-bits requires --engine\n");
+    return 1;
+  }
   int threads = static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
   if (a.has("threads")) {
     const Result<std::uint64_t> r = io::parse_whole(a.get("threads"), 4096);
@@ -3575,6 +3577,14 @@ int cmd_generate(const Args& a) {
     eo2.max_batch = 64;
     eo2.cpu_threads = threads;
     if (!gib_option(a, "budget-gb", eo2.vram_budget)) return 1;
+    if (a.has("plane-bits")) {
+      const Result<std::uint64_t> pb = io::parse_whole(a.get("plane-bits"), 5);
+      if (!pb.ok() || pb.value < 2) {
+        std::fprintf(stderr, "pelias generate: --plane-bits takes 2, 3, 4 or 5\n");
+        return 1;
+      }
+      eo2.plane_bits = static_cast<int>(pb.value);
+    }
     if (a.has("mtp-draft")) {
       const Result<std::uint64_t> r = io::parse_whole(a.get("mtp-draft"), 16);
       if (!r.ok()) {
@@ -3805,6 +3815,149 @@ int cmd_generate(const Args& a) {
   return 0;
 }
 
+os::HttpResponse gui_json_response(int status, const io::Json& body) {
+  return {status, "application/json; charset=utf-8", body.dump()};
+}
+
+os::HttpResponse gui_error_response(int status, const std::string& message) {
+  io::Json detail = io::Json::object();
+  detail.set("message", io::Json::string(message));
+  io::Json body = io::Json::object();
+  body.set("error", detail);
+  return gui_json_response(status, body);
+}
+
+bool gui_json_string(const io::Json& object, const char* key, std::string& value, std::size_t max_length) {
+  const io::Json* field = object.get(key);
+  if (!field || !field->is_string() || field->as_string().size() > max_length) return false;
+  value = field->as_string();
+  return true;
+}
+
+bool gui_json_uint(const io::Json& object, const char* key, std::uint64_t default_value, std::uint64_t max_value, std::uint64_t& value) {
+  const io::Json* field = object.get(key);
+  if (!field) {
+    value = default_value;
+    return true;
+  }
+  if (!field->is_integer() || field->as_double() < 0.0 || field->as_uint() > max_value) return false;
+  value = field->as_uint();
+  return true;
+}
+
+os::HttpResponse gui_command_result(const std::string& command, const std::function<int()>& operation) {
+  int exit_code = 0;
+  std::string output;
+  if (!os::capture_stdio(operation, exit_code, output)) return gui_error_response(500, "Could not capture command output");
+  io::Json result = io::Json::object();
+  result.set("ok", io::Json::boolean(exit_code == 0));
+  result.set("command", io::Json::string(command));
+  result.set("exit_code", io::Json::integer(exit_code));
+  result.set("output", io::Json::string(std::move(output)));
+  return gui_json_response(200, result);
+}
+
+os::HttpResponse handle_gui_api(const os::HttpRequest& request) {
+  if (request.method == "GET" && request.target == "/api/status") {
+    const bool gpu_available = gui_gpu_available();
+    io::Json status = io::Json::object();
+    status.set("status", io::Json::string("ok"));
+    status.set("version", io::Json::string(kVersion));
+    status.set("backend", io::Json::string(kHasCuda ? "cuda" : "host-only"));
+    status.set("gpu_available", io::Json::boolean(gpu_available));
+    status.set("plane_bits_available", io::Json::boolean(gpu_available));
+    return gui_json_response(200, status);
+  }
+  if (request.content_type.rfind("application/json", 0) != 0 && os::lower_ascii(request.content_type).rfind("application/json", 0) != 0)
+    return gui_error_response(415, "Content-Type must be application/json");
+  const Result<io::Json> parsed = io::Json::parse(request.body);
+  if (!parsed.ok() || !parsed.value.is_object()) return gui_error_response(400, "Request body must be a JSON object");
+  const io::Json& body = parsed.value;
+
+  if (request.target == "/api/cmd") {
+    std::string command;
+    if (!gui_json_string(body, "command", command, 32)) return gui_error_response(400, "A valid command is required");
+    if (command == "probe") {
+      Args args;
+      args.pos = {"probe"};
+      return gui_command_result(command, [&] {
+        const int device = cmd_device(args);
+        const int memory = cmd_membw(args);
+        return device != 0 ? device : memory;
+      });
+    }
+    if (command == "engine-check") {
+      std::string model;
+      std::uint64_t plane_bits = 0;
+      if (!gui_json_string(body, "model", model, 4096) || model.empty() || !gui_json_uint(body, "plane_bits", 0, 5, plane_bits) ||
+          (plane_bits != 0 && plane_bits < 2))
+        return gui_error_response(400, "Engine check needs a model path and plane bits of 0 or 2–5");
+      Args args;
+      args.pos = {"engine-check"};
+      args.opts.emplace_back("model", std::move(model));
+      if (plane_bits) args.opts.emplace_back("plane-bits", std::to_string(plane_bits));
+      return gui_command_result(command, [&] { return cmd_engine_check(args); });
+    }
+    if (command == "quantize") {
+      std::string model, output, type;
+      if (!gui_json_string(body, "model", model, 4096) || model.empty() || !gui_json_string(body, "output", output, 4096) || output.empty() ||
+          !gui_json_string(body, "type", type, 32) || type.empty())
+        return gui_error_response(400, "Quantize needs input model, output path, and output type");
+      if (model == output) return gui_error_response(400, "Input and output paths must be different");
+      if (std::ifstream(output, std::ios::binary).good()) return gui_error_response(409, "Output file already exists; choose a different path");
+      Args args;
+      args.pos = {"quantize"};
+      args.opts.emplace_back("model", std::move(model));
+      args.opts.emplace_back("out", std::move(output));
+      args.opts.emplace_back("type", std::move(type));
+      return gui_command_result(command, [&] { return cmd_quantize(args); });
+    }
+    if (command == "train") return gui_error_response(501, "Training is not implemented by the current Pelias CLI");
+    return gui_error_response(400, "Unknown GUI command");
+  }
+
+  if (request.target == "/v1/chat/completions") {
+    std::string model, prompt;
+    std::uint64_t plane_bits = 0, mtp_draft = 0, max_tokens = 128;
+    if (!gui_json_string(body, "model", model, 4096) || model.empty() || !gui_json_string(body, "prompt", prompt, 32768) || prompt.empty() ||
+        !gui_json_uint(body, "plane_bits", 0, 5, plane_bits) || (plane_bits != 0 && plane_bits < 2) ||
+        !gui_json_uint(body, "mtp_draft", 0, 4, mtp_draft) || !gui_json_uint(body, "max_tokens", 128, 1024, max_tokens) || max_tokens == 0)
+      return gui_error_response(400, "Chat request has invalid model, prompt, plane bits, MTP draft, or token limit");
+    const bool gpu_available = gui_gpu_available();
+    if (plane_bits && !gpu_available) return gui_error_response(501, "The plane slider requires a CUDA-enabled Pelias build with an available GPU");
+
+    Args args;
+    args.pos = {"generate"};
+    args.opts.emplace_back("model", std::move(model));
+    args.opts.emplace_back("prompt", std::move(prompt));
+    args.opts.emplace_back("chat", "1");
+    args.opts.emplace_back("n-predict", std::to_string(max_tokens));
+    if (gpu_available) args.opts.emplace_back("engine", "1");
+    if (plane_bits) args.opts.emplace_back("plane-bits", std::to_string(plane_bits));
+    if (mtp_draft) args.opts.emplace_back("mtp-draft", std::to_string(mtp_draft));
+    int exit_code = 0;
+    std::string output;
+    if (!os::capture_stdio([&] { return cmd_generate(args); }, exit_code, output)) return gui_error_response(500, "Could not capture generation output");
+    if (exit_code != 0) return gui_error_response(422, output.empty() ? "Generation failed" : output);
+    while (!output.empty() && (output.back() == '\n' || output.back() == '\r')) output.pop_back();
+    io::Json message = io::Json::object();
+    message.set("role", io::Json::string("assistant"));
+    message.set("content", io::Json::string(std::move(output)));
+    io::Json choice = io::Json::object();
+    choice.set("index", io::Json::integer(0));
+    choice.set("message", message);
+    choice.set("finish_reason", io::Json::string("stop"));
+    io::Json choices = io::Json::array();
+    choices.push(choice);
+    io::Json result = io::Json::object();
+    result.set("id", io::Json::string("chatcmpl-pelias"));
+    result.set("object", io::Json::string("chat.completion"));
+    result.set("choices", choices);
+    return gui_json_response(200, result);
+  }
+  return gui_error_response(404, "Unknown GUI API route");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -3839,9 +3992,26 @@ int main(int argc, char** argv) {
   if (cmd == "generate") return cmd_generate(a);
   if (cmd == "planes") return cmd_planes(a);
   if (cmd == "teacher") return cmd_teacher(a);
-  for (const char* later : {"probe", "train", "export", "serve", "bench", "web"})
+  if (cmd == "probe") {
+    const int rc1 = cmd_device(a);
+    const int rc2 = cmd_membw(a);
+    return rc1 != 0 ? rc1 : rc2;
+  }
+  if (cmd == "gui" || cmd == "serve") {
+    int port = 8062;
+    if (a.has("port")) {
+      const auto pr = io::parse_whole(a.get("port"), 65535);
+      if (pr.ok() && pr.value > 0) port = static_cast<int>(pr.value);
+    }
+    io::Json health = io::Json::object();
+    health.set("status", io::Json::string("ok"));
+    health.set("version", io::Json::string(kVersion));
+    health.set("backend", io::Json::string(kHasCuda ? "cuda" : "host-only"));
+    return os::serve_http_loop(port, cmd == "gui" || a.has("gui"), health.dump(), handle_gui_api);
+  }
+  for (const char* later : {"train", "export", "bench", "web"})
     if (cmd == later) {
-      std::fprintf(stderr, "pelias: '%s' is not built yet (a later step of the order of operations)\n", later);
+      std::fprintf(stderr, "pelias: '%s' is not implemented in this build\n", later);
       return 1;
     }
   std::fprintf(stderr, "pelias: unknown command '%s'\n", cmd.c_str());

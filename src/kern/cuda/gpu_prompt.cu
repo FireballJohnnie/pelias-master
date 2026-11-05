@@ -1,11 +1,12 @@
-// provenance: original (moved from tools/probes/batch_c kernels_c.cu: V12x8Stage, k_moe_tile<3, 64, EPI, true, true>,
+// provenance: original (moved from tools/probes/batch_c; the detail follows the copyright line)
+// Copyright (c) 2026 John Lipka and the Pelias contributors
+// provenance detail: moved from tools/probes/batch_c kernels_c.cu: V12x8Stage, k_moe_tile<3, 64, EPI, true, true>,
 // k_moe_vec, k_route_count / k_route_build / k_route_place, k_gather_q8, k_fix_to_f32, k_prep_q4k_rec, k_prep_q4k_dig8,
 // k_dig_x32; MEASURED 2026-10-30 21:05-21:40, gp/MOE; the device arithmetic unchanged. New here: the dense mode of the
 // tile kernel (units computed from blockIdx), int32 expert ids from router_topk, and silu x up rounded with gpu_ops's
 // own expressions (silu_d, act_q8x32's loops), so the down projection's input is the reference's. Q4_TG2 (2026-10-30
 // 23:3x): the TG2 probe's int8 x 3 tile and exact-table vector kernels (tools/probes/batch_c/kernels_tg2.cu, MEASURED
 // 22:31, locked 23:22) with this file's epilogues and unit modes)
-// Copyright (c) 2026 John Lipka and the Pelias contributors
 //
 // kern/cuda/gpu_prompt.cu - the int8 prompt path behind kern/gpu_prompt.h.
 #include <cuda_fp16.h>

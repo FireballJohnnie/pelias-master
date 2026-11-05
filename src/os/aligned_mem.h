@@ -1,3 +1,4 @@
+// provenance: original
 // Copyright (c) 2026 John Lipka and the Pelias contributors
 // v57 (Windows build check wincheck57c): aligned host allocation for both toolchains. MSVC's C library has no
 // std::aligned_alloc; it has _aligned_malloc / _aligned_free (which must free what it allocates).

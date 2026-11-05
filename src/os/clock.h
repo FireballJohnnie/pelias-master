@@ -11,4 +11,7 @@ namespace pelias::os {
 std::string iso_now();          // local time with offset, e.g. 2026-10-26T17:53:00-0400
 std::uint64_t monotonic_ns();   // steady clock, nanoseconds
 std::string platform_name();    // "windows-native", "wsl2" or "linux"
+struct PageFaults { std::uint64_t major = 0, minor = 0; };  // v58c: the process's page faults so far (getrusage on Linux)
+bool page_faults_available();   // true on Linux / WSL2
+PageFaults page_faults();       // zeros where not available
 }  // namespace pelias::os
