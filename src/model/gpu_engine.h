@@ -66,6 +66,10 @@ struct EngineOptions {
   // and are not plane types). 0: the activation bytes the v60b layout held for unreachable rows (act_freed, logged); more
   // comes out of the bank (an A/B knob, --mtp-cache-mb)
   int mtp_cache_mb = 0;
+  // v60 commit C2: the pinned-planes read probe at open (copy engine, GB/s, logged). pin_read_min_gbs > 0: below it the
+  // planes are freed, pinned and packed again, up to pin_read_tries times (v60d: three of five arms read them 2-3x slower)
+  double pin_read_min_gbs = 0.0;
+  int pin_read_tries = 3;
   // v24 tie rule (author 18:19): every router call orders experts by floor((logit - max) / router_tie, lower index first
   // within a band (router_topk's tie_band; the CPU reference's ForwardOptions::router_tie_band). 0: by probability.
   float router_tie = 0.0f;

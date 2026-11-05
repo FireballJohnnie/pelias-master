@@ -222,6 +222,8 @@ struct GpuEngine::Impl {
   std::int32_t* mtp_top_d = nullptr;
   const std::uint8_t* mtp_emb_dev = nullptr;
   std::uint64_t mtp_copy_runs_saved = 0;  // v60 commit C: MTP attention on the direct plan (knew / vnew), counted
+  double pin_read_gbs = -1.0;  // v60 commit C2: the pinned planes read rate at open (GB/s; -1: not probed)
+  int pin_read_tries = 0;
   std::uint64_t act_freed = 0;  // v60 commit C: activation bytes the v60b layout held for rows no step can reach (to the MTP row's cache)
 
   std::vector<float> xe_h;  // embed(): the host rows before the upload
@@ -901,33 +903,81 @@ struct GpuEngine::Impl {
       }
       if (tot > 0) {
         const Clock::time_point tp = Clock::now();
-        planes_h = g::host_alloc_mapped(static_cast<std::size_t>(tot), &planes_dev);
-        if (!planes_h || !planes_dev) {
+        // v60 commit C2: the pack as a function (the pinned-read probe below may re-pin and pack again)
+        auto pack = [&]() -> bool {
+          planes_h = g::host_alloc_mapped(static_cast<std::size_t>(tot), &planes_dev);
+          if (!planes_h || !planes_dev) {
+            planes_h = nullptr;
+            planes_dev = nullptr;
+            return false;
+          }
+          auto* ph = static_cast<std::uint8_t*>(planes_h);
+          const unsigned nt = std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
+          std::atomic<std::size_t> next{0};
+          std::vector<std::thread> th;
+          for (unsigned t = 0; t < nt; ++t)
+            th.emplace_back([&]() {
+              std::vector<std::uint8_t> row;
+              for (std::size_t i = next.fetch_add(1); i < jobs.size(); i = next.fetch_add(1)) {
+                const PJob& J = jobs[i];
+                row.resize(z(static_cast<int64_t>(J.rb)));
+                for (std::uint64_t rr = 0; rr < J.rows; ++rr) {  // the plane layout is plane-major: the prefix is the row's first pf bytes
+                  kern::gpu::plane_row(J.t, J.src + rr * J.rb, row.data(), J.rb);
+                  std::memcpy(ph + J.off + rr * J.pf, row.data(), static_cast<std::size_t>(J.pf));
+                }
+              }
+            });
+          for (auto& t : th) t.join();
+          return true;
+        };
+        if (!pack()) {
           reader_note = "off (pinned memory for the bit planes: " + std::to_string(tot >> 20) + " MiB)";
-          planes_h = nullptr;
           return;
         }
         planes_b = tot;
-        auto* ph = static_cast<std::uint8_t*>(planes_h);
-        const unsigned nt = std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
-        std::atomic<std::size_t> next{0};
-        std::vector<std::thread> th;
-        for (unsigned t = 0; t < nt; ++t)
-          th.emplace_back([&]() {
-            std::vector<std::uint8_t> row;
-            for (std::size_t i = next.fetch_add(1); i < jobs.size(); i = next.fetch_add(1)) {
-              const PJob& J = jobs[i];
-              row.resize(z(static_cast<int64_t>(J.rb)));
-              for (std::uint64_t rr = 0; rr < J.rows; ++rr) {  // the plane layout is plane-major: the prefix is the row's first pf bytes
-                kern::gpu::plane_row(J.t, J.src + rr * J.rb, row.data(), J.rb);
-                std::memcpy(ph + J.off + rr * J.pf, row.data(), static_cast<std::size_t>(J.pf));
-              }
+        const double pack_s = since(tp);
+        // v60 commit C2 (v60d MEASURED: three of five arms read the pinned planes 2-3x slower, GPU 99 % busy at 84 W, same
+        // binary, same VM): the pinned-read probe. The copy engine reads `pb_bytes` of the planes into a VRAM scratch (the
+        // mapping the expert stage's loads go through); best of two passes in GB/s. Below o.pin_read_min_gbs (0: log only)
+        // the planes are freed, pinned and packed again, up to o.pin_read_tries times; every try's number is logged
+        double gbs_best = 0.0, gbs_first = 0.0;
+        int tries = 1;
+        {
+          const std::size_t pb_bytes = std::min<std::size_t>(std::size_t{512} << 20, static_cast<std::size_t>(tot));
+          void* scratch = g::dalloc(pb_bytes);
+          auto probe = [&]() -> double {
+            if (!scratch) return -1.0;
+            double best = 0.0;
+            for (int pass = 0; pass < 2; ++pass) {
+              if (!g::sync()) return -1.0;
+              const Clock::time_point t1 = Clock::now();
+              if (!g::dcopy_any(scratch, planes_dev, pb_bytes) || !g::sync()) return -1.0;
+              const double sec = since(t1);
+              if (sec > 0.0) best = std::max(best, static_cast<double>(pb_bytes) / sec / 1e9);
             }
-          });
-        for (auto& t : th) t.join();
-        char pb[320];
-        std::snprintf(pb, sizeof pb, "; bit planes: %zu Q4_TG2 / Q5_K matrices outside the bank, %.2f GB pinned (rows packed at the slider's prefix, v60), built in %.2f s; every pick read with %d bits (at most each matrix's own), bank and slots sized for them",
-                      jobs.size(), static_cast<double>(tot) / 1e9, since(tp), o.plane_bits);
+            return best;
+          };
+          gbs_first = gbs_best = probe();
+          while (o.pin_read_min_gbs > 0.0 && gbs_best >= 0.0 && gbs_best < o.pin_read_min_gbs && tries < std::max(1, o.pin_read_tries)) {
+            g::host_free(planes_h);
+            planes_h = nullptr;
+            planes_dev = nullptr;
+            ++tries;
+            if (!pack()) {
+              reader_note = "off (pinned memory for the bit planes, re-pin " + std::to_string(tries) + ")";
+              g::dfree(scratch);
+              return;
+            }
+            gbs_best = probe();
+          }
+          g::dfree(scratch);
+          pin_read_gbs = gbs_best;
+          pin_read_tries = tries;
+        }
+        char pb[400];
+        std::snprintf(pb, sizeof pb,
+                      "; bit planes: %zu Q4_TG2 / Q5_K matrices outside the bank, %.2f GB pinned (rows packed at the slider's prefix, v60), built in %.2f s; every pick read with %d bits (at most each matrix's own), bank and slots sized for them; pinned read %.1f GB/s (copy engine, 512 MB best of 2; first pin %.1f, %d pin%s, floor %.0f)",
+                      jobs.size(), static_cast<double>(tot) / 1e9, pack_s, o.plane_bits, gbs_best, gbs_first, tries, tries == 1 ? "" : "s", o.pin_read_min_gbs);
         planes_note = pb;
       }
     }

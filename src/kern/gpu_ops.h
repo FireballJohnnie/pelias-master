@@ -255,6 +255,8 @@ bool reader_prefetch(const ExpertPtr* tab, const std::int32_t* sel_pred, int npi
 bool dcopy(void* dst, const void* src, std::size_t bytes, Stream s = nullptr);
 // v60 commit C: rows of `width` bytes from src (spitch apart) to dst (dpitch apart), device to device, stream ordered
 bool dcopy2d(void* dst, std::size_t dpitch, const void* src, std::size_t spitch, std::size_t width, std::size_t rows, Stream s = nullptr);
+// v60 commit C2: a copy whose kind the driver infers (cudaMemcpyDefault): device <- mapped host memory, the pinned-read probe
+bool dcopy_any(void* dst, const void* src, std::size_t bytes, Stream s = nullptr);
 // per value head: o = rms_norm(o) * w * silu(z), in place on core (n rows of nv * ds), z alike
 bool gated_norm(float* core, const float* z, const float* w, std::int64_t n, std::int64_t nv, std::int64_t ds, float eps,
                 Stream s = nullptr);

@@ -28,6 +28,7 @@ bool set_host_wait(int, std::string* why) {
 bool mem_info(std::size_t*, std::size_t*) { return false; }
 bool dcopy(void*, const void*, std::size_t, Stream) { return false; }
 bool dcopy2d(void*, std::size_t, const void*, std::size_t, std::size_t, std::size_t, Stream) { return false; }  // v60 C
+bool dcopy_any(void*, const void*, std::size_t, Stream) { return false; }  // v60 C2
 void* host_alloc_mapped(std::size_t, void**) { return nullptr; }
 void host_free(void*) {}
 bool bell_ring(unsigned*, unsigned, Stream, unsigned long long*) { return false; }
