@@ -8,3 +8,8 @@ build_win/
 out/
 __pycache__/
 *.pyc
+
+# local reference only (lives in pelias-trainer); never committed here
+moe_track/
+build-installer/
+.vs/
