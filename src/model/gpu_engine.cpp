@@ -61,15 +61,13 @@ struct Arena {
 
 struct DevW {
   const WeightView* v = nullptr;
-  const void* d = nullptr;
+  const void* d = nullptr;   // a plain device copy: float weights (matmul / the F32 fast products) and, for the shared
+                             // expert's fold, R3's copy where the stage reads that layout (g_q8_0r) or a stored copy
   int64_t n_out = 0, k = 0;
-  bool int8 = false;
-  g::PromptWeights pw;
-  std::uint32_t dtype = 0;   // the type the batched kernels read d as (g_q8_0r for Q8_0 held in R3's layout)
+  std::uint32_t dtype = 0;   // the type d is read as (g_q8_0r for Q8_0 held in R3's layout)
   std::uint64_t drb = 0;     // its row bytes
-  bool r3 = false;           // sw holds this weight for R3 (one-token steps)
+  bool r3 = false;           // sw holds this weight for R3 (every quantized product; v60: the only quantized path)
   g::StreamWeights sw;
-  bool lean = false;         // v55: only R3's copy is held (no raw copy, no int8 tables); every product of it must run on R3
 };
 
 struct Layer {
@@ -238,10 +236,8 @@ struct GpuEngine::Impl {
     }
     return static_cast<std::size_t>(v.ne[1] * v.ne[2] * v.row_bytes);
   }
-  static bool int8_ok(std::uint32_t type, int64_t n_out, int64_t k) { return g::prompt_type_ok(type, k) && n_out % 128 == 0; }
-  bool use_r3 = false;  // EngineOptions::r3
-  const WeightView* lean_w = nullptr;  // v55: a weight held only in R3's copy (the output head when every head product runs on R3)
-  // R3 holds the matrix and the batched kernels read that same copy
+  bool use_r3 = false;  // v60: always true (kept for r3_takes)
+  // R3's copy of these types is the stored layout (Q8_0 repacked, read as g_q8_0r): the shared expert's fold reads it too
   static bool r3_shared(std::uint32_t t) {
     return t == static_cast<std::uint32_t>(quant::Type::q8_0) || t == static_cast<std::uint32_t>(quant::Type::q4_k) ||
            t == static_cast<std::uint32_t>(quant::Type::q5_k) || t == static_cast<std::uint32_t>(quant::Type::q4_tg2);
@@ -249,25 +245,24 @@ struct GpuEngine::Impl {
   bool r3_takes(const WeightView& v) const {
     return use_r3 && v.present() && !v.rot32 && v.slots.empty() && v.ne[2] == 1 && g::stream_type_ok(v.type, static_cast<int64_t>(v.ne[0]));
   }
-  std::size_t dense_bytes(const WeightView& v) const {
+  // v60 (commit B): every quantized weight is held once, in R3's copy (counted by put_dense from stream_upload); the int8
+  // side tables and the raw copies for the batched kernels left with them (v55 did this for the output head: -0.48 GB).
+  // A plain copy stays for float weights and for a shared-expert matrix whose stored layout R3 does not keep (the fold)
+  std::size_t dense_bytes(const WeightView& v, bool fold = false) const {
     if (!v.present()) return 0;
-    const int64_t n_out = static_cast<int64_t>(v.ne[1]), k = static_cast<int64_t>(v.ne[0]);
-    if (&v == lean_w && r3_takes(v)) return 256;  // v55: R3's copy only (counted by put_dense from stream_upload)
-    std::size_t b = r3_takes(v) && r3_shared(v.type) ? 256 : al(view_bytes(v)) + 256;
-    if (int8_ok(v.type, n_out, k)) b += al(g::prompt_table_bytes(v.type, n_out, k)) + 256;
-    return b;
+    if (r3_takes(v) && (r3_shared(v.type) || !fold)) return 256;
+    return al(view_bytes(v)) + 256;
   }
   static std::size_t vec_bytes(const std::vector<float>& f) { return f.empty() ? 0 : al(f.size() * sizeof(float)) + 256; }
   std::size_t layer_dense_bytes(const Qwen35MoeLayer& l) const {
     std::size_t b = 0;
-    for (const WeightView* v : {&l.wq, &l.wk, &l.wv, &l.wo, &l.wqkv, &l.wgate, &l.wbeta, &l.walpha, &l.ssm_out, &l.gate_inp, &l.gate_shexp, &l.up_shexp,
-                                &l.down_shexp})
-      b += dense_bytes(*v);
+    for (const WeightView* v : {&l.wq, &l.wk, &l.wv, &l.wo, &l.wqkv, &l.wgate, &l.wbeta, &l.walpha, &l.ssm_out, &l.gate_inp}) b += dense_bytes(*v);
+    for (const WeightView* v : {&l.gate_shexp, &l.up_shexp, &l.down_shexp}) b += dense_bytes(*v, true);
     for (const std::vector<float>* f : {&l.attn_norm, &l.post_norm, &l.q_norm, &l.k_norm, &l.conv1d, &l.ssm_dt, &l.ssm_a, &l.ssm_norm, &l.gate_inp_shexp})
       b += vec_bytes(*f);
     return b;
   }
-  Status put_dense(const WeightView& v, DevW& dw) {
+  Status put_dense(const WeightView& v, DevW& dw, bool fold = false) {
     dw = DevW{};
     if (!v.present()) return Status::good();
     dw.v = &v;
@@ -275,36 +270,24 @@ struct GpuEngine::Impl {
     dw.k = static_cast<int64_t>(v.ne[0]);
     dw.dtype = v.type;
     dw.drb = v.row_bytes;
-    const void* d = nullptr;
     if (r3_takes(v)) {
       if (!g::stream_upload(v.type, v.data, dw.n_out, dw.k, &dw.sw)) return Status::fail(Code::internal, std::string("engine: R3 upload ") + v.name + ": " + g::stream_last_error());
       dw.r3 = true;
       dev_bytes += dw.sw.bytes;
       dense_bytes_total += dw.sw.bytes;
-      if (&v == lean_w) {  // v55: no raw copy and no int8 tables; prod() refuses any product of it that is not on R3
-        dw.lean = true;
-        return Status::good();
-      }
-      if (r3_shared(v.type)) {  // the batched kernels read R3's copy
-        d = dw.sw.w;
+      if (r3_shared(v.type)) {  // the shared expert's fold reads R3's copy as stored (Q8_0 in R3's layout)
+        dw.d = dw.sw.w;
         if (v.type == static_cast<std::uint32_t>(quant::Type::q8_0)) {
           dw.dtype = g::g_q8_0r;
           dw.drb = static_cast<std::uint64_t>(dw.k / 256) * 272;
         }
       }
+      if (dw.d || !fold) return Status::good();  // v60: held once; prod() refuses any product of it that is not on R3
     }
-    if (!d) {
-      const std::size_t bytes = view_bytes(v);
-      void* dd = arena.take(bytes);
-      if (!dd || !g::to_device(dd, v.data, bytes)) return Status::fail(Code::internal, "engine: weight upload " + v.name);
-      d = dd;
-    }
-    dw.d = d;
-    if (int8_ok(v.type, dw.n_out, dw.k)) {
-      void* tb = arena.take(g::prompt_table_bytes(v.type, dw.n_out, dw.k));
-      if (!tb || !g::prompt_prepare_at(v.type, d, dw.n_out, dw.k, tb, &dw.pw)) return gfail("engine: side tables " + v.name);
-      dw.int8 = true;
-    }
+    const std::size_t bytes = view_bytes(v);
+    void* dd = arena.take(bytes);
+    if (!dd || !g::to_device(dd, v.data, bytes)) return Status::fail(Code::internal, "engine: weight upload " + v.name);
+    dw.d = dd;
     return Status::good();
   }
   Status put_vec(const std::vector<float>& f, const float*& out_ptr) {
@@ -318,9 +301,10 @@ struct GpuEngine::Impl {
   Status put_layer(const Qwen35MoeLayer& l, Layer& D) {
     Status st;
     for (auto [v, d] : {std::pair{&l.wq, &D.wq}, {&l.wk, &D.wk}, {&l.wv, &D.wv}, {&l.wo, &D.wo}, {&l.wqkv, &D.wqkv}, {&l.wgate, &D.wgate},
-                        {&l.wbeta, &D.wbeta}, {&l.walpha, &D.walpha}, {&l.ssm_out, &D.ssm_out}, {&l.gate_inp, &D.gate_inp},
-                        {&l.gate_shexp, &D.gate_sh}, {&l.up_shexp, &D.up_sh}, {&l.down_shexp, &D.down_sh}})
+                        {&l.wbeta, &D.wbeta}, {&l.walpha, &D.walpha}, {&l.ssm_out, &D.ssm_out}, {&l.gate_inp, &D.gate_inp}})
       if (!(st = put_dense(*v, *d))) return st;
+    for (auto [v, d] : {std::pair{&l.gate_shexp, &D.gate_sh}, {&l.up_shexp, &D.up_sh}, {&l.down_shexp, &D.down_sh}})
+      if (!(st = put_dense(*v, *d, true))) return st;
     for (auto [f, d] : {std::pair{&l.attn_norm, &D.attn_norm}, {&l.post_norm, &D.post_norm}, {&l.q_norm, &D.q_norm}, {&l.k_norm, &D.k_norm},
                         {&l.conv1d, &D.conv1d}, {&l.ssm_dt, &D.ssm_dt}, {&l.ssm_a, &D.ssm_a}, {&l.ssm_norm, &D.ssm_norm},
                         {&l.gate_inp_shexp, &D.gate_inp_sh}})
@@ -347,24 +331,13 @@ struct GpuEngine::Impl {
     }
     return b;
   }
-  // v56: planed false for the MTP block's bank, which build_bank fills in the stored types with their int8 tables whatever
-  // the slider (v56 M1-M3 MEASURED: "the MTP bank arena is too small" when its arena was sized with the planed bytes)
-  std::size_t expert_bytes(const Qwen35MoeLayer& l, int e, bool planed = true) const {
-    if (planed && o.plane_bits > 0) return al(planed_bytes(l, e));  // v54c: the planed bank holds the matrices alone
-    std::size_t b = 0;
-    for (const WeightView* v : {&l.gate_exps, &l.up_exps, &l.down_exps}) {
-      const std::uint32_t t = exp_type(*v, e);
-      const int64_t n_out = static_cast<int64_t>(v->ne[1]), k = static_cast<int64_t>(v->ne[0]);
-      const quant::TypeInfo ti = quant::type_info(t);
-      b += static_cast<std::size_t>(n_out) * static_cast<std::size_t>(k / static_cast<int64_t>(ti.block_elements)) * ti.block_bytes;
-      b += g::prompt_table_bytes(t, n_out, k);
-    }
-    return b;
-  }
-  // an expert can sit in the bank when every projection's type has an int8 step (the bank's stacks carry an expert map)
+  // the bytes a bank copy or a cache slot of an expert takes (v54c: the planed bank holds the matrices alone)
+  std::size_t expert_bytes(const Qwen35MoeLayer& l, int e) const { return al(planed_bytes(l, e)); }
+  // an expert can sit in the bank when the R3 expert stage reads every projection's type (v60: the bank is read by the
+  // stage alone; the int8-step condition of the stacked bank is gone, the type set is the same for this file's types)
   bool bankable(const Qwen35MoeLayer& l, int e) const {
     for (const WeightView* v : {&l.gate_exps, &l.up_exps, &l.down_exps})
-      if (!g::prompt_type_ok(exp_type(*v, e), static_cast<int64_t>(v->ne[0])) || v->rot32) return false;
+      if (!g::rx_type_ok(exp_type(*v, e), static_cast<int64_t>(v->ne[0])) || v->rot32) return false;
     return true;
   }
   // v54c: the bank in bit planes (the slider on): each hot expert's matrices back to back in VRAM, plane matrices as the
@@ -441,8 +414,18 @@ struct GpuEngine::Impl {
   // v26 CUDA graph
   g::Stream stm = nullptr;
   int* pos_d = nullptr;
-  int* pos_hp = nullptr;
-  void* pos_hv = nullptr;
+  // v60 (commit B): the token embedding gathered on the GPU (g::gather_rows) from the file's rows, registered for the GPU
+  // (pinned; no VRAM), the ids written to a mapped ring the kernel reads in place: no host dequantization, no upload, no
+  // sync before the layers. The ring (kRing slots of kReaderMax ids, and kRing positions) lets inner prompt steps skip the
+  // step-end sync: a slot is reused only after kRing steps, and a sync is forced before the ring wraps.
+  static constexpr int kRing = 64;
+  const std::uint8_t* emb_dev = nullptr;  // tok_embd's rows as the GPU sees them (null: the host path)
+  void* ring_hv = nullptr;                // mapped: kRing x kReaderMax ids, then kRing positions
+  std::int32_t* ring_tok_h = nullptr;
+  std::int32_t* ring_tok_d = nullptr;
+  int* ring_pos_h = nullptr;
+  unsigned ring_at = 0;       // the next slot
+  unsigned unsynced = 0;      // steps enqueued since the last host sync
   float *knew = nullptr, *vnew = nullptr;
   bool graph_ok = false;
   bool trunk_dp = false;  // the trunk's step reads the device position (not the MTP block's own attention)
@@ -883,7 +866,7 @@ struct GpuEngine::Impl {
       std::uint64_t tot = 0;
       struct PJob {
         const std::uint8_t* src;
-        std::uint64_t off, rb, rows;
+        std::uint64_t off, rb, pf, rows;  // v60: pf = the prefix (the slider's bits) each row is packed to
         std::uint32_t t;
       };
       std::vector<PJob> jobs;
@@ -893,10 +876,13 @@ struct GpuEngine::Impl {
           for (int64_t ex = 0; ex < ne; ++ex) {
             if (LL(il).hot[z(ex)]) continue;
             const ExpRows r = exp_rows(*vv[pj], static_cast<int>(ex));
-            if (!planed_type(r.t, r.rb)) continue;  // v54c: Q4_TG2 and Q5_K
-            const std::uint64_t rows = static_cast<std::uint64_t>(vv[pj]->ne[1]), b = r.rb * rows;
+            const std::uint32_t pt = planed_type(r.t, r.rb);
+            if (!pt) continue;  // v54c: Q4_TG2 and Q5_K
+            // v60 (Fix 2): rows packed at the prefix pf (the slider's bits), as the bank and the slots hold them: the pinned
+            // planes shrink (13.24 GB -> the prefix share at 3 bits) and a task's rows are one contiguous run
+            const std::uint64_t rows = static_cast<std::uint64_t>(vv[pj]->ne[1]), pf = kern::gpu::plane_prefix(pt, r.rb, o.plane_bits), b = pf * rows;
             poff[z((static_cast<int64_t>(il) * 3 + pj) * ne + ex)] = tot + 1;
-            jobs.push_back({r.base, tot, r.rb, rows, static_cast<std::uint32_t>(r.t)});
+            jobs.push_back({r.base, tot, r.rb, pf, rows, static_cast<std::uint32_t>(r.t)});
             tot += (b + 255) / 256 * 256;  // each matrix 256-byte aligned
           }
       }
@@ -915,14 +901,19 @@ struct GpuEngine::Impl {
         std::vector<std::thread> th;
         for (unsigned t = 0; t < nt; ++t)
           th.emplace_back([&]() {
+            std::vector<std::uint8_t> row;
             for (std::size_t i = next.fetch_add(1); i < jobs.size(); i = next.fetch_add(1)) {
               const PJob& J = jobs[i];
-              for (std::uint64_t rr = 0; rr < J.rows; ++rr) kern::gpu::plane_row(J.t, J.src + rr * J.rb, ph + J.off + rr * J.rb, J.rb);
+              row.resize(z(static_cast<int64_t>(J.rb)));
+              for (std::uint64_t rr = 0; rr < J.rows; ++rr) {  // the plane layout is plane-major: the prefix is the row's first pf bytes
+                kern::gpu::plane_row(J.t, J.src + rr * J.rb, row.data(), J.rb);
+                std::memcpy(ph + J.off + rr * J.pf, row.data(), static_cast<std::size_t>(J.pf));
+              }
             }
           });
         for (auto& t : th) t.join();
         char pb[200];
-        std::snprintf(pb, sizeof pb, "; bit planes: %zu Q4_TG2 / Q5_K matrices outside the bank, %.2f GB pinned, built in %.2f s; every pick read with %d bits (at most each matrix's own), bank and slots sized for them",
+        std::snprintf(pb, sizeof pb, "; bit planes: %zu Q4_TG2 / Q5_K matrices outside the bank, %.2f GB pinned (rows packed at the slider's prefix, v60), built in %.2f s; every pick read with %d bits (at most each matrix's own), bank and slots sized for them",
                       jobs.size(), static_cast<double>(tot) / 1e9, since(tp), o.plane_bits);
         planes_note = pb;
       }
@@ -991,14 +982,17 @@ struct GpuEngine::Impl {
           X.w[pj] = bank ? bank : dev_of(r.base);
           X.type[pj] = static_cast<std::uint32_t>(r.t);
           X.rb[pj] = r.rb;
+          X.rs[pj] = r.rb;
           if (bank) X.vram = 1;
           if (!bank && !poff.empty() && poff[z((static_cast<int64_t>(il) * 3 + pj) * ne + ex)]) {  // v54: from the bit planes
             X.w[pj] = static_cast<const std::uint8_t*>(planes_dev) + (poff[z((static_cast<int64_t>(il) * 3 + pj) * ne + ex)] - 1);
             X.type[pj] = planed_type(r.t, r.rb);
+            X.rs[pj] = kern::gpu::plane_prefix(X.type[pj], r.rb, o.plane_bits);  // v60: packed at the prefix
           }
           if (bank && planed_type(r.t, r.rb)) {  // v54c: the planed bank holds the slider's prefix of each row
             X.type[pj] = planed_type(r.t, r.rb);
             X.rb[pj] = kern::gpu::plane_prefix(X.type[pj], r.rb, o.plane_bits);
+            X.rs[pj] = X.rb[pj];
           }
         }
       }
@@ -1024,6 +1018,7 @@ struct GpuEngine::Impl {
           X.w[pj] = static_cast<const std::uint8_t*>(W.d);
           X.type[pj] = W.dtype;
           X.rb[pj] = W.drb;
+          X.rs[pj] = W.drb;
         }
         if (!ok && il >= s.n_layer) {  // v58: the MTP block's shared expert cannot be folded: its MoE half stays on the old path
           mtp_rd = false;
@@ -1221,7 +1216,7 @@ struct GpuEngine::Impl {
         for (int pj = 0; pj < 3; ++pj) {
           if (!g::rx_type_ok(X.type[pj], pj < 2 ? H : Fx) || !X.w[pj]) return false;
           if (reinterpret_cast<std::uintptr_t>(X.w[pj]) % 16 != 0) return false;
-          if (X.type[pj] == g::g_q6_k ? X.rb[pj] % 2 != 0 : X.rb[pj] % 16 != 0) return false;
+          if (X.type[pj] == g::g_q6_k ? X.rs[pj] % 2 != 0 : X.rs[pj] % 16 != 0) return false;
         }
         return true;
       };
@@ -1412,7 +1407,7 @@ GpuEngine::~GpuEngine() {
   g::dfree(p_->pos_d);
   g::dfree(p_->knew);
   g::dfree(p_->vnew);
-  g::host_free(p_->pos_hv);
+  g::host_free(p_->ring_hv);
 }
 
 std::int64_t GpuEngine::pos() const { return p_ ? p_->pos : 0; }
@@ -1552,7 +1547,7 @@ std::string GpuEngine::summary() const {
   r += "; R3 expert stage " + I.rx_note + ", rows staged for experts read from RAM";  // v46a-1 / v46a-2 (v60: locked)
   r += I.planes_note;  // v54
   r += I.probe_note;   // v54b
-  if (I.out.lean) r += "; output head held once (R3's copy; no raw copy or int8 tables)";  // v55
+  r += "; dense weights held once (R3's copies; v55 / v60: no raw copies or int8 tables)";
   r += I.r3_direct_note();  // v55
   if (I.rx_ok && I.fold_ok) r += "; MoE half fused (one launch per layer where no side output needs the separate kernels)";  // v52
   return r;
@@ -1588,7 +1583,6 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
   // v55 (author 02:36-02:41, build audit A): with planes on, every product of the output head runs on R3 (one-token steps,
   // the GPU prompt's steps of 1-4 tokens on R3, no MTP block, no verify batches off R3), so the head's raw copy and its int8
   // tables (~0.48 GB for this model's Q6_K head) are not loaded; the VRAM probe gives that room to the experts
-  I.lean_w = &w.output;  // v55 (v60: every head product is on R3, so the head is always held once)
   if (o.mtp && !w.mtp.present) return R::fail(Status::fail(Code::unsupported, "engine: this file has no MTP block"));
   if (o.max_verify > 1 && !(ds >= 32 && ds <= 1024 && (ds & (ds - 1)) == 0))
     return R::fail(Status::fail(Code::unsupported, "engine: verify batches need the DeltaNet d_state a power of two (the checkpointing recurrence)"));
@@ -1745,13 +1739,11 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
   I.rc_eff = o.reader_cache;
   int hot_cap = o.max_hot_per_layer;
   if (o.reader_cache > 0 || o.auto_vram) {  // v26: the reader cache's bytes before the bank takes its share
+    // v60 (Fix 1): the slot is the largest expert at the slider's bits (a slot holds the planed prefix of each row, as the
+    // size pools lay it out), not the file's raw rows (v59 audit: "cslot ignores the bit-plane slider")
     std::uint64_t mx = 0;
     for (std::uint32_t il = 0; il < I.nlr(); ++il)  // v58: with the MTP row too
-      for (int ex = 0; ex < static_cast<int>(ne); ++ex) {
-        std::uint64_t b = 0;
-        for (const WeightView* v : {&I.WL(il).gate_exps, &I.WL(il).up_exps, &I.WL(il).down_exps}) b += exp_rows(*v, ex).rb * v->ne[1];
-        mx = std::max(mx, b);
-      }
+      for (int ex = 0; ex < static_cast<int>(ne); ++ex) mx = std::max<std::uint64_t>(mx, I.expert_bytes(I.WL(il), ex));
     const std::uint64_t slot_b = (mx + 255) & ~std::uint64_t{255};
     if (o.auto_vram) {  // v54b VRAM probe: the free bytes after the dense weights split cache_share / the rest
       const std::uint64_t slack = (3 * 4 * (2048 + 256 * 4) + 64 * 1024) * static_cast<std::uint64_t>(s.n_layer);
@@ -1803,6 +1795,30 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
       if (!st) return R::fail(st);
     }
   }
+  {  // v60: the mapped ring for the step's ids and position, and the token embedding registered for the GPU gather
+    void* rdev = nullptr;
+    const std::size_t ring_b = static_cast<std::size_t>(Impl::kRing) * (Impl::kReaderMax * sizeof(std::int32_t) + sizeof(int)) + 256;
+    I.ring_hv = g::host_alloc_mapped(ring_b, &rdev);
+    if (!I.ring_hv || !rdev) return R::fail(Status::fail(Code::internal, std::string("engine: mapped memory for the step ring: ") + g::last_error()));
+    I.ring_tok_h = static_cast<std::int32_t*>(I.ring_hv);
+    I.ring_tok_d = static_cast<std::int32_t*>(rdev);
+    I.ring_pos_h = reinterpret_cast<int*>(static_cast<std::uint8_t*>(I.ring_hv) + Impl::kRing * Impl::kReaderMax * sizeof(std::int32_t));
+    const WeightView& te = w.tok_embd;
+    if (te.present() && !te.rot32 && te.slots.empty() && g::type_supported(te.type)) {
+      const std::uintptr_t pg = 4096, a = reinterpret_cast<std::uintptr_t>(te.data), b = a + static_cast<std::uintptr_t>(te.row_bytes * te.ne[1]);
+      void* dv = nullptr;
+      std::string why;
+      if (g::host_register(reinterpret_cast<void*>(a & ~(pg - 1)), static_cast<std::size_t>(((b + pg - 1) & ~(pg - 1)) - (a & ~(pg - 1))), &dv, &why)) {
+        I.reg_bases.push_back(reinterpret_cast<void*>(a & ~(pg - 1)));
+        I.emb_dev = static_cast<const std::uint8_t*>(dv) + (a - (a & ~(pg - 1)));
+        I.probe_note += "; token embedding gathered on the GPU from the registered file rows (v60)";
+      } else {
+        I.probe_note += "; token embedding on the host path (registering its rows failed: " + why + ")";
+      }
+    } else {
+      I.probe_note += "; token embedding on the host path (type without a GPU decoder, rotated or sliced)";
+    }
+  }
   I.setup_reader();  // v24
   if (!I.reader || !I.rx_ok)  // v60: the reader with the R3 expert stage is the engine's only expert path
     return R::fail(Status::fail(Code::internal, "engine: the R3 expert stage could not be set up (" + I.rx_note + "; reader " + I.reader_note + ")"));
@@ -1811,15 +1827,12 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
   if (!rs) return R::fail(rs);
   if (o.graph) {  // v26: the engine's own stream (a graph cannot record the default stream), the device position
     I.graph_note = "off (setup failed)";
-    void* pdev = nullptr;
     const std::size_t kvb = z(o.max_batch) * z(I.kv_w) * sizeof(float);
     if (g::sync() && (I.stm = g::stream_new()) != nullptr) {
-      I.pos_hv = g::host_alloc_mapped(64, &pdev);
       I.pos_d = static_cast<int*>(g::dalloc(256));
       I.knew = static_cast<float*>(g::dalloc(kvb));
       I.vnew = static_cast<float*>(g::dalloc(kvb));
-      if (I.pos_hv && I.pos_d && I.knew && I.vnew) {
-        I.pos_hp = static_cast<int*>(I.pos_hv);
+      if (I.pos_d && I.knew && I.vnew) {
         g::set_stream(I.stm);
         I.graph_ok = true;
         I.graph_note = "on (reader steps of 1-4 tokens)";
@@ -1886,6 +1899,7 @@ Status GpuEngine::keep(int k) {
     if (!g::deltanet_conv(D.mixed_save, D.tail[1 - D.cur], D.conv1d, k, ch, taps, I.conv, D.tail[D.cur])) return gfail("engine: keep tail");
   }
   I.pos = I.verify_pos0 + k;
+  I.unsynced = 0;
   return g::sync() ? Status::good() : gfail("engine: keep sync");
 }
 
@@ -1897,12 +1911,22 @@ Status GpuEngine::Impl::run(const std::int32_t* tokens, int n, float* logits, bo
   const Clock::time_point t0 = Clock::now();
   EngineStats es;
   const int64_t e = s.n_embd;
-  if (Status es0 = I.embed(wt.tok_embd, tokens, n, I.x, e); !es0) return es0;
   if (n > Impl::kReaderMax) return Status::fail(Code::internal, "engine: run() takes 1-4 tokens (step() splits a prompt)");  // v60
+  for (int t = 0; t < n; ++t)
+    if (tokens[t] < 0 || static_cast<std::uint64_t>(tokens[t]) >= s.n_vocab) return Status::fail(Code::invalid_argument, "a token id is outside the vocabulary");
+  const unsigned slot = I.ring_at++ % static_cast<unsigned>(Impl::kRing);
+  if (I.emb_dev) {  // v60: the embedding rows gathered on the GPU; the ids read from the mapped ring
+    std::int32_t* th = I.ring_tok_h + static_cast<std::ptrdiff_t>(slot) * Impl::kReaderMax;
+    std::copy_n(tokens, n, th);
+    if (!g::gather_rows(wt.tok_embd.type, I.emb_dev, wt.tok_embd.row_bytes, e, I.ring_tok_d + static_cast<std::ptrdiff_t>(slot) * Impl::kReaderMax, n, I.x))
+      return gfail("engine: embedding gather");
+  } else if (Status es0 = I.embed(wt.tok_embd, tokens, n, I.x, e); !es0) {
+    return es0;
+  }
   Status st;
   if (I.graph_ok) {  // v26: the step's position for the device-side readers (on the engine's stream, before the layers)
-    *I.pos_hp = static_cast<int>(I.pos);
-    if (!g::h2d_async(I.pos_d, I.pos_hp, sizeof(int))) return gfail("engine: position");
+    I.ring_pos_h[slot] = static_cast<int>(I.pos);
+    if (!g::h2d_async(I.pos_d, I.ring_pos_h + slot, sizeof(int))) return gfail("engine: position");
   }
   I.trunk_dp = I.graph_ok;
   struct DpReset {
@@ -2024,7 +2048,15 @@ Status GpuEngine::Impl::run(const std::int32_t* tokens, int n, float* logits, bo
     }
   }
   if (I.top_req && n > r_begin && !g::to_host(I.top_req, I.top_d, z(n - r_begin) * sizeof(std::int32_t))) return gfail("engine: argmax out");
-  if (!g::sync()) return gfail("engine: sync");
+  // v60: an inner prompt step (no logits, hidden, trace, margins or probe read on the host) leaves its work queued; the next
+  // step's launches follow it on the stream (the ring above keeps its ids and position intact until it runs)
+  const bool inner = I.no_head && !hidden_out && !I.top_req && !I.trc_ts_h && !I.rlg_h && !probe_here;
+  if (inner && I.unsynced + 2 < static_cast<unsigned>(Impl::kRing)) {
+    ++I.unsynced;
+  } else {
+    if (!g::sync()) return gfail("engine: sync");
+    I.unsynced = 0;
+  }
   {  // v25: every pick runs on the GPU
     es.hot_picks += static_cast<std::uint64_t>(n) * s.n_expert_used;
     if (I.trc_ts_h) I.trace_step(n, since(t0));
@@ -2129,6 +2161,7 @@ Status GpuEngine::mtp_step(const std::int32_t* tokens, const float* h_prev, int 
   }
   if (I.top_req && logits && !g::to_host(I.top_req, I.top_d, z(n) * sizeof(std::int32_t))) return gfail("engine: MTP argmax out");
   if (!g::sync()) return gfail("engine: MTP sync");
+  I.unsynced = 0;
   I.mtp_pos += n;
   es.seconds = since(t0);
   if (stats) *stats = es;

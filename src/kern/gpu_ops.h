@@ -200,7 +200,8 @@ bool read_chunks_rate(const void* dev_base, const std::uint64_t* offsets, int n,
 struct ExpertPtr {
   const std::uint8_t* w[3] = {nullptr, nullptr, nullptr};
   std::uint32_t type[3] = {0, 0, 0};
-  std::uint64_t rb[3] = {0, 0, 0};
+  std::uint64_t rb[3] = {0, 0, 0};  // the format's row bytes (plane_prefix derives the block count from it)
+  std::uint64_t rs[3] = {0, 0, 0};  // v60: the stride between rows in memory (the RAM planes are packed at the slider's prefix)
   std::uint32_t vram = 0;  // v26: 1 if w points at VRAM (the bank, the shared expert): never cached
   std::uint32_t pbits = 0;  // v54b, a grouping's output: the code bits its plane matrices (g_q4_tg2p) are read with (2-4; 0 = 4)
 };

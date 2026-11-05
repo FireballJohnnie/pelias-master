@@ -408,7 +408,7 @@ __device__ __forceinline__ void rd3_group_one(const ExpertPtr* __restrict__ tab,
           at.w[1] = sb + srb[0] * static_cast<std::uint64_t>(F);
           at.w[2] = sb + (srb[0] + srb[1]) * static_cast<std::uint64_t>(F);
 #pragma unroll
-          for (int pj = 0; pj < 3; ++pj) at.rb[pj] = srb[pj];
+          for (int pj = 0; pj < 3; ++pj) at.rb[pj] = at.rs[pj] = srb[pj];  // a slot's rows are packed at the prefix
           at.vram = 1;
           if (w0) c.use[slot] = stamp;
           if (hit >= 0) {

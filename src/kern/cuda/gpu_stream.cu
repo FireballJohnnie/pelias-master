@@ -916,9 +916,9 @@ __device__ __forceinline__ void rx_plan_body(const int* __restrict__ grp, const 
           const int top = J.fmt == kQ5KP ? 5 : 4;
           J.pb = X.pbits >= 2 && static_cast<int>(X.pbits) < top ? static_cast<int>(X.pbits) : top;
         }
-        J.rs = static_cast<long long>(X.rb[kind]);
+        J.rs = static_cast<long long>(X.rs[kind]);  // v60: the stride in memory (the RAM planes are packed at the prefix)
         J.fw = J.fmt == kQ4TG2P || J.fmt == kQ5KP ? const_cast<std::uint8_t*>(FL.w[kind]) : nullptr;
-        J.frs = static_cast<long long>(FL.rb[kind]);
+        J.frs = static_cast<long long>(FL.rs[kind]);
         if (J.fmt < 0) s_err = 2;  // every writer stores 2; read after the barrier
         J.n = kind < 2 ? F : H;
         J.K = kind < 2 ? H : F;
@@ -1133,10 +1133,14 @@ __device__ __forceinline__ void rx_rows_staged(const DJob& J, long long t, std::
                                             // packed in the buffer and, on a miss, in the slot (fw at frs)
     const long long pf = static_cast<long long>(plane_prefix(J.fmt == kQ4TG2P ? g_q4_tg2p : g_q5_kp,
                                                              static_cast<std::uint64_t>(nB) * (J.fmt == kQ4TG2P ? 144u : 176u), J.pb));
-    wb = nullptr;
-    for (int rr = 0; rr < nr; ++rr) {
-      const std::uint8_t* d = rx_stage(J.w + (r0 + rr) * J.rs, pf, sbuf + rr * pf, J.fw ? J.fw + (r0 + rr) * J.frs : nullptr, lane);
-      if (rr == 0) wb = d;
+    if (J.rs == pf && (!J.fw || J.frs == pf)) {  // v60 (Fix 2): packed rows: the task's rows are one contiguous run, one copy
+      wb = rx_stage(J.w + static_cast<long long>(r0) * pf, nr * pf, sbuf, J.fw ? J.fw + static_cast<long long>(r0) * pf : nullptr, lane);
+    } else {
+      wb = nullptr;
+      for (int rr = 0; rr < nr; ++rr) {
+        const std::uint8_t* d = rx_stage(J.w + (r0 + rr) * J.rs, pf, sbuf + rr * pf, J.fw ? J.fw + (r0 + rr) * J.frs : nullptr, lane);
+        if (rr == 0) wb = d;
+      }
     }
   } else {
     wb = rx_stage(src, nr * rowb, sbuf, J.fd ? const_cast<std::uint8_t*>(src) + J.fd : nullptr, lane);
@@ -1191,7 +1195,9 @@ __device__ __forceinline__ void rxp_issue(const DJob& J, long long t, std::uint8
   if (J.fmt == kQ4TG2P || J.fmt == kQ5KP) {
     const long long pf = static_cast<long long>(plane_prefix(J.fmt == kQ4TG2P ? g_q4_tg2p : g_q5_kp,
                                                              static_cast<std::uint64_t>(nB) * (J.fmt == kQ4TG2P ? 144u : 176u), J.pb));
-    for (int rr = 0; rr < nr; ++rr) rxp_issue_range(J.w + (r0 + rr) * J.rs, pf, buf + rr * pf, lane);
+    if (J.rs == pf) rxp_issue_range(J.w + static_cast<long long>(r0) * pf, nr * pf, buf, lane);  // v60: packed rows, one range
+    else
+      for (int rr = 0; rr < nr; ++rr) rxp_issue_range(J.w + (r0 + rr) * J.rs, pf, buf + rr * pf, lane);
   } else {
     const long long rowb = static_cast<long long>(nB) * rx_blk(J.fmt);
     rxp_issue_range(J.w + static_cast<long long>(r0) * rowb, nr * rowb, buf, lane);
@@ -1217,8 +1223,11 @@ __device__ __forceinline__ void rxp_compute(const DJob& J, long long t, std::uin
     const long long pf = static_cast<long long>(plane_prefix(J.fmt == kQ4TG2P ? g_q4_tg2p : g_q5_kp,
                                                              static_cast<std::uint64_t>(nB) * (J.fmt == kQ4TG2P ? 144u : 176u), J.pb));
     wb = buf;
-    if (J.fw)
-      for (int rr = 0; rr < nr; ++rr) rxp_fill(J.fw + (r0 + rr) * J.frs, buf + rr * pf, pf, lane);
+    if (J.fw) {
+      if (J.frs == pf) rxp_fill(J.fw + static_cast<long long>(r0) * pf, buf, nr * pf, lane);  // v60: the slot's rows are packed, one run
+      else
+        for (int rr = 0; rr < nr; ++rr) rxp_fill(J.fw + (r0 + rr) * J.frs, buf + rr * pf, pf, lane);
+    }
   } else {
     const long long rowb = static_cast<long long>(nB) * rx_blk(J.fmt);
     const std::uint8_t* src = J.w + static_cast<long long>(r0) * rowb;
