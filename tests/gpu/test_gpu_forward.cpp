@@ -347,7 +347,7 @@ std::vector<float> engine_case(const Small& sm, int hot, const char* what, float
   CHECK(finite);
   CHECK(kl_mean <= 1e-4);
   CHECK(top >= 0.95);
-  CHECK(hp == 2 * static_cast<std::uint64_t>(n) * s.n_expert_used * s.n_layer);  // v25 / v60: every pick of every step on the GPU, both passes
+  CHECK(hp == 2 * static_cast<std::uint64_t>(n) * s.n_expert_used);  // v25 / v60: every pick of every step on the GPU (counted per step), both passes
   std::printf("    %-34s %3d tokens: logits rel L2 %.3e; KL mean %.3e max %.3e; top-1 equal %d / %d; picks %llu (all on the GPU); reset repeat bit for bit\n", what, n,
               den > 0 ? std::sqrt(num / den) : 0.0, kl_mean, kl_max, top_same, n, static_cast<unsigned long long>(hp / 2));
   return eng;
