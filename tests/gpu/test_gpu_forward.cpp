@@ -244,10 +244,9 @@ TEST(rung3_whole_trunk_on_the_gpu_against_the_reference) {
 namespace {
 
 // GP3-14 stages 1-2: the engine over a sequence fed in pieces (prefill chunks, then one token at a time) against the
-// reference's fresh pass with the same roundings. hot: experts 0 .. hot-1 of every layer in the GPU bank, the rest on
-// the CPU (0: every expert on the CPU; 8: every expert on the GPU).
-std::vector<float> engine_case(const Small& sm, int hot, const char* what, bool bell = true, bool timeline = false, bool reader = false, float band = 0.0f,
-                               int cache = 0, bool fold = false, bool prefetch = false, bool graph = false) {
+// reference's fresh pass with the same roundings. hot: experts 0 .. hot-1 of every layer in the GPU bank, the rest read
+// from the registered file mapping / the bit planes (v60: every pick on the GPU; 8: every expert in the bank).
+std::vector<float> engine_case(const Small& sm, int hot, const char* what, float band = 0.0f, int cache = 0, bool graph = false, bool trace = false) {
   const m::Qwen35MoeSpec& s = sm.spec;
   const int n = std::getenv("PELIAS_GPU_QUICK") ? 20 : 48, nv = static_cast<int>(s.n_vocab);
   std::vector<std::int32_t> tok(static_cast<std::size_t>(n));
@@ -260,14 +259,8 @@ std::vector<float> engine_case(const Small& sm, int hot, const char* what, bool 
   m::EngineOptions eo;
   eo.max_ctx = 128;
   eo.max_batch = 16;
-  eo.cpu_threads = 4;
-  eo.doorbell = bell;
-  eo.timeline = timeline;
-  eo.cold_on_gpu = reader;
-  eo.trace = reader;  // v25: the trace only reads stamps and picks
+  eo.trace = trace;  // v25: the trace only reads stamps and picks (v60: a side output, so the layers run the separate kernels)
   eo.reader_cache = cache;  // v26
-  eo.fold_shared = fold;
-  eo.prefetch = prefetch;
   eo.graph = graph;
   eo.router_tie = band;
   if (hot > 0) {
@@ -283,22 +276,14 @@ std::vector<float> engine_case(const Small& sm, int hot, const char* what, bool 
     return {};
   }
   CHECK(f.value->bank_experts() == static_cast<int>(s.n_layer) * hot);
-  if (hot > 0 && hot < static_cast<int>(s.n_expert)) {  // v22: every bank expert against the CPU path
-    std::string rep;
-    int bad = -1;
-    CHECK(f.value->bank_selftest(8, &rep, &bad).ok());
-    CHECK(bad == 0);
-    std::printf("    %s: %s\n", what, rep.substr(0, rep.find('\n')).c_str());
-  }
-  CHECK((f.value->summary().find("doorbell") != std::string::npos) == bell);
-  if (reader) {  // v24: the reader must be on (the small model's file mapping registered)
+  {  // v24: the reader must be on (the small model's file mapping registered)
     const std::string sm_sum = f.value->summary();
     CHECK(sm_sum.find("expert reader on") != std::string::npos);
     std::printf("    %s: %s\n", what, sm_sum.substr(sm_sum.find("expert reader")).c_str());
   }
   // two passes: the second after reset() must give the same logits bit for bit (the state is carried, not leaked)
   std::vector<float> first;
-  std::uint64_t hp = 0, cp = 0;
+  std::uint64_t hp = 0;
   for (int pass = 0; pass < 2; ++pass) {
     CHECK(f.value->reset().ok());
     int t = 0;
@@ -313,17 +298,15 @@ std::vector<float> engine_case(const Small& sm, int hot, const char* what, bool 
         return {};
       }
       hp += es.hot_picks;
-      cp += es.cold_picks;
       t += k;
     }
     for (; t < n; ++t) {
       m::EngineStats es;
       CHECK(f.value->step(tok.data() + t, 1, eng.data() + static_cast<std::size_t>(t) * static_cast<std::size_t>(nv), true, &es).ok());
       hp += es.hot_picks;
-      cp += es.cold_picks;
     }
     CHECK(f.value->pos() == n);
-    if (reader) {  // v25: one S line per reader step, one L line per layer
+    if (trace) {  // v25: one S line per step, one L line per layer
       const std::string tr = f.value->trace_take();
       std::size_t s_lines = 0, l_lines = 0;
       for (std::size_t i = 0; i < tr.size();) {
@@ -332,8 +315,8 @@ std::vector<float> engine_case(const Small& sm, int hot, const char* what, bool 
         if (tr.compare(i, 2, "L\t") == 0) ++l_lines;
         i = j == std::string::npos ? tr.size() : j + 1;
       }
-      // v48: with the prompt on the GPU (the default), the prefill pieces (16, 13) are reader steps too: 4 + 4 steps of up to 4
-      const std::size_t pre = eo.gpu_prompt && n >= 29 ? 8 : 0;
+      // v48: with the prompt on the GPU, the prefill pieces (16, 13) are steps of up to 4 too: 4 + 4 steps
+      const std::size_t pre = n >= 29 ? 8 : 0;
       CHECK(s_lines == pre + static_cast<std::size_t>(std::max(0, n - 29)) && l_lines == s_lines * s.n_layer);
       if (pass == 0) std::printf("    %s: trace %zu steps, %zu layer lines\n", what, s_lines, l_lines);
     }
@@ -364,30 +347,9 @@ std::vector<float> engine_case(const Small& sm, int hot, const char* what, bool 
   CHECK(finite);
   CHECK(kl_mean <= 1e-4);
   CHECK(top >= 0.95);
-  if (hot == 0 && !reader) CHECK(hp == 0);  // v25: a reader step counts every pick as on the GPU
-  if (hot == static_cast<int>(s.n_expert)) CHECK(cp == 0);
-  // v48: with the reader on and the prompt on the GPU (the default) no pick goes to the CPU, the prompt's included
-  if (hot > 0 && hot < static_cast<int>(s.n_expert)) CHECK(reader && eo.gpu_prompt ? hp > 0 && cp == 0 : hp > 0 && cp > 0);
-  if (timeline) {  // v19: every doorbell step counted (2 passes of 2 prefill pieces + the single tokens), times sane
-    const m::EngineTimeline& T = f.value->timeline();
-    const int steps_per_pass = 2 + std::max(0, n - 29);
-    double idle = 0.0, cold = 0.0, hotg = 0.0;
-    bool sane = true;
-    for (std::size_t il = 0; il < T.gpu_idle.size(); ++il) {
-      idle += T.gpu_idle[il];
-      cold += T.cpu_cold[il];
-      hotg += T.gpu_hot[il];
-      sane = sane && T.gpu_idle[il] >= 0.0 && T.gpu_hot[il] >= 0.0 && T.gpu_dense[il] >= 0.0 && T.cpu_wait[il] >= 0.0 && std::isfinite(T.gpu_idle[il]);
-    }
-    CHECK(T.steps == 2 * steps_per_pass);
-    CHECK(T.gpu_idle.size() == s.n_layer);
-    CHECK(sane);
-    CHECK(cold > 0.0 && hotg > 0.0 && T.cold_bytes > 0.0 && T.cold_picks > 0 && T.hot_picks > 0);
-    std::printf("    timeline: %d steps; GPU idle %.3f ms, bank + shared %.3f ms; CPU cold %.3f ms (whole run); stages %.3f / %.3f / %.3f / %.3f / %.3f ms\n", T.steps,
-                idle * 1e3, hotg * 1e3, cold * 1e3, T.stage[0] * 1e3, T.stage[1] * 1e3, T.stage[2] * 1e3, T.stage[3] * 1e3, T.stage[4] * 1e3);
-  }
-  std::printf("    %-34s %3d tokens: logits rel L2 %.3e; KL mean %.3e max %.3e; top-1 equal %d / %d; picks GPU %llu CPU %llu; reset repeat bit for bit\n", what, n,
-              den > 0 ? std::sqrt(num / den) : 0.0, kl_mean, kl_max, top_same, n, static_cast<unsigned long long>(hp / 2), static_cast<unsigned long long>(cp / 2));
+  CHECK(hp == 2 * static_cast<std::uint64_t>(n) * s.n_expert_used * s.n_layer);  // v25 / v60: every pick of every step on the GPU, both passes
+  std::printf("    %-34s %3d tokens: logits rel L2 %.3e; KL mean %.3e max %.3e; top-1 equal %d / %d; picks %llu (all on the GPU); reset repeat bit for bit\n", what, n,
+              den > 0 ? std::sqrt(num / den) : 0.0, kl_mean, kl_max, top_same, n, static_cast<unsigned long long>(hp / 2));
   return eng;
 }
 
@@ -399,43 +361,29 @@ TEST(rung4_engine_decode_against_the_reference) {
   small_model(sm);
   CHECK(sm.ok);
   if (!sm.ok) return;
-  engine_case(sm, 0, "engine, every expert on the CPU");
-  const std::vector<float> a = engine_case(sm, 4, "engine, half the experts in the bank");
+  engine_case(sm, 0, "engine, no bank (planes / file mapping)");
+  engine_case(sm, 0, "engine, no bank, trace (separate kernels)", 0.0f, 0, false, true);
+  engine_case(sm, 4, "engine, half the experts in the bank");
   engine_case(sm, 8, "engine, every expert in the bank");
-  // the doorbell and the per-layer device syncs run the same arithmetic: the same logits bit for bit
-  const std::vector<float> b = engine_case(sm, 4, "engine, half in the bank, device syncs", false);
-  // v19: the timeline only reads clocks; the logits stay bit for bit
-  const std::vector<float> c = engine_case(sm, 4, "engine, half in the bank, timeline", true, true);
-  CHECK(!a.empty() && a.size() == c.size() && std::memcmp(a.data(), c.data(), a.size() * sizeof(float)) == 0);
-  CHECK(!a.empty() && a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0);
-  std::printf("    doorbell vs device syncs: logits bit for bit %s\n", !a.empty() && a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0 ? "equal" : "DIFFERENT");
-  // v24: the picked-expert reader (decode steps: every routed expert on the GPU, bank and file mapping), and the tie band
-  engine_case(sm, 4, "engine, reader, half in the bank", true, false, true);
-  engine_case(sm, 0, "engine, reader, no bank", true, false, true);
-  engine_case(sm, 4, "engine, tie band 0.01", true, false, false, 0.01f);
-  engine_case(sm, 4, "engine, reader + tie band 0.01", true, false, true, 0.01f);
+  engine_case(sm, 4, "engine, tie band 0.01", 0.01f);
   // v26: the cache changes where bytes come from, never the arithmetic: logits bit for bit with and without it
-  const std::vector<float> r0 = engine_case(sm, 2, "engine, reader v3, bank 2", true, false, true);
-  const std::vector<float> r1 = engine_case(sm, 2, "engine, reader v3 + cache 3", true, false, true, 0.0f, 3);
+  const std::vector<float> r0 = engine_case(sm, 2, "engine, bank 2", 0.0f, 0);
+  const std::vector<float> r1 = engine_case(sm, 2, "engine, bank 2 + cache 3", 0.0f, 3);
   CHECK(!r0.empty() && r0.size() == r1.size() && std::memcmp(r0.data(), r1.data(), r0.size() * sizeof(float)) == 0);
   std::printf("    reader cache on vs off: logits bit for bit %s\n",
               !r0.empty() && r0.size() == r1.size() && std::memcmp(r0.data(), r1.data(), r0.size() * sizeof(float)) == 0 ? "equal" : "DIFFERENT");
-  engine_case(sm, 2, "engine, reader v3 + cache + shared fold", true, false, true, 0.0f, 3, true);
-  // v26: prefetch and the graph move work, never the arithmetic: bit for bit with the plain cached reader
-  const std::vector<float> r2 = engine_case(sm, 2, "engine, reader v3 + cache 3 + prefetch", true, false, true, 0.0f, 3, false, true);
-  const std::vector<float> r3 = engine_case(sm, 2, "engine, reader v3 + cache 3 + prefetch + graph", true, false, true, 0.0f, 3, false, true, true);
-  const bool e2 = !r1.empty() && r1.size() == r2.size() && std::memcmp(r1.data(), r2.data(), r1.size() * sizeof(float)) == 0;
+  // v26: the graph moves work, never the arithmetic: bit for bit with the plain launches
+  const std::vector<float> r3 = engine_case(sm, 2, "engine, bank 2 + cache 3 + graph", 0.0f, 3, true);
   const bool e3 = !r1.empty() && r1.size() == r3.size() && std::memcmp(r1.data(), r3.data(), r1.size() * sizeof(float)) == 0;
-  CHECK(e2);
   CHECK(e3);
-  std::printf("    prefetch: logits bit for bit %s; prefetch + graph: %s\n", e2 ? "equal" : "DIFFERENT", e3 ? "equal" : "DIFFERENT");
+  std::printf("    graph: logits bit for bit %s\n", e3 ? "equal" : "DIFFERENT");
 }
 
 // GP3-14 stage 3: verify batches and keep() (the MTP rollback) on the small model: after a 16-token prefill, batches of 4
 // are verified and only their first k tokens kept (k cycling 1 .. 4); the kept rows' logits against the reference's
 // fresh pass over the kept sequence, and the position after each keep.
-// v26 option B and the CUDA graph: with the reader, tokens decoded one at a time and the same tokens verified 4 at a time
-// give the same logits bit for bit when batch_identical is on (each product's per-token arithmetic is the one-token path's);
+// v26 option B and the CUDA graph: tokens decoded one at a time and the same tokens verified 4 at a time give the same
+// logits bit for bit (each product's per-token arithmetic is the one-token path's; v60: every 1-4-token step is on R3);
 // with the graph on, the same again and equal to the plain launches (replays from the third step of each kind)
 TEST(rung4_engine_batch_identical_and_graph) {
   if (!g::available()) return;
@@ -448,24 +396,19 @@ TEST(rung4_engine_batch_identical_and_graph) {
   const std::size_t row = static_cast<std::size_t>(nv);
   std::vector<std::int32_t> tok(static_cast<std::size_t>(npre + ndec));
   for (std::size_t i = 0; i < tok.size(); ++i) tok[i] = static_cast<std::int32_t>((i * 37 + 11) % 1000);
-  std::vector<std::vector<float>> one(4), ver(4);
-  // 3 (v47): batch-identical + graph + the R3 expert stage with staged RAM experts: verify batches run the kernels that load
-  // each row once for every token (lane_part_n), one-token steps the one-token kernels; both must give the same logits
-  for (int cfg = 0; cfg < 4; ++cfg) {  // 0: plain batched kernels; 1: batch-identical; 2: batch-identical + graph
+  std::vector<std::vector<float>> one(2), ver(2);
+  // (v47) the R3 expert stage with staged RAM experts: verify batches run the kernels that load each row once for every
+  // token (lane_part_n), one-token steps the one-token kernels; both must give the same logits
+  for (int cfg = 0; cfg < 2; ++cfg) {  // 0: plain launches; 1: the graph
     m::EngineOptions eo;
     eo.max_ctx = 128;
     eo.max_batch = 16;
     eo.max_verify = 4;
-    eo.cpu_threads = 4;
-    eo.cold_on_gpu = true;
     eo.hot_order.assign(s.n_layer, {});
     for (auto& v : eo.hot_order)
       for (int e = 0; e < static_cast<int>(s.n_expert); ++e) v.push_back(e);
     eo.max_hot_per_layer = 2;
-    eo.batch_identical = cfg >= 1;
-    eo.graph = cfg >= 2;
-    eo.r3_experts = cfg == 3;
-    eo.rx_load = cfg == 3 ? 1 : 0;
+    eo.graph = cfg == 1;
     auto f = m::GpuEngine::open(s, sm.w, eo);
     CHECK(f.ok());
     if (!f.ok()) {
@@ -487,27 +430,23 @@ TEST(rung4_engine_batch_identical_and_graph) {
       CHECK(E.verify(tok.data() + npre + 4 * b, 4, ver[static_cast<std::size_t>(cfg)].data() + static_cast<std::size_t>(4 * b) * row, bh.data()).ok());
       CHECK(E.keep(4).ok());
     }
-    std::printf("    config %d (%s): %s\n", cfg,
-                cfg == 0 ? "batched kernels" : cfg == 1 ? "batch-identical" : cfg == 2 ? "batch-identical + graph" : "+ R3 expert stage", E.graph_report().c_str());
-    if (cfg == 3) std::printf("      %s\n", E.summary().c_str());
-    if (cfg >= 2) CHECK(E.graph_report().find("replays 0") == std::string::npos);
+    std::printf("    config %d (%s): %s\n", cfg, cfg == 0 ? "plain launches" : "graph", E.graph_report().c_str());
+    if (cfg == 0) std::printf("      %s\n", E.summary().c_str());
+    if (cfg == 1) CHECK(E.graph_report().find("replays 0") == std::string::npos);
   }
   const std::size_t nb = static_cast<std::size_t>(ndec) * row * sizeof(float);
-  const bool plain_split = std::memcmp(one[0].data(), ver[0].data(), nb) != 0;
-  const bool bi_eq = std::memcmp(one[1].data(), ver[1].data(), nb) == 0;
-  const bool gr_eq = std::memcmp(one[2].data(), ver[2].data(), nb) == 0 && std::memcmp(one[1].data(), one[2].data(), nb) == 0;
-  const bool rx_eq = std::memcmp(one[3].data(), ver[3].data(), nb) == 0;
+  const bool bi_eq = std::memcmp(one[0].data(), ver[0].data(), nb) == 0;
+  const bool gr_eq = std::memcmp(one[1].data(), ver[1].data(), nb) == 0 && std::memcmp(one[0].data(), one[1].data(), nb) == 0;
   CHECK(bi_eq);
   CHECK(gr_eq);
-  CHECK(rx_eq);
-  std::printf("    v47 R3 expert stage + multi-token loads: one token at a time vs verify batches of 4 %s\n", rx_eq ? "bit for bit" : "DIFFER");
-  std::printf("    one token at a time vs verify batches of 4: batched kernels %s; batch-identical %s; with the graph %s (and equal to plain launches)\n",
-              plain_split ? "differ (the split)" : "equal", bi_eq ? "bit for bit" : "DIFFER", gr_eq ? "bit for bit" : "DIFFER");
+  std::printf("    one token at a time vs verify batches of 4 (R3 expert stage, multi-token loads): plain launches %s; with the graph %s (and equal to plain launches)\n",
+              bi_eq ? "bit for bit" : "DIFFER", gr_eq ? "bit for bit" : "DIFFER");
 }
 
 // v52 (token kernel 3a): the fused MoE half (one cooperative launch per layer: residual, post norm, rounding, router, shared
-// gate, picks, grouping with the reader cache, plan, R3 expert stage, combine, residual) against the separate kernels: the
-// prompt (GPU steps of up to 4 tokens), one-token decode and verify batches of 4, with the graph, logits bit for bit
+// gate, picks, grouping with the reader cache, plan, R3 expert stage, combine, residual) against the separate kernels (v60:
+// a layer runs them when a side output needs them; here the trace): the prompt (GPU steps of up to 4 tokens), one-token
+// decode and verify batches of 4, with the graph, logits bit for bit
 TEST(rung4_engine_fused_moe_half) {
   if (!g::available()) return;
   Small sm;
@@ -526,20 +465,14 @@ TEST(rung4_engine_fused_moe_half) {
     eo.max_ctx = 128;
     eo.max_batch = 16;
     eo.max_verify = 4;
-    eo.cpu_threads = 4;
-    eo.cold_on_gpu = true;
     eo.hot_order.assign(s.n_layer, {});
     for (auto& v : eo.hot_order)
       for (int e = 0; e < static_cast<int>(s.n_expert); ++e) v.push_back(e);
     eo.max_hot_per_layer = 2;
     eo.reader_cache = 3;
-    eo.fold_shared = true;
-    eo.batch_identical = true;
     eo.graph = true;
-    eo.r3_experts = true;
-    eo.rx_load = 1;
     eo.router_tie = 0.01f;
-    eo.fused_moe = fz == 1;
+    eo.trace = fz == 0;  // v60: the trace is a side output, so every layer runs the separate kernels
     auto f = m::GpuEngine::open(s, sm.w, eo);
     CHECK(f.ok());
     if (!f.ok()) {
@@ -561,8 +494,9 @@ TEST(rung4_engine_fused_moe_half) {
       CHECK(E.keep(4).ok());
     }
     summ[fz] = E.summary();
+    if (fz == 0) CHECK(!E.trace_take().empty());
   }
-  const bool noted = summ[1].find("MoE half fused") != std::string::npos && summ[0].find("MoE half fused") == std::string::npos;
+  const bool noted = summ[1].find("MoE half fused") != std::string::npos;
   const bool eq = out[0].size() == out[1].size() && std::memcmp(out[0].data(), out[1].data(), out[0].size() * sizeof(float)) == 0;
   CHECK(noted);
   CHECK(eq);
@@ -587,7 +521,7 @@ TEST(rung4_engine_bit_planes) {
   std::vector<std::int32_t> tok(static_cast<std::size_t>(npre + ndec));
   for (std::size_t i = 0; i < tok.size(); ++i) tok[i] = static_cast<std::int32_t>((i * 29 + 5) % 1000);
   struct Cfg {
-    int bits, cache, load;
+    int bits, cache;
     bool probe;
   };
   auto run = [&](const Cfg& c, std::string* summ) {
@@ -595,18 +529,12 @@ TEST(rung4_engine_bit_planes) {
     eo.max_ctx = 128;
     eo.max_batch = 16;
     eo.max_verify = 4;
-    eo.cpu_threads = 4;
-    eo.cold_on_gpu = true;
     eo.hot_order.assign(s.n_layer, {});
     for (auto& v : eo.hot_order)
       for (int e = 0; e < static_cast<int>(s.n_expert); ++e) v.push_back(e);
     eo.max_hot_per_layer = 2;
     eo.reader_cache = c.cache;
-    eo.fold_shared = true;
-    eo.batch_identical = true;
     eo.graph = true;
-    eo.r3_experts = true;
-    eo.rx_load = c.load;
     eo.router_tie = 0.01f;
     eo.plane_bits = c.bits;
     eo.auto_vram = c.probe;
@@ -645,25 +573,23 @@ TEST(rung4_engine_bit_planes) {
                                      static_cast<std::size_t>(ndec) * row * sizeof(float)) == 0;
   };
   std::string summ, summp;
-  const std::vector<float> base = run({0, 3, 1, false}, nullptr);
-  const std::vector<float> p5 = run({5, 3, 1, false}, &summ);
-  const bool full_eq = same(base, p5);
+  const std::vector<float> base = run({5, 3, false}, &summ);  // v60: 5 bits (every code as stored) is the base
+  const bool full_eq = finite(base) && one_vs_ver(base);
   CHECK(full_eq);
   CHECK(summ.find("bit planes:") != std::string::npos);
-  const std::vector<float> p4 = run({4, 3, 1, false}, nullptr), p2 = run({2, 3, 1, false}, nullptr), p3 = run({3, 3, 1, false}, nullptr);
+  const std::vector<float> p4 = run({4, 3, false}, nullptr), p2 = run({2, 3, false}, nullptr), p3 = run({3, 3, false}, nullptr);
   const bool lossy = !same(p4, base) && !same(p2, base) && !same(p3, base) && !same(p2, p3) && !same(p3, p4) && finite(p2) && finite(p3) && finite(p4);
   CHECK(lossy);
   const bool det = one_vs_ver(p2) && one_vs_ver(p3) && one_vs_ver(p4);
   CHECK(det);
-  const std::vector<float> c0 = run({2, 0, 1, false}, nullptr), c1 = run({2, 1, 1, false}, nullptr), c4 = run({2, 4, 1, false}, nullptr),
-                           l2 = run({2, 3, 2, false}, nullptr);
-  const bool cache_free = same(p2, c0) && same(p2, c1) && same(p2, c4) && same(p2, l2);
+  const std::vector<float> c0 = run({2, 0, false}, nullptr), c1 = run({2, 1, false}, nullptr), c4 = run({2, 4, false}, nullptr);
+  const bool cache_free = same(p2, c0) && same(p2, c1) && same(p2, c4);
   CHECK(cache_free);
-  const std::vector<float> pr = run({5, 3, 1, true}, &summp);
+  const std::vector<float> pr = run({5, 3, true}, &summp);
   const bool probe = same(base, pr) && summp.find("VRAM probe:") != std::string::npos;
   CHECK(probe);
-  std::printf("    bit planes: 5 bits = stored layout %s; 4 / 3 / 2 bits change the logits %s, one token = verify batches %s; "
-              "2 bits with no cache / 1 / 3 / 4 slots / every expert staged %s; VRAM probe %s\n",
+  std::printf("    bit planes: 5 bits (stored layout) finite, one token = verify batches %s; 4 / 3 / 2 bits change the logits %s, one token = verify batches %s; "
+              "2 bits with no cache / 1 / 3 / 4 slots %s; VRAM probe %s\n",
               full_eq ? "bit for bit" : "DIFFER", lossy ? "(finite)" : "NOT AS EXPECTED", det ? "bit for bit" : "DIFFER",
               cache_free ? "bit for bit" : "DIFFER", probe ? "runs, same bits at 5" : "WRONG");
   std::printf("      %s\n", summp.c_str());
@@ -687,7 +613,6 @@ TEST(rung4_engine_verify_and_keep) {
   eo.max_ctx = 128;
   eo.max_batch = 16;
   eo.max_verify = 4;
-  eo.cpu_threads = 4;
   eo.hot_order.assign(s.n_layer, {});
   for (auto& v : eo.hot_order)
     for (int e = 0; e < static_cast<int>(s.n_expert); ++e) v.push_back(e);

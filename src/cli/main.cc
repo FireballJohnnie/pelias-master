@@ -2435,13 +2435,12 @@ int cmd_engine_check(const Args& a) {
   const std::string path = a.get("model");
   if (path.empty()) {
     std::fprintf(stderr,
-                 "usage: pelias engine-check --model FILE [--routes ROUTES.bin] [--prefill 64] [--decode 32] [--ctx 4096] [--batch 64] [--threads N]\n"
-                 "                           [--budget-gb G] [--hot-max N (default 40)] [--mtp-draft K] [--fast-cpu] [--no-cpu] [--float-ref]\n"
-                 "                           [--text FILE [--skip-tokens N]] [--timeline] [--dump-top OUT.tsv] [--dump-router OUT.tsv] [--dump-draft OUT.tsv] [--dump-split [--split-sizes 2,3,4] [--split-step]]\n"
-                 "                           [--no-doorbell] [--timeline-ops] [--split-ref] [--bank-selftest MIXES] [--probe-pos P]\n"
-                 "                           [--router-tie BAND (default 0.01)] [--no-cold-on-gpu] [--trace OUT.tsv] [--reader-cache K] [--no-fold-shared]\n"
-                 "                           [--batch-identical] [--no-graph] [--prefetch] [--plane-tail N] [--cpu-light] [--reader-rpw 1|2] [--no-r3-experts] [--rx-load lane|miss (default)|all] [--prompt-batched] [--cpu-prompt] [--no-cache-pools] [--no-fast-f32] [--dn-half] [--no-dn-smem] [--no-rx-pipe] [--no-rx-sact] [--no-fused-moe] [--no-mtp-fused] [--plane-bits 2|3|4|5] [--no-auto-vram] [--cache-share F] [--verbose-gpu]\n"
-                 "                           [--pin-gap-kib K] [--pin-huge-ok] [--cpu-up-rows N] [--cpu-down2] [--cpu-gu2] [--cpu-tile] [--spin-pause] [--cpu-prefetch] [--cpu-check] [--host-wait auto|spin|yield|block] [--pin-cpus 0,2,4,...] [--pin-host N] [--ref-threads N] [--no-cpu-light] [--split-slow] [--preload-light]\n");
+                 "usage: pelias engine-check --model FILE [--routes ROUTES.bin] [--prefill 64] [--decode 32] [--ctx 4096] [--batch 64]\n"
+                 "                           [--budget-gb G] [--hot-max N (default 40)] [--mtp-draft K] [--fast-cpu] [--no-cpu] [--float-ref] [--ref-threads N]\n"
+                 "                           [--text FILE [--skip-tokens N]] [--dump-top OUT.tsv] [--dump-router OUT.tsv] [--dump-draft OUT.tsv] [--dump-split [--split-sizes 2,3,4] [--split-step]]\n"
+                 "                           [--split-ref] [--probe-pos P] [--router-tie BAND (default 0.01)] [--trace OUT.tsv] [--reader-cache K] [--no-graph]\n"
+                 "                           [--plane-bits 2|3|4|5 (default 5)] [--no-auto-vram] [--cache-share F] [--verbose-gpu] [--pin-gap-kib K] [--pin-huge-ok] [--host-wait auto|spin|yield|block]\n"
+                 "                           (v60: the engine's A/B switches are locked in; --batch-identical and the other old switches are accepted and ignored)\n");
     return 1;
   }
   auto num = [&](const char* k, std::uint64_t d, std::uint64_t lo, std::uint64_t hi, std::uint64_t& out) {
@@ -2457,7 +2456,7 @@ int cmd_engine_check(const Args& a) {
   };
   std::uint64_t npre = 0, ndec = 0, ctx = 0, batch = 0, thr = 0, hmax = 0, ndraft = 0, skip = 0;
   if (!num("prefill", 64, 1, 1 << 20, npre) || !num("decode", 32, 0, 1 << 20, ndec) || !num("ctx", 4096, 2, 1 << 20, ctx) || !num("batch", 64, 1, 4096, batch) ||
-      !num("threads", 0, 0, 4096, thr) || !num("hot-max", 40, 0, 4096, hmax) || !num("mtp-draft", 0, 0, 16, ndraft) ||
+      !num("threads", 0, 0, 4096, thr) || !num("hot-max", 40, 0, 4096, hmax) || !num("mtp-draft", 0, 0, 16, ndraft) ||  // --threads: the CPU reference only (v60)
       !num("skip-tokens", 0, 0, std::uint64_t{1} << 40, skip))
     return 1;
   const std::string dump_top = a.get("dump-top");
@@ -2499,17 +2498,12 @@ int cmd_engine_check(const Args& a) {
   model::EngineOptions eo = model::EngineOptions::production();  // v58: the measured fast path is the starting point
   eo.max_ctx = static_cast<int>(ctx);
   eo.max_batch = static_cast<int>(batch);
-  eo.cpu_threads = static_cast<int>(thr);
   eo.vram_budget = budget;
   eo.max_hot_per_layer = static_cast<int>(hmax);
   eo.mtp = ndraft > 0 || !a.get("dump-draft").empty();  // v49b: the draft dump needs the MTP block
   eo.max_verify = static_cast<int>(ndraft) + 1;
-  eo.timeline = a.has("timeline");
   eo.router_margins = !a.get("dump-router").empty();  // v49
-  eo.doorbell = !a.has("no-doorbell");
-  eo.timeline_ops = a.has("timeline-ops");
-  // v24: the tie rule's band (the engine and the rounded CPU reference; the float reference keeps the plain order) and the
-  // picked-expert reader
+  // v24: the tie rule's band (the engine and the rounded CPU reference; the float reference keeps the plain order)
   float tie_band = eo.router_tie;  // v58: 0.01 unless --router-tie says otherwise
   if (a.has("router-tie")) {
     const std::string tv = a.get("router-tie");
@@ -2521,33 +2515,7 @@ int cmd_engine_check(const Args& a) {
     }
   }
   eo.router_tie = tie_band;
-  eo.cold_on_gpu = !a.has("no-cold-on-gpu");  // v58: on by default (--cold-on-gpu still accepted)
-  // v26 switches (each measured on its own in the run)
-  eo.fold_shared = !a.has("no-fold-shared");  // v58: on by default
-  eo.r3_experts = !a.has("no-r3-experts");  // v46a-1; v58: on by default
-  eo.gpu_prompt = !a.has("cpu-prompt");  // v49e: the GPU prompt by default (fix forward); --cpu-prompt / --prompt-batched are temporary diagnosis switches
-  eo.prompt_r3 = !a.has("prompt-batched");
-  if (a.has("rx-load")) {  // v46a-2
-    const std::string rxl = a.get("rx-load");
-    if (rxl == "lane") eo.rx_load = 0;
-    else if (rxl == "miss") eo.rx_load = 1;
-    else if (rxl == "all") eo.rx_load = 2;
-    else {
-      std::fprintf(stderr, "pelias: --rx-load takes lane, miss or all\n");
-      return 1;
-    }
-  }
-  eo.batch_identical = a.has("batch-identical");
   eo.graph = !a.has("no-graph");  // v58: on by default
-  eo.prefetch = a.has("prefetch");
-  if (a.has("plane-tail")) {
-    const Result<std::uint64_t> pt = io::parse_whole(a.get("plane-tail"), 8);
-    if (!pt.ok()) {
-      std::fprintf(stderr, "pelias: --plane-tail takes 0 .. 8 picks\n");
-      return 1;
-    }
-    eo.plane_tail = static_cast<int>(pt.value);
-  }
   if (a.has("reader-cache")) {
     const Result<std::uint64_t> rc = io::parse_whole(a.get("reader-cache"), 64);
     if (!rc.ok()) {
@@ -2555,20 +2523,6 @@ int cmd_engine_check(const Args& a) {
       return 1;
     }
     eo.reader_cache = static_cast<int>(rc.value);
-  }
-  // v28: the author's split (light experts on the CPU, heavy pinned for the GPU), rows per warp, the pin merge gap
-  // v28b (author 23:14) made the CPU split the default. v46 step 1 (THE PLAN, author 2026-11-01 17:46-17:54): the GPU does
-  // all of the decoding again; the split (light experts on the CPU) only with --cpu-light. --no-cpu-light is still accepted.
-  eo.cpu_light = a.has("cpu-light") && !a.has("no-cpu-light");
-  eo.split_slow = a.has("split-slow");
-  eo.preload_light = a.has("preload-light");
-  if (a.has("reader-rpw")) {
-    const Result<std::uint64_t> rw = io::parse_whole(a.get("reader-rpw"), 2);
-    if (!rw.ok() || rw.value < 1) {
-      std::fprintf(stderr, "pelias: --reader-rpw takes 1 or 2\n");
-      return 1;
-    }
-    eo.reader_rows_per_warp = static_cast<int>(rw.value);
   }
   if (a.has("pin-gap-kib")) {
     const Result<std::uint64_t> pgk = io::parse_whole(a.get("pin-gap-kib"), 1u << 20);
@@ -2579,43 +2533,17 @@ int cmd_engine_check(const Args& a) {
     eo.pin_gap = pgk.value << 10;
   }
   if (a.has("pin-huge-ok")) eo.pin_small_pages = false;  // v34: leave the registered ranges on 2 MB pages (the v33 stall)
-  if (a.has("cpu-up-rows")) {  // v40
-    const Result<std::uint64_t> ur = io::parse_whole(a.get("cpu-up-rows"), 512);
-    if (!ur.ok() || ur.value < 8) {
-      std::fprintf(stderr, "pelias: --cpu-up-rows takes 8 .. 512\n");
-      return 1;
-    }
-    eo.cpu_up_rows = static_cast<int>(ur.value);
-  }
-  eo.cpu_down2 = a.has("cpu-down2");
-  eo.cpu_prefetch = a.has("cpu-prefetch");
-  eo.cpu_gu2 = a.has("cpu-gu2");
-  eo.cpu_tile = a.has("cpu-tile");
-  eo.spin_pause = a.has("spin-pause");
-  eo.cpu_check = a.has("cpu-check");
-  if (a.has("pin-cpus")) {  // v43: comma list; the first is the doorbell thread, the rest the pool workers in order
-    std::string lst = a.get("pin-cpus");
-    std::size_t at = 0;
-    while (at <= lst.size()) {
-      const std::size_t comma = lst.find(',', at);
-      const std::string one = lst.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
-      const Result<std::uint64_t> c1 = io::parse_whole(one, 1023);
-      if (!c1.ok()) {
-        std::fprintf(stderr, "pelias: --pin-cpus takes logical CPU numbers separated by commas\n");
-        return 1;
-      }
-      eo.pin_pool.push_back(static_cast<int>(c1.value));
-      if (comma == std::string::npos) break;
-      at = comma + 1;
-    }
-  }
-  if (a.has("pin-host")) {
-    const Result<std::uint64_t> h1 = io::parse_whole(a.get("pin-host"), 1023);
-    if (!h1.ok()) {
-      std::fprintf(stderr, "pelias: --pin-host takes one logical CPU number\n");
-      return 1;
-    }
-    eo.pin_host = static_cast<int>(h1.value);
+  // v60: the switches the engine locked in (measured v46-v59) are accepted so the run scripts keep working, and say so once
+  {
+    static const char* const kLocked[] = {"batch-identical", "cold-on-gpu", "no-cold-on-gpu", "fold-shared", "no-fold-shared", "r3-experts", "no-r3-experts",
+                                          "rx-load", "cpu-prompt", "prompt-batched", "no-cache-pools", "no-fast-f32", "no-dn-half", "dn-half-mt", "no-dn-smem",
+                                          "no-rx-pipe", "no-rx-sact", "no-fused-moe", "no-mtp-fused", "no-doorbell", "timeline", "timeline-ops", "prefetch",
+                                          "plane-tail", "cpu-light", "no-cpu-light", "reader-rpw", "cpu-up-rows", "cpu-down2", "cpu-gu2", "cpu-tile",
+                                          "spin-pause", "cpu-prefetch", "cpu-check", "pin-cpus", "pin-host", "split-slow", "preload-light", "bank-selftest"};
+    std::string seen;
+    for (const char* k : kLocked)
+      if (a.has(k)) seen += std::string(seen.empty() ? "" : ", ") + "--" + k;
+    if (!seen.empty()) std::printf("pelias engine-check: %s: ignored (v60: locked in the engine, see gpu_engine.h)\n", seen.c_str());
   }
 
   // v25 trace: a new file (nothing is overwritten); the reader's steps, per layer
@@ -2653,15 +2581,6 @@ int cmd_engine_check(const Args& a) {
     if (!ho.ok()) return fail_input(ho.status);
     eo.hot_order = std::move(ho.value);
   }
-  eo.cache_pools = !a.has("no-cache-pools");  // v51 (temporary switch)
-  eo.fast_f32 = !a.has("no-fast-f32");        // v52 (temporary switch)
-  eo.dn_half = !a.has("no-dn-half");  // v55g (L3); v57: on by default again, --no-dn-half off (temporary, A/B)
-  eo.dn_half_mt = a.has("dn-half-mt");  // v57 (temporary, A/B)
-  eo.dn_smem = !a.has("no-dn-smem");  // v56b (temporary, A/B)
-  eo.rx_pipe = !a.has("no-rx-pipe");  // v57 (temporary, A/B)
-  eo.rx_sact = !a.has("no-rx-sact");  // v57 (temporary, A/B)
-  eo.fused_moe = !a.has("no-fused-moe");      // v52 (temporary switch)
-  eo.mtp_fused = !a.has("no-mtp-fused");      // v58 (temporary, A/B)
   eo.verbose_gpu = a.has("verbose-gpu");       // v55b
   if (a.has("plane-bits")) {  // v54b
     const Result<std::uint64_t> pb = io::parse_whole(a.get("plane-bits"), 5);
@@ -2704,18 +2623,6 @@ int cmd_engine_check(const Args& a) {
           "picks from the bank, picks from the file, bytes from VRAM, bytes from the file, reader us: grouping, gate/up, silu, down, combine; picks (tokens split by ;)\n"
        << "# " << eng.value->summary() << "\n";
   }
-  int selftest_bad = 0;
-  if (a.has("bank-selftest")) {  // v22: every bank expert against the CPU path, before any step (MIXES random 8-pick mixes per layer)
-    const Result<std::uint64_t> mr = io::parse_whole(a.get("bank-selftest"), 100000);
-    if (!mr.ok()) {
-      std::fprintf(stderr, "pelias: --bank-selftest takes a number of mixes per layer (0 for none)\n");
-      return 1;
-    }
-    std::string rep;
-    Timer tst;
-    if (Status st = eng.value->bank_selftest(static_cast<int>(mr.value), &rep, &selftest_bad); !st) return fail_input(st);
-    std::printf("  %s (%.1f s)\n", rep.c_str(), tst.seconds());
-  }
   const int n = static_cast<int>(npre + ndec);
   std::vector<std::int32_t> ids(static_cast<std::size_t>(n));
   if (a.has("text")) {  // v19: real text, tokens skip .. skip + n of the file (decode steps are fed the text's next tokens)
@@ -2739,11 +2646,7 @@ int cmd_engine_check(const Args& a) {
   model::EngineStats tot_pre, tot_dec;
   auto add = [](model::EngineStats& a2, const model::EngineStats& b2) {
     a2.seconds += b2.seconds;
-    a2.cold_seconds += b2.cold_seconds;
-    a2.wait_seconds += b2.wait_seconds;
     a2.hot_picks += b2.hot_picks;
-    a2.cold_picks += b2.cold_picks;
-    a2.cold_bytes += b2.cold_bytes;
   };
   int t = 0;
   const std::size_t ne_ = s.n_embd;
@@ -2757,14 +2660,6 @@ int cmd_engine_check(const Args& a) {
     t += k;
   }
   std::vector<double> per;
-  eng.value->timeline_reset();
-  {  // v30: the light experts' pre-load finishes before the measured decode (so the decode is warm)
-    double pls = 0.0;
-    std::uint64_t plb = 0;
-    if (eng.value->preload_wait(&pls, &plb))
-      std::printf("  pre-load of the light experts: %.2f GB touched in place in %.2f s (%.2f GB/s, background from start-up)\n", static_cast<double>(plb) / 1e9, pls,
-                  pls > 0 ? static_cast<double>(plb) / 1e9 / pls : 0.0);
-  }
   const os::PageFaults pf0 = os::page_faults();  // v30: page faults during the decode (Linux; zeros elsewhere)
   for (; t < n; ++t) {
     model::EngineStats es;
@@ -2828,114 +2723,24 @@ int cmd_engine_check(const Args& a) {
     std::fclose(fr);
     std::printf("  router margins: %d of %d positions written to %s\n", rows, n, dump_router.c_str());
   }
-  auto share = [](const model::EngineStats& e2) {
-    const double all = static_cast<double>(e2.hot_picks + e2.cold_picks);
-    return all > 0 ? 100.0 * static_cast<double>(e2.hot_picks) / all : 0.0;
-  };
-  std::printf("  prefill %llu tokens: %.3f s = %.1f tokens/s; picks on the GPU %.1f %%; CPU cold work %.3f s, host waits %.3f s\n",
-              static_cast<unsigned long long>(npre), tot_pre.seconds, static_cast<double>(npre) / tot_pre.seconds, share(tot_pre), tot_pre.cold_seconds,
-              tot_pre.wait_seconds);
+  std::printf("  prefill %llu tokens: %.3f s = %.1f tokens/s; %llu picks, all on the GPU\n", static_cast<unsigned long long>(npre), tot_pre.seconds,
+              static_cast<double>(npre) / tot_pre.seconds, static_cast<unsigned long long>(tot_pre.hot_picks));
   if (ndec > 0) {
     std::vector<double> sorted = per;
     std::sort(sorted.begin(), sorted.end());
     const double med = sorted[sorted.size() / 2];
-    std::printf("  decode %llu tokens: %.3f s = %.1f tokens/s (median step %.2f ms = %.1f tokens/s, slowest %.2f ms); picks on the GPU %.1f %%; CPU cold work %.2f ms, host waits %.2f ms per token\n",
+    std::printf("  decode %llu tokens: %.3f s = %.1f tokens/s (median step %.2f ms = %.1f tokens/s, slowest %.2f ms); %llu picks, all on the GPU\n",
                 static_cast<unsigned long long>(ndec), tot_dec.seconds, static_cast<double>(ndec) / tot_dec.seconds, med * 1e3, 1.0 / med, sorted.back() * 1e3,
-                share(tot_dec), tot_dec.cold_seconds * 1e3 / static_cast<double>(ndec), tot_dec.wait_seconds * 1e3 / static_cast<double>(ndec));
+                static_cast<unsigned long long>(tot_dec.hot_picks));
     if (os::page_faults_available()) {  // v30: page faults during the decode (major: read from the file / drive; minor: mapped without reading)
       const os::PageFaults pf1 = os::page_faults();
       std::printf("  page faults in the decode: %.1f major and %.0f minor per token\n",
                   static_cast<double>(pf1.major - pf0.major) / static_cast<double>(ndec), static_cast<double>(pf1.minor - pf0.minor) / static_cast<double>(ndec));
     }
-    if (tot_dec.cold_bytes > 0 && tot_dec.cold_seconds > 0.0)  // v28: the CPU's rate on its picks (bytes / its cold work time)
-      std::printf("  CPU cold experts: %llu picks, %.1f MB per token, %.2f GB/s over its cold work time\n", static_cast<unsigned long long>(tot_dec.cold_picks),
-                  static_cast<double>(tot_dec.cold_bytes) / 1e6 / static_cast<double>(ndec), static_cast<double>(tot_dec.cold_bytes) / tot_dec.cold_seconds / 1e9);
   }
   tflush("decode (the speed numbers above)");
   std::printf("  graph: %s\n", eng.value->graph_report().c_str());
   if (const std::string ph = eng.value->moe_phase_report(); !ph.empty()) std::printf("  %s\n", ph.c_str());  // v55b
-  if (a.has("timeline-ops") && ndec > 0) {  // v21: per operation, one-token steps
-    const model::EngineTimeline& T = eng.value->timeline();
-    if (T.ops_steps == 0) {
-      std::printf("  per-operation timeline: no steps recorded\n");
-    } else {
-      int nl[2] = {0, 0};
-      for (std::uint32_t il = 0; il < s.n_layer; ++il) ++nl[w.value.layers[il].recurrent ? 0 : 1];
-      std::printf("  per-operation timeline, %d one-token steps (stamps add a launch each; GPU clock), ms per token over %d DeltaNet + %d attention layers:\n",
-                  T.ops_steps, nl[0], nl[1]);
-      double tot[2] = {0.0, 0.0};
-      for (int k = 1; k < model::EngineTimeline::kOps; ++k) {
-        const double dn = 1e3 * T.ops[0][k] / T.ops_steps, at = 1e3 * T.ops[1][k] / T.ops_steps;
-        tot[0] += dn;
-        tot[1] += at;
-        std::printf("    %-46s DeltaNet %7.3f (%.3f per layer)   attention %7.3f (%.3f per layer)\n", model::kOpNames[k], dn, nl[0] ? dn / nl[0] : 0.0, at,
-                    nl[1] ? at / nl[1] : 0.0);
-      }
-      std::printf("    %-46s DeltaNet %7.3f   attention %7.3f   all %.3f ms per token\n", "sum", tot[0], tot[1], tot[0] + tot[1]);
-    }
-  }
-  if (a.has("timeline") && ndec > 0) {
-    const model::EngineTimeline& T = eng.value->timeline();
-    if (T.steps == 0) {
-      std::printf("  timeline: no steps recorded (needs the doorbell and mapped memory)\n");
-    } else {
-      const double k = 1e3 / T.steps;  // ms per token
-      auto sum = [](const std::vector<double>& v) {
-        double q = 0.0;
-        for (double x : v) q += x;
-        return q;
-      };
-      const double cold = sum(T.cpu_cold);
-      const double picks = static_cast<double>(T.hot_picks + T.cold_picks);
-      if (sum(T.gpu_dense) + sum(T.gpu_hot) + cold <= 0.0) {  // v25: reader steps only (no doorbell): the columns below do not apply
-        std::printf("  timeline: %d decode steps, every one with the expert reader (no doorbell, no CPU cold work); see the per-operation lines and the trace\n", T.steps);
-      } else {
-      std::printf("  timeline, %d decode steps, ms per token (GPU clock): dense %.2f, bank + shared experts %.2f, idle waiting for the CPU %.2f\n", T.steps,
-                  sum(T.gpu_dense) * k, sum(T.gpu_hot) * k, sum(T.gpu_idle) * k);
-      std::printf("  timeline, ms per token (CPU clock): waiting for the ring %.2f, cold experts %.2f = input rounding %.2f + gate/up %.2f + silu %.2f + down %.2f + combine %.2f\n",
-                  sum(T.cpu_wait) * k, cold * k, T.stage[0] * k, T.stage[1] * k, T.stage[2] * k, T.stage[3] * k, T.stage[4] * k);
-      std::printf("  timeline: cold %.1f MB per token, %.1f GB/s over the cold time; thread use (item time / (wall x %d threads)) gate/up %.0f %%, down %.0f %%; first worker starts %.1f us after a job opens (mean of %d); picks on the GPU %.1f %%\n",
-                  T.cold_bytes / T.steps / 1e6, cold > 0 ? T.cold_bytes / cold / 1e9 : 0.0, T.threads,
-                  T.stage[1] > 0 ? 100.0 * T.busy[1] / (T.stage[1] * T.threads) : 0.0, T.stage[3] > 0 ? 100.0 * T.busy[3] / (T.stage[3] * T.threads) : 0.0,
-                  T.wake_n ? 1e6 * T.wake / T.wake_n : 0.0, T.wake_n, picks > 0 ? 100.0 * static_cast<double>(T.hot_picks) / picks : 0.0);
-      if (T.split_stamps)
-        std::printf("  timeline (split path, v39): silu is inside gate/up and the combine inside down; the first item starts %.1f us after a layer's job opens\n",
-                    T.wake_n ? 1e6 * T.wake / T.wake_n : 0.0);
-      if (T.split_stamps && T.thr_n > 0) {  // v40: per thread, ms per token of item time
-        double umin = 1e30, umax = 0.0, dmin = 1e30, dmax = 0.0;
-        std::printf("  timeline (v40) per thread, ms per token, gate/up | down:");
-        for (int q2 = 0; q2 < T.thr_n; ++q2) {
-          const double u = T.thr_up[q2] * k, d = T.thr_dn[q2] * k;
-          if (u <= 0.0 && d <= 0.0) continue;
-          umin = std::min(umin, u); umax = std::max(umax, u); dmin = std::min(dmin, d); dmax = std::max(dmax, d);
-          std::printf(" [%d] %.2f | %.2f", q2, u, d);
-        }
-        std::printf("\n  timeline (v40): gate/up per thread %.2f .. %.2f ms, down %.2f .. %.2f ms per token\n", umin, umax, dmin, dmax);
-      }
-      if (T.lag_n > 0)
-        std::printf("  timeline (v45): first down item after gate/up ends: mean %.1f us, max %.1f us (%llu thread-layers)\n", 1e6 * T.lag_sum / static_cast<double>(T.lag_n),
-                    1e6 * T.lag_max, static_cast<unsigned long long>(T.lag_n));
-      if (T.gu2_rows > 0)
-        std::printf("  check (v45): paired gate/up vs one-row path: %llu rows compared, %llu differ (bit for bit)\n", static_cast<unsigned long long>(T.gu2_rows),
-                    static_cast<unsigned long long>(T.gu2_mismatch));
-      if (T.round_n > 0)
-        std::printf("  check (v45): AVX2 input rounding vs scalar: %llu vectors compared, %llu differ (bit for bit)\n", static_cast<unsigned long long>(T.round_n),
-                    static_cast<unsigned long long>(T.round_mismatch));
-      if (T.gx_n > 0)
-        std::printf("  check (v45b): GPU rounded input vs CPU rounded input: %llu vectors compared, %llu differ (bit for bit)\n", static_cast<unsigned long long>(T.gx_n),
-                    static_cast<unsigned long long>(T.gx_mismatch));
-      if (T.down2_rows > 0)
-        std::printf("  check (v40): two-row down vs one-row path: %llu rows compared, %llu differ (bit for bit)\n", static_cast<unsigned long long>(T.down2_rows),
-                    static_cast<unsigned long long>(T.down2_mismatch));
-      for (std::size_t il = 0; il < T.gpu_dense.size(); ++il) {
-        std::printf("    layer %2zu: GPU dense %.3f, bank + shared %.3f, idle %.3f | CPU wait %.3f, cold %.3f ms", il, T.gpu_dense[il] * k, T.gpu_hot[il] * k, T.gpu_idle[il] * k,
-                    T.cpu_wait[il] * k, T.cpu_cold[il] * k);
-        if (T.split_stamps && il < T.cpu_picks.size()) std::printf(" | CPU picks %.2f, expert groups %.2f per token", T.cpu_picks[il] / T.steps, T.cpu_groups[il] / T.steps);
-        std::printf("\n");
-      }
-      }
-    }
-  }
   // --mtp-draft K: greedy decoding of --decode tokens from the made-up prompt, plain and with MTP drafting (K per step):
   // the same tokens expected (the reference's generate_greedy_mtp contract), the kept share, and the speed of each
   if (ndraft > 0 && ndec > 0) {
@@ -2992,7 +2797,6 @@ int cmd_engine_check(const Args& a) {
     model::MtpStats ms;
     model::EngineStats emt;
     model::EngineMtpTiming tmg;
-    eng.value->timeline_reset();
     Timer tmt;
     if (Status st = model::engine_generate_greedy_mtp(*eng.value, s, prompt, static_cast<int>(ndec), static_cast<int>(ndraft), {}, drafted, &ms, &emt, {}, &tmg); !st)
       return fail_input(st);
@@ -3014,27 +2818,16 @@ int cmd_engine_check(const Args& a) {
         std::snprintf(buf, sizeof buf, "%s%s%d: %d x %.1f ms", vb_s.empty() ? "" : ", ", b2 == 9 ? ">" : "", b2 == 9 ? 8 : b2, tmg.verify_n[b2], 1e3 * tmg.verify_s[b2] / tmg.verify_n[b2]);
         vb_s += buf;
       }
-      std::printf("  MTP time: prompt %.3f s; drafts %d x %.1f ms = %.3f s; verify %.3f s (by batch size %s); keep %.3f s; MTP catch-up %.3f s; promote %.3f s; host argmax %.3f s\n",
-                  tmg.prompt_s, tmg.drafts, tmg.drafts ? 1e3 * tmg.draft_s / tmg.drafts : 0.0, tmg.draft_s, vs, vb_s.c_str(), tmg.keep_s, tmg.catchup_s, tmg.promote_s,
-                  tmg.argmax_s);
+      std::printf("  MTP time: prompt %.3f s; drafts %d x %.1f ms = %.3f s; verify %.3f s (by batch size %s); keep %.3f s; MTP catch-up %.3f s; host argmax %.3f s\n",
+                  tmg.prompt_s, tmg.drafts, tmg.drafts ? 1e3 * tmg.draft_s / tmg.drafts : 0.0, tmg.draft_s, vs, vb_s.c_str(), tmg.keep_s, tmg.catchup_s, tmg.argmax_s);
       // v28b (author 23:14, the unlisted ~1.5 s): the MTP run's total minus the plain run's prefill still holds the MTP run's own
       // longer prompt phase; here the decode phase alone, and what is left after the listed parts
       const double mtp_dec = mtp_s + pre_s - tmg.prompt_s;
-      const double listed = tmg.draft_s + vs + tmg.keep_s + tmg.catchup_s + tmg.promote_s + tmg.argmax_s;
+      const double listed = tmg.draft_s + vs + tmg.keep_s + tmg.catchup_s + tmg.argmax_s;
       std::printf("  MTP check: plain prefill %.3f s, MTP prompt %.3f s (%.3f s more, charged to the MTP run above); decode phase alone: plain %.3f s vs MTP %.3f s = %.2fx; listed parts %.3f s, not listed %.3f s\n",
                   pre_s, tmg.prompt_s, tmg.prompt_s - pre_s, plain_s, mtp_dec, mtp_dec > 0 ? plain_s / mtp_dec : 0.0, listed, mtp_dec - listed);
       if (const std::string ph = eng.value->moe_phase_report(); !ph.empty()) std::printf("  after the MTP run (v57): %s\n", ph.c_str());  // the verify-step stamps
       if (const std::string mp = eng.value->mtp_path_report(); !mp.empty()) std::printf("  %s\n", mp.c_str());  // v58
-      if (a.has("timeline")) {
-        const model::EngineTimeline& T = eng.value->timeline();
-        for (int b2 = 1; b2 < 10; ++b2) {
-          const double c = T.by_n_steps[b2];
-          if (c <= 0) continue;
-          std::printf("  timeline, trunk steps of %s%d tokens: %.0f steps, per step wall %.2f ms, GPU busy %.2f, GPU idle %.2f | CPU cold %.2f, CPU wait %.2f ms\n",
-                      b2 == 9 ? "more than " : "", b2 == 9 ? 8 : b2, c, 1e3 * T.by_n_wall[b2] / c, 1e3 * T.by_n_gpu_busy[b2] / c, 1e3 * T.by_n_gpu_idle[b2] / c,
-                      1e3 * T.by_n_cpu_cold[b2] / c, 1e3 * T.by_n_cpu_wait[b2] / c);
-        }
-      }
     }
     // v19 / v20 --dump-split: the plain tokens again, through batches of each split size (verify: the MTP's path with the
     // DeltaNet checkpoints; with --split-step also plain step() batches, no checkpoints), each row against the one-token
@@ -3235,7 +3028,7 @@ int cmd_engine_check(const Args& a) {
       }
     }
   }
-  if (a.has("no-cpu")) return selftest_bad > 0 ? 4 : 0;
+  if (a.has("no-cpu")) return 0;
   model::ForwardOptions o = model::GpuForward::matching_reference_options();
   o.threads = static_cast<int>(thr);
   if (a.has("ref-threads")) {  // v28: the CPU reference's threads apart from the engine's cold-path workers (--threads)
@@ -3575,7 +3368,6 @@ int cmd_generate(const Args& a) {
     model::EngineOptions eo2 = model::EngineOptions::production();  // v58: the measured fast path (was the bank + CPU path)
     eo2.max_ctx = n_ctx;
     eo2.max_batch = 64;
-    eo2.cpu_threads = threads;
     if (!gib_option(a, "budget-gb", eo2.vram_budget)) return 1;
     if (a.has("plane-bits")) {
       const Result<std::uint64_t> pb = io::parse_whole(a.get("plane-bits"), 5);
@@ -3687,11 +3479,7 @@ int cmd_generate(const Args& a) {
       s = model::generate_greedy_mtp(spec.value, w.value, ids, n_predict, static_cast<int>(r.value), stop, out, &ms, fo);
     }
     if (!s) return fail_input(s);
-    if (engine) {
-      const double all = static_cast<double>(emt.hot_picks + emt.cold_picks);
-      std::fprintf(stderr, "pelias generate: engine picks on the GPU %.1f %% (trunk and MTP block); CPU cold work %.2f s, host waits %.2f s\n",
-                   all > 0 ? 100.0 * static_cast<double>(emt.hot_picks) / all : 0.0, emt.cold_seconds, emt.wait_seconds);
-    }
+    if (engine) std::fprintf(stderr, "pelias generate: %llu engine picks, all on the GPU (trunk and MTP block)\n", static_cast<unsigned long long>(emt.hot_picks));
     const double gen_s = tg.seconds();
     for (const std::int32_t id : out)
       if (std::find(stop.begin(), stop.end(), id) == stop.end() && (show_special || tk.value.type(id) != tok::TokenType::control)) {
@@ -3730,10 +3518,7 @@ int cmd_generate(const Args& a) {
   auto engine_step = [&](const std::int32_t* tk2, int n2) -> Status {
     model::EngineStats es;
     const Status r2 = engine->step(tk2, n2, logits.data(), true, &es);
-    es_tot.cold_seconds += es.cold_seconds;
-    es_tot.wait_seconds += es.wait_seconds;
     es_tot.hot_picks += es.hot_picks;
-    es_tot.cold_picks += es.cold_picks;
     return r2;
   };
   if (engine) {
@@ -3778,11 +3563,7 @@ int cmd_generate(const Args& a) {
     if (!s) return fail_input(s);
   }
   const double decode_s = td.seconds();
-  if (engine) {
-    const double all = static_cast<double>(es_tot.hot_picks + es_tot.cold_picks);
-    std::fprintf(stderr, "pelias generate: engine picks on the GPU %.1f %%; CPU cold work %.2f s, host waits %.2f s\n",
-                 all > 0 ? 100.0 * static_cast<double>(es_tot.hot_picks) / all : 0.0, es_tot.cold_seconds, es_tot.wait_seconds);
-  }
+  if (engine) std::fprintf(stderr, "pelias generate: %llu engine picks, all on the GPU\n", static_cast<unsigned long long>(es_tot.hot_picks));
   std::fputs("\n", tout);
   std::fflush(tout);
   if (tout != stdout) std::fclose(tout);
