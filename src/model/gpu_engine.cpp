@@ -912,7 +912,7 @@ struct GpuEngine::Impl {
             }
           });
         for (auto& t : th) t.join();
-        char pb[200];
+        char pb[320];
         std::snprintf(pb, sizeof pb, "; bit planes: %zu Q4_TG2 / Q5_K matrices outside the bank, %.2f GB pinned (rows packed at the slider's prefix, v60), built in %.2f s; every pick read with %d bits (at most each matrix's own), bank and slots sized for them",
                       jobs.size(), static_cast<double>(tot) / 1e9, since(tp), o.plane_bits);
         planes_note = pb;
