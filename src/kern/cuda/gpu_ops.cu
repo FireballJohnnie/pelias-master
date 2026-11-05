@@ -1351,6 +1351,33 @@ bool to_host_async(void* dst, const void* src, std::size_t bytes, Stream s) {
 bool dcopy(void* dst, const void* src, std::size_t bytes, Stream s) {
   return ck(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, st(s)), "device copy");
 }
+// v60 C3: the SM-load probe over a mapped host range (the path the expert stage's loads take; v60e MEASURED: the copy
+// engine read 26 GB/s in an arm whose SM loads ran 2.8x slow). mode 0: streaming, every thread one 16 B word per step,
+// coalesced; mode 1: one 128 B line per 4 KB page (8 lanes per line, the next line 4 KB on): the translation-bound pattern.
+// The xor keeps the loads live; *out is written only for an unreachable value.
+__global__ void k_probe_read(const uint4* __restrict__ p, std::size_t n16, int mode, unsigned* out) {
+  unsigned acc = 0;
+  const std::size_t total = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+  const std::size_t tid = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (mode == 0) {
+    for (std::size_t i = tid; i < n16; i += total) {
+      const uint4 v = p[i];
+      acc ^= v.x ^ v.y ^ v.z ^ v.w;
+    }
+  } else {
+    const std::size_t pages = n16 / 256, lines = total / 8;
+    for (std::size_t g = tid / 8; g < pages; g += lines) {
+      const uint4 v = p[g * 256 + (tid & 7)];
+      acc ^= v.x ^ v.y ^ v.z ^ v.w;
+    }
+  }
+  if (acc == 0x9e3779b9u) atomicAdd(out, 1u);
+}
+bool probe_read_sm(const void* src, std::size_t bytes, int mode, unsigned* out, Stream s) {
+  if (!src || !out || bytes < 4096) return fail("probe_read_sm: bad range");
+  k_probe_read<<<46 * 8, 256, 0, st(s)>>>(static_cast<const uint4*>(src), bytes / 16, mode, out);
+  return launched("probe_read_sm");
+}
 bool dcopy_any(void* dst, const void* src, std::size_t bytes, Stream s) {  // v60 C2
   return ck(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDefault, st(s)), "copy (default kind)");
 }

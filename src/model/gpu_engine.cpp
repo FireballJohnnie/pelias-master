@@ -940,25 +940,38 @@ struct GpuEngine::Impl {
         // binary, same VM): the pinned-read probe. The copy engine reads `pb_bytes` of the planes into a VRAM scratch (the
         // mapping the expert stage's loads go through); best of two passes in GB/s. Below o.pin_read_min_gbs (0: log only)
         // the planes are freed, pinned and packed again, up to o.pin_read_tries times; every try's number is logged
-        double gbs_best = 0.0, gbs_first = 0.0;
+        // v60 C3 (v60e MEASURED: the copy engine read 26 GB/s in the slow arm too): three readers of the same 512 MB - the copy
+        // engine, SM streaming loads, SM one-line-per-page loads (the expert stage's kind); the floor applies to the page-line
+        // number (GB/s of 128 B lines), the one that should see a badly mapped range
+        double gbs_copy = 0.0, gbs_sm = 0.0, gbs_pg = 0.0, pg_first = 0.0;
         int tries = 1;
         {
-          const std::size_t pb_bytes = std::min<std::size_t>(std::size_t{512} << 20, static_cast<std::size_t>(tot));
-          void* scratch = g::dalloc(pb_bytes);
-          auto probe = [&]() -> double {
-            if (!scratch) return -1.0;
+          const std::size_t pb_bytes = std::min<std::size_t>(std::size_t{512} << 20, static_cast<std::size_t>(tot)) & ~std::size_t{4095};
+          void* scratch = pb_bytes >= 4096 ? g::dalloc(pb_bytes + 256) : nullptr;
+          unsigned* live = scratch ? reinterpret_cast<unsigned*>(static_cast<std::uint8_t*>(scratch) + pb_bytes) : nullptr;
+          auto timed = [&](const std::function<bool()>& f, double bytes_moved) -> double {
             double best = 0.0;
             for (int pass = 0; pass < 2; ++pass) {
               if (!g::sync()) return -1.0;
               const Clock::time_point t1 = Clock::now();
-              if (!g::dcopy_any(scratch, planes_dev, pb_bytes) || !g::sync()) return -1.0;
+              if (!f() || !g::sync()) return -1.0;
               const double sec = since(t1);
-              if (sec > 0.0) best = std::max(best, static_cast<double>(pb_bytes) / sec / 1e9);
+              if (sec > 0.0) best = std::max(best, bytes_moved / sec / 1e9);
             }
             return best;
           };
-          gbs_first = gbs_best = probe();
-          while (o.pin_read_min_gbs > 0.0 && gbs_best >= 0.0 && gbs_best < o.pin_read_min_gbs && tries < std::max(1, o.pin_read_tries)) {
+          auto probe = [&]() {
+            if (!scratch) {
+              gbs_copy = gbs_sm = gbs_pg = -1.0;
+              return;
+            }
+            gbs_copy = timed([&]() { return g::dcopy_any(scratch, planes_dev, pb_bytes); }, static_cast<double>(pb_bytes));
+            gbs_sm = timed([&]() { return g::probe_read_sm(planes_dev, pb_bytes, 0, live); }, static_cast<double>(pb_bytes));
+            gbs_pg = timed([&]() { return g::probe_read_sm(planes_dev, pb_bytes, 1, live); }, static_cast<double>(pb_bytes / 4096) * 128.0);
+          };
+          probe();
+          pg_first = gbs_pg;
+          while (o.pin_read_min_gbs > 0.0 && gbs_pg >= 0.0 && gbs_pg < o.pin_read_min_gbs && tries < std::max(1, o.pin_read_tries)) {
             g::host_free(planes_h);
             planes_h = nullptr;
             planes_dev = nullptr;
@@ -968,16 +981,16 @@ struct GpuEngine::Impl {
               g::dfree(scratch);
               return;
             }
-            gbs_best = probe();
+            probe();
           }
           g::dfree(scratch);
-          pin_read_gbs = gbs_best;
+          pin_read_gbs = gbs_pg;
           pin_read_tries = tries;
         }
-        char pb[400];
+        char pb[460];
         std::snprintf(pb, sizeof pb,
-                      "; bit planes: %zu Q4_TG2 / Q5_K matrices outside the bank, %.2f GB pinned (rows packed at the slider's prefix, v60), built in %.2f s; every pick read with %d bits (at most each matrix's own), bank and slots sized for them; pinned read %.1f GB/s (copy engine, 512 MB best of 2; first pin %.1f, %d pin%s, floor %.0f)",
-                      jobs.size(), static_cast<double>(tot) / 1e9, pack_s, o.plane_bits, gbs_best, gbs_first, tries, tries == 1 ? "" : "s", o.pin_read_min_gbs);
+                      "; bit planes: %zu Q4_TG2 / Q5_K matrices outside the bank, %.2f GB pinned (rows packed at the slider's prefix, v60), built in %.2f s; every pick read with %d bits (at most each matrix's own), bank and slots sized for them; pinned read (512 MB, best of 2): copy engine %.1f, SM streaming %.1f, SM one line per page %.1f GB/s (first pin %.1f, %d pin%s, floor %.0f on the page lines)",
+                      jobs.size(), static_cast<double>(tot) / 1e9, pack_s, o.plane_bits, gbs_copy, gbs_sm, gbs_pg, pg_first, tries, tries == 1 ? "" : "s", o.pin_read_min_gbs);
         planes_note = pb;
       }
     }
@@ -1258,12 +1271,16 @@ struct GpuEngine::Impl {
           dev_bytes += cache_reserved + meta_b;
           char cb[320];
           if (use_pools)
-            std::snprintf(cb, sizeof cb, "; cache %.2f GB in size pools (%d slots of %d before; %d-%d slots per layer, %.1f average%s%.0f MB more for the MTP row = %d slots, v60 C)",
-                          static_cast<double>(cache_reserved) / 1e9, rc_eff, rc_eff, kmin, K, static_cast<double>(kall) / static_cast<double>(nl),
-                          mtp_rd ? "; " : "", mtp_rd ? static_cast<double>(mtp_cache_bonus) / 1048576.0 : 0.0, mtp_rd ? rcache.back().K : 0);
+            std::snprintf(cb, sizeof cb, "; cache %.2f GB in size pools (%d slots of %d before; %d-%d slots per layer, %.1f average)",
+                          static_cast<double>(cache_reserved) / 1e9, rc_eff, rc_eff, kmin, K, static_cast<double>(kall) / static_cast<double>(nl));
           else
             std::snprintf(cb, sizeof cb, "; cache %d slots per layer, %.2f GB (size pools off: layout over budget)", K, static_cast<double>(cache_reserved) / 1e9);
           cache_note = cb;
+          if (use_pools && mtp_rd) {  // v60 C: the MTP row's extra cache
+            char mb[120];
+            std::snprintf(mb, sizeof mb, "; %.0f MB more for the MTP row = %d slots (v60 C)", static_cast<double>(mtp_cache_bonus) / 1048576.0, rcache.back().K);
+            cache_note += mb;
+          }
         }
       }
       if (rcache.empty()) cache_note = "; cache off (device memory)";

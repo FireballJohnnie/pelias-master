@@ -68,7 +68,7 @@ struct EngineOptions {
   int mtp_cache_mb = 0;
   // v60 commit C2: the pinned-planes read probe at open (copy engine, GB/s, logged). pin_read_min_gbs > 0: below it the
   // planes are freed, pinned and packed again, up to pin_read_tries times (v60d: three of five arms read them 2-3x slower)
-  double pin_read_min_gbs = 0.0;
+  double pin_read_min_gbs = 0.0;  // v60 C3: applies to the SM one-line-per-page read (GB/s of 128 B lines)
   int pin_read_tries = 3;
   // v24 tie rule (author 18:19): every router call orders experts by floor((logit - max) / router_tie, lower index first
   // within a band (router_topk's tie_band; the CPU reference's ForwardOptions::router_tie_band). 0: by probability.
