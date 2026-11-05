@@ -365,7 +365,10 @@ TEST(rung4_engine_decode_against_the_reference) {
   engine_case(sm, 0, "engine, no bank, trace (separate kernels)", 0.0f, 0, false, true);
   engine_case(sm, 4, "engine, half the experts in the bank");
   engine_case(sm, 8, "engine, every expert in the bank");
-  engine_case(sm, 4, "engine, tie band 0.01", 0.01f);
+  // v60: the tie band through the fused half's fast router vs through router_topk (the separate kernels, forced by the trace):
+  // the reference orders by the same band; a gap between the two is the fused router's tie rule
+  engine_case(sm, 4, "engine, tie band 0.01 (fused router)", 0.01f);
+  engine_case(sm, 4, "engine, tie band 0.01, trace (router_topk)", 0.01f, 0, false, true);
   // v26: the cache changes where bytes come from, never the arithmetic: logits bit for bit with and without it
   const std::vector<float> r0 = engine_case(sm, 2, "engine, bank 2", 0.0f, 0);
   const std::vector<float> r1 = engine_case(sm, 2, "engine, bank 2 + cache 3", 0.0f, 3);
