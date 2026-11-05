@@ -1808,8 +1808,12 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
       const std::uintptr_t pg = 4096, a = reinterpret_cast<std::uintptr_t>(te.data), b = a + static_cast<std::uintptr_t>(te.row_bytes * te.ne[1]);
       void* dv = nullptr;
       std::string why;
-      if (g::host_register(reinterpret_cast<void*>(a & ~(pg - 1)), static_cast<std::size_t>(((b + pg - 1) & ~(pg - 1)) - (a & ~(pg - 1))), &dv, &why)) {
-        I.reg_bases.push_back(reinterpret_cast<void*>(a & ~(pg - 1)));
+      const std::uintptr_t ra = a & ~(pg - 1), rl = ((b + pg - 1) & ~(pg - 1)) - ra;
+      // v60c: the same small-pages advise the reader's file ranges get before registering (v27): registering the mapping
+      // on huge pages spun in the kernel (v60b GP5: 290 s of system time in open, no progress)
+      if (o.pin_small_pages) hal::advise_small_pages(reinterpret_cast<void*>(ra), static_cast<std::size_t>(rl));
+      if (g::host_register(reinterpret_cast<void*>(ra), static_cast<std::size_t>(rl), &dv, &why)) {
+        I.reg_bases.push_back(reinterpret_cast<void*>(ra));
         I.emb_dev = static_cast<const std::uint8_t*>(dv) + (a - (a & ~(pg - 1)));
         I.probe_note += "; token embedding gathered on the GPU from the registered file rows (v60)";
       } else {
