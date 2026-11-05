@@ -62,6 +62,10 @@ struct EngineOptions {
   // the fused launch as the reader's row n_layer, its experts in bit planes / the file mapping; its own attention cache).
   int max_verify = 0;
   bool mtp = false;
+  // v60 commit C: extra VRAM for the MTP row's reader cache in MiB (its experts are read on every draft and catch-up step
+  // and are not plane types). 0: the activation bytes the v60b layout held for unreachable rows (act_freed, logged); more
+  // comes out of the bank (an A/B knob, --mtp-cache-mb)
+  int mtp_cache_mb = 0;
   // v24 tie rule (author 18:19): every router call orders experts by floor((logit - max) / router_tie, lower index first
   // within a band (router_topk's tie_band; the CPU reference's ForwardOptions::router_tie_band). 0: by probability.
   float router_tie = 0.0f;
@@ -145,6 +149,11 @@ class GpuEngine {
   Status verify_top(const std::int32_t* tokens, int n, std::int32_t* top, float* hidden_out, EngineStats* st = nullptr);
   Status mtp_step_top(const std::int32_t* tokens, const float* h_prev, int n, std::int32_t* top, float* h_out, EngineStats* st = nullptr);
   [[nodiscard]] std::int64_t mtp_pos() const;
+  // v60 commit C: the MTP greedy loop keeps the hidden rows, the draft chain and the MTP block's input on the device
+  // (engine_generate_greedy_mtp reaches the engine's device buffers; no API for host callers changed)
+  friend Status engine_generate_greedy_mtp(GpuEngine& eng, const Qwen35MoeSpec& s, const std::vector<std::int32_t>& prompt, int n_predict, int n_draft,
+                                           const std::vector<std::int32_t>& stops, std::vector<std::int32_t>& out, MtpStats* stats, EngineStats* es,
+                                           const std::function<void(std::int32_t)>& on_token, EngineMtpTiming* tm);
   [[nodiscard]] std::uint64_t device_bytes() const;
   [[nodiscard]] int max_batch() const;
   [[nodiscard]] int bank_experts() const;      // experts held on the GPU (all layers)

@@ -22,7 +22,6 @@
 #include "kern/tg2_planes.h"
 #include "kern/gpu_ops.h"
 #include "kern/gpu_decode.h"
-#include "kern/gpu_decode.h"
 #include "kern/gpu_prompt.h"
 #include "kern/gpu_stream.h"
 #include "quant/block_types.h"
@@ -124,8 +123,7 @@ struct GpuEngine::Impl {
   DevW out;
   const float* out_norm = nullptr;
   const float* rope_ff = nullptr;
-  g::MoeScratch moe;
-  float *x = nullptr, *xn = nullptr, *y = nullptr, *xr = nullptr, *scale = nullptr, *dig = nullptr;
+  float *x = nullptr, *xn = nullptr, *y = nullptr, *xr = nullptr, *scale = nullptr;
   std::int8_t* q = nullptr;
   int* sum = nullptr;
   float *qg = nullptr, *att = nullptr, *ascr = nullptr;
@@ -135,7 +133,6 @@ struct GpuEngine::Impl {
   unsigned* dn_hcnt = nullptr;  // v55g (L3): per value head, the dense half's units that finished it (zero between launches)
   std::uint64_t dn_half_runs = 0;
   float *logits_r = nullptr, *wsel = nullptr, *gs = nullptr, *us = nullptr, *sh = nullptr, *gsh = nullptr, *galpha = nullptr, *zero2 = nullptr;
-  float* yc = nullptr;  // the cold sum, copied up
   std::int32_t* sel = nullptr;
   float* lg = nullptr;
   // v24 picked-expert reader
@@ -155,7 +152,7 @@ struct GpuEngine::Impl {
   // v26 reader v3: the shared expert per layer (device), the groups' sources / fills, the cache
   g::ExpertPtr *rshx = nullptr, *rgsrc = nullptr, *rgfill = nullptr;
   bool fold_ok = false;
-  std::uint64_t cache_reserved = 0, cslot = 0;
+  std::uint64_t cache_reserved = 0, cslot = 0, mtp_cache_bonus = 0;  // v60 commit C: the MTP row's extra cache bytes
   int rc_eff = 0;      // v54b: the reader cache's slots per layer (--reader-cache, or the VRAM probe's)
   std::string probe_note;
   void* cache_mem = nullptr;
@@ -178,6 +175,7 @@ struct GpuEngine::Impl {
   double vph_sum[3][4] = {}, vdph_sum[3][4] = {};
   std::uint64_t vph_steps[3] = {}, vdph_steps[3] = {};
   unsigned long long* rst_d = nullptr;                    // v55e3 diagnosis: the expert stage's counters (g::kRxStatN, verbose_gpu)
+  unsigned long long* rst_mtp_d = nullptr;                // v60 commit C: the MTP row's own (its draft / catch-up launches)
   double ph_sum[4] = {0, 0, 0, 0};
   std::uint64_t ph_steps = 0, ph_layers = 0;
   std::string rx_note = "off";
@@ -192,7 +190,7 @@ struct GpuEngine::Impl {
   std::vector<float> rmarg;                  // v49: per position 2 x n_layer router margins
   std::vector<std::uint8_t> rmarg_have;
   std::uint64_t trace_seq = 0;
-  static constexpr int kOutRows = 64;
+  static constexpr int kOutRows = 4;  // v60 commit C: every step is 1-4 tokens (kReaderMax); the head runs at most 4 rows
   // verify / keep (stage 3)
   bool ckpt_mode = false;
   bool in_prompt = false;   // v48b: a step of a split prompt (its products of 2-4 tokens go through R3, as option B's)
@@ -213,8 +211,19 @@ struct GpuEngine::Impl {
   DevW eh, head;
   const float *enorm = nullptr, *hnorm = nullptr, *head_norm = nullptr;
   std::int64_t mtp_pos = 0;
-  float* cat = nullptr;  // max_batch x 2 n_embd
+  float* cat = nullptr;  // kReaderMax x 2 n_embd
   std::vector<float> cat_h;
+  // v60 commit C: the MTP path on the device. hid_d: the trunk's post-norm hidden rows of a prompt chunk (row 0 the row
+  // before the chunk, then max_batch rows) or of a verify batch; h_d / hn_d: the draft chain's seed and output; mtp_top_d:
+  // each draft's argmax (draft i reads row i - 1 as its id: no host in the chain); mtp_emb_dev: the MTP block's embedding
+  // rows registered for the GPU gather (the trunk's emb_dev when the file shares the tensor)
+  float *hid_d = nullptr, *h_d = nullptr, *hn_d = nullptr;
+  float* hidden_dev_req = nullptr;  // v60 commit C: set around step() / verify(): the post-norm hidden rows go here (device), no host copy
+  std::int32_t* mtp_top_d = nullptr;
+  const std::uint8_t* mtp_emb_dev = nullptr;
+  std::uint64_t mtp_copy_runs_saved = 0;  // v60 commit C: MTP attention on the direct plan (knew / vnew), counted
+  std::uint64_t act_freed = 0;  // v60 commit C: activation bytes the v60b layout held for rows no step can reach (to the MTP row's cache)
+
   std::vector<float> xe_h;  // embed(): the host rows before the upload
   // v23 probe
   std::int64_t probe_pos = -1;
@@ -236,7 +245,7 @@ struct GpuEngine::Impl {
     }
     return static_cast<std::size_t>(v.ne[1] * v.ne[2] * v.row_bytes);
   }
-  bool use_r3 = false;  // v60: always true (kept for r3_takes)
+  bool use_r3 = true;  // v60: always true (kept for r3_takes)
   // R3's copy of these types is the stored layout (Q8_0 repacked, read as g_q8_0r): the shared expert's fold reads it too
   static bool r3_shared(std::uint32_t t) {
     return t == static_cast<std::uint32_t>(quant::Type::q8_0) || t == static_cast<std::uint32_t>(quant::Type::q4_k) ||
@@ -503,10 +512,12 @@ struct GpuEngine::Impl {
     return Status::good();
   }
 
-  Status attention_block(Layer& D, int64_t n, int64_t p0) {
+  // dev_pos: the step's position is in pos_d (the trunk under a graph; v60 commit C: every MTP step too): new K / V rows go
+  // to knew / vnew (fixed addresses, so the R3 direct plan matches every step) and kv_store puts them at *pos_d
+  Status attention_block(Layer& D, int64_t n, int64_t p0, bool dev_pos) {
     const int64_t hd = s.head_dim, nh = s.n_head, nkv = s.n_head_kv;
     const int64_t qh = s.attn_gate ? 2 * hd : hd, q_w = qh * nh;
-    const bool gp = trunk_dp;  // v26: new rows in scratch, stored at the device position; rope / attention read it there
+    const bool gp = dev_pos;  // v26: new rows in scratch, stored at the device position; rope / attention read it there
     float* kn = gp ? knew : D.K + p0 * kv_w;  // the new keys and values go straight into the cache
     float* vn = gp ? vnew : D.V + p0 * kv_w;
     Status st;
@@ -591,7 +602,7 @@ struct GpuEngine::Impl {
     A.ckpt = ck ? D.ckpt : nullptr;
     A.msave = ck ? D.mixed_save : nullptr;
     if (ck && (!D.ckpt || !D.mixed_save)) return Status::good();
-    A.ph = dph_d ? dph_d + static_cast<int64_t>(&D - L.data()) * 5 : nullptr;  // v56: stage stamps (verbose_gpu)
+    A.ph = dph_d && !in_prompt ? dph_d + static_cast<int64_t>(&D - L.data()) * 5 : nullptr;  // v56: stage stamps (verbose_gpu; v60 C: not prompt steps)
     if (!g::dn_half_ok(A)) return Status::good();
     if (!g::dn_half(A)) return Status::fail(Code::internal, std::string("engine: dense half (L3): ") + g::stream_last_error());
     D.cur = 1 - D.cur;
@@ -632,7 +643,9 @@ struct GpuEngine::Impl {
     return Status::good();
   }
 
-  Status run(const std::int32_t* tokens, int n, float* logits, bool last_only, EngineStats* stats, float* hidden_out);
+  Status run(const std::int32_t* tokens, int n, float* logits, bool last_only, EngineStats* stats, float* hidden_out, float* hidden_dev = nullptr);
+  Status mtp_run(const std::int32_t* tokens_h, const std::int32_t* tokens_d, const float* h_prev_d, int n, std::int32_t* top_d_out, float* h_out_d,
+                 float* logits_h, std::int32_t* top_h);  // v60 commit C
   // embedding rows on the host (the reference's embed_row without planes), then one copy
   Status embed(const WeightView& et, const std::int32_t* tokens, int n, float* dst, int64_t e) {
     xe_h.resize(z(n) * z(e));
@@ -720,10 +733,10 @@ struct GpuEngine::Impl {
     A.max_picks = rx_maxp;
     A.load_mode = kRxLoad;
     A.y = y;
-    A.ph = ph_d && il < s.n_layer ? ph_d + static_cast<int64_t>(il) * 5 : nullptr;  // v55b (v58: not the MTP row)
+    A.ph = ph_d && il < s.n_layer && !in_prompt ? ph_d + static_cast<int64_t>(il) * 5 : nullptr;  // v55b (v58: not the MTP row; v60 C: not prompt steps, whose stamps nobody reads)
     A.pipe = 1;  // v57 copy pipeline (v60: locked on; v59d X3 MEASURED no gain without it)
     A.sact = 1;  // v57 shared activations (v60: locked on; v59d X2 / v59g G5-G6 MEASURED neutral-to-better)
-    A.st = rst_d;                                                 // v55e3
+    A.st = il < s.n_layer ? rst_d : rst_mtp_d;                    // v55e3 (v60 C: the MTP row has its own counters)
     // v55f / v55f2: the bit planes only feed planed experts' 1-bit route; with no planes (--plane-bits 0) nothing reads
     // them, so they are not built (v55f2 S0 +0.33 ms vs g55e3, MEASURED)
     A.xb = o.plane_bits > 0 ? rxb : nullptr;
@@ -1055,7 +1068,9 @@ struct GpuEngine::Impl {
     if (cache_reserved > 0) {
       int K = rc_eff;
       const std::size_t nl = nlr();
-      const std::uint64_t budget = cslot * static_cast<std::uint64_t>(rc_eff);  // per layer, as before (v54b: rc_eff, the probe's or --reader-cache)
+      const std::uint64_t budget0 = cslot * static_cast<std::uint64_t>(rc_eff);  // per layer, as before (v54b: rc_eff, the probe's or --reader-cache)
+      // v60 commit C: the MTP row (the last region) gets mtp_cache_bonus more; the trunk regions are budget0 apart
+      auto budget_of = [&](std::size_t il) { return budget0 + (il == s.n_layer ? mtp_cache_bonus : 0); };
       // v51 size pools: per layer the file experts (not in the bank) by real size; each size's share of the budget follows
       // its experts' routes counts x size (counts + 1); at most kMaxPools sizes (the smallest-demand size merges upward)
       std::vector<g::ReaderCache> pc(nl);
@@ -1067,6 +1082,7 @@ struct GpuEngine::Impl {
         for (std::size_t il = 0; il < nl; ++il) {
           const Qwen35MoeLayer& l = WL(static_cast<std::uint32_t>(il));
           Layer& Li = LL(static_cast<std::uint32_t>(il));
+          const std::uint64_t budget = budget_of(il);
           std::vector<std::uint64_t> esz(z(ne), 0);
           std::map<std::uint64_t, double> dem;
           for (int ex = 0; ex < static_cast<int>(ne); ++ex) {
@@ -1181,7 +1197,7 @@ struct GpuEngine::Impl {
             c.tag = reinterpret_cast<int*>(mb) + il * static_cast<std::size_t>(K);
             c.use = reinterpret_cast<unsigned*>(mb + nl * static_cast<std::size_t>(K) * 4) + il * static_cast<std::size_t>(K);
             c.stamp = reinterpret_cast<unsigned*>(mb + nl * static_cast<std::size_t>(K) * 8) + il;
-            c.base = static_cast<std::uint8_t*>(cache_mem) + il * budget;
+            c.base = static_cast<std::uint8_t*>(cache_mem) + il * budget0;  // (the MTP row is last: its bonus extends the end)
             c.slot_bytes = cslot;
             if (use_pools) c.pool_of = reinterpret_cast<const signed char*>(mb + nl * (static_cast<std::size_t>(K) * 8 + 16)) + il * z(ne);
             if (o.plane_bits > 0) c.plane_bits = o.plane_bits;  // v54b
@@ -1190,10 +1206,11 @@ struct GpuEngine::Impl {
             rcache.push_back(c);
           }
           dev_bytes += cache_reserved + meta_b;
-          char cb[200];
+          char cb[320];
           if (use_pools)
-            std::snprintf(cb, sizeof cb, "; cache %.2f GB in size pools (%d slots of %d before; %d-%d slots per layer, %.1f average)", static_cast<double>(cache_reserved) / 1e9,
-                          rc_eff, rc_eff, kmin, K, static_cast<double>(kall) / static_cast<double>(nl));
+            std::snprintf(cb, sizeof cb, "; cache %.2f GB in size pools (%d slots of %d before; %d-%d slots per layer, %.1f average%s%.0f MB more for the MTP row = %d slots, v60 C)",
+                          static_cast<double>(cache_reserved) / 1e9, rc_eff, rc_eff, kmin, K, static_cast<double>(kall) / static_cast<double>(nl),
+                          mtp_rd ? "; " : "", mtp_rd ? static_cast<double>(mtp_cache_bonus) / 1048576.0 : 0.0, mtp_rd ? rcache.back().K : 0);
           else
             std::snprintf(cb, sizeof cb, "; cache %d slots per layer, %.2f GB (size pools off: layout over budget)", K, static_cast<double>(cache_reserved) / 1e9);
           cache_note = cb;
@@ -1289,6 +1306,13 @@ struct GpuEngine::Impl {
               g::dfree(rst_d);
               rst_d = nullptr;
             }
+            if (rst_d) {  // v60 commit C: the MTP row's counters apart from the trunk's
+              rst_mtp_d = static_cast<unsigned long long*>(g::dalloc(g::kRxStatN * sizeof(unsigned long long)));
+              if (rst_mtp_d && !g::dzero(rst_mtp_d, g::kRxStatN * sizeof(unsigned long long))) {
+                g::dfree(rst_mtp_d);
+                rst_mtp_d = nullptr;
+              }
+            }
           }
         } else {
           rx_note = "off (device memory)";
@@ -1339,6 +1363,7 @@ struct GpuEngine::Impl {
     pos = 0;
     mtp_pos = 0;
     last_n = 0;
+    unsynced = 0;  // v60 commit C (the ring guard counts from a synced state; dzero below is stream-ordered)
     for (Layer& D : L) {
       D.cur = 0;
       if (D.state && !g::dzero(D.state, z(s.ssm_dt_rank * s.ssm_d_state * s.ssm_d_state) * sizeof(float))) return gfail("engine: state reset");
@@ -1377,6 +1402,7 @@ GpuEngine::~GpuEngine() {
   g::host_free(p_->ph_h);  // v55b
   g::host_free(p_->dph_h);  // v56
   g::dfree(p_->rst_d);      // v55e3
+  g::dfree(p_->rst_mtp_d);  // v60 C
   g::host_free(p_->rlg_h);  // v49
   g::dfree(p_->probe_bd);
   g::dfree(p_->probe_ld);
@@ -1384,7 +1410,6 @@ GpuEngine::~GpuEngine() {
   g::dfree(p_->probe_xd);
   g::dfree(p_->probe_seld);
   g::dfree(p_->probe_wd);
-  g::moe_scratch_free(&p_->moe);
   for (Layer& D : p_->L) g::dfree(D.bank_mem);
   g::dfree(p_->M.bank_mem);
   p_->r3plans.clear();
@@ -1485,9 +1510,14 @@ std::string GpuEngine::moe_phase_report() const {  // v55b
       r += d;
     }
   }
-  if (I.rst_d) {  // v55e3 diagnosis: the one-token expert stage's counters (SM cycles; every one-token step since open)
+  // v55e3 diagnosis: the one-token expert stage's counters (SM cycles; every one-token step since open). v60 commit C: the
+  // trunk's launches and the MTP row's (its draft and catch-up steps) reported apart
+  auto counters = [&](const unsigned long long* src, const char* who) {
+    if (!src) return;
     unsigned long long c[g::kRxStatN] = {};
-    if (g::sync() && g::to_host(c, I.rst_d, sizeof c)) {
+    if (g::sync() && g::to_host(c, src, sizeof c)) {
+      if (c[4] == 0) return;
+      r += who;
       const double wt = static_cast<double>(c[0]), wk = static_cast<double>(c[1]), sp = static_cast<double>(c[3]);
       const double tk = static_cast<double>(c[2]), wp = static_cast<double>(c[4]);
       char e[600];
@@ -1508,7 +1538,9 @@ std::string GpuEngine::moe_phase_report() const {  // v55b
         r += e;
       }
     }
-  }
+  };
+  counters(I.rst_d, "");
+  counters(I.rst_mtp_d, "\nMTP row:");
   return r;
 }
 std::string GpuEngine::mtp_path_report() const {
@@ -1516,6 +1548,8 @@ std::string GpuEngine::mtp_path_report() const {
   if (!I.has_mtp) return {};
   std::string r = "MTP block MoE half (v58): on the fused launch (reader row n_layer), " + std::to_string(I.mtp_fused_steps) + " steps";
   if (!I.mtp_router_note.empty()) r += "; " + I.mtp_router_note;
+  if (I.mtp_emb_dev) r += "; v60 C: input gathered and concatenated on the GPU, hidden rows and the draft chain on the device, K / V through the direct plan";
+  r += "; R3 dense runs since open: " + std::to_string(I.r3_direct_runs) + " on the direct plan, " + std::to_string(I.r3_copy_runs) + " through scratch copies";
   return r;
 }
 
@@ -1548,6 +1582,12 @@ std::string GpuEngine::summary() const {
   r += I.planes_note;  // v54
   r += I.probe_note;   // v54b
   r += "; dense weights held once (R3's copies; v55 / v60: no raw copies or int8 tables)";
+  {  // v60 commit C: the activation layout (steps of 1-4 rows) and what the v60b layout held beyond it
+    char ab[200];
+    std::snprintf(ab, sizeof ab, "; activations for %d-row steps (v60b layout held %.0f MB more, freed before the VRAM probe)", Impl::kReaderMax,
+                  static_cast<double>(I.act_freed) / 1048576.0);
+    r += ab;
+  }
   r += I.r3_direct_note();  // v55
   if (I.rx_ok && I.fold_ok) r += "; MoE half fused (one launch per layer where no side output needs the separate kernels)";  // v52
   return r;
@@ -1573,7 +1613,11 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
   I.s = s;
   I.w = &w;
   I.o = o;
-  I.npad = (o.max_batch + 63) / 64 * 64 + 64;
+  // v60 commit C: every step is 1-4 tokens (run() and mtp_step reject more; step() splits a prompt), so the activations hold
+  // kReaderMax rows. v60b held (max_batch + 63) / 64 * 64 + 64 rows (192 at max_batch 64) of which 4 were reachable; the
+  // difference (act_freed, logged) goes to the MTP row's cache (see the VRAM probe)
+  I.npad = Impl::kReaderMax;
+  const std::size_t np_old = z((o.max_batch + 63) / 64 * 64 + 64);
   const int64_t e = s.n_embd, hd = s.head_dim, nh = s.n_head, nkv = s.n_head_kv, qh = s.attn_gate ? 2 * hd : hd;
   const int64_t ch = s.conv_channels(), di = s.ssm_d_inner, ds = s.ssm_d_state, nv = s.ssm_dt_rank, ne = s.n_expert, nu = s.n_expert_used;
   const int64_t ffs = s.n_ff_shexp, ff = s.n_ff_exp, taps = s.ssm_d_conv;
@@ -1595,28 +1639,46 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
     void** ptr;
     std::size_t bytes;
   };
-  std::vector<Buf> bufs = {
-      {reinterpret_cast<void**>(&I.x), np * z(e) * 4},          {reinterpret_cast<void**>(&I.xn), np * z(e) * 4},
-      {reinterpret_cast<void**>(&I.y), np * z(e) * 4},          {reinterpret_cast<void**>(&I.xr), np * z(I.kmax) * 4},
-      {reinterpret_cast<void**>(&I.q), np * z(I.kmax)},         {reinterpret_cast<void**>(&I.scale), np * z(I.kmax / 32) * 4},
-      {reinterpret_cast<void**>(&I.sum), np * z(I.kmax / 32) * 4}, {reinterpret_cast<void**>(&I.dig), np * z(I.kmax / 32) * 4},
-      {reinterpret_cast<void**>(&I.qg), np * z(qh * nh) * 4},   {reinterpret_cast<void**>(&I.att), np * z(hd * nh) * 4},
-      {reinterpret_cast<void**>(&I.ascr), np * z(nh) * z(o.max_ctx) * 4},
-      {reinterpret_cast<void**>(&I.mixed), np * z(ch) * 4},     {reinterpret_cast<void**>(&I.zg), np * z(di) * 4},
-      {reinterpret_cast<void**>(&I.beta), np * z(nv) * 4},      {reinterpret_cast<void**>(&I.alpha), np * z(nv) * 4},
-      {reinterpret_cast<void**>(&I.conv), np * z(ch) * 4},      {reinterpret_cast<void**>(&I.core), np * z(di) * 4},
-      {reinterpret_cast<void**>(&I.dn_hcnt), z(nv > 0 ? nv : 1) * 4},
-      {reinterpret_cast<void**>(&I.top_d), np * 4 + 64},
-      {reinterpret_cast<void**>(&I.logits_r), np * z(ne) * 4},  {reinterpret_cast<void**>(&I.sel), np * z(nu) * 4},
-      {reinterpret_cast<void**>(&I.wsel), np * z(nu) * 4},      {reinterpret_cast<void**>(&I.gs), np * z(ffs) * 4},
-      {reinterpret_cast<void**>(&I.us), np * z(ffs) * 4},       {reinterpret_cast<void**>(&I.sh), np * z(e) * 4},
-      {reinterpret_cast<void**>(&I.gsh), np * 4},               {reinterpret_cast<void**>(&I.galpha), np * 4},
-      {reinterpret_cast<void**>(&I.zero2), 256},                {reinterpret_cast<void**>(&I.yc), np * z(e) * 4},
-      {reinterpret_cast<void**>(&I.cat), o.mtp ? np * z(2 * e) * 4 : 256},
-      {reinterpret_cast<void**>(&I.r3y), 4 * (z(s.n_vocab) + z(qh * nh) + z(4 * I.kv_w) + z(2 * ch) + z(2 * di) + z(4 * ffs) + 1024) * 4},
-      {reinterpret_cast<void**>(&I.lg), z(Impl::kOutRows) * z(s.n_vocab) * 4}};
+  // the buffers for `rows` step rows and `hrows` head rows (v60 commit C: called once for the layout and once, with the v60b
+  // sizes, to count what that layout held for rows no step can reach)
+  auto bufs_for = [&](std::size_t rows, std::size_t hrows) {
+    std::vector<Buf> b = {
+        {reinterpret_cast<void**>(&I.x), rows * z(e) * 4},          {reinterpret_cast<void**>(&I.xn), rows * z(e) * 4},
+        {reinterpret_cast<void**>(&I.y), rows * z(e) * 4},          {reinterpret_cast<void**>(&I.xr), rows * z(I.kmax) * 4},
+        {reinterpret_cast<void**>(&I.q), rows * z(I.kmax)},         {reinterpret_cast<void**>(&I.scale), rows * z(I.kmax / 32) * 4},
+        {reinterpret_cast<void**>(&I.sum), rows * z(I.kmax / 32) * 4},
+        {reinterpret_cast<void**>(&I.qg), rows * z(qh * nh) * 4},   {reinterpret_cast<void**>(&I.att), rows * z(hd * nh) * 4},
+        {reinterpret_cast<void**>(&I.ascr), rows * z(nh) * z(o.max_ctx) * 4},
+        {reinterpret_cast<void**>(&I.mixed), rows * z(ch) * 4},     {reinterpret_cast<void**>(&I.zg), rows * z(di) * 4},
+        {reinterpret_cast<void**>(&I.beta), rows * z(nv) * 4},      {reinterpret_cast<void**>(&I.alpha), rows * z(nv) * 4},
+        {reinterpret_cast<void**>(&I.conv), rows * z(ch) * 4},      {reinterpret_cast<void**>(&I.core), rows * z(di) * 4},
+        {reinterpret_cast<void**>(&I.dn_hcnt), z(nv > 0 ? nv : 1) * 4},
+        {reinterpret_cast<void**>(&I.top_d), rows * 4 + 64},
+        {reinterpret_cast<void**>(&I.logits_r), rows * z(ne) * 4},  {reinterpret_cast<void**>(&I.sel), rows * z(nu) * 4},
+        {reinterpret_cast<void**>(&I.wsel), rows * z(nu) * 4},      {reinterpret_cast<void**>(&I.gs), rows * z(ffs) * 4},
+        {reinterpret_cast<void**>(&I.us), rows * z(ffs) * 4},       {reinterpret_cast<void**>(&I.sh), rows * z(e) * 4},
+        {reinterpret_cast<void**>(&I.gsh), rows * 4},               {reinterpret_cast<void**>(&I.galpha), rows * 4},
+        {reinterpret_cast<void**>(&I.zero2), 256},
+        {reinterpret_cast<void**>(&I.cat), o.mtp ? rows * z(2 * e) * 4 : 256},
+        // v60 commit C: the MTP path's device rows (hid_d: 1 + max_batch rows; h_d / hn_d one row each; the draft chain's ids)
+        {reinterpret_cast<void**>(&I.hid_d), o.mtp ? (z(o.max_batch) + 1) * z(e) * 4 : 256},
+        {reinterpret_cast<void**>(&I.h_d), o.mtp ? z(e) * 4 : 256},
+        {reinterpret_cast<void**>(&I.hn_d), o.mtp ? z(e) * 4 : 256},
+        {reinterpret_cast<void**>(&I.mtp_top_d), o.mtp ? z(o.max_batch) * 4 + 64 : 256},
+        {reinterpret_cast<void**>(&I.r3y), 4 * (z(s.n_vocab) + z(qh * nh) + z(4 * I.kv_w) + z(2 * ch) + z(2 * di) + z(4 * ffs) + 1024) * 4},
+        {reinterpret_cast<void**>(&I.lg), hrows * z(s.n_vocab) * 4}};
+    return b;
+  };
+  std::vector<Buf> bufs = bufs_for(np, z(Impl::kOutRows));
   std::size_t total = 0;
   for (const Buf& b : bufs) total += al(b.bytes);
+  {  // v60 commit C: the v60b layout for the same buffers (np_old rows, 64 head rows) plus dig and yc (never read)
+    std::size_t old_total = al(np_old * z(I.kmax / 32) * 4) + al(np_old * z(e) * 4);
+    for (const Buf& b : bufs_for(np_old, 64)) old_total += al(b.bytes);
+    // the four commit-C buffers did not exist in v60b: take them back out of the old figure
+    old_total -= al(o.mtp ? (z(o.max_batch) + 1) * z(e) * 4 : 256) + 2 * al(o.mtp ? z(e) * 4 : 256) + al(o.mtp ? z(o.max_batch) * 4 + 64 : 256);
+    I.act_freed = old_total > total ? old_total - total : 0;
+  }
   I.r3y_floats = 4 * (z(s.n_vocab) + z(qh * nh) + z(4 * I.kv_w) + z(2 * ch) + z(2 * di) + z(4 * ffs) + 1024);  // v26: up to 4 tokens
   I.act_mem = g::dalloc(total);
   if (!I.act_mem || !g::dzero(I.act_mem, total)) return R::fail(Status::fail(Code::over_ceiling, "engine: activation memory"));
@@ -1669,9 +1731,8 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
       c += al(z(o.max_ctx) * z(I.kv_w) * 4);
     }
   }
-  // the experts' scratch (the bank's stacks all have an int8 step: no exact buffers)
-  if (!g::moe_scratch_alloc(o.max_batch, static_cast<int>(nu), static_cast<int>(ne), e, ff, &I.moe, false))
-    return R::fail(Status::fail(Code::over_ceiling, std::string("engine: expert scratch: ") + g::prompt_last_error()));
+  // (v60 commit C: the batched MoE scratch (g::moe_scratch_alloc) is gone: nothing read it since the R3 stage became the only
+  // expert path; its bytes were taken before the VRAM probe and never used)
   // the dense weights of every layer and the output layer, resident
   {
     std::size_t db = I.dense_bytes(w.output) + Impl::vec_bytes(w.output_norm) + Impl::vec_bytes(w.rope_freqs) + 1024;
@@ -1751,8 +1812,8 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
       // the cache share, capped so bank + cache never ask for more than every expert's bytes (a model whose experts all fit
       // in the bank gets no cache)
       std::uint64_t all_b = 0;
-      for (std::uint32_t il = 0; il < s.n_layer; ++il)
-        for (int ex = 0; ex < static_cast<int>(ne); ++ex) all_b += I.expert_bytes(w.layers[il], ex);
+      for (std::uint32_t il = 0; il < I.nlr(); ++il)  // v60 C: the MTP row's experts counted too
+        for (int ex = 0; ex < static_cast<int>(ne); ++ex) all_b += I.expert_bytes(I.WL(il), ex);
       double cache_b = static_cast<double>(ex_b) * o.cache_share;
       if (static_cast<double>(all_b) <= static_cast<double>(ex_b)) cache_b = 0.0;
       else cache_b = std::min(cache_b, static_cast<double>(all_b) - static_cast<double>(ex_b) * (1.0 - o.cache_share));
@@ -1764,11 +1825,16 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
                     static_cast<double>(slot_b) / 1e6);
       I.probe_note = pn;
     }
-    const std::uint64_t need = slot_b * static_cast<std::uint64_t>(I.rc_eff) * I.nlr();
+    // v60 commit C: the MTP row's cache gets more than a trunk layer's budget: the activation bytes v60b held for unreachable
+    // rows (act_freed, DERIVED above) or, when set, --mtp-cache-mb (an A/B knob: more takes from the bank). Its experts are
+    // read on every draft and every catch-up step and are not plane types (raw rows over PCIe when they miss)
+    const std::uint64_t mtp_bonus = I.mtp_rd ? (o.mtp_cache_mb > 0 ? static_cast<std::uint64_t>(o.mtp_cache_mb) << 20 : I.act_freed) & ~std::uint64_t{255} : 0;
+    const std::uint64_t need = slot_b * static_cast<std::uint64_t>(I.rc_eff) * I.nlr() + mtp_bonus;
     if (need < left) {
       left -= need;
       I.cache_reserved = need;
       I.cslot = slot_b;
+      I.mtp_cache_bonus = mtp_bonus;
     }
   }
   if (!o.hot_order.empty()) {
@@ -1804,8 +1870,9 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
     I.ring_tok_d = static_cast<std::int32_t*>(rdev);
     I.ring_pos_h = reinterpret_cast<int*>(static_cast<std::uint8_t*>(I.ring_hv) + Impl::kRing * Impl::kReaderMax * sizeof(std::int32_t));
     const WeightView& te = w.tok_embd;
+    const std::uintptr_t pg = 4096;
     if (te.present() && !te.rot32 && te.slots.empty() && g::type_supported(te.type)) {
-      const std::uintptr_t pg = 4096, a = reinterpret_cast<std::uintptr_t>(te.data), b = a + static_cast<std::uintptr_t>(te.row_bytes * te.ne[1]);
+      const std::uintptr_t a = reinterpret_cast<std::uintptr_t>(te.data), b = a + static_cast<std::uintptr_t>(te.row_bytes * te.ne[1]);
       void* dv = nullptr;
       std::string why;
       const std::uintptr_t ra = a & ~(pg - 1), rl = ((b + pg - 1) & ~(pg - 1)) - ra;
@@ -1822,6 +1889,28 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
     } else {
       I.probe_note += "; token embedding on the host path (type without a GPU decoder, rotated or sliced)";
     }
+    // v60 commit C: the MTP block's embedding for the GPU gather (the trunk's registration when the file shares the tensor)
+    if (I.mtp_rd) {
+      const WeightView& me = w.mtp.embed_tokens;
+      if (me.present() && me.data == te.data && I.emb_dev) {
+        I.mtp_emb_dev = I.emb_dev;
+      } else if (me.present() && !me.rot32 && me.slots.empty() && g::type_supported(me.type)) {
+        const std::uintptr_t ma = reinterpret_cast<std::uintptr_t>(me.data), mb = ma + static_cast<std::uintptr_t>(me.row_bytes * me.ne[1]);
+        const std::uintptr_t ra = ma & ~(pg - 1), rl = ((mb + pg - 1) & ~(pg - 1)) - ra;
+        void* dv = nullptr;
+        std::string why;
+        if (o.pin_small_pages) hal::advise_small_pages(reinterpret_cast<void*>(ra), static_cast<std::size_t>(rl));  // the v33 stall (v60c)
+        if (g::host_register(reinterpret_cast<void*>(ra), static_cast<std::size_t>(rl), &dv, &why)) {
+          I.reg_bases.push_back(reinterpret_cast<void*>(ra));
+          I.mtp_emb_dev = static_cast<const std::uint8_t*>(dv) + (ma - ra);
+        } else {
+          I.probe_note += "; MTP embedding not registered (" + why + "): the MTP block cannot run (v60 C needs the GPU gather)";
+        }
+      } else {
+        I.probe_note += "; MTP embedding without a GPU decoder, rotated or sliced: the MTP block cannot run (v60 C)";
+      }
+      if (I.mtp_emb_dev) I.probe_note += "; MTP input built on the GPU (embedding gather + hidden rows, v60 C)";
+    }
   }
   I.setup_reader();  // v24
   if (!I.reader || !I.rx_ok)  // v60: the reader with the R3 expert stage is the engine's only expert path
@@ -1829,19 +1918,20 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
   if (o.mtp && !I.mtp_rd) return R::fail(Status::fail(Code::unsupported, "engine: the MTP block's experts cannot run on the R3 expert stage (type or alignment)"));
   const Status rs = I.reset_state();
   if (!rs) return R::fail(rs);
-  if (o.graph) {  // v26: the engine's own stream (a graph cannot record the default stream), the device position
+  {  // v26: the device position and the K / V landing rows (v60 commit C: always, the MTP block's attention uses them too)
+    const std::size_t kvb = z(Impl::kReaderMax) * z(I.kv_w) * sizeof(float);  // a step is 1-4 rows
+    I.pos_d = static_cast<int*>(g::dalloc(256));
+    I.knew = static_cast<float*>(g::dalloc(kvb));
+    I.vnew = static_cast<float*>(g::dalloc(kvb));
+    if (!I.pos_d || !I.knew || !I.vnew) return R::fail(Status::fail(Code::over_ceiling, "engine: device position / K V rows"));
+    I.dev_bytes += 256 + 2 * kvb;
+  }
+  if (o.graph) {  // v26: the engine's own stream (a graph cannot record the default stream)
     I.graph_note = "off (setup failed)";
-    const std::size_t kvb = z(o.max_batch) * z(I.kv_w) * sizeof(float);
     if (g::sync() && (I.stm = g::stream_new()) != nullptr) {
-      I.pos_d = static_cast<int*>(g::dalloc(256));
-      I.knew = static_cast<float*>(g::dalloc(kvb));
-      I.vnew = static_cast<float*>(g::dalloc(kvb));
-      if (I.pos_d && I.knew && I.vnew) {
-        g::set_stream(I.stm);
-        I.graph_ok = true;
-        I.graph_note = "on (reader steps of 1-4 tokens)";
-        I.dev_bytes += 256 + 2 * kvb;
-      }
+      g::set_stream(I.stm);
+      I.graph_ok = true;
+      I.graph_note = "on (reader steps of 1-4 tokens)";
     }
   }
   return R::good(std::unique_ptr<GpuEngine>(new GpuEngine(std::move(p))));
@@ -1851,7 +1941,7 @@ Status GpuEngine::step(const std::int32_t* tokens, int n, float* logits, bool la
   Impl& I = *p_;
   I.ckpt_mode = false;
   I.last_n = 0;
-  if (n <= Impl::kReaderMax) return I.run(tokens, n, logits, last_only, stats, hidden_out);
+  if (n <= Impl::kReaderMax) return I.run(tokens, n, logits, last_only, stats, hidden_out, I.hidden_dev_req);
   // v48: the prompt as steps of up to kReaderMax tokens on the GPU-only path; each step's rows land where the one batch
   // would have put them (logits row c0 + r, hidden row c0 + r); with last_only only the final step runs the head
   if (n > I.o.max_batch || !tokens || !logits) return Status::fail(Code::invalid_argument, "engine: 1 .. max_batch tokens and an output");
@@ -1864,7 +1954,8 @@ Status GpuEngine::step(const std::int32_t* tokens, int n, float* logits, bool la
     I.no_head = last_only && !last;
     I.in_prompt = true;
     const Status st = I.run(tokens + c0, m, last_only ? logits : logits + static_cast<std::int64_t>(c0) * nvoc, last_only, &es,
-                            hidden_out ? hidden_out + static_cast<std::int64_t>(c0) * e : nullptr);
+                            hidden_out ? hidden_out + static_cast<std::int64_t>(c0) * e : nullptr,
+                            I.hidden_dev_req ? I.hidden_dev_req + static_cast<std::int64_t>(c0) * e : nullptr);
     I.no_head = false;
     I.in_prompt = false;
     if (!st) return st;
@@ -1880,7 +1971,7 @@ Status GpuEngine::verify(const std::int32_t* tokens, int n, float* logits, float
   if (n > std::max(1, I.o.max_verify)) return Status::fail(Code::invalid_argument, "engine: verify batch above max_verify");
   I.ckpt_mode = true;
   I.verify_pos0 = I.pos;
-  const Status st = I.run(tokens, n, logits, false, stats, hidden_out);
+  const Status st = I.run(tokens, n, logits, false, stats, hidden_out, I.hidden_dev_req);
   I.ckpt_mode = false;
   I.last_n = st ? n : 0;
   return st;
@@ -1907,7 +1998,7 @@ Status GpuEngine::keep(int k) {
   return g::sync() ? Status::good() : gfail("engine: keep sync");
 }
 
-Status GpuEngine::Impl::run(const std::int32_t* tokens, int n, float* logits, bool last_only, EngineStats* stats, float* hidden_out) {
+Status GpuEngine::Impl::run(const std::int32_t* tokens, int n, float* logits, bool last_only, EngineStats* stats, float* hidden_out, float* hidden_dev) {
   Impl& I = *this;
   const Qwen35MoeWeights& wt = *I.w;
   if (n <= 0 || n > I.o.max_batch || !tokens || !logits) return Status::fail(Code::invalid_argument, "engine: 1 .. max_batch tokens and an output");
@@ -1945,7 +2036,7 @@ Status GpuEngine::Impl::run(const std::int32_t* tokens, int n, float* logits, bo
     if (l.recurrent && !(st = I.dn_half_layer(D, n, &dnh))) return st;
     if (!dnh) {
     if (!g::rms_norm(I.x, D.attn_norm, I.xn, e, 1, e, e, n, s.rms_eps)) return gfail("engine: attn norm");
-    if (!(st = l.recurrent ? I.deltanet_block(D, n) : I.attention_block(D, n, I.pos))) return st;
+    if (!(st = l.recurrent ? I.deltanet_block(D, n) : I.attention_block(D, n, I.pos, I.trunk_dp))) return st;
     }
     const bool probe_row = I.probe_pos >= I.pos && I.probe_pos < I.pos + n && I.probe_bd;
     if (probe_row && !g::dcopy(I.probe_bd + static_cast<int64_t>(il) * e, I.y + (I.probe_pos - I.pos) * e, z(e) * sizeof(float))) return gfail("engine: probe copy");
@@ -1995,6 +2086,8 @@ Status GpuEngine::Impl::run(const std::int32_t* tokens, int n, float* logits, bo
       ++I.graph_replays;
     } else if (I.graph_seen[key]++ >= 1) {
       void* ex = nullptr;
+      std::vector<int> cur_before(s.n_layer);  // v60 commit C: the tail parities before the attempt (a failure part-way flipped only some)
+      for (std::uint32_t il = 0; il < s.n_layer; ++il) cur_before[il] = I.L[il].cur;
       const bool began = g::capture_begin(nullptr);
       const Status cs = began ? layers() : Status::fail(Code::internal, "capture did not begin");
       const bool ended = began && g::capture_end(nullptr, &ex);
@@ -2002,8 +2095,8 @@ Status GpuEngine::Impl::run(const std::int32_t* tokens, int n, float* logits, bo
         I.graphs[key] = ex;
         ++I.graph_captures;
         if (!g::graph_launch(ex, nullptr)) return gfail("engine: graph launch");
-      } else {  // the attempt ran the host side only: undo its tail flips, stop using graphs, run this step plainly
-        if (began) flip();
+      } else {  // the attempt ran the host side only: restore the tails' parities, stop using graphs, run this step plainly
+        for (std::uint32_t il = 0; il < s.n_layer; ++il) I.L[il].cur = cur_before[il];
         g::graph_free(ex);
         I.graph_ok = false;
         I.graph_note = std::string("off after a failed capture (") + (cs.ok() ? g::last_error() : cs.text()) + ")";
@@ -2036,10 +2129,12 @@ Status GpuEngine::Impl::run(const std::int32_t* tokens, int n, float* logits, bo
   }
   const int64_t nvoc = s.n_vocab;
   const int r_begin = I.no_head ? n : last_only ? n - 1 : 0;  // v48: no_head runs no row through the head
-  for (int r0 = hidden_out ? 0 : r_begin; r0 < n; r0 += Impl::kOutRows) {
+  for (int r0 = hidden_out || hidden_dev ? 0 : r_begin; r0 < n; r0 += Impl::kOutRows) {
     const int m = std::min(Impl::kOutRows, n - r0);
     if (!g::rms_norm(I.x + static_cast<int64_t>(r0) * e, I.out_norm, I.xn, e, 1, e, e, m, s.rms_eps)) return gfail("engine: output norm");
     if (hidden_out && !g::to_host(hidden_out + static_cast<int64_t>(r0) * e, I.xn, z(m) * z(e) * sizeof(float))) return gfail("engine: hidden");
+    // v60 commit C: the hidden rows kept on the device (the MTP path's seed); stream-ordered, no host visit, the step stays inner
+    if (hidden_dev && !g::dcopy(hidden_dev + static_cast<int64_t>(r0) * e, I.xn, z(m) * z(e) * sizeof(float))) return gfail("engine: hidden (device)");
     if (r0 + m <= r_begin) continue;
     // rows before r_begin (asked for the hidden only) are run through the head with the rest of their chunk; only rows
     // from r_begin on are copied out
@@ -2083,11 +2178,11 @@ Status GpuEngine::Impl::run(const std::int32_t* tokens, int n, float* logits, bo
       return any;
     };
     const bool dec = !I.in_prompt && n >= 1 && n <= 4;
-    if (I.ph_h) {
+    if (I.ph_h && dec) {
       const bool any = take(I.ph_h, dec ? (n == 1 ? I.ph_sum : I.vph_sum[n - 2]) : nullptr, dec && n == 1 ? &I.ph_layers : nullptr);
       if (any && dec) ++(n == 1 ? I.ph_steps : I.vph_steps[n - 2]);
     }
-    if (I.dph_h) {
+    if (I.dph_h && dec) {
       const bool any = take(I.dph_h, dec ? (n == 1 ? I.dph_sum : I.vdph_sum[n - 2]) : nullptr, dec && n == 1 ? &I.dph_layers : nullptr);
       if (any && dec) ++(n == 1 ? I.dph_steps : I.vdph_steps[n - 2]);
     }
@@ -2114,35 +2209,47 @@ Status GpuEngine::Impl::run(const std::int32_t* tokens, int n, float* logits, bo
   return Status::good();
 }
 
-Status GpuEngine::mtp_step(const std::int32_t* tokens, const float* h_prev, int n, float* logits, float* h_out, EngineStats* stats) {
-  Impl& I = *p_;
-  const Qwen35MoeSpec& s = I.s;
-  const Qwen35MoeWeights& w = *I.w;
+// v60 commit C: the MTP block's step with everything on the device. tokens_h (host ids, through the mapped ring) or
+// tokens_d (device ids: the draft chain reads the previous draft's argmax); h_prev_d: n hidden rows (device, stride n_embd);
+// top_d_out: each row's argmax written on the device (null: no head); h_out_d: the block's post-norm hidden rows (device,
+// null: not wanted). The host is not visited: the input is gathered and concatenated on the GPU (gather_rows + strided
+// copies), the attention's K / V go through knew / vnew at the device position (the direct R3 plan, no scratch copies), and
+// the step stays queued (unsynced) unless the caller syncs. logits_h / top_h: the v58 host outputs for mtp_step() callers.
+Status GpuEngine::Impl::mtp_run(const std::int32_t* tokens_h, const std::int32_t* tokens_d, const float* h_prev_d, int n, std::int32_t* top_d_out,
+                                float* h_out_d, float* logits_h, std::int32_t* top_h) {
+  Impl& I = *this;
+  const Qwen35MoeWeights& wt = *I.w;
   if (!I.has_mtp) return Status::fail(Code::unsupported, "engine: opened without the MTP block (EngineOptions::mtp)");
-  if (n <= 0 || n > I.o.max_batch || !tokens || !h_prev) return Status::fail(Code::invalid_argument, "engine: MTP 1 .. max_batch tokens and their hidden rows");
+  if (n <= 0 || n > Impl::kReaderMax || (!tokens_h && !tokens_d) || !h_prev_d)
+    return Status::fail(Code::invalid_argument, "engine: MTP steps are 1-4 tokens with their hidden rows (v60)");
   if (I.mtp_pos + n > I.o.max_ctx) return Status::fail(Code::invalid_argument, "engine: the MTP cache is full (max_ctx)");
-  const Clock::time_point t0 = Clock::now();
-  EngineStats es;
+  if (!I.mtp_emb_dev) return Status::fail(Code::unsupported, "engine: the MTP embedding is not registered for the GPU gather (see the open note)");
   const int64_t e = s.n_embd;
-  // [enorm(embedding) | hnorm(h_prev)] -> eh_proj
-  I.cat_h.resize(z(n) * z(2 * e));
-  for (int t = 0; t < n; ++t) {
-    const std::int32_t tok = tokens[t];
-    if (tok < 0 || static_cast<std::uint64_t>(tok) >= s.n_vocab) return Status::fail(Code::invalid_argument, "a token id is outside the vocabulary");
-    const WeightView& et = w.mtp.embed_tokens;
-    if (!quant::dequantize_row(static_cast<quant::Type>(et.type), et.data + static_cast<std::uint64_t>(tok) * et.row_bytes, I.cat_h.data() + z(t) * z(2 * e), e).ok())
-      return Status::fail(Code::unsupported, "engine: the MTP embedding type cannot be read on the host");
-    std::copy_n(h_prev + static_cast<int64_t>(t) * e, e, I.cat_h.data() + z(t) * z(2 * e) + z(e));
+  // ids and the position through the mapped ring, as run() does (the slot stays untouched until the GPU reads it)
+  const unsigned slot = I.ring_at++ % static_cast<unsigned>(Impl::kRing);
+  const std::int32_t* ids = tokens_d;
+  if (tokens_h) {
+    for (int t = 0; t < n; ++t)
+      if (tokens_h[t] < 0 || static_cast<std::uint64_t>(tokens_h[t]) >= s.n_vocab) return Status::fail(Code::invalid_argument, "a token id is outside the vocabulary");
+    std::int32_t* th = I.ring_tok_h + static_cast<std::ptrdiff_t>(slot) * Impl::kReaderMax;
+    std::copy_n(tokens_h, n, th);
+    ids = I.ring_tok_d + static_cast<std::ptrdiff_t>(slot) * Impl::kReaderMax;
   }
-  if (!g::to_device(I.cat, I.cat_h.data(), I.cat_h.size() * sizeof(float))) return gfail("engine: MTP input upload");
+  I.ring_pos_h[slot] = static_cast<int>(I.mtp_pos);
+  if (!g::h2d_async(I.pos_d, I.ring_pos_h + slot, sizeof(int))) return gfail("engine: MTP position");
+  // [enorm(embedding) | hnorm(h_prev)] -> eh_proj: the embedding rows gathered into xr, both halves copied at the 2 n_embd stride
+  const WeightView& et = wt.mtp.embed_tokens;
+  if (!g::gather_rows(et.type, I.mtp_emb_dev, et.row_bytes, e, ids, n, I.xr)) return gfail("engine: MTP embedding gather");
+  if (!g::dcopy2d(I.cat, z(2 * e) * sizeof(float), I.xr, z(e) * sizeof(float), z(e) * sizeof(float), z(n)) ||
+      !g::dcopy2d(I.cat + e, z(2 * e) * sizeof(float), h_prev_d, z(e) * sizeof(float), z(e) * sizeof(float), z(n)))
+    return gfail("engine: MTP input");
   if (!g::rms_norm(I.cat, I.enorm, I.cat, e, 1, e, 2 * e, n, s.rms_eps) || !g::rms_norm(I.cat + e, I.hnorm, I.cat + e, e, 1, e, 2 * e, n, s.rms_eps))
     return gfail("engine: MTP norms");
   Status st;
   if (!(st = I.prod(I.eh, I.cat, n, I.x))) return st;
-  if (n > Impl::kReaderMax) return Status::fail(Code::invalid_argument, "engine: MTP steps are 1-4 tokens (v60)");
   Layer& D = I.M;
   if (!g::rms_norm(I.x, D.attn_norm, I.xn, e, 1, e, e, n, s.rms_eps)) return gfail("engine: MTP attn norm");
-  if (!(st = I.attention_block(D, n, I.mtp_pos))) return st;
+  if (!(st = I.attention_block(D, n, I.mtp_pos, true))) return st;  // v60 C: K / V through knew / vnew at *pos_d (the direct plan)
   if (!I.fused_ok(D, n, false)) {  // v58b: names the first condition that keeps the block off the fused launch
     const char* why = I.fused_why(D, n, false);
     return Status::fail(Code::internal, std::string("engine: the MTP block's MoE half cannot run on the fused launch: ") + (why ? why : "?"));
@@ -2150,23 +2257,44 @@ Status GpuEngine::mtp_step(const std::int32_t* tokens, const float* h_prev, int 
   if (!(st = I.moe_half_fused(D, n, s.n_layer))) return st;  // v58: residual + MoE half + residual in one launch, the reader's row n_layer
   ++I.mtp_fused_steps;
   const int64_t nvoc = s.n_vocab;
-  for (int r0 = 0; r0 < n; r0 += Impl::kOutRows) {
-    const int m = std::min(Impl::kOutRows, n - r0);
-    if (!g::rms_norm(I.x + static_cast<int64_t>(r0) * e, I.head_norm, I.xn, e, 1, e, e, m, s.rms_eps)) return gfail("engine: MTP head norm");
-    if (h_out && !g::to_host(h_out + static_cast<int64_t>(r0) * e, I.xn, z(m) * z(e) * sizeof(float))) return gfail("engine: MTP hidden");
-    if (logits) {
-      if (!(st = I.prod(I.head, I.xn, m, I.lg))) return st;
-      if (I.top_req) {  // v56
-        if (!g::argmax_rows(I.lg, nvoc, m, nvoc, I.top_d + r0)) return gfail("engine: MTP argmax");
-      } else if (!g::to_host(logits + static_cast<int64_t>(r0) * nvoc, I.lg, z(m) * z(nvoc) * sizeof(float))) {
-        return gfail("engine: MTP logits");
-      }
+  if (!g::rms_norm(I.x, I.head_norm, I.xn, e, 1, e, e, n, s.rms_eps)) return gfail("engine: MTP head norm");
+  if (h_out_d && !g::dcopy(h_out_d, I.xn, z(n) * z(e) * sizeof(float))) return gfail("engine: MTP hidden");
+  if (top_d_out || logits_h || top_h) {
+    if (!(st = I.prod(I.head, I.xn, n, I.lg))) return st;
+    if (top_d_out && !g::argmax_rows(I.lg, nvoc, n, nvoc, top_d_out)) return gfail("engine: MTP argmax");
+    if (top_h) {
+      if (!top_d_out && !g::argmax_rows(I.lg, nvoc, n, nvoc, I.top_d)) return gfail("engine: MTP argmax");
+      if (!g::to_host(top_h, top_d_out ? top_d_out : I.top_d, z(n) * sizeof(std::int32_t))) return gfail("engine: MTP argmax out");
     }
+    if (logits_h && !g::to_host(logits_h, I.lg, z(n) * z(nvoc) * sizeof(float))) return gfail("engine: MTP logits");
   }
-  if (I.top_req && logits && !g::to_host(I.top_req, I.top_d, z(n) * sizeof(std::int32_t))) return gfail("engine: MTP argmax out");
+  I.mtp_pos += n;
+  // the ring guard, as run(): a step that read nothing on the host stays queued; the slots must not lap the GPU
+  if (I.unsynced + 2 < static_cast<unsigned>(Impl::kRing)) {
+    ++I.unsynced;
+  } else {
+    if (!g::sync()) return gfail("engine: MTP sync");
+    I.unsynced = 0;
+  }
+  return Status::good();
+}
+
+Status GpuEngine::mtp_step(const std::int32_t* tokens, const float* h_prev, int n, float* logits, float* h_out, EngineStats* stats) {
+  Impl& I = *p_;
+  const Qwen35MoeSpec& s = I.s;
+  if (!I.has_mtp) return Status::fail(Code::unsupported, "engine: opened without the MTP block (EngineOptions::mtp)");
+  if (n <= 0 || n > Impl::kReaderMax || !tokens || !h_prev) return Status::fail(Code::invalid_argument, "engine: MTP 1 .. 4 tokens and their hidden rows (v60)");
+  const Clock::time_point t0 = Clock::now();
+  EngineStats es;
+  const int64_t e = s.n_embd;
+  // the host rows up (the v58 interface: engine-check's dump path); the device loop in engine_generate_greedy_mtp uses mtp_run
+  if (!g::to_device(I.hid_d, h_prev, z(n) * z(e) * sizeof(float))) return gfail("engine: MTP hidden upload");
+  Status st = I.mtp_run(tokens, nullptr, I.hid_d, n, I.top_req ? I.top_d : nullptr, h_out ? I.hid_d : nullptr, I.top_req ? nullptr : logits,
+                        I.top_req && logits ? I.top_req : nullptr);
+  if (!st) return st;
+  if (h_out && !g::to_host(h_out, I.hid_d, z(n) * z(e) * sizeof(float))) return gfail("engine: MTP hidden");
   if (!g::sync()) return gfail("engine: MTP sync");
   I.unsynced = 0;
-  I.mtp_pos += n;
   es.seconds = since(t0);
   if (stats) *stats = es;
   return Status::good();
@@ -2232,53 +2360,61 @@ Status engine_generate_greedy_mtp(GpuEngine& eng, const Qwen35MoeSpec& s, const 
   MtpStats& stt = stats ? *stats : local;
   EngineStats tot;
   if (Status r = eng.reset(); !r) return r;
-  // the prompt in chunks: the trunk's last logits and every position's hidden
+  // v60 commit C: the whole loop on the device. The trunk's hidden rows go to hid_d (never to the host), the MTP block's input
+  // is gathered and concatenated on the GPU, the draft chain feeds each draft's device argmax to the next draft's gather, and
+  // the host reads one int per draft (the ids it needs for the verify batch) plus the verify's argmaxes
+  GpuEngine::Impl& I = *eng.p_;
+  if (n_draft > 0 && !I.mtp_emb_dev) return Status::fail(Code::unsupported, "engine: the MTP block's device input is off (see the open note)");
+  const float* const hid0 = I.hid_d;  // row 0: the hidden before a chunk (zeros before the first); rows 1 .. k: the chunk's
+  if (!g::dzero(I.hid_d, z(e) * sizeof(float))) return Status::fail(Code::internal, "engine: MTP seed");
+  // the prompt in chunks: the trunk's last logits (host) and every position's hidden (device); the MTP catch-up of each
+  // chunk queued right behind it in 4-token steps (v58c: no picks go to a slow path), nothing waits on the host in between
   const int kChunk = eng.max_batch();
-  std::vector<float> lg(z(nv)), hid(z(P * e));
+  std::vector<float> lg(z(nv));
   for (int64_t t0 = 0; t0 < P; t0 += kChunk) {
     const int k = static_cast<int>(std::min<int64_t>(kChunk, P - t0));
     EngineStats x;
-    if (Status r = eng.step(prompt.data() + t0, k, lg.data(), true, &x, hid.data() + t0 * e); !r) return r;
+    I.hidden_dev_req = I.hid_d + e;
+    const Status r = eng.step(prompt.data() + t0, k, lg.data(), true, &x);
+    I.hidden_dev_req = nullptr;
+    if (!r) return r;
     add_stats(tot, x);
+    if (n_draft > 0)
+      for (int u = 0; u < k; u += GpuEngine::Impl::kReaderMax) {  // token t0 + u with the hidden of t0 + u - 1 = row u
+        const int m = std::min(GpuEngine::Impl::kReaderMax, k - u);
+        if (Status rc = I.mtp_run(prompt.data() + t0 + u, nullptr, hid0 + static_cast<int64_t>(u) * e, m, nullptr, nullptr, nullptr, nullptr); !rc) return rc;
+      }
+    if (!g::dcopy(I.hid_d, I.hid_d + static_cast<int64_t>(k) * e, z(e) * sizeof(float))) return Status::fail(Code::internal, "engine: hidden carry");
   }
-  std::vector<float> pending(hid.end() - e, hid.end());
-  if (n_draft > 0) {  // v58c: catch up in 4-token R3 fused steps so 0 picks go to the slow CPU path
-    std::vector<float> hp(z(P * e), 0.0f);
-    std::copy(hid.begin(), hid.end() - e, hp.begin() + e);
-    const int kMtpChunk = 4;
-    for (int64_t t0 = 0; t0 < P; t0 += kMtpChunk) {
-      const int k = static_cast<int>(std::min<int64_t>(kMtpChunk, P - t0));
-      EngineStats x;
-      if (Status r = eng.mtp_step(prompt.data() + t0, hp.data() + t0 * e, k, nullptr, nullptr, &x); !r) return r;
-      add_stats(tot, x);
-    }
-  }
+  if (!g::sync()) return Status::fail(Code::internal, std::string("engine: prompt sync: ") + g::last_error());
+  I.unsynced = 0;
+  // pending: the hidden of the last prompt position (row 0 after the carry) -> h_d, the draft chain's seed
+  if (!g::dcopy(I.h_d, I.hid_d, z(e) * sizeof(float))) return Status::fail(Code::internal, "engine: MTP seed");
   T.prompt_s += secs(tp0);
   std::int32_t last = argmax_of(lg.data(), nv);
   out.push_back(last);
   if (on_token) on_token(last);
-  std::vector<float> hn(z(e)), h(z(e)), bh;
+  std::vector<std::int32_t> drafts;
   while (static_cast<int>(out.size()) < n_predict && !is_stop(last)) {
     ++stt.steps;
     const int room = n_predict - static_cast<int>(out.size()) - 1;
     const int k = std::max(0, std::min(n_draft, room));
-    std::vector<std::int32_t> drafts;
+    drafts.assign(z(k), 0);
     const std::int64_t m0 = eng.mtp_pos();
     if (k > 0) {
-      h = pending;
-      std::int32_t tok = last;
+      const Clock::time_point tq = Clock::now();
       for (int i = 0; i < k; ++i) {
-        EngineStats x;
-        const Clock::time_point tq = Clock::now();
-        std::int32_t nt = 0;  // v56: the draft's argmax on the device (one int to the host instead of n_vocab floats)
-        if (Status r = eng.mtp_step_top(&tok, h.data(), 1, &nt, hn.data(), &x); !r) return r;
-        T.draft_s += secs(tq);
-        ++T.drafts;
-        add_stats(tot, x);
-        tok = nt;
-        drafts.push_back(tok);
-        h = hn;
+        // draft 0: the trunk's token (host id through the ring) with the pending hidden; draft i: the previous draft's device
+        // argmax as its id, the previous draft's hidden (hn_d; the read precedes the write on the stream)
+        if (Status r = I.mtp_run(i == 0 ? &last : nullptr, i == 0 ? nullptr : I.mtp_top_d + (i - 1), i == 0 ? I.h_d : I.hn_d, 1, I.mtp_top_d + i, I.hn_d,
+                                 nullptr, nullptr);
+            !r)
+          return r;
       }
+      if (!g::to_host(drafts.data(), I.mtp_top_d, z(k) * sizeof(std::int32_t))) return Status::fail(Code::internal, "engine: draft ids");
+      I.unsynced = 0;
+      T.draft_s += secs(tq);
+      T.drafts += k;
       // v58c: draft[0] at position m0 used exact (last, pending), so m0 + 1 is ALREADY valid in the MTP KV cache!
       eng.mtp_truncate(m0 + 1);
       stt.drafted += k;
@@ -2287,11 +2423,12 @@ Status engine_generate_greedy_mtp(GpuEngine& eng, const Qwen35MoeSpec& s, const 
     std::vector<std::int32_t> batch{last};
     batch.insert(batch.end(), drafts.begin(), drafts.end());
     std::vector<std::int32_t> tops(z(nb));
-    bh.resize(z(nb * e));
     EngineStats x;
     const Clock::time_point tv = Clock::now();
-    if (Status r = k > 0 ? eng.verify_top(batch.data(), nb, tops.data(), bh.data(), &x) : eng.step_top(batch.data(), 1, tops.data(), true, &x, bh.data()); !r)
-      return r;
+    I.hidden_dev_req = I.hid_d;  // the batch's hidden rows 0 .. nb - 1 on the device
+    const Status rv = k > 0 ? eng.verify_top(batch.data(), nb, tops.data(), nullptr, &x) : eng.step_top(batch.data(), 1, tops.data(), true, &x, nullptr);
+    I.hidden_dev_req = nullptr;
+    if (!rv) return rv;
     T.verify_s[nb > 8 ? 9 : nb] += secs(tv);
     ++T.verify_n[nb > 8 ? 9 : nb];
     add_stats(tot, x);
@@ -2306,22 +2443,18 @@ Status engine_generate_greedy_mtp(GpuEngine& eng, const Qwen35MoeSpec& s, const 
       if (Status r = eng.keep(a + 1); !r) return r;
     T.keep_s += secs(tk);
     stt.accepted += a;
-    if (n_draft > 0) {
-      if (k == 0) {
-        EngineStats y;
-        const Clock::time_point tc = Clock::now();
-        if (Status r = eng.mtp_step(batch.data(), pending.data(), 1, nullptr, nullptr, &y); !r) return r;
-        T.catchup_s += secs(tc);
-        add_stats(tot, y);
-      } else if (a > 0) {
-        EngineStats y;
-        const Clock::time_point tc = Clock::now();
-        if (Status r = eng.mtp_step(batch.data() + 1, bh.data(), a, nullptr, nullptr, &y); !r) return r;
-        T.catchup_s += secs(tc);
-        add_stats(tot, y);
-      }
+    if (n_draft > 0) {  // the MTP block catches up over the accepted tokens (their hidden rows are in hid_d), one queued step
+      const Clock::time_point tc = Clock::now();
+      Status rc;
+      if (k == 0) rc = I.mtp_run(batch.data(), nullptr, I.h_d, 1, nullptr, nullptr, nullptr, nullptr);
+      else if (a > 0) rc = I.mtp_run(batch.data() + 1, nullptr, I.hid_d, a, nullptr, nullptr, nullptr, nullptr);
+      if (!rc) return rc;
+      if (!g::sync()) return Status::fail(Code::internal, std::string("engine: catch-up sync: ") + g::last_error());
+      I.unsynced = 0;
+      T.catchup_s += secs(tc);
     }
-    pending.assign(bh.begin() + a * e, bh.begin() + (a + 1) * e);
+    // pending: the hidden of the accepted token (row a) -> h_d
+    if (!g::dcopy(I.h_d, I.hid_d + static_cast<int64_t>(a) * e, z(e) * sizeof(float))) return Status::fail(Code::internal, "engine: pending hidden");
     for (int i = 0; i < a && static_cast<int>(out.size()) < n_predict; ++i) {
       out.push_back(drafts[z(i)]);
       if (on_token) on_token(drafts[z(i)]);

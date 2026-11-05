@@ -1351,6 +1351,10 @@ bool to_host_async(void* dst, const void* src, std::size_t bytes, Stream s) {
 bool dcopy(void* dst, const void* src, std::size_t bytes, Stream s) {
   return ck(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, st(s)), "device copy");
 }
+bool dcopy2d(void* dst, std::size_t dpitch, const void* src, std::size_t spitch, std::size_t width, std::size_t rows, Stream s) {  // v60 C
+  if (rows == 0 || width == 0) return true;
+  return ck(cudaMemcpy2DAsync(dst, dpitch, src, spitch, width, rows, cudaMemcpyDeviceToDevice, st(s)), "device copy (2d)");
+}
 bool mem_info(std::size_t* free_bytes, std::size_t* total_bytes) {
   std::size_t f = 0, t = 0;
   if (!ck(cudaMemGetInfo(&f, &t), "cudaMemGetInfo")) return false;

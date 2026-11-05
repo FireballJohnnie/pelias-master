@@ -2439,7 +2439,7 @@ int cmd_engine_check(const Args& a) {
                  "                           [--budget-gb G] [--hot-max N (default 40)] [--mtp-draft K] [--fast-cpu] [--no-cpu] [--float-ref] [--ref-threads N]\n"
                  "                           [--text FILE [--skip-tokens N]] [--dump-top OUT.tsv] [--dump-router OUT.tsv] [--dump-draft OUT.tsv] [--dump-split [--split-sizes 2,3,4] [--split-step]]\n"
                  "                           [--split-ref] [--probe-pos P] [--router-tie BAND (default 0.01)] [--trace OUT.tsv] [--reader-cache K] [--no-graph]\n"
-                 "                           [--plane-bits 2|3|4|5 (default 5)] [--no-auto-vram] [--cache-share F] [--verbose-gpu] [--pin-gap-kib K] [--pin-huge-ok] [--host-wait auto|spin|yield|block]\n"
+                 "                           [--plane-bits 2|3|4|5 (default 5)] [--no-auto-vram] [--cache-share F] [--mtp-cache-mb M] [--verbose-gpu] [--pin-gap-kib K] [--pin-huge-ok] [--host-wait auto|spin|yield|block]\n"
                  "                           (v60: the engine's A/B switches are locked in; --batch-identical and the other old switches are accepted and ignored)\n");
     return 1;
   }
@@ -2454,10 +2454,10 @@ int cmd_engine_check(const Args& a) {
     out = r.value;
     return true;
   };
-  std::uint64_t npre = 0, ndec = 0, ctx = 0, batch = 0, thr = 0, hmax = 0, ndraft = 0, skip = 0;
+  std::uint64_t npre = 0, ndec = 0, ctx = 0, batch = 0, thr = 0, hmax = 0, ndraft = 0, skip = 0, mtpc = 0;
   if (!num("prefill", 64, 1, 1 << 20, npre) || !num("decode", 32, 0, 1 << 20, ndec) || !num("ctx", 4096, 2, 1 << 20, ctx) || !num("batch", 64, 1, 4096, batch) ||
       !num("threads", 0, 0, 4096, thr) || !num("hot-max", 40, 0, 4096, hmax) || !num("mtp-draft", 0, 0, 16, ndraft) ||  // --threads: the CPU reference only (v60)
-      !num("skip-tokens", 0, 0, std::uint64_t{1} << 40, skip))
+      !num("skip-tokens", 0, 0, std::uint64_t{1} << 40, skip) || !num("mtp-cache-mb", 0, 0, 65536, mtpc))  // v60 C: the MTP row's extra cache
     return 1;
   const std::string dump_top = a.get("dump-top");
   if (!dump_top.empty()) {
@@ -2591,6 +2591,7 @@ int cmd_engine_check(const Args& a) {
     eo.plane_bits = static_cast<int>(pb.value);
   }
   eo.auto_vram = !a.has("no-auto-vram");  // v54b; v58: on by default
+  eo.mtp_cache_mb = static_cast<int>(mtpc);  // v60 C: 0 = the activation bytes freed by the 4-row layout
   if (a.has("cache-share")) {
     char* end = nullptr;
     const std::string cs = a.get("cache-share");
