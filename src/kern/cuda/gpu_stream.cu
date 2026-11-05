@@ -1141,7 +1141,11 @@ __device__ __forceinline__ void rx_rows_staged(const DJob& J, long long t, std::
   } else {
     wb = rx_stage(src, nr * rowb, sbuf, J.fd ? const_cast<std::uint8_t*>(src) + J.fd : nullptr, lane);
   }
-  if constexpr (kMT) {  // v47: the group's picks (2-4) on one load of the rows (fill, if any, by that one load)
+  const bool sh = s_rx_xq0 != nullptr && J.xq == s_rx_gxq;
+  const std::int8_t* bq = sh ? s_rx_xq0 : J.xq;
+  const float* bs = sh ? s_rx_xs0 : J.xs;
+  const int* bm = sh ? s_rx_xsum0 : J.xsum;
+  if constexpr (kMT) {  // v47 / v58c: use shared-memory activations (M = 5) when staged
     if (J.ntok > 1) {
       const std::int8_t* xq[4];
       const float* xs[4];
@@ -1150,13 +1154,16 @@ __device__ __forceinline__ void rx_rows_staged(const DJob& J, long long t, std::
       for (int tk = 0; tk < 4; ++tk) {
         const int u = tk < J.ntok ? tk : 0;
         const long long xo = J.tokx[u];
-        xq[tk] = J.xq + xo * J.xqs;
-        xs[tk] = J.xs + xo * J.xss;
-        xsum[tk] = J.xsum + xo * J.xss;
+        xq[tk] = bq + xo * J.xqs;
+        xs[tk] = bs + xo * J.xss;
+        xsum[tk] = bm + xo * J.xss;
         yo[tk] = J.ypk[u] * J.ys;
       }
       float acc[4] = {0.f, 0.f, 0.f, 0.f};
-      if (r < J.n) lane_part_d<3, ONLY>(J, r, part, xq, xs, xsum, J.ntok, acc, wb, static_cast<long long>(r0) * nB);
+      if (r < J.n) {
+        if (sh) lane_part_d<5, ONLY>(J, r, part, xq, xs, xsum, J.ntok, acc, wb, static_cast<long long>(r0) * nB);
+        else lane_part_d<3, ONLY>(J, r, part, xq, xs, xsum, J.ntok, acc, wb, static_cast<long long>(r0) * nB);
+      }
       store_rows(J, r, part, acc, J.ntok, yo);
       __syncwarp();
       return;
@@ -1165,7 +1172,10 @@ __device__ __forceinline__ void rx_rows_staged(const DJob& J, long long t, std::
   for (int tk = 0; tk < J.ntok; ++tk) {
     const long long xo = J.tokx[tk];
     float acc = 0.f;
-    if (r < J.n) acc = lane_part<3, ONLY>(J, r, part, J.xq + xo * J.xqs, J.xs + xo * J.xss, J.xsum + xo * J.xss, false, wb, static_cast<long long>(r0) * nB);
+    if (r < J.n) {
+      if (sh) acc = lane_part<5, ONLY>(J, r, part, bq + xo * J.xqs, bs + xo * J.xss, bm + xo * J.xss, false, wb, static_cast<long long>(r0) * nB);
+      else acc = lane_part<3, ONLY>(J, r, part, bq + xo * J.xqs, bs + xo * J.xss, bm + xo * J.xss, false, wb, static_cast<long long>(r0) * nB);
+    }
     for (int o = J.lpr / 2; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
     if (r < J.n && part == 0) J.y[J.ypk[tk] * J.ys + r] = acc;
   }
@@ -1465,16 +1475,15 @@ __device__ PG_NOINL void mh_phase_a(const MoeHalfArgs& A, float* stg, double* s_
     }
   }
 }
-// block 0 only (every thread of it: the router and the plan synchronise the block)
-__device__ PG_NOINL void mh_phase_b(const MoeHalfArgs& A, float* stg, float* s_rsh, float* s_inv, float* s_bv, int* s_bi) {
-  const int n = A.n, tid = static_cast<int>(threadIdx.x);
+// v58c: Parallel Phase B across blocks 0..n-1 for multi-token verify steps (cuts verify-3 Phase B from 2.49 ms to 0.89 ms)
+__device__ PG_NOINL void mh_phase_b_tok(const MoeHalfArgs& A, int t, float* stg, float* s_rsh, float* s_inv, float* s_bv, int* s_bi) {
   const md::RouterSmem S{stg, stg + md::kRouterMaxExperts, reinterpret_cast<unsigned char*>(stg + 2 * md::kRouterMaxExperts), s_rsh, s_inv, s_bv, s_bi};
-  for (int t = 0; t < n; ++t) {
-    md::router_row(A.logits + static_cast<long long>(t) * A.ne, A.ne, A.nu, A.wscale, A.sel + t * A.nu, A.wsel + t * A.nu, A.band, S);
-    __syncthreads();
-  }
-  if (A.wsh && tid < n) A.gsh[tid] = md::sigmoid_d(A.gsh[tid]);  // deltanet_gates(gsh, ...) with one head: beta = sigmoid(beta)
-  if (tid < 32) md::rd3_group_one<true>(A.tab, A.wsh ? A.shx : nullptr, A.sel, n, A.nu, A.cache, A.F, A.grp, A.gsrc, A.gfill, nullptr);  // v55e: one warp
+  md::router_row(A.logits + static_cast<long long>(t) * A.ne, A.ne, A.nu, A.wscale, A.sel + t * A.nu, A.wsel + t * A.nu, A.band, S);
+}
+__device__ PG_NOINL void mh_phase_b_plan(const MoeHalfArgs& A) {
+  const int n = A.n, tid = static_cast<int>(threadIdx.x);
+  if (A.wsh && tid < n) A.gsh[tid] = md::sigmoid_d(A.gsh[tid]);
+  if (tid < 32) md::rd3_group_one<true>(A.tab, A.wsh ? A.shx : nullptr, A.sel, n, A.nu, A.cache, A.F, A.grp, A.gsrc, A.gfill, nullptr);
   __syncthreads();
   rx_plan_body(A.grp, A.gsrc, A.gfill, n, A.nu, A.H, A.F, A.xq, A.xs, A.xsum, A.gu, A.hq, A.hs, A.hsum, A.yd, static_cast<std::uint8_t*>(A.plan),
                A.max_picks, A.load_mode, A.xb, A.hb);
@@ -1503,7 +1512,17 @@ __global__ void __launch_bounds__(256, 1) k_moe_half(const __grid_constant__ Moe
   grid.sync();
   if (phs) A.ph[1] = gtimer_s();
   // ---- B
-  if (blockIdx.x == 0) mh_phase_b(A, stg, s_rsh, &s_inv, s_bv, s_bi);
+  if constexpr (kMT) {
+    if (static_cast<int>(blockIdx.x) < n) mh_phase_b_tok(A, static_cast<int>(blockIdx.x), stg, s_rsh, &s_inv, s_bv, s_bi);
+    grid.sync();
+    if (blockIdx.x == 0) mh_phase_b_plan(A);
+  } else {
+    if (blockIdx.x == 0) {
+      mh_phase_b_tok(A, 0, stg, s_rsh, &s_inv, s_bv, s_bi);
+      __syncthreads();
+      mh_phase_b_plan(A);
+    }
+  }
   grid.sync();
   if (phs) A.ph[2] = gtimer_s();
   // ---- C

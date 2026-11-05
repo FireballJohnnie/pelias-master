@@ -2828,7 +2828,7 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
   // v55 (author 02:36-02:41, build audit A): with planes on, every product of the output head runs on R3 (one-token steps,
   // the GPU prompt's steps of 1-4 tokens on R3, no MTP block, no verify batches off R3), so the head's raw copy and its int8
   // tables (~0.48 GB for this model's Q6_K head) are not loaded; the VRAM probe gives that room to the experts
-  if (o.r3 && o.plane_bits > 0 && !o.mtp && (o.max_verify <= 1 || o.batch_identical) && o.gpu_prompt && o.prompt_r3) I.lean_w = &w.output;
+  if (o.r3 && o.plane_bits > 0 && (o.max_verify <= 1 || o.batch_identical) && o.gpu_prompt && o.prompt_r3) I.lean_w = &w.output;
   if (o.mtp && !w.mtp.present) return R::fail(Status::fail(Code::unsupported, "engine: this file has no MTP block"));
   if (o.max_verify > 1 && !(ds >= 32 && ds <= 1024 && (ds & (ds - 1)) == 0))
     return R::fail(Status::fail(Code::unsupported, "engine: verify batches need the DeltaNet d_state a power of two (the checkpointing recurrence)"));
@@ -2960,11 +2960,16 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
   if (I.mtp_rd) {  // v58b: the fused launch reads the router as F32 rows; the MTP block's may be stored otherwise
     const WeightView& rv = w.mtp.layer.gate_inp;
     I.mtp_router_note = std::string("MTP router stored as ") + quant::type_info(rv.type).name + (rv.rot32 ? " (rotated)" : "");
-    if (!I.router_of(I.M) && rv.present() && !rv.rot32) {
+    if (!I.router_of(I.M) && rv.present()) {
       std::vector<float> rf(z(ne) * z(e));
       bool ok = true;
-      for (int64_t r = 0; r < ne && ok; ++r)
-        ok = quant::dequantize_row(static_cast<quant::Type>(rv.type), rv.data + static_cast<std::uint64_t>(r) * rv.row_bytes, rf.data() + z(r) * z(e), e).ok();
+      for (int64_t r = 0; r < ne && ok; ++r) {
+        float* rptr = rf.data() + z(r) * z(e);
+        ok = quant::dequantize_row(static_cast<quant::Type>(rv.type), rv.data + static_cast<std::uint64_t>(r) * rv.row_bytes, rptr, e).ok();
+        if (ok && rv.rot32) {
+          quant::hadamard32(rptr, e);
+        }
+      }
       void* rd = ok ? g::dalloc(rf.size() * sizeof(float)) : nullptr;
       if (rd && g::to_device(rd, rf.data(), rf.size() * sizeof(float))) {
         I.M.router_f32 = static_cast<const float*>(rd);
@@ -3592,6 +3597,9 @@ Status GpuEngine::mtp_step(const std::int32_t* tokens, const float* h_prev, int 
     return gfail("engine: MTP norms");
   Status st;
   if (!(st = I.prod(I.eh, I.cat, n, I.x))) return st;
+  const bool prev_bi = I.bi_now;
+  if (n <= Impl::kReaderMax && (I.o.batch_identical || I.o.prompt_r3)) I.bi_now = true;
+  struct MtpBiReset { bool& f; bool v; ~MtpBiReset() { f = v; } } mtp_bi_reset{I.bi_now, prev_bi};
   Layer& D = I.M;
   if (!g::rms_norm(I.x, D.attn_norm, I.xn, e, 1, e, e, n, s.rms_eps)) return gfail("engine: MTP attn norm");
   if (!(st = I.attention_block(D, n, I.mtp_pos))) return st;
@@ -3735,16 +3743,17 @@ Status engine_generate_greedy_mtp(GpuEngine& eng, const Qwen35MoeSpec& s, const 
     add_stats(tot, x);
   }
   std::vector<float> pending(hid.end() - e, hid.end());
-  if (n_draft > 0) {  // the MTP block catches up on the prompt: token p with h of p - 1 (zeros before the first)
+  if (n_draft > 0) {  // v58c: catch up in 4-token R3 fused steps so 0 picks go to the slow CPU path
     std::vector<float> hp(z(P * e), 0.0f);
     std::copy(hid.begin(), hid.end() - e, hp.begin() + e);
-    for (int64_t t0 = 0; t0 < P; t0 += kChunk) {
-      const int k = static_cast<int>(std::min<int64_t>(kChunk, P - t0));
+    const int kMtpChunk = 4;
+    for (int64_t t0 = 0; t0 < P; t0 += kMtpChunk) {
+      const int k = static_cast<int>(std::min<int64_t>(kMtpChunk, P - t0));
       EngineStats x;
       if (Status r = eng.mtp_step(prompt.data() + t0, hp.data() + t0 * e, k, nullptr, nullptr, &x); !r) return r;
       add_stats(tot, x);
     }
-    if (auto pr = eng.mtp_promote(); !pr.ok()) return pr.status;  // the MTP bank from the prompt's picks
+    if (auto pr = eng.mtp_promote(); !pr.ok()) return pr.status;
   }
   T.prompt_s += secs(tp0);
   std::int32_t last = argmax_of(lg.data(), nv);
@@ -3777,13 +3786,14 @@ Status engine_generate_greedy_mtp(GpuEngine& eng, const Qwen35MoeSpec& s, const 
         drafts.push_back(tok);
         h = hn;
       }
-      eng.mtp_truncate(m0);
+      // v58c: draft[0] at position m0 used exact (last, pending), so m0 + 1 is ALREADY valid in the MTP KV cache!
+      eng.mtp_truncate(m0 + 1);
       stt.drafted += k;
     }
     const int nb = 1 + k;
     std::vector<std::int32_t> batch{last};
     batch.insert(batch.end(), drafts.begin(), drafts.end());
-    std::vector<std::int32_t> tops(z(nb));  // v56: each verified row's argmax from the device
+    std::vector<std::int32_t> tops(z(nb));
     bh.resize(z(nb * e));
     EngineStats x;
     const Clock::time_point tv = Clock::now();
@@ -3804,14 +3814,19 @@ Status engine_generate_greedy_mtp(GpuEngine& eng, const Qwen35MoeSpec& s, const 
     T.keep_s += secs(tk);
     stt.accepted += a;
     if (n_draft > 0) {
-      std::vector<float> hp(z((a + 1) * e));
-      std::copy(pending.begin(), pending.end(), hp.begin());
-      std::copy(bh.begin(), bh.begin() + a * e, hp.begin() + e);
-      EngineStats y;
-      const Clock::time_point tc = Clock::now();
-      if (Status r = eng.mtp_step(batch.data(), hp.data(), a + 1, nullptr, nullptr, &y); !r) return r;
-      T.catchup_s += secs(tc);
-      add_stats(tot, y);
+      if (k == 0) {
+        EngineStats y;
+        const Clock::time_point tc = Clock::now();
+        if (Status r = eng.mtp_step(batch.data(), pending.data(), 1, nullptr, nullptr, &y); !r) return r;
+        T.catchup_s += secs(tc);
+        add_stats(tot, y);
+      } else if (a > 0) {
+        EngineStats y;
+        const Clock::time_point tc = Clock::now();
+        if (Status r = eng.mtp_step(batch.data() + 1, bh.data(), a, nullptr, nullptr, &y); !r) return r;
+        T.catchup_s += secs(tc);
+        add_stats(tot, y);
+      }
     }
     pending.assign(bh.begin() + a * e, bh.begin() + (a + 1) * e);
     for (int i = 0; i < a && static_cast<int>(out.size()) < n_predict; ++i) {
