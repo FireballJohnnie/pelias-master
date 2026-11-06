@@ -77,6 +77,12 @@ struct EngineOptions {
   // verify behind it and feels a lost bit directly (v60n MEASURED: 3 of 4 bits kept 84.1 / 72.1 % vs 86.8 / 74.5 % at 4), and
   // its planes are ~1/41 of the whole, so the default keeps it at 4. Not for a Q4_TG2 MTP block (one decode grid per launch)
   int mtp_plane_bits = 4;
+  // v60 H (Fix 4 A/B, item 5): the one-token fused MoE half at __launch_bounds__(256, 2) (moe_blocks 2: registers capped at 128,
+  // 40 B of spill at compile time, two blocks per SM; the copy pipeline off, since two blocks' buffers do not fit in 100 KB of
+  // shared memory) against the (256, 1) default; rx_pipe 0 turns the v57 copy pipeline off on the default kernel (the A/B's other
+  // half: what the pipeline is worth today). Both are measurement knobs; the loser leaves (one engine path).
+  int moe_blocks = 1;
+  int rx_pipe = 1;
   // v60 commit C2: the pinned-planes read probe at open (copy engine, GB/s, logged). pin_read_min_gbs > 0: below it the
   // planes are freed, pinned and packed again, up to pin_read_tries times (v60d: three of five arms read them 2-3x slower)
   double pin_read_min_gbs = 0.0;  // v60 C3: applies to the SM one-line-per-page read (GB/s of 128 B lines)
@@ -144,6 +150,9 @@ struct EngineMtpTiming {
   // v60 E2: the sketch chain's GPU time split over the drafts (stamps inside the chain): the sketch product, the top-k select,
   // the gather + re-score + argmax + pick
   double sketch_dot_s = 0.0, sketch_select_s = 0.0, sketch_rescore_s = 0.0;
+  // v60 H: the drafts' block split (stamps inside the block): 0 the input (embedding gather, cat, norms), 1 eh_proj, 2 the
+  // attention, 3 the MoE half (sums over the drafts; v60n-p MEASURED the whole block swinging 0.40-0.69 ms per draft)
+  double draft_block_s[4] = {0.0, 0.0, 0.0, 0.0};
 };
 
 class GpuEngine {

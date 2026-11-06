@@ -157,6 +157,9 @@ struct MoeHalfArgs {
   unsigned long long* st = nullptr;
   int pipe = 0;  // v57: the expert stage's copy pipeline (each warp's next task's rows by cp.async while it computes; needs load_mode 1 or 2)
   int sact = 0;  // v57: with pipe, each block keeps the gate / up inputs in shared memory (their jobs read them there)
+  // v60 H (Fix 4 A/B): 2 = the one-token kernel's __launch_bounds__(256, 2) instantiation (registers capped at 128: compile-time
+  // 40 B of spill), which needs pipe = 0 (two blocks' pipeline buffers do not fit in an SM's 100 KB of shared memory); 1 = (256, 1)
+  int blocks = 1;
 };
 constexpr int kRxStatN = 32;
 bool moe_half(const MoeHalfArgs& args, Stream s = nullptr);

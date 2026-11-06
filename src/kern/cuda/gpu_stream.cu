@@ -1515,8 +1515,10 @@ __device__ PG_NOINL void mh_phase_b_plan(const MoeHalfArgs& A) {
 // it gave the counting copy of the same code 173 registers, 1 block, 0 spill. Measured so far: 1 block with no spill
 // (v55d stage 5.80 ms at 3 bits) beat 2 blocks with spills (v55e2 6.39 ms). So the bound says 1 block: the natural
 // registers, no spill
-template <bool kMT, int NJ, bool kStat = false>
-__global__ void __launch_bounds__(256, 1) k_moe_half(const __grid_constant__ MoeHalfArgs A, int sbytes) {
+// v60 H (Fix 4 A/B): MINB = 2 instantiates the one-token kernel at __launch_bounds__(256, 2) (registers capped at 128) for a
+// measured A/B against the (256, 1) default; selected by MoeHalfArgs::blocks, pipeline off (shared memory: two blocks' buffers)
+template <bool kMT, int NJ, bool kStat = false, int MINB = 1>
+__global__ void __launch_bounds__(256, MINB) k_moe_half(const __grid_constant__ MoeHalfArgs A, int sbytes) {
   namespace cg = cooperative_groups;
   cg::grid_group grid = cg::this_grid();
   __shared__ double s_sh[33];
@@ -1967,17 +1969,22 @@ bool moe_half(const MoeHalfArgs& A, Stream s) {
   const bool stat = !mt && A.st != nullptr;  // v55e3 diagnosis: the counting kernel (verbose runs only)
   const int nj = nsub <= 32 ? 1 : nsub / 32;
   void* fn = nullptr;
-  if (stat) fn = nj == 1 ? reinterpret_cast<void*>(k_moe_half<false, 1, true>) : nj == 2 ? reinterpret_cast<void*>(k_moe_half<false, 2, true>)
+  const bool two = A.blocks == 2 && !mt && !stat;  // v60 H: the (256, 2) instantiation of the one-token kernel
+  if (A.blocks != 1 && A.blocks != 2) return sfail("moe_half: blocks must be 1 or 2");
+  if (two && A.pipe) return sfail("moe_half: the (256, 2) instantiation runs without the copy pipeline (two blocks' buffers do not fit)");
+  if (two) fn = nj == 1 ? reinterpret_cast<void*>(k_moe_half<false, 1, false, 2>) : nj == 2 ? reinterpret_cast<void*>(k_moe_half<false, 2, false, 2>)
+                                                                                           : PG_NJ4(reinterpret_cast<void*>(k_moe_half<false, 4, false, 2>));
+  else if (stat) fn = nj == 1 ? reinterpret_cast<void*>(k_moe_half<false, 1, true>) : nj == 2 ? reinterpret_cast<void*>(k_moe_half<false, 2, true>)
                                                                                         : PG_NJ4(reinterpret_cast<void*>(k_moe_half<false, 4, true>));
   else if (nj == 1) fn = mt ? reinterpret_cast<void*>(k_moe_half<true, 1>) : reinterpret_cast<void*>(k_moe_half<false, 1>);
   else if (nj == 2) fn = mt ? reinterpret_cast<void*>(k_moe_half<true, 2>) : reinterpret_cast<void*>(k_moe_half<false, 2>);
   else fn = mt ? PG_NJ4(reinterpret_cast<void*>(k_moe_half<true, 4>)) : PG_NJ4(reinterpret_cast<void*>(k_moe_half<false, 4>));
   if (!fn) return sfail("moe_half: this width (H 4096) is not built (-DPELIAS_ALL_WIDTHS)");  // v58
-  static int grids[2][3][3][2][3] = {};  // v57: [pipe, + shared inputs]
-  static int gsm[2][3][3][2][3] = {};    // v57: the shared memory each grid was sized and opted in for
-  const int gi0 = mt ? 1 : 0, gi1 = nj == 1 ? 0 : (nj == 2 ? 1 : 2), gi4 = A.pipe ? (A.sact ? 2 : 1) : 0;
-  int& grid = grids[gi0][gi1][A.load_mode][stat ? 1 : 0][gi4];
-  int& gs = gsm[gi0][gi1][A.load_mode][stat ? 1 : 0][gi4];
+  static int grids[2][3][3][2][3][2] = {};  // v57: [pipe, + shared inputs]; v60 H: [(256, 2)]
+  static int gsm[2][3][3][2][3][2] = {};    // v57: the shared memory each grid was sized and opted in for
+  const int gi0 = mt ? 1 : 0, gi1 = nj == 1 ? 0 : (nj == 2 ? 1 : 2), gi4 = A.pipe ? (A.sact ? 2 : 1) : 0, gi5 = two ? 1 : 0;
+  int& grid = grids[gi0][gi1][A.load_mode][stat ? 1 : 0][gi4][gi5];
+  int& gs = gsm[gi0][gi1][A.load_mode][stat ? 1 : 0][gi4][gi5];
   // v57 (v57 GPU tests: two engines of different shapes in one process): the shared memory now depends on the model (the
   // staging per its formats, the inputs' copy per H); a larger request than the kernel was opted in for re-opts and re-sizes
   if (!grid || smem > gs) {
@@ -1994,8 +2001,9 @@ bool moe_half(const MoeHalfArgs& A, Stream s) {
     int occ_rx = 0;  // v52 diagnosis: the separate expert stage's blocks per SM at its own shared memory, for comparison
     (void)cudaFuncSetAttribute(reinterpret_cast<const void*>(mt ? k_rx<true> : k_rx<false>), cudaFuncAttributeMaxDynamicSharedMemorySize, sm_rx);
     (void)cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ_rx, mt ? k_rx<true> : k_rx<false>, 256, static_cast<std::size_t>(sm_rx));
-    std::fprintf(stderr, "moe_half: %s tokens%s, H %d: grid %d (%d SMs x %d blocks), shared memory %d B; k_rx alone %d blocks per SM%s\n", mt ? "2-4" : "1",
-                 stat ? " (counting kernel)" : "", A.H, grid, sms, occ, smem, occ_rx, A.pipe ? "; copy pipeline (v57)" : "");
+    std::fprintf(stderr, "moe_half: %s tokens%s, H %d: grid %d (%d SMs x %d blocks), shared memory %d B; k_rx alone %d blocks per SM%s%s\n", mt ? "2-4" : "1",
+                 stat ? " (counting kernel)" : "", A.H, grid, sms, occ, smem, occ_rx, A.pipe ? "; copy pipeline (v57)" : "",
+                 two ? "; __launch_bounds__(256, 2) (v60 H A/B)" : "");
   }
   MoeHalfArgs a = A;
   int sb = sbytes;
@@ -2530,6 +2538,7 @@ void stream_kernel_report() {  // v55b: registers, local memory and blocks per S
   const K ks[] = {{reinterpret_cast<const void*>(k_moe_half<false, 2>), "k_moe_half<1 token>", sm_moe},  // v58: the H 2048 instances (were H <= 1024)
                   {reinterpret_cast<const void*>(k_moe_half<true, 2>), "k_moe_half<2-4 tokens>", sm_moe},
                   {reinterpret_cast<const void*>(k_moe_half<false, 2, true>), "k_moe_half<1, counting>", sm_moe},
+                  {reinterpret_cast<const void*>(k_moe_half<false, 2, false, 2>), "k_moe_half<1 token, (256,2)>", kLutRxBytes + 8 * sb},  // v60 H: no pipeline
                   {reinterpret_cast<const void*>(k_rx<false>), "k_rx<1 token>", kLutRxBytes + 8 * sb},
                   {reinterpret_cast<const void*>(k_rx<true>), "k_rx<2-4 tokens>", kLutRxBytes + 8 * sb},
                   {reinterpret_cast<const void*>(k_stream<false>), "k_stream<1 token>", kLutBytes},

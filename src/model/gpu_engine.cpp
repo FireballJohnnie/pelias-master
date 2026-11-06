@@ -244,7 +244,9 @@ struct GpuEngine::Impl {
   // 1 after the MoE half (= the block: gather, norms, eh_proj, attention, MoE), 2 before the head product, 3 after the
   // argmax; the generate loop sums them after its sync (mtp_slots lists the steps)
   unsigned long long *mtp_ts_h = nullptr, *mtp_ts_d = nullptr;
-  static constexpr int kMtpStamps = 6;  // v60 E2: 0 start, 1 after the MoE half, 2 before the head, 3 after the sketch dot, 4 after the top-k select, 5 after the argmax / pick
+  // v60 E2: 0 start, 1 after the MoE half, 2 before the head, 3 after the sketch dot, 4 after the top-k select, 5 after the
+  // argmax / pick; v60 H: 6 after the input (gather, cat, norms), 7 after eh_proj, 8 after the attention (the MoE half ends at 1)
+  static constexpr int kMtpStamps = 9;
   std::vector<unsigned> mtp_slots;
   std::int32_t* mtp_top_d = nullptr;
   const std::uint8_t* mtp_emb_dev = nullptr;
@@ -771,8 +773,11 @@ struct GpuEngine::Impl {
     A.load_mode = kRxLoad;
     A.y = y;
     A.ph = ph_d && il < s.n_layer && !in_prompt ? ph_d + static_cast<int64_t>(il) * 5 : nullptr;  // v55b (v58: not the MTP row; v60 C: not prompt steps, whose stamps nobody reads)
-    A.pipe = 1;  // v57 copy pipeline (v60: locked on; v59d X3 MEASURED no gain without it)
-    A.sact = 1;  // v57 shared activations (v60: locked on; v59d X2 / v59g G5-G6 MEASURED neutral-to-better)
+    // v57 copy pipeline + shared activations (v60: locked on; v59d X3 MEASURED no gain without it; X2 / v59g G5-G6 neutral-to-
+    // better). v60 H (Fix 4 A/B): off for the (256, 2) instantiation (two blocks' buffers do not fit) or with rx_pipe 0
+    A.pipe = o.rx_pipe != 0 && o.moe_blocks != 2 ? 1 : 0;
+    A.sact = A.pipe;
+    A.blocks = o.moe_blocks;
     A.st = il < s.n_layer ? rst_d : rst_mtp_d;                    // v55e3 (v60 C: the MTP row has its own counters)
     // v55f / v55f2: the bit planes only feed planed experts' 1-bit route; with no planes (--plane-bits 0) nothing reads
     // them, so they are not built (v55f2 S0 +0.33 ms vs g55e3, MEASURED)
@@ -1377,7 +1382,9 @@ struct GpuEngine::Impl {
         if (rhq && rhs && rhsum && rxplan) {
           dev_bytes += z(P * Fx) + z(P * Fx / 32) * 8 + pb;
           rx_ok = true;
-          rx_note = "on (gate / up, silu x up, down of every pick in one R3 launch per layer)";
+          rx_note = std::string("on (gate / up, silu x up, down of every pick in one R3 launch per layer)") +
+                    (o.moe_blocks == 2 ? "; one-token kernel at __launch_bounds__(256, 2), copy pipeline off (v60 H A/B)"
+                                       : o.rx_pipe == 0 ? "; copy pipeline off (v60 H A/B)" : "");
           // v55b: the stage's one grid in shared memory: the slider's bits for every Q4_TG2 job (planes), else the stored grid
           {  // v55f: the staging buffer sized to the largest block of any matrix the stage stages (load mode 1: the experts
              // not in VRAM; 2: every expert and the shared one), at the slider's bits for the plane matrices
@@ -1743,6 +1750,8 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
   if (o.plane_bits < 2 || o.plane_bits > 5) return R::fail(Status::fail(Code::invalid_argument, "engine: plane_bits 2, 3, 4 or 5 (5: every code as stored; v60: always on)"));
   if (o.mtp_plane_bits != 0 && (o.mtp_plane_bits < 2 || o.mtp_plane_bits > 5))
     return R::fail(Status::fail(Code::invalid_argument, "engine: mtp_plane_bits 0 (the slider) or 2-5 (v60 F2)"));
+  if ((o.moe_blocks != 1 && o.moe_blocks != 2) || (o.rx_pipe != 0 && o.rx_pipe != 1))
+    return R::fail(Status::fail(Code::invalid_argument, "engine: moe_blocks 1 or 2, rx_pipe 0 or 1 (v60 H)"));
   if (o.mtp && I.row_bits(s.n_layer) != o.plane_bits) {  // v60 F2: the Q4_TG2 decode grid (c_rx_bits) is one per launch, so a planed
     // Q4_TG2 matrix in the MTP row cannot read with other bits than the trunk's; this file's MTP experts are Q4_K (no grid)
     for (const WeightView* v : {&w.mtp.layer.gate_exps, &w.mtp.layer.up_exps, &w.mtp.layer.down_exps})
@@ -2052,7 +2061,7 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
   {  // v60: the mapped ring for the step's ids and position, and the token embedding registered for the GPU gather
     void* rdev = nullptr;
     const std::size_t ring_ids = static_cast<std::size_t>(Impl::kRing) * (Impl::kReaderMax * sizeof(std::int32_t) + sizeof(int));
-    const std::size_t ring_ts = (ring_ids + 255) / 256 * 256;  // v60 D: the MTP stamps start here, kMtpStamps x u64 per slot (E2: 6)
+    const std::size_t ring_ts = (ring_ids + 255) / 256 * 256;  // v60 D: the MTP stamps start here, kMtpStamps x u64 per slot (E2: 6; H: 9)
     const std::size_t ring_b = ring_ts + static_cast<std::size_t>(Impl::kRing) * Impl::kMtpStamps * sizeof(unsigned long long) + 256;
     I.ring_hv = g::host_alloc_mapped(ring_b, &rdev);
     if (!I.ring_hv || !rdev) return R::fail(Status::fail(Code::internal, std::string("engine: mapped memory for the step ring: ") + g::last_error()));
@@ -2469,11 +2478,14 @@ Status GpuEngine::Impl::mtp_run(const std::int32_t* tokens_h, const std::int32_t
     return gfail("engine: MTP input");
   if (!g::rms_norm(I.cat, I.enorm, I.cat, e, 1, e, 2 * e, n, s.rms_eps) || !g::rms_norm(I.cat + e, I.hnorm, I.cat + e, e, 1, e, 2 * e, n, s.rms_eps))
     return gfail("engine: MTP norms");
+  if (ts && !g::stamp(ts + 6)) return gfail("engine: MTP stamp");  // v60 H: after the input
   Status st;
   if (!(st = I.prod(I.eh, I.cat, n, I.x))) return st;
+  if (ts && !g::stamp(ts + 7)) return gfail("engine: MTP stamp");  // v60 H: after eh_proj
   Layer& D = I.M;
   if (!g::rms_norm(I.x, D.attn_norm, I.xn, e, 1, e, e, n, s.rms_eps)) return gfail("engine: MTP attn norm");
   if (!(st = I.attention_block(D, n, I.mtp_pos, true))) return st;  // v60 C: K / V through knew / vnew at *pos_d (the direct plan)
+  if (ts && !g::stamp(ts + 8)) return gfail("engine: MTP stamp");  // v60 H: after the attention (the MoE half ends at stamp 1)
   if (!I.fused_ok(D, n, false)) {  // v58b: names the first condition that keeps the block off the fused launch
     const char* why = I.fused_why(D, n, false);
     return Status::fail(Code::internal, std::string("engine: the MTP block's MoE half cannot run on the fused launch: ") + (why ? why : "?"));
@@ -2618,11 +2630,18 @@ Status engine_generate_greedy_mtp(GpuEngine& eng, const Qwen35MoeSpec& s, const 
   if (n_draft > 0 && !I.mtp_emb_dev) return Status::fail(Code::unsupported, "engine: the MTP block's device input is off (see the open note)");
   const float* const hid0 = I.hid_d;  // row 0: the hidden before a chunk (zeros before the first); rows 1 .. k: the chunk's
   // v60 D: after a sync, the GPU time of the MTP steps issued since the last fold, split at the head (stamps 0-1 layer, 2-3 head)
-  auto fold_stamps = [&](double* total_s, double* layer_s, double* head_s) {
+  auto fold_stamps = [&](double* total_s, double* layer_s, double* head_s, double* block_s) {
     for (unsigned slot : I.mtp_slots) {
       const unsigned long long* t = I.mtp_ts_h + static_cast<std::ptrdiff_t>(slot) * GpuEngine::Impl::kMtpStamps;
       if (t[0] && t[5] >= t[0]) *total_s += static_cast<double>(t[5] - t[0]) * 1e-9;
       if (t[0] && t[1] >= t[0]) *layer_s += static_cast<double>(t[1] - t[0]) * 1e-9;
+      // v60 H: the block's split (stamps 6, 7, 8 inside it; drafts only)
+      if (block_s && t[0] && t[6] >= t[0] && t[7] >= t[6] && t[8] >= t[7] && t[1] >= t[8]) {
+        block_s[0] += static_cast<double>(t[6] - t[0]) * 1e-9;
+        block_s[1] += static_cast<double>(t[7] - t[6]) * 1e-9;
+        block_s[2] += static_cast<double>(t[8] - t[7]) * 1e-9;
+        block_s[3] += static_cast<double>(t[1] - t[8]) * 1e-9;
+      }
       if (t[2] && t[5] >= t[2]) *head_s += static_cast<double>(t[5] - t[2]) * 1e-9;
       // v60 E2: the sketch chain's split (stamps 3 and 4 are written only on the sketch path; zero otherwise)
       if (t[2] && t[3] >= t[2] && t[4] >= t[3] && t[5] >= t[4]) {
@@ -2655,7 +2674,7 @@ Status engine_generate_greedy_mtp(GpuEngine& eng, const Qwen35MoeSpec& s, const 
   }
   if (!g::sync()) return Status::fail(Code::internal, std::string("engine: prompt sync: ") + g::last_error());
   I.unsynced = 0;
-  if (I.mtp_ts_h) fold_stamps(&T.prompt_mtp_gpu_s, &T.prompt_mtp_layer_s, &T.prompt_mtp_head_s);  // v60 D: the MTP catch-up over the prompt
+  if (I.mtp_ts_h) fold_stamps(&T.prompt_mtp_gpu_s, &T.prompt_mtp_layer_s, &T.prompt_mtp_head_s, nullptr);  // v60 D: the MTP catch-up over the prompt
   // pending: the hidden of the last prompt position (row 0 after the carry) -> h_d, the draft chain's seed
   if (!g::dcopy(I.h_d, I.hid_d, z(e) * sizeof(float))) return Status::fail(Code::internal, "engine: MTP seed");
   T.prompt_s += secs(tp0);
@@ -2682,7 +2701,7 @@ Status engine_generate_greedy_mtp(GpuEngine& eng, const Qwen35MoeSpec& s, const 
       if (!g::to_host(drafts.data(), I.mtp_top_d, z(k) * sizeof(std::int32_t))) return Status::fail(Code::internal, "engine: draft ids");
       I.unsynced = 0;
       T.draft_s += secs(tq);
-      if (I.mtp_ts_h) fold_stamps(&T.draft_gpu_s, &T.draft_layer_s, &T.draft_head_s);
+      if (I.mtp_ts_h) fold_stamps(&T.draft_gpu_s, &T.draft_layer_s, &T.draft_head_s, T.draft_block_s);
       T.drafts += k;
       // v58c: draft[0] at position m0 used exact (last, pending), so m0 + 1 is ALREADY valid in the MTP KV cache!
       eng.mtp_truncate(m0 + 1);
@@ -2721,7 +2740,7 @@ Status engine_generate_greedy_mtp(GpuEngine& eng, const Qwen35MoeSpec& s, const 
       if (!g::sync()) return Status::fail(Code::internal, std::string("engine: catch-up sync: ") + g::last_error());
       I.unsynced = 0;
       T.catchup_s += secs(tc);
-      if (I.mtp_ts_h) fold_stamps(&T.catchup_gpu_s, &T.catchup_layer_s, &T.catchup_head_s);
+      if (I.mtp_ts_h) fold_stamps(&T.catchup_gpu_s, &T.catchup_layer_s, &T.catchup_head_s, nullptr);
     }
     // pending: the hidden of the accepted token (row a) -> h_d
     if (!g::dcopy(I.h_d, I.hid_d + static_cast<int64_t>(a) * e, z(e) * sizeof(float))) return Status::fail(Code::internal, "engine: pending hidden");
