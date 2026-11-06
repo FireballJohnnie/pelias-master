@@ -103,6 +103,13 @@ bool attention(const float*, std::int64_t, std::int64_t, const float*, const flo
 bool deltanet_conv(const float*, const float*, const float*, std::int64_t, std::int64_t, std::int64_t, float*, float*, Stream) { return false; }
 bool deltanet_gates(float*, float*, const float*, const float*, std::int64_t, std::int64_t, Stream) { return false; }
 bool argmax_rows(const float*, std::int64_t, std::int64_t, std::int64_t, std::int32_t*, Stream) { return false; }
+// v60 E: the head sketch
+bool head_sketch_build(const void*, std::int64_t, std::int64_t, std::uint8_t*, Stream) { return false; }
+bool head_sketch_dot(const std::uint8_t*, const std::uint16_t*, std::int64_t, std::int64_t, const std::int8_t*, const float*, float*, Stream) { return false; }
+bool topk_select(const float*, std::int64_t, int, std::int32_t*, Stream) { return false; }
+bool gather_q6k_rows(const void*, const std::uint16_t*, std::int64_t, const std::int32_t*, int, void*, std::uint16_t*, Stream) { return false; }
+bool pick_id(const std::int32_t*, const std::int32_t*, std::int32_t*, Stream) { return false; }
+bool recall_count(const std::int32_t*, int, const std::int32_t*, unsigned*, unsigned*, Stream) { return false; }
 bool deltanet_ba_fast(std::uint32_t, const void*, std::uint64_t, std::uint32_t, const void*, std::uint64_t, std::int64_t, std::int64_t, const float*, std::int64_t,
                       std::int64_t) {
   return false;

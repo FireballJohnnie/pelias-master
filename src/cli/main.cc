@@ -2439,7 +2439,7 @@ int cmd_engine_check(const Args& a) {
                  "                           [--budget-gb G] [--hot-max N (default 40)] [--mtp-draft K] [--fast-cpu] [--no-cpu] [--float-ref] [--ref-threads N]\n"
                  "                           [--text FILE [--skip-tokens N]] [--dump-top OUT.tsv] [--dump-router OUT.tsv] [--dump-draft OUT.tsv] [--dump-split [--split-sizes 2,3,4] [--split-step]]\n"
                  "                           [--split-ref] [--probe-pos P] [--router-tie BAND (default 0.01)] [--trace OUT.tsv] [--reader-cache K] [--no-graph]\n"
-                 "                           [--plane-bits 2|3|4|5 (default 5)] [--no-auto-vram] [--cache-share F] [--mtp-cache-mb M] [--pin-read-min-gbs F] [--pin-read-tries N] [--verbose-gpu] [--pin-gap-kib K] [--pin-huge-ok] [--host-wait auto|spin|yield|block]\n"
+                 "                           [--plane-bits 2|3|4|5 (default 5)] [--no-auto-vram] [--cache-share F] [--mtp-cache-mb M] [--mtp-head-sketch 0|2] [--mtp-head-sketch-check] [--pin-read-min-gbs F] [--pin-read-tries N] [--verbose-gpu] [--pin-gap-kib K] [--pin-huge-ok] [--host-wait auto|spin|yield|block]\n"
                  "                           (v60: the engine's A/B switches are locked in; --batch-identical and the other old switches are accepted and ignored)\n");
     return 1;
   }
@@ -2454,11 +2454,12 @@ int cmd_engine_check(const Args& a) {
     out = r.value;
     return true;
   };
-  std::uint64_t npre = 0, ndec = 0, ctx = 0, batch = 0, thr = 0, hmax = 0, ndraft = 0, skip = 0, mtpc = 0, pintries = 3;
+  std::uint64_t npre = 0, ndec = 0, ctx = 0, batch = 0, thr = 0, hmax = 0, ndraft = 0, skip = 0, mtpc = 0, pintries = 3, hsk = 0;
   if (!num("prefill", 64, 1, 1 << 20, npre) || !num("decode", 32, 0, 1 << 20, ndec) || !num("ctx", 4096, 2, 1 << 20, ctx) || !num("batch", 64, 1, 4096, batch) ||
       !num("threads", 0, 0, 4096, thr) || !num("hot-max", 40, 0, 4096, hmax) || !num("mtp-draft", 0, 0, 16, ndraft) ||  // --threads: the CPU reference only (v60)
       !num("skip-tokens", 0, 0, std::uint64_t{1} << 40, skip) || !num("mtp-cache-mb", 0, 0, 65536, mtpc) ||  // v60 C: the MTP row's extra cache
-      !num("pin-read-tries", 3, 1, 16, pintries))  // v60 C2: re-pin attempts when the pinned read is below --pin-read-min-gbs
+      !num("pin-read-tries", 3, 1, 16, pintries) ||  // v60 C2: re-pin attempts when the pinned read is below --pin-read-min-gbs
+      !num("mtp-head-sketch", 0, 0, 2, hsk))  // v60 E: 2 = the draft's head through the Q6_K head's two top code planes (0: the full head)
     return 1;
   const std::string dump_top = a.get("dump-top");
   if (!dump_top.empty()) {
@@ -2594,6 +2595,8 @@ int cmd_engine_check(const Args& a) {
   eo.auto_vram = !a.has("no-auto-vram");  // v54b; v58: on by default
   eo.mtp_cache_mb = static_cast<int>(mtpc);  // v60 C: 0 = the activation bytes freed by the 4-row layout
   eo.pin_read_tries = static_cast<int>(pintries);  // v60 C2
+  eo.mtp_head_sketch = static_cast<int>(hsk);      // v60 E
+  eo.mtp_head_sketch_check = a.has("mtp-head-sketch-check");  // v60 E: the full head too, recall counted per draft
   if (a.has("pin-read-min-gbs")) {  // v60 C2: the pinned-read floor in GB/s (0: probe and log only)
     char* end = nullptr;
     const std::string pm = a.get("pin-read-min-gbs");
@@ -2835,10 +2838,18 @@ int cmd_engine_check(const Args& a) {
                   tmg.prompt_s, tmg.drafts, tmg.drafts ? 1e3 * tmg.draft_s / tmg.drafts : 0.0, tmg.draft_s, vs, vb_s.c_str(), tmg.keep_s, tmg.catchup_s, tmg.argmax_s);
       if (tmg.draft_gpu_s > 0.0 || tmg.prompt_mtp_gpu_s > 0.0) {  // v60 D: the MTP block's GPU time by part (globaltimer stamps)
         const double nd = tmg.drafts > 0 ? static_cast<double>(tmg.drafts) : 1.0;
-        std::printf("  MTP GPU time per draft: %.2f ms = the block %.2f (input gather, eh_proj, attention, MoE half) + head %.2f (248k-row product + argmax) + %.2f between; catch-up steps %.3f s GPU (block %.3f); prompt catch-up %.3f s GPU (block %.3f) of the %.3f s prompt tax\n",
+        std::printf("  MTP GPU time per draft: %.2f ms = the block %.2f (input gather, eh_proj, attention, MoE half) + head %.2f (248k-row product + argmax, or the sketch chain) + %.2f between; catch-up steps %.3f s GPU (block %.3f); prompt catch-up %.3f s GPU (block %.3f) of the %.3f s prompt tax\n",
                     1e3 * tmg.draft_gpu_s / nd, 1e3 * tmg.draft_layer_s / nd, 1e3 * tmg.draft_head_s / nd,
                     1e3 * (tmg.draft_gpu_s - tmg.draft_layer_s - tmg.draft_head_s) / nd, tmg.catchup_gpu_s, tmg.catchup_layer_s, tmg.prompt_mtp_gpu_s,
                     tmg.prompt_mtp_layer_s, tmg.prompt_s - pre_s);
+      }
+      if (tmg.sketch_drafts > 0) {  // v60 E: the head sketch's drafts and, in check mode, its recall
+        std::printf("  MTP head sketch: %llu of %d drafts took the two-plane sketch + top-64 re-score", static_cast<unsigned long long>(tmg.sketch_drafts), tmg.drafts);
+        if (tmg.sketch_recall_n > 0)
+          std::printf("; recall %llu / %llu = %.2f %% (the full head's argmax among the sketch's top rows; the kept rate is the gate)",
+                      static_cast<unsigned long long>(tmg.sketch_recall_hit), static_cast<unsigned long long>(tmg.sketch_recall_n),
+                      100.0 * static_cast<double>(tmg.sketch_recall_hit) / static_cast<double>(tmg.sketch_recall_n));
+        std::printf("\n");
       }
       // v28b (author 23:14, the unlisted ~1.5 s): the MTP run's total minus the plain run's prefill still holds the MTP run's own
       // longer prompt phase; here the decode phase alone, and what is left after the listed parts

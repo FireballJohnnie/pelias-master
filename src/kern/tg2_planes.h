@@ -189,6 +189,44 @@ inline void q5p_unplane_row(const std::uint8_t* in, std::uint8_t* out, int nB, i
       }
   }
 }
+// v60 E (the head sketch for MTP drafts; docs/PELIAS_GAME_PLAN_V59_FORWARD.md item 2b): a Q6_K matrix's top two code planes
+// with its stored sub-block scales, so the draft's head product can read ~38 % of the head's bytes by the 1-bit route and
+// re-score its top rows exactly. The 6-bit code q (0..63, value d x sc x (q - 32)) keeps bits 5 and 4 as two 1-bit planes;
+// read alone they give the code with its low four bits at the middle of their range (the v27 rule: q - 32 -> 16 c - 24.5
+// for the 2-bit code c), the same rule the Q4_TG2 / Q5_K planes use. Row layout for k values (10 k / 32 bytes; k = 2048:
+// 640): [k / 32 sub-blocks x 8 bytes: word 2 s = bit 5 of sub-block s's 32 codes (value l at bit l), word 2 s + 1 = bit 4]
+// [k / 16 scale bytes: the blocks' 16 int8 scales as stored, scale 2 s + hf for values 16 hf .. 16 hf + 15 of sub-block s].
+// The block's fp16 d stays in R3's d6 array (one per 256). Sub-block s of the row = block s / 8, half (s / 4) & 1, p = s & 3
+// in the R3 kernel's own numbering (q6_sub: ql bytes 64 h + 32 (p & 1) + i at nibble p >> 1, qh bytes 32 h + i bits 2 p).
+constexpr std::uint32_t g_q6_ksk = 1011;  // GPU-path id (not a file type): the sketch layout
+PG_HD std::uint64_t q6k_sketch_row_bytes(std::int64_t k) { return static_cast<std::uint64_t>(k) * 10 / 32; }
+// one 256-value block (its 208 bytes in R3's layout: ql[128] | qh[64] | scales[16]) -> its 16 plane words and 16 scale bytes
+PG_HD void q6k_sketch_block(const std::uint8_t* b208, std::uint32_t* planes16, std::uint8_t* sc16) {
+  for (int h = 0; h < 2; ++h)
+    for (int p = 0; p < 4; ++p) {
+      std::uint32_t hi = 0, nx = 0;
+      for (int i = 0; i < 32; ++i) {
+        const int q = ((b208[64 * h + 32 * (p & 1) + i] >> (4 * (p >> 1))) & 15) | (((b208[128 + 32 * h + i] >> (2 * p)) & 3) << 4);
+        hi |= static_cast<std::uint32_t>((q >> 5) & 1) << i;
+        nx |= static_cast<std::uint32_t>((q >> 4) & 1) << i;
+      }
+      planes16[2 * (4 * h + p)] = hi;
+      planes16[2 * (4 * h + p) + 1] = nx;
+    }
+  for (int i = 0; i < 16; ++i) sc16[i] = b208[192 + i];
+}
+// twice the sketch's integer sum over one 16-value half (hf 0: values 0-15, 1: 16-31) of a sub-block: 2 sum (16 c - 24.5) x
+// = 32 (2 D5 + D4) - 49 X with D5 / D4 the plane dots (plane_dot32 on the half's bits) and X = the half's sum of x (the
+// caller has it from plane_dot32(mask, u8), once per token and sub-block). Exact integers; the GPU kernel and the host test
+// run this same function
+PG_HD int q6k_sketch_half2(std::uint32_t hi, std::uint32_t nx, const std::uint32_t* u8, int hf, int xsum16) {
+  const std::uint32_t m = hf ? 0xffff0000u : 0x0000ffffu;
+  return 32 * (2 * plane_dot32(hi & m, u8) + plane_dot32(nx & m, u8)) - 49 * xsum16;
+}
+// one sub-block's sketch term as the R3 kernel forms the exact one (acc += d * xs * float(sc0 (a0 - 32 x0) + sc1 (a1 - 32 x1))):
+// d * xs * (sc0 T0 + sc1 T1) / 2 with T the doubled half sums above
+PG_HD float q6k_sketch_sub(float d, float xs, int sc0, int sc1, int t0, int t1) { return d * xs * (0.5f * static_cast<float>(sc0 * t0 + sc1 * t1)); }
+
 // host: a stored row of either planed type into its plane layout (by the stored quant type id: 204 Q4_TG2, 13 Q5_K)
 inline void plane_row(std::uint32_t stored_type, const std::uint8_t* in, std::uint8_t* out, std::uint64_t rb) {
   if (stored_type == 204) tg2p_plane_row(in, out, static_cast<int>(rb / 144));

@@ -21,6 +21,7 @@
 #include "kern/cuda/moe_dev.cuh"
 #include "kern/gpu_decode.h"
 #include "kern/gpu_ops.h"
+#include "kern/tg2_planes.h"
 #include "quant/iq_tables.h"
 #include "quant/quant_cpu.h"
 
@@ -1707,6 +1708,177 @@ bool argmax_rows(const float* x, std::int64_t n, std::int64_t rows, std::int64_t
   if (rows <= 0) return true;
   k_argmax_rows<<<static_cast<unsigned>(rows), 1024, 0, st(s)>>>(x, n, ld, out);
   return launched("argmax rows");
+}
+
+// ------------------------------------------------------------------------------------------------ head sketch (v60 E)
+// The MTP draft's head through the Q6_K head's top two code planes (kern/tg2_planes.h g_q6_ksk): built once at open, read by
+// the 1-bit route per draft, its top k rows re-scored by the full product's own kernel. Nothing here is on the verify path.
+
+// one thread per 256-value block: 208 R3 bytes -> 16 plane words + 16 scale bytes in the row layout (nbr blocks per row)
+__global__ void k_head_sketch_build(const std::uint8_t* __restrict__ w208, std::int64_t nblk, int nbr, std::uint8_t* __restrict__ out) {
+  const std::int64_t id = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (id >= nblk) return;
+  const std::int64_t r = id / nbr, b = id % nbr;
+  std::uint32_t pl[16];
+  std::uint8_t sc[16];
+  q6k_sketch_block(w208 + 208 * id, pl, sc);
+  const std::uint64_t rb = static_cast<std::uint64_t>(nbr) * 80;  // 10 k / 32 with k = 256 nbr
+  auto* pw = reinterpret_cast<std::uint32_t*>(out + static_cast<std::uint64_t>(r) * rb) + 16 * b;
+  for (int i = 0; i < 16; ++i) pw[i] = pl[i];
+  std::uint8_t* ps = out + static_cast<std::uint64_t>(r) * rb + static_cast<std::uint64_t>(nbr) * 64 + 16 * b;
+  for (int i = 0; i < 16; ++i) ps[i] = sc[i];
+}
+
+// one warp per row, 8 rows per block; the token's activation bit planes (act_bits32) and half sums built once per block in
+// shared memory; lane l takes sub-blocks l, l + 32, ... (8 B of planes + 2 scale bytes each) and forms the sketch term with
+// the shared tg2_planes.h helpers; warp_sum, as the R3 kernel's lanes
+constexpr int kSkSubMax = 128;  // k <= 4096
+__global__ void __launch_bounds__(256) k_head_sketch_dot(const std::uint8_t* __restrict__ sk, const std::uint16_t* __restrict__ d6, std::int64_t rows,
+                                                          int nsub, const std::int8_t* __restrict__ q, const float* __restrict__ xs,
+                                                          float* __restrict__ y) {
+  __shared__ std::uint32_t u8[kSkSubMax][9];  // 9: lanes read s = lane -> distinct banks
+  __shared__ int xh[kSkSubMax][2];
+  __shared__ float sxs[kSkSubMax];
+  for (int s = static_cast<int>(threadIdx.x); s < nsub; s += static_cast<int>(blockDim.x)) {
+    act_bits32(q + 32 * s, u8[s]);
+    xh[s][0] = plane_dot32(0x0000ffffu, u8[s]);
+    xh[s][1] = plane_dot32(0xffff0000u, u8[s]);
+    sxs[s] = xs[s];
+  }
+  __syncthreads();
+  const int warp = static_cast<int>(threadIdx.x) >> 5, lane = static_cast<int>(threadIdx.x) & 31;
+  const std::int64_t r = static_cast<std::int64_t>(blockIdx.x) * 8 + warp;
+  if (r >= rows) return;
+  const std::uint64_t rb = static_cast<std::uint64_t>(nsub) * 10;
+  const std::uint8_t* row = sk + static_cast<std::uint64_t>(r) * rb;
+  const auto* pw = reinterpret_cast<const std::uint32_t*>(row);
+  const std::uint8_t* sc = row + static_cast<std::uint64_t>(nsub) * 8;
+  const std::uint16_t* dr = d6 + r * (nsub >> 3);
+  float acc = 0.0f;
+  for (int s = lane; s < nsub; s += 32) {
+    const uint2 w2 = *reinterpret_cast<const uint2*>(pw + 2 * s);
+    const int sc0 = static_cast<int>(static_cast<std::int8_t>(sc[2 * s])), sc1 = static_cast<int>(static_cast<std::int8_t>(sc[2 * s + 1]));
+    const float d = half_float(dr[s >> 3]);  // gpu_decode.h: exact, as quant::fp16_to_fp32 (the host test uses that)
+    const int t0 = q6k_sketch_half2(w2.x, w2.y, u8[s], 0, xh[s][0]);
+    const int t1 = q6k_sketch_half2(w2.x, w2.y, u8[s], 1, xh[s][1]);
+    acc += q6k_sketch_sub(d, sxs[s], sc0, sc1, t0, t1);
+  }
+  acc = warp_sum(acc);
+  if (lane == 0) y[r] = acc;
+}
+
+// the k largest of n floats, one block of 1024: radix select on the order-preserving key of the float (4 passes of 8 bits from
+// the top: a shared histogram of the candidates' digit, the digit holding the k-th largest chosen), then the ids with a key
+// above the k-th key, then as many ids with the k-th key as are still needed
+__device__ __forceinline__ unsigned f_key(float f) {
+  const unsigned u = __float_as_uint(f);
+  return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+__global__ void __launch_bounds__(1024) k_topk_select(const float* __restrict__ x, std::int64_t n, int k, std::int32_t* __restrict__ ids) {
+  __shared__ unsigned hist[256];
+  __shared__ unsigned s_pre, s_mask, s_need, s_cnt_gt, s_cnt_eq;
+  const int tid = static_cast<int>(threadIdx.x);
+  if (tid == 0) {
+    s_pre = 0;
+    s_mask = 0;
+    s_need = static_cast<unsigned>(k);
+  }
+  for (int shift = 24; shift >= 0; shift -= 8) {
+    if (tid < 256) hist[tid] = 0;
+    __syncthreads();
+    const unsigned pre = s_pre, mask = s_mask;
+    for (std::int64_t i = tid; i < n; i += 1024) {
+      const unsigned ky = f_key(x[i]);
+      if ((ky & mask) == pre) atomicAdd(&hist[(ky >> shift) & 255u], 1u);
+    }
+    __syncthreads();
+    if (tid == 0) {
+      unsigned cum = 0, need = s_need, chosen = 0;
+      for (int d = 255; d >= 0; --d) {
+        cum += hist[d];
+        if (cum >= need) {
+          chosen = static_cast<unsigned>(d);
+          need -= cum - hist[d];
+          break;
+        }
+      }
+      s_pre = pre | (chosen << shift);
+      s_mask = mask | (255u << shift);
+      s_need = need;
+      s_cnt_gt = 0;
+      s_cnt_eq = 0;
+    }
+    __syncthreads();
+  }
+  const unsigned kth = s_pre, need = s_need;
+  const unsigned n_gt = static_cast<unsigned>(k) - need;
+  for (std::int64_t i = tid; i < n; i += 1024) {
+    const unsigned ky = f_key(x[i]);
+    if (ky > kth) {
+      const unsigned at = atomicAdd(&s_cnt_gt, 1u);
+      if (at < n_gt) ids[at] = static_cast<std::int32_t>(i);
+    } else if (ky == kth) {
+      const unsigned at = atomicAdd(&s_cnt_eq, 1u);
+      if (at < need) ids[n_gt + at] = static_cast<std::int32_t>(i);
+    }
+  }
+}
+
+// n rows of 208-byte blocks (13 int4 each) and their d6 gathered by id; one block per row
+__global__ void __launch_bounds__(256) k_gather_q6k_rows(const int4* __restrict__ w, const std::uint16_t* __restrict__ d6, int nbr, const std::int32_t* __restrict__ ids,
+                                                          int4* __restrict__ wo, std::uint16_t* __restrict__ d6o) {
+  const int r = static_cast<int>(blockIdx.x);
+  const std::int64_t src = static_cast<std::int64_t>(ids[r]) * nbr;
+  const int nw = nbr * 13;
+  for (int i = static_cast<int>(threadIdx.x); i < nw; i += static_cast<int>(blockDim.x)) wo[static_cast<std::int64_t>(r) * nw + i] = w[src * 13 + i];
+  if (threadIdx.x < static_cast<unsigned>(nbr)) d6o[r * nbr + static_cast<int>(threadIdx.x)] = d6[src + static_cast<int>(threadIdx.x)];
+}
+__global__ void k_pick_id(const std::int32_t* __restrict__ ids, const std::int32_t* __restrict__ idx, std::int32_t* __restrict__ out) { out[0] = ids[idx[0]]; }
+__global__ void k_recall_count(const std::int32_t* __restrict__ ids, int n, const std::int32_t* __restrict__ truth, unsigned* hit, unsigned* total) {
+  __shared__ int found;
+  if (threadIdx.x == 0) found = 0;
+  __syncthreads();
+  const std::int32_t t = truth[0];
+  for (int i = static_cast<int>(threadIdx.x); i < n; i += static_cast<int>(blockDim.x))
+    if (ids[i] == t) found = 1;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    ++*total;
+    if (found) ++*hit;
+  }
+}
+
+bool head_sketch_build(const void* w208, std::int64_t rows, std::int64_t k, std::uint8_t* out, Stream s) {
+  if (!w208 || !out || rows <= 0 || k < 256 || k > 4096 || k % 256) return fail("head_sketch_build: bad shape");
+  const std::int64_t nblk = rows * (k / 256);
+  k_head_sketch_build<<<blocks_for(nblk, 256), 256, 0, st(s)>>>(static_cast<const std::uint8_t*>(w208), nblk, static_cast<int>(k / 256), out);
+  return launched("head sketch build");
+}
+bool head_sketch_dot(const std::uint8_t* sk, const std::uint16_t* d6, std::int64_t rows, std::int64_t k, const std::int8_t* q, const float* xs, float* y,
+                     Stream s) {
+  if (!sk || !d6 || !q || !xs || !y || rows <= 0 || k < 256 || k > 4096 || k % 256) return fail("head_sketch_dot: bad shape");
+  k_head_sketch_dot<<<blocks_for(rows, 8), 256, 0, st(s)>>>(sk, d6, rows, static_cast<int>(k / 32), q, xs, y);
+  return launched("head sketch dot");
+}
+bool topk_select(const float* x, std::int64_t n, int k, std::int32_t* ids, Stream s) {
+  if (!x || !ids || k <= 0 || k > 1024 || n < k) return fail("topk_select: bad shape");
+  k_topk_select<<<1, 1024, 0, st(s)>>>(x, n, k, ids);
+  return launched("top-k select");
+}
+bool gather_q6k_rows(const void* w208, const std::uint16_t* d6, std::int64_t k, const std::int32_t* ids, int n, void* w_out, std::uint16_t* d6_out, Stream s) {
+  if (!w208 || !d6 || !ids || !w_out || !d6_out || n <= 0 || k < 256 || k > 4096 || k % 256) return fail("gather_q6k_rows: bad shape");
+  k_gather_q6k_rows<<<static_cast<unsigned>(n), 256, 0, st(s)>>>(static_cast<const int4*>(w208), d6, static_cast<int>(k / 256), ids, static_cast<int4*>(w_out), d6_out);
+  return launched("gather Q6_K rows");
+}
+bool pick_id(const std::int32_t* ids, const std::int32_t* idx, std::int32_t* out, Stream s) {
+  if (!ids || !idx || !out) return fail("pick_id: no address");
+  k_pick_id<<<1, 1, 0, st(s)>>>(ids, idx, out);
+  return launched("pick id");
+}
+bool recall_count(const std::int32_t* ids, int n, const std::int32_t* truth, unsigned* hit, unsigned* total, Stream s) {
+  if (!ids || !truth || !hit || !total || n <= 0) return fail("recall_count: bad arguments");
+  k_recall_count<<<1, 256, 0, st(s)>>>(ids, n, truth, hit, total);
+  return launched("recall count");
 }
 
 bool deltanet_gates(float* beta, float* alpha, const float* dt, const float* a, std::int64_t n, std::int64_t nv, Stream s) {

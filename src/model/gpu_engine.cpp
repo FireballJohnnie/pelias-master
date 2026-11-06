@@ -209,6 +209,23 @@ struct GpuEngine::Impl {
   const Qwen35MoeLayer& WL(std::uint32_t il) const { return il < s.n_layer ? w->layers[il] : w->mtp.layer; }
   Layer& LL(std::uint32_t il) { return il < s.n_layer ? L[il] : M; }
   DevW eh, head;
+  // v60 E: the head sketch (EngineOptions::mtp_head_sketch; kern/tg2_planes.h g_q6_ksk): the head's top two code planes +
+  // scales (hsk), a kHeadSketchTop-row Q6_K scratch in R3's layout that the full product's own kernel re-scores (head_top:
+  // gathered per draft, fixed addresses so its direct plan is built once), the candidate ids, the re-scored argmax's index,
+  // and the recall counters (hit, total) of the check mode
+  static constexpr int kHeadSketchTop = 64;
+  void* hsk_mem = nullptr;
+  std::uint8_t* hsk = nullptr;
+  std::size_t hsk_bytes = 0;
+  DevW head_top;
+  void* htop_w = nullptr;
+  std::uint16_t* htop_d6 = nullptr;
+  std::int32_t* cand_d = nullptr;
+  std::int32_t* idx_d = nullptr;
+  float* lg_top = nullptr;
+  unsigned* sk_cnt_d = nullptr;
+  std::uint64_t sk_drafts = 0, sk_hit = 0, sk_total = 0;
+  std::string sketch_note;
   const float *enorm = nullptr, *hnorm = nullptr, *head_norm = nullptr;
   std::int64_t mtp_pos = 0;
   float* cat = nullptr;  // kReaderMax x 2 n_embd
@@ -1495,6 +1512,7 @@ GpuEngine::~GpuEngine() {
   if (p_->M.router_f32) g::dfree(const_cast<float*>(p_->M.router_f32));  // v58b: the MTP router's F32 copy (device memory)
   if (p_->head.r3 && p_->head.sw.w != p_->out.sw.w) rel(p_->head);
   g::dfree(p_->act_mem);
+  g::dfree(p_->hsk_mem);  // v60 E: the head sketch (head_top's plan went with r3plans; its weights live here)
   g::dfree(p_->dense_mem);
   g::dfree(p_->state_mem);
   if (p_->stm) {  // v26
@@ -1623,6 +1641,10 @@ std::string GpuEngine::mtp_path_report() const {
   if (!I.mtp_router_note.empty()) r += "; " + I.mtp_router_note;
   if (I.mtp_emb_dev) r += "; v60 C: input gathered and concatenated on the GPU, hidden rows and the draft chain on the device, K / V through the direct plan";
   r += "; R3 dense runs since open: " + std::to_string(I.r3_direct_runs) + " on the direct plan, " + std::to_string(I.r3_copy_runs) + " through scratch copies";
+  if (I.hsk) {  // v60 E
+    r += "; head sketch: " + std::to_string(I.sk_drafts) + " drafts through the two-plane sketch + top-" + std::to_string(Impl::kHeadSketchTop) + " re-score";
+    if (I.o.mtp_head_sketch_check) r += ", recall " + std::to_string(I.sk_hit) + " / " + std::to_string(I.sk_total) + " (the full head's argmax among the sketch's top rows)";
+  }
   return r;
 }
 
@@ -1653,6 +1675,7 @@ std::string GpuEngine::summary() const {
   r += "; prompt on the GPU in steps of 1-4 tokens";  // v48 (v60: the only prompt path)
   r += "; R3 expert stage " + I.rx_note + ", rows staged for experts read from RAM";  // v46a-1 / v46a-2 (v60: locked)
   r += I.planes_note;  // v54
+  r += I.sketch_note;  // v60 E
   r += I.probe_note;   // v54b
   r += "; dense weights held once (R3's copies; v55 / v60: no raw copies or int8 tables)";
   {  // v60 commit C: the activation layout (steps of 1-4 rows) and what the v60b layout held beyond it
@@ -1836,6 +1859,57 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
       I.M.hot.assign(z(ne), 0);  // the MTP block has no bank: its experts come from the planes / the file mapping (v58)
     }
     if (!st) return R::fail(st);
+  }
+  // v60 E: the head sketch for the drafts, taken before the bank is sized (the bank gives up its bytes; ~100 experts here)
+  if (o.mtp && o.mtp_head_sketch > 0) {
+    if (o.mtp_head_sketch != 2) return R::fail(Status::fail(Code::unsupported, "engine: mtp_head_sketch takes 0 or 2 (the two-plane sketch is the one built; v60 E)"));
+    if (!I.head.r3 || !I.head.v || I.head.v->type != static_cast<std::uint32_t>(quant::Type::q6_k) || !I.head.sw.d6)
+      return R::fail(Status::fail(Code::unsupported, std::string("engine: the head sketch reads a Q6_K head held by R3 (this file's head is ") +
+                                                        (I.head.v ? quant::type_info(I.head.v->type).name : "absent") + ")"));
+    const int64_t nvoc = s.n_vocab, hk = I.head.k, nbr = hk / 256;
+    const std::size_t sk_b = al(z(nvoc) * static_cast<std::size_t>(kern::gpu::q6k_sketch_row_bytes(hk)));
+    const std::size_t top_w = al(z(Impl::kHeadSketchTop) * z(nbr) * 208), top_d = al(z(Impl::kHeadSketchTop) * z(nbr) * 2);
+    const std::size_t ids_b = al(z(Impl::kHeadSketchTop) * 4);
+    I.hsk_bytes = sk_b + top_w + top_d + ids_b * 2 + al(64) + al(256);
+    I.hsk_mem = g::dalloc(I.hsk_bytes);
+    if (!I.hsk_mem || !g::dzero(I.hsk_mem, I.hsk_bytes))
+      return R::fail(Status::fail(Code::over_ceiling, "engine: head sketch memory (" + std::to_string(I.hsk_bytes >> 20) + " MiB)"));
+    I.dev_bytes += I.hsk_bytes;
+    auto* c = static_cast<std::uint8_t*>(I.hsk_mem);
+    I.hsk = c;
+    c += sk_b;
+    I.htop_w = c;
+    c += top_w;
+    I.htop_d6 = reinterpret_cast<std::uint16_t*>(c);
+    c += top_d;
+    I.cand_d = reinterpret_cast<std::int32_t*>(c);
+    c += ids_b;
+    I.lg_top = reinterpret_cast<float*>(c);
+    c += ids_b;
+    I.idx_d = reinterpret_cast<std::int32_t*>(c);
+    c += al(64);
+    I.sk_cnt_d = reinterpret_cast<unsigned*>(c);
+    if (!g::head_sketch_build(I.head.sw.w, nvoc, hk, I.hsk)) return R::fail(gfail("engine: head sketch build"));
+    // the re-score weight: kHeadSketchTop rows in R3's Q6_K layout at fixed addresses, filled per draft, run by the same kernel
+    // and plan kind as the head itself (prod_r3 keys the plan on this DevW)
+    I.head_top = DevW{};
+    I.head_top.v = I.head.v;
+    I.head_top.n_out = Impl::kHeadSketchTop;
+    I.head_top.k = hk;
+    I.head_top.dtype = I.head.dtype;
+    I.head_top.drb = I.head.drb;
+    I.head_top.r3 = true;
+    I.head_top.sw.type = I.head.sw.type;
+    I.head_top.sw.n = Impl::kHeadSketchTop;
+    I.head_top.sw.k = hk;
+    I.head_top.sw.w = I.htop_w;
+    I.head_top.sw.d6 = I.htop_d6;
+    I.head_top.sw.bytes = z(Impl::kHeadSketchTop) * z(nbr) * 210;
+    char sb[240];
+    std::snprintf(sb, sizeof sb, "; head sketch (v60 E): the Q6_K head's top two code planes + scales, %.1f MB (%lld rows x %llu B, built on the GPU), top %d re-scored by the head's own kernel%s",
+                  static_cast<double>(sk_b) / 1e6, static_cast<long long>(nvoc), static_cast<unsigned long long>(kern::gpu::q6k_sketch_row_bytes(hk)), Impl::kHeadSketchTop,
+                  o.mtp_head_sketch_check ? ", recall checked against the full head" : "");
+    I.sketch_note = sb;
   }
   // the bank: what is left of the budget, filled rank by rank across the layers
   for (Layer& D : I.L) D.hot.assign(z(ne), 0);
@@ -2346,7 +2420,28 @@ Status GpuEngine::Impl::mtp_run(const std::int32_t* tokens_h, const std::int32_t
   if (!g::rms_norm(I.x, I.head_norm, I.xn, e, 1, e, e, n, s.rms_eps)) return gfail("engine: MTP head norm");
   if (h_out_d && !g::dcopy(h_out_d, I.xn, z(n) * z(e) * sizeof(float))) return gfail("engine: MTP hidden");
   if (ts && !g::stamp(ts + 2)) return gfail("engine: MTP stamp");
-  if (top_d_out || logits_h || top_h) {
+  // v60 E: a one-token draft that wants only its device argmax takes the head sketch (the full head's bytes x ~0.38): the
+  // sketch product by the 1-bit route, the top kHeadSketchTop rows gathered and re-scored by the head's own kernel, their
+  // argmax mapped back. Anything that reads logits, or more than one row, runs the full head below as before
+  const bool sketch = I.hsk && n == 1 && top_d_out && !logits_h;
+  if (sketch) {
+    const int64_t hk = I.head.k;
+    if (I.o.mtp_head_sketch_check) {  // the full head too, its argmax into top_d (the truth the recall counter compares with)
+      if (!(st = I.prod(I.head, I.xn, 1, I.lg + nvoc))) return st;
+      if (!g::argmax_rows(I.lg + nvoc, nvoc, 1, nvoc, I.top_d)) return gfail("engine: MTP argmax (check)");
+    }
+    if (!g::act_q8x32(I.xn, hk, 1, hk, I.head.v->rot32, I.xr, hk, I.q, I.scale, I.sum)) return gfail("engine: rounding for the head sketch");
+    if (!g::head_sketch_dot(I.hsk, static_cast<const std::uint16_t*>(I.head.sw.d6), nvoc, hk, I.q, I.scale, I.lg)) return gfail("engine: head sketch");
+    if (!g::topk_select(I.lg, nvoc, Impl::kHeadSketchTop, I.cand_d)) return gfail("engine: head sketch top rows");
+    if (!g::gather_q6k_rows(I.head.sw.w, static_cast<const std::uint16_t*>(I.head.sw.d6), hk, I.cand_d, Impl::kHeadSketchTop, I.htop_w, I.htop_d6))
+      return gfail("engine: head sketch gather");
+    if (!(st = I.prod_r3({{&I.head_top, I.lg_top}}, I.xn, 1))) return st;  // the exact Q6_K product of the top rows
+    if (!g::argmax_rows(I.lg_top, Impl::kHeadSketchTop, 1, Impl::kHeadSketchTop, I.idx_d)) return gfail("engine: head sketch argmax");
+    if (!g::pick_id(I.cand_d, I.idx_d, top_d_out)) return gfail("engine: head sketch pick");
+    if (I.o.mtp_head_sketch_check && !g::recall_count(I.cand_d, Impl::kHeadSketchTop, I.top_d, I.sk_cnt_d, I.sk_cnt_d + 1)) return gfail("engine: head sketch recall");
+    ++I.sk_drafts;
+    if (top_h && !g::to_host(top_h, top_d_out, sizeof(std::int32_t))) return gfail("engine: MTP argmax out");
+  } else if (top_d_out || logits_h || top_h) {
     if (!(st = I.prod(I.head, I.xn, n, I.lg))) return st;
     if (top_d_out && !g::argmax_rows(I.lg, nvoc, n, nvoc, top_d_out)) return gfail("engine: MTP argmax");
     if (top_h) {
@@ -2567,6 +2662,15 @@ Status engine_generate_greedy_mtp(GpuEngine& eng, const Qwen35MoeSpec& s, const 
       if (on_token) on_token(next);
     }
     last = next;
+  }
+  if (I.hsk) {  // v60 E: the sketch's counters (the last step synced before its host read; the counters are plain device ints)
+    unsigned cnt[2] = {0, 0};
+    if (!g::sync() || !g::to_host(cnt, I.sk_cnt_d, sizeof cnt)) return gfail("engine: head sketch counters");
+    I.sk_hit = cnt[0];
+    I.sk_total = cnt[1];
+    T.sketch_drafts = I.sk_drafts;
+    T.sketch_recall_hit = I.sk_hit;
+    T.sketch_recall_n = I.sk_total;
   }
   if (es) *es = tot;
   return Status::good();

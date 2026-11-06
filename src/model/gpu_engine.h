@@ -66,6 +66,13 @@ struct EngineOptions {
   // and are not plane types). 0: the activation bytes the v60b layout held for unreachable rows (act_freed, logged); more
   // comes out of the bank (an A/B knob, --mtp-cache-mb)
   int mtp_cache_mb = 0;
+  // v60 E: the draft's head through a sketch (kern/tg2_planes.h g_q6_ksk): 2 = the Q6_K head's top two code planes with its
+  // scales (~38 % of the head's bytes, 159 MB for this model, taken before the bank is sized), the top kHeadSketchTop rows
+  // re-scored by the full product's own kernel. 0: the full head per draft. Only one-token drafts with a device argmax take
+  // it; verify, the catch-up steps and any caller that reads logits run the full head unchanged. check: the full head runs
+  // too and the sketch's recall (its top rows hold the full head's argmax) is counted per draft (EngineMtpTiming)
+  int mtp_head_sketch = 0;
+  bool mtp_head_sketch_check = false;
   // v60 commit C2: the pinned-planes read probe at open (copy engine, GB/s, logged). pin_read_min_gbs > 0: below it the
   // planes are freed, pinned and packed again, up to pin_read_tries times (v60d: three of five arms read them 2-3x slower)
   double pin_read_min_gbs = 0.0;  // v60 C3: applies to the SM one-line-per-page read (GB/s of 128 B lines)
@@ -127,6 +134,9 @@ struct EngineMtpTiming {
   double verify_s[10] = {};
   int verify_n[10] = {};
   int drafts = 0;
+  // v60 E: drafts whose argmax went through the head sketch, and (with EngineOptions::mtp_head_sketch_check) how many of
+  // them had the full head's argmax among the sketch's top rows
+  std::uint64_t sketch_drafts = 0, sketch_recall_hit = 0, sketch_recall_n = 0;
 };
 
 class GpuEngine {

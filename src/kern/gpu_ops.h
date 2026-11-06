@@ -129,6 +129,25 @@ bool deltanet_conv(const float* mixed, const float* tail, const float* w, std::i
                    float* conv, float* new_tail, Stream s = nullptr);
 // v56: out[r] = the first index of row r's largest value (rows of n floats at stride ld), as a host scan with strict >
 bool argmax_rows(const float* x, std::int64_t n, std::int64_t rows, std::int64_t ld, std::int32_t* out, Stream s = nullptr);
+// v60 E: the head sketch for MTP drafts (kern/tg2_planes.h, g_q6_ksk): a Q6_K matrix's top two code planes + scales
+// built on the device from R3's 208-byte blocks (w208: rows x k / 256 blocks; out: rows x q6k_sketch_row_bytes(k))
+bool head_sketch_build(const void* w208, std::int64_t rows, std::int64_t k, std::uint8_t* out, Stream s = nullptr);
+// the sketch's product for one token: y[r] = sum over the row of d x xs x (sketch code - 32 as the v27 mean) x q, read by
+// the 1-bit route (AND + popcount against the activation bit planes); q / xs from act_q8x32 (k values, k / 32 scales); d6:
+// R3's fp16 d per 256-block (rows x k / 256). k one of 256 .. 4096
+bool head_sketch_dot(const std::uint8_t* sk, const std::uint16_t* d6, std::int64_t rows, std::int64_t k, const std::int8_t* q, const float* xs,
+                     float* y, Stream s = nullptr);
+// ids[0..k) = the indices of the k largest of x[0..n) (radix select on the device, one block; the set is exact, its
+// order is not, and among values tied at the k-th place the choice is not deterministic). k <= 1024, n >= k
+bool topk_select(const float* x, std::int64_t n, int k, std::int32_t* ids, Stream s = nullptr);
+// n rows of a Q6_K matrix in R3's layout (w208 blocks + d6) gathered by id into a contiguous n-row copy (w_out: n x k / 256
+// x 208 bytes, d6_out: n x k / 256), so a fixed n-row R3 plan re-scores them with the full product's own kernel
+bool gather_q6k_rows(const void* w208, const std::uint16_t* d6, std::int64_t k, const std::int32_t* ids, int n, void* w_out, std::uint16_t* d6_out,
+                     Stream s = nullptr);
+// out[0] = ids[idx[0]] (the re-scored argmax mapped back to its vocabulary id)
+bool pick_id(const std::int32_t* ids, const std::int32_t* idx, std::int32_t* out, Stream s = nullptr);
+// recall counter: ++*total; ++*hit when truth[0] is among ids[0..n) (device counters)
+bool recall_count(const std::int32_t* ids, int n, const std::int32_t* truth, unsigned* hit, unsigned* total, Stream s = nullptr);
 // in place: beta = sigmoid(beta); alpha = softplus(alpha + dt[h]) * a[h]  (n rows of nv)
 bool deltanet_gates(float* beta, float* alpha, const float* dt, const float* a, std::int64_t n, std::int64_t nv, Stream s = nullptr);
 // v55g (L3): whether deltanet_beta_alpha_gates takes these (both products on k_gemv_f32's fast F32 path, so the same sums)

@@ -9,12 +9,15 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <algorithm>
 #include <cstring>
+#include <numeric>
 #include <vector>
 
 #include "../unit/gpu_test_rows.h"
 #include "kern/gpu_ops.h"
 #include "kern/gpu_stream.h"
+#include "kern/tg2_planes.h"
 #include "pelias_test.h"
 #include "quant/block_types.h"
 #include "quant/quant_cpu.h"
@@ -77,11 +80,12 @@ struct Mat {
   q::Type t;
   std::int64_t n, k;
   std::vector<float> deq;
+  std::vector<std::uint8_t> bytes;  // v60 E: the GGUF rows (the head sketch test rebuilds the planes from them on the host)
   g::StreamWeights w;
   Mat(q::Type tt, std::int64_t nn, std::int64_t kk, std::uint32_t seed) : t(tt), n(nn), k(kk) {
     const auto id = static_cast<std::uint32_t>(t);
     const std::uint64_t rb = q::row_bytes(id, static_cast<std::uint64_t>(k));
-    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(rb * static_cast<std::uint64_t>(n)));
+    bytes.resize(static_cast<std::size_t>(rb * static_cast<std::uint64_t>(n)));
     deq.resize(static_cast<std::size_t>(n * k));
     for (std::int64_t r = 0; r < n; ++r) {
       const std::uint32_t rs = seed + static_cast<std::uint32_t>(r) * 7919u;
@@ -235,4 +239,152 @@ TEST(rung1_stream_refuses_unsafe_tables) {
   CHECK(!g::stream_upload(static_cast<std::uint32_t>(q::Type::q4_0), junk.data(), 1, 256, &w));   // not a streaming type (Q4_K streams since 23bd80e)
   CHECK(!g::stream_upload(static_cast<std::uint32_t>(q::Type::q5_k), junk.data(), 1, 768, &w));   // k not a power of two
   std::printf("    deadlocking, unsignalled, misaligned and uncovered tables refused; unreadable types and widths refused\n");
+}
+
+// v60 E: the head sketch (kern/tg2_planes.h g_q6_ksk; gpu_ops.h head_sketch_*): (1) the planes built on the device equal the
+// host builder's byte for byte; (2) the sketch product equals the host's run of the same integer formula (float sum order
+// aside); (3) topk_select returns the exact set a host sort gives; (4) the gathered top rows, run through a fixed 64-row R3
+// plan, equal the full plan's values for those rows bit for bit (the re-score is the head's own kernel on the same bytes);
+// (5) the picked id is the re-scored argmax. Recall on random weights is printed, not gated: the real head's recall is the
+// gate's number (the kept rate).
+TEST(rung1_head_sketch_two_planes) {
+  if (!g::available()) return;
+  constexpr std::int64_t k = 2048, n = 1000;
+  constexpr int top = 64;
+  Mat m(q::Type::q6_k, n, k, 909u);
+  const std::int64_t nbr = k / 256;
+  const std::uint64_t srb = g::q6k_sketch_row_bytes(k);
+  CHECK(srb == 640);
+  // (1) planes
+  Dev<std::uint8_t> sk(static_cast<std::size_t>(n) * srb);
+  CHECK(g::head_sketch_build(m.w.w, n, k, sk.p));
+  CHECK(g::sync());
+  const std::vector<std::uint8_t> dsk = sk.get();
+  std::vector<std::uint8_t> hsk(dsk.size());
+  for (std::int64_t r = 0; r < n; ++r)
+    for (std::int64_t b = 0; b < nbr; ++b) {
+      std::uint32_t pl[16];
+      std::uint8_t sc[16];
+      // R3's 208-byte block = the GGUF block's first 208 bytes (ql, qh, scales); d apart
+      g::q6k_sketch_block(m.bytes.data() + static_cast<std::size_t>((r * nbr + b) * 210), pl, sc);
+      std::memcpy(hsk.data() + static_cast<std::size_t>(r) * srb + static_cast<std::size_t>(64 * b), pl, 64);
+      std::memcpy(hsk.data() + static_cast<std::size_t>(r) * srb + static_cast<std::size_t>(64 * nbr + 16 * b), sc, 16);
+    }
+  const bool planes_equal = std::memcmp(dsk.data(), hsk.data(), dsk.size()) == 0;
+  CHECK(planes_equal);
+  // the full product (the reference the sketch approximates, and the bits the re-score must reproduce)
+  Act a(k, 7u);
+  Dev<float> yfull(static_cast<std::size_t>(n));
+  {
+    g::StreamJob J;
+    J.w = &m.w;
+    J.xq = a.qv.p;
+    J.xs = a.s.p;
+    J.xsum = a.sum.p;
+    J.y = yfull.p;
+    const int se[] = {1};
+    g::StreamPlan plan;
+    CHECK(plan.build(&J, 1, se, 1, 0));
+    CHECK(plan.run_unstaged());
+    CHECK(g::sync());
+  }
+  const std::vector<float> hfull = yfull.get();
+  // (2) the sketch product vs the host's run of the same formula
+  Dev<float> ysk(static_cast<std::size_t>(n));
+  CHECK(g::head_sketch_dot(sk.p, static_cast<const std::uint16_t*>(m.w.d6), n, k, a.qv.p, a.s.p, ysk.p));
+  CHECK(g::sync());
+  const std::vector<float> hsk_y = ysk.get();
+  const std::vector<std::int8_t> hq = a.qv.get();
+  const std::vector<float> hs = a.s.get();
+  std::vector<std::uint16_t> hd6(static_cast<std::size_t>(n * nbr));
+  CHECK(g::to_host(hd6.data(), m.w.d6, hd6.size() * 2));
+  const int nsub = static_cast<int>(k / 32);
+  std::vector<std::uint32_t> u8(static_cast<std::size_t>(nsub) * 8);
+  for (int sb = 0; sb < nsub; ++sb) g::act_bits32(hq.data() + 32 * sb, u8.data() + 8 * sb);
+  double worst_rel = 0.0;
+  for (std::int64_t r = 0; r < n; ++r) {
+    const auto* pw = reinterpret_cast<const std::uint32_t*>(hsk.data() + static_cast<std::size_t>(r) * srb);
+    const std::uint8_t* sc = hsk.data() + static_cast<std::size_t>(r) * srb + static_cast<std::size_t>(8 * nsub);
+    double acc = 0.0;
+    for (int sb = 0; sb < nsub; ++sb) {
+      const std::uint32_t* u = u8.data() + 8 * sb;
+      const int x0 = g::plane_dot32(0x0000ffffu, u), x1 = g::plane_dot32(0xffff0000u, u);
+      const int t0 = g::q6k_sketch_half2(pw[2 * sb], pw[2 * sb + 1], u, 0, x0), t1 = g::q6k_sketch_half2(pw[2 * sb], pw[2 * sb + 1], u, 1, x1);
+      const std::uint16_t dh = hd6[static_cast<std::size_t>(r * nbr + sb / 8)];
+      const float d = q::fp16_to_fp32(dh);
+      acc += static_cast<double>(g::q6k_sketch_sub(d, hs[static_cast<std::size_t>(sb)], static_cast<std::int8_t>(sc[2 * sb]), static_cast<std::int8_t>(sc[2 * sb + 1]), t0, t1));
+    }
+    const double dev = std::fabs(static_cast<double>(hsk_y[static_cast<std::size_t>(r)]) - acc), mag = std::max(1e-6, std::fabs(acc));
+    worst_rel = std::max(worst_rel, dev / mag);
+  }
+  CHECK(worst_rel <= 1e-4);
+  // (3) top-64 of the sketch logits: the exact set
+  Dev<std::int32_t> cand(static_cast<std::size_t>(top));
+  CHECK(g::topk_select(ysk.p, n, top, cand.p));
+  CHECK(g::sync());
+  std::vector<std::int32_t> hc = cand.get(), order(static_cast<std::size_t>(n));
+  std::iota(order.begin(), order.end(), 0);
+  std::stable_sort(order.begin(), order.end(), [&](int i, int j) { return hsk_y[static_cast<std::size_t>(i)] > hsk_y[static_cast<std::size_t>(j)]; });
+  std::vector<std::int32_t> want(order.begin(), order.begin() + top);
+  std::sort(want.begin(), want.end());
+  std::vector<std::int32_t> got = hc;
+  std::sort(got.begin(), got.end());
+  const bool set_equal = got == want;  // ties exactly at the 64th place would make this order-dependent; random floats have none
+  CHECK(set_equal);
+  // (4) gather + the fixed 64-row plan = the full plan's rows, bit for bit
+  Dev<std::uint8_t> tw(static_cast<std::size_t>(top * nbr * 208));
+  Dev<std::uint16_t> td(static_cast<std::size_t>(top * nbr));
+  CHECK(g::gather_q6k_rows(m.w.w, static_cast<const std::uint16_t*>(m.w.d6), k, cand.p, top, tw.p, td.p));
+  g::StreamWeights wt;
+  wt.type = m.w.type;
+  wt.n = top;
+  wt.k = k;
+  wt.w = tw.p;
+  wt.d6 = td.p;
+  wt.bytes = static_cast<std::uint64_t>(top * nbr) * 210;
+  Dev<float> ytop(static_cast<std::size_t>(top));
+  {
+    g::StreamJob J;
+    J.w = &wt;
+    J.xq = a.qv.p;
+    J.xs = a.s.p;
+    J.xsum = a.sum.p;
+    J.y = ytop.p;
+    const int se[] = {1};
+    g::StreamPlan plan;
+    CHECK(plan.build(&J, 1, se, 1, 0));
+    CHECK(plan.run_unstaged());
+    CHECK(g::sync());
+  }
+  const std::vector<float> htop = ytop.get();
+  bool rows_equal = true;
+  for (int i = 0; i < top; ++i) rows_equal = rows_equal && std::memcmp(&htop[static_cast<std::size_t>(i)], &hfull[static_cast<std::size_t>(hc[static_cast<std::size_t>(i)])], 4) == 0;
+  CHECK(rows_equal);
+  // (5) the pick: argmax over the 64 re-scored values, mapped back
+  Dev<std::int32_t> idx(1), pick(1);
+  CHECK(g::argmax_rows(ytop.p, top, 1, top, idx.p));
+  CHECK(g::pick_id(cand.p, idx.p, pick.p));
+  CHECK(g::sync());
+  const std::int32_t picked = pick.get()[0];
+  int best = 0;
+  for (int i = 1; i < top; ++i)
+    if (htop[static_cast<std::size_t>(i)] > htop[static_cast<std::size_t>(best)]) best = i;
+  CHECK(picked == hc[static_cast<std::size_t>(best)]);
+  // recall on these random rows (information): is the full product's argmax among the sketch's top 64?
+  int full_best = 0;
+  for (std::int64_t i = 1; i < n; ++i)
+    if (hfull[static_cast<std::size_t>(i)] > hfull[static_cast<std::size_t>(full_best)]) full_best = static_cast<int>(i);
+  const bool recall = std::find(hc.begin(), hc.end(), full_best) != hc.end();
+  Dev<unsigned> cnt(2);
+  CHECK(g::dzero(cnt.p, 8));
+  Dev<std::int32_t> truth(std::vector<std::int32_t>{full_best});
+  CHECK(g::recall_count(cand.p, top, truth.p, cnt.p, cnt.p + 1));
+  CHECK(g::sync());
+  const std::vector<unsigned> hcnt = cnt.get();
+  CHECK(hcnt[1] == 1 && (hcnt[0] == 1) == recall);
+  std::printf("    Q6_K %lld x %lld: sketch planes %s the host builder (%llu B per row); sketch product vs the host formula worst rel %.2e; top-%d set %s; "
+              "gathered rows through the 64-row plan %s the full plan; pick = row %d (%s); full argmax %d %s the sketch's top %d (random rows: information only)\n",
+              static_cast<long long>(n), static_cast<long long>(k), planes_equal ? "equal" : "DIFFER from", static_cast<unsigned long long>(srb), worst_rel, top,
+              set_equal ? "exact" : "WRONG", rows_equal ? "bit for bit equal to" : "DIFFER from", picked, picked == hc[static_cast<std::size_t>(best)] ? "ok" : "WRONG",
+              full_best, recall ? "inside" : "OUTSIDE", top);
 }
