@@ -366,8 +366,11 @@ __device__ __forceinline__ void rd3_group_one(const ExpertPtr* __restrict__ tab,
     while (u < U && grp[1 + 6 * u] != e) ++u;
     if (u == U) {
       ExpertPtr src = tab[e], fill;
-      // v54b: an expert with plane matrices is read with the slider's bits; its slot holds those bits' prefix of each row
-      auto pl = [](std::uint32_t t) { return t == g_q4_tg2p || t == g_q5_kp; };
+      // v54b: an expert with plane matrices is read with the slider's bits; its slot holds those bits' prefix of each row.
+      // v60 F3: g_q4_kp too - without it an all-Q4_K expert (the MTP block's) got pbits 4 while its rows were packed at the
+      // slider's prefix: the stage read 144-byte rows from 112-byte-packed data (v60m: the small model faulted past the planes'
+      // end; the real model's drafter read misaligned planes, kept 84.1 % instead of 86.8 %). Every planed type id belongs here
+      auto pl = [](std::uint32_t t) { return t == g_q4_tg2p || t == g_q5_kp || t == g_q4_kp; };
       const bool planed = pl(src.type[0]) || pl(src.type[1]) || pl(src.type[2]);
       const int want = planed ? c.plane_bits : 4;
       src.pbits = static_cast<std::uint32_t>(want);
