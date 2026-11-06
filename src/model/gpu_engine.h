@@ -73,6 +73,10 @@ struct EngineOptions {
   // too and the sketch's recall (its top rows hold the full head's argmax) is counted per draft (EngineMtpTiming)
   int mtp_head_sketch = 0;
   bool mtp_head_sketch_check = false;
+  // v60 F2: the bits the MTP row's plane matrices are packed and read with (0: the slider's plane_bits). The drafter has no
+  // verify behind it and feels a lost bit directly (v60n MEASURED: 3 of 4 bits kept 84.1 / 72.1 % vs 86.8 / 74.5 % at 4), and
+  // its planes are ~1/41 of the whole, so the default keeps it at 4. Not for a Q4_TG2 MTP block (one decode grid per launch)
+  int mtp_plane_bits = 4;
   // v60 commit C2: the pinned-planes read probe at open (copy engine, GB/s, logged). pin_read_min_gbs > 0: below it the
   // planes are freed, pinned and packed again, up to pin_read_tries times (v60d: three of five arms read them 2-3x slower)
   double pin_read_min_gbs = 0.0;  // v60 C3: applies to the SM one-line-per-page read (GB/s of 128 B lines)
