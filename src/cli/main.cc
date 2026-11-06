@@ -2833,6 +2833,13 @@ int cmd_engine_check(const Args& a) {
       }
       std::printf("  MTP time: prompt %.3f s; drafts %d x %.1f ms = %.3f s; verify %.3f s (by batch size %s); keep %.3f s; MTP catch-up %.3f s; host argmax %.3f s\n",
                   tmg.prompt_s, tmg.drafts, tmg.drafts ? 1e3 * tmg.draft_s / tmg.drafts : 0.0, tmg.draft_s, vs, vb_s.c_str(), tmg.keep_s, tmg.catchup_s, tmg.argmax_s);
+      if (tmg.draft_gpu_s > 0.0 || tmg.prompt_mtp_gpu_s > 0.0) {  // v60 D: the MTP block's GPU time by part (globaltimer stamps)
+        const double nd = tmg.drafts > 0 ? static_cast<double>(tmg.drafts) : 1.0;
+        std::printf("  MTP GPU time per draft: %.2f ms = the block %.2f (input gather, eh_proj, attention, MoE half) + head %.2f (248k-row product + argmax) + %.2f between; catch-up steps %.3f s GPU (block %.3f); prompt catch-up %.3f s GPU (block %.3f) of the %.3f s prompt tax\n",
+                    1e3 * tmg.draft_gpu_s / nd, 1e3 * tmg.draft_layer_s / nd, 1e3 * tmg.draft_head_s / nd,
+                    1e3 * (tmg.draft_gpu_s - tmg.draft_layer_s - tmg.draft_head_s) / nd, tmg.catchup_gpu_s, tmg.catchup_layer_s, tmg.prompt_mtp_gpu_s,
+                    tmg.prompt_mtp_layer_s, tmg.prompt_s - pre_s);
+      }
       // v28b (author 23:14, the unlisted ~1.5 s): the MTP run's total minus the plain run's prefill still holds the MTP run's own
       // longer prompt phase; here the decode phase alone, and what is left after the listed parts
       const double mtp_dec = mtp_s + pre_s - tmg.prompt_s;

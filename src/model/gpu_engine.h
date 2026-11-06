@@ -119,6 +119,11 @@ struct EngineStats {
 // host's argmax over the vocabulary
 struct EngineMtpTiming {
   double draft_s = 0.0, keep_s = 0.0, catchup_s = 0.0, argmax_s = 0.0, prompt_s = 0.0;
+  // v60 D: GPU time (globaltimer stamps) of the MTP block's steps, split at the head: the drafts, the catch-up steps, and
+  // the catch-up over the prompt (the "prompt tax"). total >= layer + head (the rest: the input gather / norms / eh_proj)
+  double draft_gpu_s = 0.0, draft_layer_s = 0.0, draft_head_s = 0.0;
+  double catchup_gpu_s = 0.0, catchup_layer_s = 0.0, catchup_head_s = 0.0;
+  double prompt_mtp_gpu_s = 0.0, prompt_mtp_layer_s = 0.0, prompt_mtp_head_s = 0.0;
   double verify_s[10] = {};
   int verify_n[10] = {};
   int drafts = 0;

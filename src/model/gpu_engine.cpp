@@ -219,6 +219,12 @@ struct GpuEngine::Impl {
   // rows registered for the GPU gather (the trunk's emb_dev when the file shares the tensor)
   float *hid_d = nullptr, *h_d = nullptr, *hn_d = nullptr;
   float* hidden_dev_req = nullptr;  // v60 commit C: set around step() / verify(): the post-norm hidden rows go here (device), no host copy
+  // v60 commit D (author 11-06 12:00, "see why the extra bank didn't do anything"): where a draft's time goes. Four GPU
+  // timestamps (globaltimer ns, g::stamp into mapped memory) per MTP step at its ring slot: 0 start (after the position),
+  // 1 after the MoE half (= the block: gather, norms, eh_proj, attention, MoE), 2 before the head product, 3 after the
+  // argmax; the generate loop sums them after its sync (mtp_slots lists the steps)
+  unsigned long long *mtp_ts_h = nullptr, *mtp_ts_d = nullptr;
+  std::vector<unsigned> mtp_slots;
   std::int32_t* mtp_top_d = nullptr;
   const std::uint8_t* mtp_emb_dev = nullptr;
   std::uint64_t mtp_copy_runs_saved = 0;  // v60 commit C: MTP attention on the direct plan (knew / vnew), counted
@@ -1930,12 +1936,19 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
   }
   {  // v60: the mapped ring for the step's ids and position, and the token embedding registered for the GPU gather
     void* rdev = nullptr;
-    const std::size_t ring_b = static_cast<std::size_t>(Impl::kRing) * (Impl::kReaderMax * sizeof(std::int32_t) + sizeof(int)) + 256;
+    const std::size_t ring_ids = static_cast<std::size_t>(Impl::kRing) * (Impl::kReaderMax * sizeof(std::int32_t) + sizeof(int));
+    const std::size_t ring_ts = (ring_ids + 255) / 256 * 256;  // v60 D: the MTP stamps start here, 4 x u64 per slot
+    const std::size_t ring_b = ring_ts + static_cast<std::size_t>(Impl::kRing) * 4 * sizeof(unsigned long long) + 256;
     I.ring_hv = g::host_alloc_mapped(ring_b, &rdev);
     if (!I.ring_hv || !rdev) return R::fail(Status::fail(Code::internal, std::string("engine: mapped memory for the step ring: ") + g::last_error()));
+    std::memset(I.ring_hv, 0, ring_b);
     I.ring_tok_h = static_cast<std::int32_t*>(I.ring_hv);
     I.ring_tok_d = static_cast<std::int32_t*>(rdev);
     I.ring_pos_h = reinterpret_cast<int*>(static_cast<std::uint8_t*>(I.ring_hv) + Impl::kRing * Impl::kReaderMax * sizeof(std::int32_t));
+    if (o.mtp) {
+      I.mtp_ts_h = reinterpret_cast<unsigned long long*>(static_cast<std::uint8_t*>(I.ring_hv) + ring_ts);
+      I.mtp_ts_d = reinterpret_cast<unsigned long long*>(static_cast<std::uint8_t*>(rdev) + ring_ts);
+    }
     const WeightView& te = w.tok_embd;
     const std::uintptr_t pg = 4096;
     if (te.present() && !te.rot32 && te.slots.empty() && g::type_supported(te.type)) {
@@ -2304,6 +2317,11 @@ Status GpuEngine::Impl::mtp_run(const std::int32_t* tokens_h, const std::int32_t
   }
   I.ring_pos_h[slot] = static_cast<int>(I.mtp_pos);
   if (!g::h2d_async(I.pos_d, I.ring_pos_h + slot, sizeof(int))) return gfail("engine: MTP position");
+  unsigned long long* ts = I.mtp_ts_d ? I.mtp_ts_d + static_cast<std::ptrdiff_t>(slot) * 4 : nullptr;  // v60 D
+  if (ts) {
+    I.mtp_slots.push_back(slot);
+    if (!g::stamp(ts + 0)) return gfail("engine: MTP stamp");
+  }
   // [enorm(embedding) | hnorm(h_prev)] -> eh_proj: the embedding rows gathered into xr, both halves copied at the 2 n_embd stride
   const WeightView& et = wt.mtp.embed_tokens;
   if (!g::gather_rows(et.type, I.mtp_emb_dev, et.row_bytes, e, ids, n, I.xr)) return gfail("engine: MTP embedding gather");
@@ -2323,9 +2341,11 @@ Status GpuEngine::Impl::mtp_run(const std::int32_t* tokens_h, const std::int32_t
   }
   if (!(st = I.moe_half_fused(D, n, s.n_layer))) return st;  // v58: residual + MoE half + residual in one launch, the reader's row n_layer
   ++I.mtp_fused_steps;
+  if (ts && !g::stamp(ts + 1)) return gfail("engine: MTP stamp");
   const int64_t nvoc = s.n_vocab;
   if (!g::rms_norm(I.x, I.head_norm, I.xn, e, 1, e, e, n, s.rms_eps)) return gfail("engine: MTP head norm");
   if (h_out_d && !g::dcopy(h_out_d, I.xn, z(n) * z(e) * sizeof(float))) return gfail("engine: MTP hidden");
+  if (ts && !g::stamp(ts + 2)) return gfail("engine: MTP stamp");
   if (top_d_out || logits_h || top_h) {
     if (!(st = I.prod(I.head, I.xn, n, I.lg))) return st;
     if (top_d_out && !g::argmax_rows(I.lg, nvoc, n, nvoc, top_d_out)) return gfail("engine: MTP argmax");
@@ -2335,6 +2355,7 @@ Status GpuEngine::Impl::mtp_run(const std::int32_t* tokens_h, const std::int32_t
     }
     if (logits_h && !g::to_host(logits_h, I.lg, z(n) * z(nvoc) * sizeof(float))) return gfail("engine: MTP logits");
   }
+  if (ts && !g::stamp(ts + 3)) return gfail("engine: MTP stamp");
   I.mtp_pos += n;
   // the ring guard, as run(): a step that read nothing on the host stays queued; the slots must not lap the GPU
   if (I.unsynced + 2 < static_cast<unsigned>(Impl::kRing)) {
@@ -2362,6 +2383,7 @@ Status GpuEngine::mtp_step(const std::int32_t* tokens, const float* h_prev, int 
   if (h_out && !g::to_host(h_out, I.hid_d, z(n) * z(e) * sizeof(float))) return gfail("engine: MTP hidden");
   if (!g::sync()) return gfail("engine: MTP sync");
   I.unsynced = 0;
+  I.mtp_slots.clear();  // v60 D: the host interface does not fold the stamps
   es.seconds = since(t0);
   if (stats) *stats = es;
   return Status::good();
@@ -2433,6 +2455,16 @@ Status engine_generate_greedy_mtp(GpuEngine& eng, const Qwen35MoeSpec& s, const 
   GpuEngine::Impl& I = *eng.p_;
   if (n_draft > 0 && !I.mtp_emb_dev) return Status::fail(Code::unsupported, "engine: the MTP block's device input is off (see the open note)");
   const float* const hid0 = I.hid_d;  // row 0: the hidden before a chunk (zeros before the first); rows 1 .. k: the chunk's
+  // v60 D: after a sync, the GPU time of the MTP steps issued since the last fold, split at the head (stamps 0-1 layer, 2-3 head)
+  auto fold_stamps = [&](double* total_s, double* layer_s, double* head_s) {
+    for (unsigned slot : I.mtp_slots) {
+      const unsigned long long* t = I.mtp_ts_h + static_cast<std::ptrdiff_t>(slot) * 4;
+      if (t[0] && t[3] >= t[0]) *total_s += static_cast<double>(t[3] - t[0]) * 1e-9;
+      if (t[0] && t[1] >= t[0]) *layer_s += static_cast<double>(t[1] - t[0]) * 1e-9;
+      if (t[2] && t[3] >= t[2]) *head_s += static_cast<double>(t[3] - t[2]) * 1e-9;
+    }
+    I.mtp_slots.clear();
+  };
   if (!g::dzero(I.hid_d, z(e) * sizeof(float))) return Status::fail(Code::internal, "engine: MTP seed");
   // the prompt in chunks: the trunk's last logits (host) and every position's hidden (device); the MTP catch-up of each
   // chunk queued right behind it in 4-token steps (v58c: no picks go to a slow path), nothing waits on the host in between
@@ -2455,6 +2487,7 @@ Status engine_generate_greedy_mtp(GpuEngine& eng, const Qwen35MoeSpec& s, const 
   }
   if (!g::sync()) return Status::fail(Code::internal, std::string("engine: prompt sync: ") + g::last_error());
   I.unsynced = 0;
+  if (I.mtp_ts_h) fold_stamps(&T.prompt_mtp_gpu_s, &T.prompt_mtp_layer_s, &T.prompt_mtp_head_s);  // v60 D: the MTP catch-up over the prompt
   // pending: the hidden of the last prompt position (row 0 after the carry) -> h_d, the draft chain's seed
   if (!g::dcopy(I.h_d, I.hid_d, z(e) * sizeof(float))) return Status::fail(Code::internal, "engine: MTP seed");
   T.prompt_s += secs(tp0);
@@ -2481,6 +2514,7 @@ Status engine_generate_greedy_mtp(GpuEngine& eng, const Qwen35MoeSpec& s, const 
       if (!g::to_host(drafts.data(), I.mtp_top_d, z(k) * sizeof(std::int32_t))) return Status::fail(Code::internal, "engine: draft ids");
       I.unsynced = 0;
       T.draft_s += secs(tq);
+      if (I.mtp_ts_h) fold_stamps(&T.draft_gpu_s, &T.draft_layer_s, &T.draft_head_s);
       T.drafts += k;
       // v58c: draft[0] at position m0 used exact (last, pending), so m0 + 1 is ALREADY valid in the MTP KV cache!
       eng.mtp_truncate(m0 + 1);
@@ -2519,6 +2553,7 @@ Status engine_generate_greedy_mtp(GpuEngine& eng, const Qwen35MoeSpec& s, const 
       if (!g::sync()) return Status::fail(Code::internal, std::string("engine: catch-up sync: ") + g::last_error());
       I.unsynced = 0;
       T.catchup_s += secs(tc);
+      if (I.mtp_ts_h) fold_stamps(&T.catchup_gpu_s, &T.catchup_layer_s, &T.catchup_head_s);
     }
     // pending: the hidden of the accepted token (row a) -> h_d
     if (!g::dcopy(I.h_d, I.hid_d + static_cast<int64_t>(a) * e, z(e) * sizeof(float))) return Status::fail(Code::internal, "engine: pending hidden");
