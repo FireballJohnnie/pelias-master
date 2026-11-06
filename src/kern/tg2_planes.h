@@ -223,6 +223,35 @@ PG_HD int q6k_sketch_half2(std::uint32_t hi, std::uint32_t nx, const std::uint32
   const std::uint32_t m = hf ? 0xffff0000u : 0x0000ffffu;
   return 32 * (2 * plane_dot32(hi & m, u8) + plane_dot32(nx & m, u8)) - 49 * xsum16;
 }
+// v60 E3 (v60j MEASURED: the popcount form read the 159 MB sketch at 318 GB/s - popc issues at a quarter of the INT rate on
+// sm_89, ~36 per sub-block): the same integers formed the way the Q5_KP path forms its codes - the four codes of values 4 g ..
+// 4 g + 3 of a sub-block spread to one byte each (c = 2 bit5 + bit4, 0..3; the q5p_bytes4 multiply: bit k -> byte k) and dp4a'd
+// against the four int8 activations as one word. Exact integers, identical to q6k_sketch_half2 (the host test asserts it)
+PG_HD int dp4a_i32(int a, int b, int c) {
+#if defined(__CUDA_ARCH__)
+  return __dp4a(a, b, c);
+#else
+  for (int k = 0; k < 4; ++k) {
+    const int ab = static_cast<int>(static_cast<std::int8_t>((static_cast<unsigned>(a) >> (8 * k)) & 0xffu));
+    const int bb = static_cast<int>(static_cast<std::int8_t>((static_cast<unsigned>(b) >> (8 * k)) & 0xffu));
+    c += ab * bb;
+  }
+  return c;
+#endif
+}
+PG_HD std::uint32_t q6k_sketch_codes4(std::uint32_t hi4, std::uint32_t nx4) {
+  constexpr std::uint32_t m = 0x00204081u;
+  return ((((hi4 & 15u) * m) & 0x01010101u) << 1) | (((nx4 & 15u) * m) & 0x01010101u);
+}
+// twice the half's sketch sum, dp4a form: xw = the sub-block's 32 int8 activations as 8 words (xw[4 hf .. 4 hf + 3] = the half)
+PG_HD int q6k_sketch_half2_dp(std::uint32_t hi, std::uint32_t nx, const std::int32_t* xw, int hf, int xsum16) {
+  int cx = 0;
+  for (int g = 0; g < 4; ++g) {
+    const int sh = 16 * hf + 4 * g;
+    cx = dp4a_i32(static_cast<int>(q6k_sketch_codes4(hi >> sh, nx >> sh)), xw[4 * hf + g], cx);
+  }
+  return 32 * cx - 49 * xsum16;
+}
 // one sub-block's sketch term as the R3 kernel forms the exact one (acc += d * xs * float(sc0 (a0 - 32 x0) + sc1 (a1 - 32 x1))):
 // d * xs * (sc0 T0 + sc1 T1) / 2 with T the doubled half sums above
 PG_HD float q6k_sketch_sub(float d, float xs, int sc0, int sc1, int t0, int t1) { return d * xs * (0.5f * static_cast<float>(sc0 * t0 + sc1 * t1)); }

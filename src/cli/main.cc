@@ -2636,6 +2636,7 @@ int cmd_engine_check(const Args& a) {
     cpu_prev = c;
   };
   cpu_phase("the load + open (the open's pack is 16 threads by design)", topen.seconds());
+  Timer tsetup;  // v60 E3
   // v25 trace: each phase's lines under a "# phase" line; whatever is left is written when engine-check returns
   auto tflush = [&](const std::string& phase) {
     if (trace_path.empty()) return;
@@ -2683,6 +2684,7 @@ int cmd_engine_check(const Args& a) {
   const std::size_t ne_ = s.n_embd;
   std::vector<float> hid(dump_draft.empty() ? 0 : static_cast<std::size_t>(n) * ne_);  // v49b: every position's post-norm hidden
   auto hrow = [&](int p) { return hid.empty() ? nullptr : hid.data() + static_cast<std::size_t>(p) * ne_; };
+  cpu_phase("the setup between open and prefill (token file, buffers)", tsetup.seconds());  // v60 E3: the prefill alone from here
   while (t < static_cast<int>(npre)) {
     const int k = std::min(static_cast<int>(batch), static_cast<int>(npre) - t);
     model::EngineStats es;
@@ -2756,7 +2758,7 @@ int cmd_engine_check(const Args& a) {
   }
   std::printf("  prefill %llu tokens: %.3f s = %.1f tokens/s; %llu picks, all on the GPU\n", static_cast<unsigned long long>(npre), tot_pre.seconds,
               static_cast<double>(npre) / tot_pre.seconds, static_cast<unsigned long long>(tot_pre.hot_picks));
-  cpu_phase("the prefill (+ the setup between)", tot_pre.seconds);  // v60 E2
+  cpu_phase("the prefill (steps of 1-4 tokens on the GPU; graph captures included)", tot_pre.seconds);  // v60 E2 / E3
   if (ndec > 0) {
     std::vector<double> sorted = per;
     std::sort(sorted.begin(), sorted.end());

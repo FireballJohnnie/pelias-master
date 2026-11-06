@@ -302,6 +302,9 @@ TEST(rung1_head_sketch_two_planes) {
   std::vector<std::uint32_t> u8(static_cast<std::size_t>(nsub) * 8);
   for (int sb = 0; sb < nsub; ++sb) g::act_bits32(hq.data() + 32 * sb, u8.data() + 8 * sb);
   double worst_rel = 0.0;
+  bool forms_equal = true;  // v60 E3: the dp4a form (what the kernel runs) == the popcount form (the 1-bit route's definition), every half
+  std::vector<std::int32_t> xw(static_cast<std::size_t>(k / 4));
+  std::memcpy(xw.data(), hq.data(), static_cast<std::size_t>(k));
   for (std::int64_t r = 0; r < n; ++r) {
     const auto* pw = reinterpret_cast<const std::uint32_t*>(hsk.data() + static_cast<std::size_t>(r) * srb);
     const std::uint8_t* sc = hsk.data() + static_cast<std::size_t>(r) * srb + static_cast<std::size_t>(8 * nsub);
@@ -310,6 +313,8 @@ TEST(rung1_head_sketch_two_planes) {
       const std::uint32_t* u = u8.data() + 8 * sb;
       const int x0 = g::plane_dot32(0x0000ffffu, u), x1 = g::plane_dot32(0xffff0000u, u);
       const int t0 = g::q6k_sketch_half2(pw[2 * sb], pw[2 * sb + 1], u, 0, x0), t1 = g::q6k_sketch_half2(pw[2 * sb], pw[2 * sb + 1], u, 1, x1);
+      const int d0 = g::q6k_sketch_half2_dp(pw[2 * sb], pw[2 * sb + 1], xw.data() + 8 * sb, 0, x0), d1 = g::q6k_sketch_half2_dp(pw[2 * sb], pw[2 * sb + 1], xw.data() + 8 * sb, 1, x1);
+      forms_equal = forms_equal && d0 == t0 && d1 == t1;
       const std::uint16_t dh = hd6[static_cast<std::size_t>(r * nbr + sb / 8)];
       const float d = q::fp16_to_fp32(dh);
       acc += static_cast<double>(g::q6k_sketch_sub(d, hs[static_cast<std::size_t>(sb)], static_cast<std::int8_t>(sc[2 * sb]), static_cast<std::int8_t>(sc[2 * sb + 1]), t0, t1));
@@ -318,6 +323,7 @@ TEST(rung1_head_sketch_two_planes) {
     worst_rel = std::max(worst_rel, dev / mag);
   }
   CHECK(worst_rel <= 1e-4);
+  CHECK(forms_equal);
   // (3) top-64 of the sketch logits: the exact set
   Dev<std::int32_t> cand(static_cast<std::size_t>(top));
   CHECK(g::topk_select(ysk.p, n, top, cand.p));
@@ -382,9 +388,9 @@ TEST(rung1_head_sketch_two_planes) {
   CHECK(g::sync());
   const std::vector<unsigned> hcnt = cnt.get();
   CHECK(hcnt[1] == 1 && (hcnt[0] == 1) == recall);
-  std::printf("    Q6_K %lld x %lld: sketch planes %s the host builder (%llu B per row); sketch product vs the host formula worst rel %.2e; top-%d set %s; "
+  std::printf("    Q6_K %lld x %lld: sketch planes %s the host builder (%llu B per row); dp4a form %s the popcount form on every half; sketch product vs the host formula worst rel %.2e; top-%d set %s; "
               "gathered rows through the 64-row plan %s the full plan; pick = row %d (%s); full argmax %d %s the sketch's top %d (random rows: information only)\n",
-              static_cast<long long>(n), static_cast<long long>(k), planes_equal ? "equal" : "DIFFER from", static_cast<unsigned long long>(srb), worst_rel, top,
+              static_cast<long long>(n), static_cast<long long>(k), planes_equal ? "equal" : "DIFFER from", static_cast<unsigned long long>(srb), forms_equal ? "==" : "!=", worst_rel, top,
               set_equal ? "exact" : "WRONG", rows_equal ? "bit for bit equal to" : "DIFFER from", picked, picked == hc[static_cast<std::size_t>(best)] ? "ok" : "WRONG",
               full_best, recall ? "inside" : "OUTSIDE", top);
 }

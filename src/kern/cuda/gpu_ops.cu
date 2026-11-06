@@ -1729,20 +1729,29 @@ __global__ void k_head_sketch_build(const std::uint8_t* __restrict__ w208, std::
   for (int i = 0; i < 16; ++i) ps[i] = sc[i];
 }
 
-// one warp per row, 8 rows per block; the token's activation bit planes (act_bits32) and half sums built once per block in
-// shared memory; lane l takes sub-blocks l, l + 32, ... (8 B of planes + 2 scale bytes each) and forms the sketch term with
-// the shared tg2_planes.h helpers; warp_sum, as the R3 kernel's lanes
+// one warp per row, 8 rows per block; the token's int8 activations as words and the per-half sums of x (dp4a against
+// 0x01010101) built once per block in shared memory; lane l takes sub-blocks l, l + 32, ... (8 B of planes + 2 scale bytes
+// each) and forms the sketch term with the shared tg2_planes.h helpers in their dp4a form (v60 E3; the popcount form read at
+// 318 GB/s, MEASURED v60j: popc is a quarter-rate instruction on sm_89); warp_sum, as the R3 kernel's lanes
 constexpr int kSkSubMax = 128;  // k <= 4096
 __global__ void __launch_bounds__(256) k_head_sketch_dot(const std::uint8_t* __restrict__ sk, const std::uint16_t* __restrict__ d6, std::int64_t rows,
                                                           int nsub, const std::int8_t* __restrict__ q, const float* __restrict__ xs,
                                                           float* __restrict__ y) {
-  __shared__ std::uint32_t u8[kSkSubMax][9];  // 9: lanes read s = lane -> distinct banks
+  __shared__ std::int32_t xw[kSkSubMax][9];  // 9: lanes read s = lane -> distinct banks
   __shared__ int xh[kSkSubMax][2];
   __shared__ float sxs[kSkSubMax];
   for (int s = static_cast<int>(threadIdx.x); s < nsub; s += static_cast<int>(blockDim.x)) {
-    act_bits32(q + 32 * s, u8[s]);
-    xh[s][0] = plane_dot32(0x0000ffffu, u8[s]);
-    xh[s][1] = plane_dot32(0xffff0000u, u8[s]);
+    const auto* qw = reinterpret_cast<const std::int32_t*>(q + 32 * s);
+    int h0 = 0, h1 = 0;
+#pragma unroll
+    for (int g = 0; g < 4; ++g) {
+      xw[s][g] = qw[g];
+      xw[s][4 + g] = qw[4 + g];
+      h0 = dp4a_i32(qw[g], 0x01010101, h0);
+      h1 = dp4a_i32(qw[4 + g], 0x01010101, h1);
+    }
+    xh[s][0] = h0;
+    xh[s][1] = h1;
     sxs[s] = xs[s];
   }
   __syncthreads();
@@ -1759,8 +1768,8 @@ __global__ void __launch_bounds__(256) k_head_sketch_dot(const std::uint8_t* __r
     const uint2 w2 = *reinterpret_cast<const uint2*>(pw + 2 * s);
     const int sc0 = static_cast<int>(static_cast<std::int8_t>(sc[2 * s])), sc1 = static_cast<int>(static_cast<std::int8_t>(sc[2 * s + 1]));
     const float d = half_float(dr[s >> 3]);  // gpu_decode.h: exact, as quant::fp16_to_fp32 (the host test uses that)
-    const int t0 = q6k_sketch_half2(w2.x, w2.y, u8[s], 0, xh[s][0]);
-    const int t1 = q6k_sketch_half2(w2.x, w2.y, u8[s], 1, xh[s][1]);
+    const int t0 = q6k_sketch_half2_dp(w2.x, w2.y, xw[s], 0, xh[s][0]);
+    const int t1 = q6k_sketch_half2_dp(w2.x, w2.y, xw[s], 1, xh[s][1]);
     acc += q6k_sketch_sub(d, sxs[s], sc0, sc1, t0, t1);
   }
   acc = warp_sum(acc);
@@ -1783,13 +1792,28 @@ __global__ void __launch_bounds__(1024) k_topk_select(const float* __restrict__ 
     s_mask = 0;
     s_need = static_cast<unsigned>(k);
   }
+  const int lane = tid & 31;
   for (int shift = 24; shift >= 0; shift -= 8) {
     if (tid < 256) hist[tid] = 0;
     __syncthreads();
     const unsigned pre = s_pre, mask = s_mask;
-    for (std::int64_t i = tid; i < n; i += 1024) {
-      const unsigned ky = f_key(x[i]);
-      if ((ky & mask) == pre) atomicAdd(&hist[(ky >> shift) & 255u], 1u);
+    // v60 E3: logits share their top key bits, so a plain per-element atomicAdd funnels most of a pass into one bin; the warp
+    // aggregates first (lanes with the same digit elect a leader, one add per distinct digit per warp). Every lane runs every
+    // iteration (the bound is on base, not i) so the ballot / match masks are whole
+    for (std::int64_t base = 0; base < n; base += 1024) {
+      const std::int64_t i = base + tid;
+      unsigned digit = 0;
+      bool cand = false;
+      if (i < n) {
+        const unsigned ky = f_key(x[i]);
+        cand = (ky & mask) == pre;
+        digit = (ky >> shift) & 255u;
+      }
+      const unsigned m = __ballot_sync(0xffffffffu, cand);
+      if (cand) {
+        const unsigned peers = __match_any_sync(m, digit);
+        if (lane == __ffs(static_cast<int>(peers)) - 1) atomicAdd(&hist[digit], static_cast<unsigned>(__popc(peers)));
+      }
     }
     __syncthreads();
     if (tid == 0) {
