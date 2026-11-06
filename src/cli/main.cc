@@ -2621,6 +2621,21 @@ int cmd_engine_check(const Args& a) {
   auto eng = model::GpuEngine::open(s, w.value, eo);
   if (!eng.ok()) return fail_input(eng.status);
   std::printf("pelias engine-check: %s, %u layers; open %.2f s\n  %s\n", s.arch.c_str(), s.n_layer, topen.seconds(), eng.value->summary().c_str());
+  // v60 E2 (author 13:29): the process's CPU seconds per phase against the phase's wall seconds = the cores it kept busy, and
+  // the live thread count - the instrument for "nothing of the token path is on the CPU" (the open's pack is 16 threads by
+  // design; a decode phase near 1.0 is one core driving launches and spinning on the step-end sync; above that, something
+  // is folded in that should not be)
+  os::CpuTime cpu_prev;
+  auto cpu_mark = [&]() { cpu_prev = os::cpu_time(); };
+  auto cpu_phase = [&](const char* name, double wall_s) {
+    if (!os::cpu_time_available()) return;
+    const os::CpuTime c = os::cpu_time();
+    const double u = c.user_s - cpu_prev.user_s, sy = c.sys_s - cpu_prev.sys_s;
+    std::printf("  CPU in %s: %.2f s user + %.2f s system over %.2f s wall = %.2f cores busy; %d threads live\n", name, u, sy, wall_s,
+                wall_s > 0.0 ? (u + sy) / wall_s : 0.0, c.threads);
+    cpu_prev = c;
+  };
+  cpu_phase("the load + open (the open's pack is 16 threads by design)", topen.seconds());
   // v25 trace: each phase's lines under a "# phase" line; whatever is left is written when engine-check returns
   auto tflush = [&](const std::string& phase) {
     if (trace_path.empty()) return;
@@ -2741,6 +2756,7 @@ int cmd_engine_check(const Args& a) {
   }
   std::printf("  prefill %llu tokens: %.3f s = %.1f tokens/s; %llu picks, all on the GPU\n", static_cast<unsigned long long>(npre), tot_pre.seconds,
               static_cast<double>(npre) / tot_pre.seconds, static_cast<unsigned long long>(tot_pre.hot_picks));
+  cpu_phase("the prefill (+ the setup between)", tot_pre.seconds);  // v60 E2
   if (ndec > 0) {
     std::vector<double> sorted = per;
     std::sort(sorted.begin(), sorted.end());
@@ -2753,6 +2769,7 @@ int cmd_engine_check(const Args& a) {
       std::printf("  page faults in the decode: %.1f major and %.0f minor per token\n",
                   static_cast<double>(pf1.major - pf0.major) / static_cast<double>(ndec), static_cast<double>(pf1.minor - pf0.minor) / static_cast<double>(ndec));
     }
+    cpu_phase("the decode", tot_dec.seconds);  // v60 E2
   }
   tflush("decode (the speed numbers above)");
   std::printf("  graph: %s\n", eng.value->graph_report().c_str());
@@ -2788,6 +2805,7 @@ int cmd_engine_check(const Args& a) {
     std::vector<std::int32_t> psa, psb;
     std::vector<float> boa, loa, moa, bob, lob, mob;  // v25: per-operation rows at the probe (one-token / batched)
     Timer tdp;
+    cpu_mark();  // v60 E2
     std::int32_t next_top = -1;  // v56: without --dump-split the plain run takes each step's argmax from the device, as the MTP run does
     for (std::uint64_t i = 0; i < ndec; ++i) {
       std::int32_t best = 0;
@@ -2807,6 +2825,7 @@ int cmd_engine_check(const Args& a) {
       }
     }
     const double plain_s = tdp.seconds();
+    cpu_phase("the plain greedy decode", plain_s);  // v60 E2
     if (probe_p >= 0 && !eng.value->probe_get(&pxa, &psa, &pwa)) std::printf("  probe: nothing captured in the plain run\n");
     if (probe_p >= 0) eng.value->probe_get_ops(&boa, &loa, &moa);
     tflush("split check: plain, one token at a time");
@@ -2814,9 +2833,11 @@ int cmd_engine_check(const Args& a) {
     model::EngineStats emt;
     model::EngineMtpTiming tmg;
     Timer tmt;
+    cpu_mark();  // v60 E2
     if (Status st = model::engine_generate_greedy_mtp(*eng.value, s, prompt, static_cast<int>(ndec), static_cast<int>(ndraft), {}, drafted, &ms, &emt, {}, &tmg); !st)
       return fail_input(st);
     const double mtp_s = tmt.seconds() - pre_s;  // its prefill (trunk) is the same as the plain run's; the MTP catch-up stays in
+    cpu_phase("the MTP run (its prompt pass + drafting)", tmt.seconds());  // v60 E2
     std::size_t same = 0;
     while (same < plain.size() && same < drafted.size() && plain[same] == drafted[same]) ++same;
     std::printf("  greedy %llu tokens: plain %.3f s (%.1f tokens/s); MTP drafting %llu per step %.3f s (%.1f tokens/s, %.2fx), %lld steps, %lld drafted, %lld kept (%.1f %%); first %zu of %zu tokens equal to plain\n",
@@ -2845,6 +2866,11 @@ int cmd_engine_check(const Args& a) {
       }
       if (tmg.sketch_drafts > 0) {  // v60 E: the head sketch's drafts and, in check mode, its recall
         std::printf("  MTP head sketch: %llu of %d drafts took the two-plane sketch + top-64 re-score", static_cast<unsigned long long>(tmg.sketch_drafts), tmg.drafts);
+        if (tmg.sketch_dot_s > 0.0) {  // v60 E2: the chain's split per draft (stamps inside the chain)
+          const double nsd = static_cast<double>(tmg.sketch_drafts);
+          std::printf("; chain per draft: sketch product %.3f ms + top-64 select %.3f + gather / re-score / argmax / pick %.3f", 1e3 * tmg.sketch_dot_s / nsd,
+                      1e3 * tmg.sketch_select_s / nsd, 1e3 * tmg.sketch_rescore_s / nsd);
+        }
         if (tmg.sketch_recall_n > 0)
           std::printf("; recall %llu / %llu = %.2f %% (the full head's argmax among the sketch's top rows; the kept rate is the gate)",
                       static_cast<unsigned long long>(tmg.sketch_recall_hit), static_cast<unsigned long long>(tmg.sketch_recall_n),

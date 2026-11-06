@@ -137,6 +137,9 @@ struct EngineMtpTiming {
   // v60 E: drafts whose argmax went through the head sketch, and (with EngineOptions::mtp_head_sketch_check) how many of
   // them had the full head's argmax among the sketch's top rows
   std::uint64_t sketch_drafts = 0, sketch_recall_hit = 0, sketch_recall_n = 0;
+  // v60 E2: the sketch chain's GPU time split over the drafts (stamps inside the chain): the sketch product, the top-k select,
+  // the gather + re-score + argmax + pick
+  double sketch_dot_s = 0.0, sketch_select_s = 0.0, sketch_rescore_s = 0.0;
 };
 
 class GpuEngine {

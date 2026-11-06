@@ -4,9 +4,13 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #if defined(__linux__)
 #include <sys/resource.h>
+#endif
+#ifdef _WIN32
+#include <windows.h>
 #endif
 
 #ifndef _WIN32
@@ -64,5 +68,43 @@ PageFaults page_faults() {
   }
 #endif
   return p;
+}
+// v60 E2
+bool cpu_time_available() {
+#if defined(__linux__) || defined(_WIN32)
+  return true;
+#else
+  return false;
+#endif
+}
+CpuTime cpu_time() {
+  CpuTime c;
+#if defined(__linux__)
+  struct rusage ru {};
+  if (getrusage(RUSAGE_SELF, &ru) == 0) {
+    c.user_s = static_cast<double>(ru.ru_utime.tv_sec) + 1e-6 * static_cast<double>(ru.ru_utime.tv_usec);
+    c.sys_s = static_cast<double>(ru.ru_stime.tv_sec) + 1e-6 * static_cast<double>(ru.ru_stime.tv_usec);
+  }
+  std::ifstream f("/proc/self/status");
+  std::string line;
+  while (f && std::getline(f, line))
+    if (line.rfind("Threads:", 0) == 0) {
+      c.threads = std::atoi(line.c_str() + 8);
+      break;
+    }
+#elif defined(_WIN32)
+  FILETIME ct, et, kt, ut;
+  if (GetProcessTimes(GetCurrentProcess(), &ct, &et, &kt, &ut)) {
+    auto secs = [](const FILETIME& ft) {
+      ULARGE_INTEGER u;
+      u.LowPart = ft.dwLowDateTime;
+      u.HighPart = ft.dwHighDateTime;
+      return static_cast<double>(u.QuadPart) * 1e-7;  // 100 ns units
+    };
+    c.user_s = secs(ut);
+    c.sys_s = secs(kt);
+  }
+#endif
+  return c;
 }
 }  // namespace pelias::os

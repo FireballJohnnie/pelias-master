@@ -241,6 +241,7 @@ struct GpuEngine::Impl {
   // 1 after the MoE half (= the block: gather, norms, eh_proj, attention, MoE), 2 before the head product, 3 after the
   // argmax; the generate loop sums them after its sync (mtp_slots lists the steps)
   unsigned long long *mtp_ts_h = nullptr, *mtp_ts_d = nullptr;
+  static constexpr int kMtpStamps = 6;  // v60 E2: 0 start, 1 after the MoE half, 2 before the head, 3 after the sketch dot, 4 after the top-k select, 5 after the argmax / pick
   std::vector<unsigned> mtp_slots;
   std::int32_t* mtp_top_d = nullptr;
   const std::uint8_t* mtp_emb_dev = nullptr;
@@ -2011,8 +2012,8 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
   {  // v60: the mapped ring for the step's ids and position, and the token embedding registered for the GPU gather
     void* rdev = nullptr;
     const std::size_t ring_ids = static_cast<std::size_t>(Impl::kRing) * (Impl::kReaderMax * sizeof(std::int32_t) + sizeof(int));
-    const std::size_t ring_ts = (ring_ids + 255) / 256 * 256;  // v60 D: the MTP stamps start here, 4 x u64 per slot
-    const std::size_t ring_b = ring_ts + static_cast<std::size_t>(Impl::kRing) * 4 * sizeof(unsigned long long) + 256;
+    const std::size_t ring_ts = (ring_ids + 255) / 256 * 256;  // v60 D: the MTP stamps start here, kMtpStamps x u64 per slot (E2: 6)
+    const std::size_t ring_b = ring_ts + static_cast<std::size_t>(Impl::kRing) * Impl::kMtpStamps * sizeof(unsigned long long) + 256;
     I.ring_hv = g::host_alloc_mapped(ring_b, &rdev);
     if (!I.ring_hv || !rdev) return R::fail(Status::fail(Code::internal, std::string("engine: mapped memory for the step ring: ") + g::last_error()));
     std::memset(I.ring_hv, 0, ring_b);
@@ -2391,9 +2392,14 @@ Status GpuEngine::Impl::mtp_run(const std::int32_t* tokens_h, const std::int32_t
   }
   I.ring_pos_h[slot] = static_cast<int>(I.mtp_pos);
   if (!g::h2d_async(I.pos_d, I.ring_pos_h + slot, sizeof(int))) return gfail("engine: MTP position");
-  unsigned long long* ts = I.mtp_ts_d ? I.mtp_ts_d + static_cast<std::ptrdiff_t>(slot) * 4 : nullptr;  // v60 D
+  unsigned long long* ts = I.mtp_ts_d ? I.mtp_ts_d + static_cast<std::ptrdiff_t>(slot) * Impl::kMtpStamps : nullptr;  // v60 D (E2: 6 per slot)
   if (ts) {
     I.mtp_slots.push_back(slot);
+    // v60 E2: the chain stamps (3, 4) are written on the sketch path only; the slot is reused after kRing steps, so clear them
+    // on the host first (mapped memory; the GPU's writes for this step come later in stream order)
+    unsigned long long* th = I.mtp_ts_h + static_cast<std::ptrdiff_t>(slot) * Impl::kMtpStamps;
+    th[3] = 0;
+    th[4] = 0;
     if (!g::stamp(ts + 0)) return gfail("engine: MTP stamp");
   }
   // [enorm(embedding) | hnorm(h_prev)] -> eh_proj: the embedding rows gathered into xr, both halves copied at the 2 n_embd stride
@@ -2432,7 +2438,9 @@ Status GpuEngine::Impl::mtp_run(const std::int32_t* tokens_h, const std::int32_t
     }
     if (!g::act_q8x32(I.xn, hk, 1, hk, I.head.v->rot32, I.xr, hk, I.q, I.scale, I.sum)) return gfail("engine: rounding for the head sketch");
     if (!g::head_sketch_dot(I.hsk, static_cast<const std::uint16_t*>(I.head.sw.d6), nvoc, hk, I.q, I.scale, I.lg)) return gfail("engine: head sketch");
+    if (ts && !g::stamp(ts + 3)) return gfail("engine: MTP stamp");  // v60 E2: after the sketch dot
     if (!g::topk_select(I.lg, nvoc, Impl::kHeadSketchTop, I.cand_d)) return gfail("engine: head sketch top rows");
+    if (ts && !g::stamp(ts + 4)) return gfail("engine: MTP stamp");  // v60 E2: after the top-k select
     if (!g::gather_q6k_rows(I.head.sw.w, static_cast<const std::uint16_t*>(I.head.sw.d6), hk, I.cand_d, Impl::kHeadSketchTop, I.htop_w, I.htop_d6))
       return gfail("engine: head sketch gather");
     if (!(st = I.prod_r3({{&I.head_top, I.lg_top}}, I.xn, 1))) return st;  // the exact Q6_K product of the top rows
@@ -2450,7 +2458,7 @@ Status GpuEngine::Impl::mtp_run(const std::int32_t* tokens_h, const std::int32_t
     }
     if (logits_h && !g::to_host(logits_h, I.lg, z(n) * z(nvoc) * sizeof(float))) return gfail("engine: MTP logits");
   }
-  if (ts && !g::stamp(ts + 3)) return gfail("engine: MTP stamp");
+  if (ts && !g::stamp(ts + 5)) return gfail("engine: MTP stamp");
   I.mtp_pos += n;
   // the ring guard, as run(): a step that read nothing on the host stays queued; the slots must not lap the GPU
   if (I.unsynced + 2 < static_cast<unsigned>(Impl::kRing)) {
@@ -2553,10 +2561,16 @@ Status engine_generate_greedy_mtp(GpuEngine& eng, const Qwen35MoeSpec& s, const 
   // v60 D: after a sync, the GPU time of the MTP steps issued since the last fold, split at the head (stamps 0-1 layer, 2-3 head)
   auto fold_stamps = [&](double* total_s, double* layer_s, double* head_s) {
     for (unsigned slot : I.mtp_slots) {
-      const unsigned long long* t = I.mtp_ts_h + static_cast<std::ptrdiff_t>(slot) * 4;
-      if (t[0] && t[3] >= t[0]) *total_s += static_cast<double>(t[3] - t[0]) * 1e-9;
+      const unsigned long long* t = I.mtp_ts_h + static_cast<std::ptrdiff_t>(slot) * GpuEngine::Impl::kMtpStamps;
+      if (t[0] && t[5] >= t[0]) *total_s += static_cast<double>(t[5] - t[0]) * 1e-9;
       if (t[0] && t[1] >= t[0]) *layer_s += static_cast<double>(t[1] - t[0]) * 1e-9;
-      if (t[2] && t[3] >= t[2]) *head_s += static_cast<double>(t[3] - t[2]) * 1e-9;
+      if (t[2] && t[5] >= t[2]) *head_s += static_cast<double>(t[5] - t[2]) * 1e-9;
+      // v60 E2: the sketch chain's split (stamps 3 and 4 are written only on the sketch path; zero otherwise)
+      if (t[2] && t[3] >= t[2] && t[4] >= t[3] && t[5] >= t[4]) {
+        T.sketch_dot_s += static_cast<double>(t[3] - t[2]) * 1e-9;
+        T.sketch_select_s += static_cast<double>(t[4] - t[3]) * 1e-9;
+        T.sketch_rescore_s += static_cast<double>(t[5] - t[4]) * 1e-9;
+      }
     }
     I.mtp_slots.clear();
   };
