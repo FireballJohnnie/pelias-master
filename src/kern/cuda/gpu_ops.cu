@@ -1792,28 +1792,17 @@ __global__ void __launch_bounds__(1024) k_topk_select(const float* __restrict__ 
     s_mask = 0;
     s_need = static_cast<unsigned>(k);
   }
-  const int lane = tid & 31;
   for (int shift = 24; shift >= 0; shift -= 8) {
     if (tid < 256) hist[tid] = 0;
     __syncthreads();
     const unsigned pre = s_pre, mask = s_mask;
-    // v60 E3: logits share their top key bits, so a plain per-element atomicAdd funnels most of a pass into one bin; the warp
-    // aggregates first (lanes with the same digit elect a leader, one add per distinct digit per warp). Every lane runs every
-    // iteration (the bound is on base, not i) so the ballot / match masks are whole
-    for (std::int64_t base = 0; base < n; base += 1024) {
-      const std::int64_t i = base + tid;
-      unsigned digit = 0;
-      bool cand = false;
-      if (i < n) {
-        const unsigned ky = f_key(x[i]);
-        cand = (ky & mask) == pre;
-        digit = (ky >> shift) & 255u;
-      }
-      const unsigned m = __ballot_sync(0xffffffffu, cand);
-      if (cand) {
-        const unsigned peers = __match_any_sync(m, digit);
-        if (lane == __ffs(static_cast<int>(peers)) - 1) atomicAdd(&hist[digit], static_cast<unsigned>(__popc(peers)));
-      }
+    // the plain per-element shared atomicAdd (v60 E; 0.105 ms per 248k on this card, MEASURED v60j). v60 E3 tried a warp
+    // aggregation first (__ballot_sync + __match_any_sync, one add per distinct digit per warp, the loop bounded on base):
+    // 0.26 ms, MEASURED v60k - the match costs more than the same-bin atomics it saves on sm_89; reverted in E3b. The next
+    // step for this 0.1 ms, if it ever matters, is a grid-wide radix select (per-block histograms into a global one)
+    for (std::int64_t i = tid; i < n; i += 1024) {
+      const unsigned ky = f_key(x[i]);
+      if ((ky & mask) == pre) atomicAdd(&hist[(ky >> shift) & 255u], 1u);
     }
     __syncthreads();
     if (tid == 0) {
