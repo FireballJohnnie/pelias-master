@@ -354,6 +354,7 @@ struct GpuEngine::Impl {
     if (o.plane_bits <= 0) return 0;
     if (t == quant::Type::q4_tg2 && rb % 144 == 0) return kern::gpu::g_q4_tg2p;
     if (t == quant::Type::q5_k && rb % 176 == 0) return kern::gpu::g_q5_kp;
+    if (t == quant::Type::q4_k && rb % 144 == 0) return kern::gpu::g_q4_kp;  // v60 F: the MTP block's experts (and stock Q4_K files)
     return 0;
   }
   // v54c: an expert's matrices at the slider's bits (the bytes a bank copy or a cache slot of it takes)
@@ -1013,7 +1014,7 @@ struct GpuEngine::Impl {
         }
         char pb[460];
         std::snprintf(pb, sizeof pb,
-                      "; bit planes: %zu Q4_TG2 / Q5_K matrices outside the bank, %.2f GB pinned (rows packed at the slider's prefix, v60), built in %.2f s; every pick read with %d bits (at most each matrix's own), bank and slots sized for them; pinned read (512 MB, best of 2): copy engine %.1f, SM streaming %.1f, SM one line per page %.1f GB/s (first pin %.1f, %d pin%s, floor %.0f on the page lines)",
+                      "; bit planes: %zu Q4_TG2 / Q5_K / Q4_K matrices outside the bank, %.2f GB pinned (rows packed at the slider's prefix, v60), built in %.2f s; every pick read with %d bits (at most each matrix's own), bank and slots sized for them; pinned read (512 MB, best of 2): copy engine %.1f, SM streaming %.1f, SM one line per page %.1f GB/s (first pin %.1f, %d pin%s, floor %.0f on the page lines)",
                       jobs.size(), static_cast<double>(tot) / 1e9, pack_s, o.plane_bits, gbs_copy, gbs_sm, gbs_pg, pg_first, tries, tries == 1 ? "" : "s", o.pin_read_min_gbs);
         planes_note = pb;
       }

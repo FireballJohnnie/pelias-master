@@ -32,6 +32,13 @@ constexpr std::uint32_t g_q4_tg2p = 1009;  // GPU-path id (not a file type): Q4_
 // A row's first 16 nB + 32 nB x b bytes hold b bits; 5 bits = the stored code exactly. Fewer bits read the code with its
 // missing low bits at the middle of their range (the expected value of a uniform remainder).
 constexpr std::uint32_t g_q5_kp = 1010;
+// v60 F (game plan item 3; the MTP block's experts are Q4_K, read unplaned until now): Q4_K rows (144 bytes per 256 values,
+// d | dmin | scales[12] | qs[128]: Q5_K without qh) in the Q5_K plane layout one plane short - [16 nB] headers as stored |
+// [64 nB] A (code bits 3 and 2 as two 1-bit planes: word 2 j' bit 3, word 2 j' + 1 bit 2) | [32 nB] B (bit 1) | [32 nB] C
+// (bit 0); value v of a half (v = 32 j' + l) at bit l of its sub-block's word. A row's first 16 nB + 32 nB x b bytes hold b
+// bits (2-4); 4 bits = the stored code exactly. The stage reads it through the Q5_K plane path with every code one bit lower
+// (gpu_stream.cu kQ4KP); the slider's "3 bits" means 3 of 4 here, as for Q4_TG2
+constexpr std::uint32_t g_q4_kp = 1012;
 
 // the bytes of a plane row's first `bits` bits, for its type (rb = the row's full bytes); other types: rb
 PG_HD std::uint64_t plane_prefix(std::uint32_t type, std::uint64_t rb, int bits) {
@@ -42,6 +49,10 @@ PG_HD std::uint64_t plane_prefix(std::uint32_t type, std::uint64_t rb, int bits)
   if (type == g_q5_kp) {
     const std::uint64_t nB = rb / 176;
     return 16 * nB + 32 * nB * static_cast<std::uint64_t>(bits < 5 ? bits : 5);
+  }
+  if (type == g_q4_kp) {  // v60 F
+    const std::uint64_t nB = rb / 144;
+    return 16 * nB + 32 * nB * static_cast<std::uint64_t>(bits < 4 ? bits : 4);
   }
   return rb;
 }
@@ -256,9 +267,46 @@ PG_HD int q6k_sketch_half2_dp(std::uint32_t hi, std::uint32_t nx, const std::int
 // d * xs * (sc0 T0 + sc1 T1) / 2 with T the doubled half sums above
 PG_HD float q6k_sketch_sub(float d, float xs, int sc0, int sc1, int t0, int t1) { return d * xs * (0.5f * static_cast<float>(sc0 * t0 + sc1 * t1)); }
 
-// host: a stored row of either planed type into its plane layout (by the stored quant type id: 204 Q4_TG2, 13 Q5_K)
+// v60 F, host: one row of nB stored Q4_K blocks (144 nB bytes) into the plane layout (g_q4_kp; out: 144 nB bytes). Sub-block j
+// (0..7) of a block: value l's code is the nibble (j & 1) of byte 16 + 32 (j / 2) + l, as the stage's kQ4K path reads it
+inline void q4kp_plane_row(const std::uint8_t* in, std::uint8_t* out, int nB) {
+  std::memset(out, 0, static_cast<std::size_t>(144) * static_cast<std::size_t>(nB));
+  for (int b = 0; b < nB; ++b) {
+    const std::uint8_t* blk = in + 144 * b;
+    std::memcpy(out + 16 * b, blk, 16);
+    const std::uint8_t* qs = blk + 16;
+    for (int j = 0; j < 8; ++j)
+      for (int l = 0; l < 32; ++l) {
+        const int q = (qs[32 * (j / 2) + l] >> (4 * (j & 1))) & 15;
+        const int h = j >> 2, v = 32 * (j & 3) + l;
+        out[16 * nB + 64 * b + 32 * h + 8 * (j & 3) + (l >> 3)] |= static_cast<std::uint8_t>(((q >> 3) & 1) << (l & 7));
+        out[16 * nB + 64 * b + 32 * h + 8 * (j & 3) + 4 + (l >> 3)] |= static_cast<std::uint8_t>(((q >> 2) & 1) << (l & 7));
+        out[80 * nB + 32 * b + 16 * h + (v >> 3)] |= static_cast<std::uint8_t>(((q >> 1) & 1) << (v & 7));
+        out[112 * nB + 32 * b + 16 * h + (v >> 3)] |= static_cast<std::uint8_t>((q & 1) << (v & 7));
+      }
+  }
+}
+// host: back to stored Q4_K from the first `bits` bits (missing low bits zero); for the tests
+inline void q4kp_unplane_row(const std::uint8_t* in, std::uint8_t* out, int nB, int bits) {
+  for (int b = 0; b < nB; ++b) {
+    std::uint8_t* blk = out + 144 * b;
+    std::memcpy(blk, in + 16 * b, 16);
+    std::memset(blk + 16, 0, 128);
+    for (int j = 0; j < 8; ++j)
+      for (int l = 0; l < 32; ++l) {
+        const int h = j >> 2, v = 32 * (j & 3) + l;
+        int q = (((in[16 * nB + 64 * b + 32 * h + 8 * (j & 3) + (l >> 3)] >> (l & 7)) & 1) << 3) |
+                (((in[16 * nB + 64 * b + 32 * h + 8 * (j & 3) + 4 + (l >> 3)] >> (l & 7)) & 1) << 2);
+        if (bits >= 3) q |= ((in[80 * nB + 32 * b + 16 * h + (v >> 3)] >> (v & 7)) & 1) << 1;
+        if (bits >= 4) q |= (in[112 * nB + 32 * b + 16 * h + (v >> 3)] >> (v & 7)) & 1;
+        blk[16 + 32 * (j / 2) + l] |= static_cast<std::uint8_t>(q << (4 * (j & 1)));
+      }
+  }
+}
+// host: a stored row of a planed type into its plane layout (by the stored quant type id: 204 Q4_TG2, 13 Q5_K, 12 Q4_K)
 inline void plane_row(std::uint32_t stored_type, const std::uint8_t* in, std::uint8_t* out, std::uint64_t rb) {
   if (stored_type == 204) tg2p_plane_row(in, out, static_cast<int>(rb / 144));
+  else if (stored_type == 12) q4kp_plane_row(in, out, static_cast<int>(rb / 144));
   else q5p_plane_row(in, out, static_cast<int>(rb / 176));
 }
 

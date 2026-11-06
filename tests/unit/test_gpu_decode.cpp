@@ -304,3 +304,113 @@ TEST(q5_planes_layout_and_reads) {
               rows, round ? "exact" : "WRONG", masked ? "yes" : "NO", halves ? "= stored" : "WRONG", words ? "= stored codes" : "WRONG", dots,
               ones ? "= stored codes x inputs" : "WRONG", pre ? "ok" : "WRONG");
 }
+
+// v60 F: Q4_K in bit planes (g_q4_kp; Q5_K's layout one plane short): the round trip at 4 bits, the 2 / 3-bit reads = the stored
+// codes with their low bits zero, the dp4a word as the stage forms it (q5p_word >> 1 with the D plane zero) = the stored
+// codes, the 1-bit route's sums with the shifts one lower = the stored codes x inputs, and the prefixes
+TEST(q4k_planes_layout_and_reads) {
+  std::uint32_t seed = 4242u;
+  auto rnd = [&]() {
+    seed = seed * 1664525u + 1013904223u;
+    return static_cast<std::uint8_t>(seed >> 24);
+  };
+  int rows = 0;
+  bool round = true, masked = true, words = true, ones = true;
+  long dots = 0;
+  for (const int nB : {1, 2, 8}) {
+    for (int rep = 0; rep < 20; ++rep, ++rows) {
+      std::vector<std::uint8_t> row(static_cast<std::size_t>(144 * nB)), pl(row.size()), back(row.size()), want(row.size());
+      for (auto& x : row) x = rnd();
+      g::q4kp_plane_row(row.data(), pl.data(), nB);
+      g::q4kp_unplane_row(pl.data(), back.data(), nB, 4);
+      round = round && back == row;
+      for (const int bits : {2, 3}) {
+        g::q4kp_unplane_row(pl.data(), back.data(), nB, bits);
+        want = row;
+        for (int b = 0; b < nB; ++b) {
+          std::uint8_t* qs = want.data() + 144 * b + 16;
+          for (int j = 0; j < 8; ++j)
+            for (int l = 0; l < 32; ++l) {
+              int q = (qs[32 * (j / 2) + l] >> (4 * (j & 1))) & 15;
+              q &= ~((1 << (4 - bits)) - 1);
+              qs[32 * (j / 2) + l] = static_cast<std::uint8_t>((qs[32 * (j / 2) + l] & ~(15 << (4 * (j & 1)))) | (q << (4 * (j & 1))));
+            }
+        }
+        masked = masked && back == want;
+      }
+      auto u32 = [&](std::size_t off) {
+        std::uint32_t v;
+        std::memcpy(&v, pl.data() + off, 4);
+        return v;
+      };
+      for (int b = 0; b < nB; ++b)
+        for (int h = 0; h < 2; ++h) {
+          std::uint32_t a[8], bb[4], c[4];
+          const std::uint32_t d[4] = {0u, 0u, 0u, 0u};  // Q4_K has no fifth plane
+          for (int i = 0; i < 8; ++i) a[i] = u32(static_cast<std::size_t>(16 * nB + 64 * b + 32 * h + 4 * i));
+          for (int i = 0; i < 4; ++i) {
+            bb[i] = u32(static_cast<std::size_t>(80 * nB + 32 * b + 16 * h + 4 * i));
+            c[i] = u32(static_cast<std::size_t>(112 * nB + 32 * b + 16 * h + 4 * i));
+          }
+          const std::uint8_t* qs = row.data() + 144 * b + 16;
+          for (int bits = 2; bits <= 4; ++bits) {
+            std::uint32_t b2[4], c2[4];
+            for (int i = 0; i < 4; ++i) {
+              b2[i] = bits >= 3 ? bb[i] : 0u;
+              c2[i] = bits >= 4 ? c[i] : 0u;
+            }
+            for (int jj = 0; jj < 4; ++jj)
+              for (int g8 = 0; g8 < 8; ++g8) {
+                const std::uint32_t w = g::q5p_word(a, b2, c2, d, jj, g8) >> 1;  // the stage's kQ4KP word
+                for (int k = 0; k < 4; ++k) {
+                  const int j = 4 * h + jj, l = 4 * g8 + k;
+                  int q = (qs[32 * (j / 2) + l] >> (4 * (j & 1))) & 15;
+                  q &= ~((1 << (4 - bits)) - 1);
+                  words = words && static_cast<int>((w >> (8 * k)) & 0xffu) == q;
+                }
+              }
+            for (int jj = 0; jj < 4; ++jj) {
+              std::int8_t x[32];
+              for (int l = 0; l < 32; ++l) x[l] = static_cast<std::int8_t>(rnd());
+              if (rep == 0) x[0] = -128, x[1] = 127, x[2] = 0;
+              std::uint32_t u8[8];
+              g::act_bits32(x, u8);
+              int got = (g::plane_dot32(a[2 * jj], u8) << 3) + (g::plane_dot32(a[2 * jj + 1], u8) << 2);
+              if (bits >= 3) got += g::plane_dot32(bb[jj], u8) << 1;
+              if (bits >= 4) got += g::plane_dot32(c[jj], u8);
+              int ref = 0;
+              for (int l = 0; l < 32; ++l) {
+                const int j = 4 * h + jj;
+                int q = (qs[32 * (j / 2) + l] >> (4 * (j & 1))) & 15;
+                q &= ~((1 << (4 - bits)) - 1);
+                ref += q * x[l];
+              }
+              ones = ones && got == ref;
+              ++dots;
+            }
+          }
+        }
+    }
+  }
+  const bool pre = g::plane_prefix(g::g_q4_kp, 144 * 8, 2) == 640 && g::plane_prefix(g::g_q4_kp, 144 * 8, 3) == 896 &&
+                   g::plane_prefix(g::g_q4_kp, 144 * 8, 4) == 1152 && g::plane_prefix(g::g_q4_kp, 144 * 8, 5) == 1152;
+  // the generic dispatch packs Q4_K rows by the stored type id 12
+  bool disp = true;
+  {
+    std::vector<std::uint8_t> row(144 * 2), p1(144 * 2), p2(144 * 2);
+    for (auto& x : row) x = rnd();
+    g::q4kp_plane_row(row.data(), p1.data(), 2);
+    g::plane_row(12, row.data(), p2.data(), 144 * 2);
+    disp = p1 == p2;
+  }
+  CHECK(round);
+  CHECK(masked);
+  CHECK(words);
+  CHECK(ones);
+  CHECK(pre);
+  CHECK(disp);
+  std::printf("    Q4_K planes (v60 F): %d rows: 4 bits round trip %s; 2 / 3 bits = stored with low code bits zero %s; dp4a words (Q5 word >> 1) at 4/3/2 bits %s; "
+              "1-bit route %ld sub-block sums %s; prefixes %s; plane_row(12) dispatch %s\n",
+              rows, round ? "exact" : "WRONG", masked ? "yes" : "NO", words ? "= stored codes" : "WRONG", dots, ones ? "= stored codes x inputs" : "WRONG",
+              pre ? "ok" : "WRONG", disp ? "ok" : "WRONG");
+}

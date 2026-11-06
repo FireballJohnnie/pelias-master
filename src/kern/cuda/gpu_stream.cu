@@ -36,7 +36,16 @@ namespace {
 
 // v46a-1: kQ6KS Q6_K as stored (210-byte blocks, 2-byte aligned: the expert stage reads the file's / bank's bytes); kEpi
 // the expert stage's silu(g) x u rounding (not a matrix: one warp task per expert group)
-enum Fmt : int { kQ7ZT = 0, kQ4TG2 = 1, kQ5K = 2, kQ6K = 3, kQ8_0 = 4, kQ4K = 5, kIQ4XS = 6, kQ6KS = 7, kEpi = 8, kQ4TG2P = 9, kQ5KP = 10 };  // v54 kQ4TG2P / v54c kQ5KP: Q4_TG2 / Q5_K in bit planes (kern/tg2_planes.h)
+enum Fmt : int { kQ7ZT = 0, kQ4TG2 = 1, kQ5K = 2, kQ6K = 3, kQ8_0 = 4, kQ4K = 5, kIQ4XS = 6, kQ6KS = 7, kEpi = 8, kQ4TG2P = 9, kQ5KP = 10, kQ4KP = 11 };  // v54 kQ4TG2P / v54c kQ5KP / v60 F kQ4KP: Q4_TG2 / Q5_K / Q4_K in bit planes (kern/tg2_planes.h)
+// v60 F: the three plane formats share the stage's plane handling (packed prefix rows, slot fills through fw / frs); their
+// GPU-path type id and the stored row's block bytes
+__host__ __device__ inline bool is_plane_fmt(int f) { return f == kQ4TG2P || f == kQ5KP || f == kQ4KP; }
+__host__ __device__ inline std::uint32_t plane_type_of(int f) { return f == kQ4TG2P ? g_q4_tg2p : f == kQ5KP ? g_q5_kp : g_q4_kp; }
+__host__ __device__ inline unsigned plane_blk_of(int f) { return f == kQ5KP ? 176u : 144u; }
+// the bytes of a plane row's first pb bits for a stage job (nB blocks per row)
+__host__ __device__ inline long long plane_pf(int f, int nB, int pb) {
+  return static_cast<long long>(plane_prefix(plane_type_of(f), static_cast<std::uint64_t>(nB) * plane_blk_of(f), pb));
+}
 
 struct DJob {
   int fmt, n, K, lpr;      // format, rows, inputs, lanes per row (K / 128)
@@ -280,7 +289,7 @@ constexpr int kOnlyRx = -2;
 template <int ONLY>
 __device__ __forceinline__ constexpr bool fm_on(int f) {
   return ONLY == -1 || ONLY == f ||
-         (ONLY == kOnlyRx && (f == kQ4TG2 || f == kQ4TG2P || f == kQ5K || f == kQ5KP || f == kQ4K || f == kQ6KS || f == kQ8_0));
+         (ONLY == kOnlyRx && (f == kQ4TG2 || f == kQ4TG2P || f == kQ5K || f == kQ5KP || f == kQ4K || f == kQ4KP || f == kQ6KS || f == kQ8_0));
 }
 // the 8 activation words (32 int8) of sub-block jg
 template <int M>
@@ -445,12 +454,17 @@ __device__ __forceinline__ void lane_part_n(const DJob& J, int r, int part, cons
         acc[t] += s * ldxs<M>(xs[t] + jg) * sum;
       }
     }
-  } else if (fm_on<ONLY>(kQ5KP) && J.fmt == kQ5KP) {  // v54c / v55: Q5_K in bit planes, plane words -> 4 codes a word -> dp4a
+  } else if ((fm_on<ONLY>(kQ5KP) && J.fmt == kQ5KP) || (fm_on<ONLY>(kQ4KP) && J.fmt == kQ4KP)) {
+    // v54c / v55: Q5_K in bit planes, plane words -> 4 codes a word -> dp4a (or the 1-bit route). v60 F: Q4_K in the same layout
+    // one plane short (Q4_K is Q5_K without qh: the same header, the same d sc q - dmin mn; its planes hold bits 3, 2 | 1 | 0,
+    // so every code sits one bit lower: the dot's shifts drop by one, the dp4a word is the Q5 word >> 1 (its D plane is zero),
+    // and the unread bits count from 4). The two share q5p_part (A at 16 nB, B at 80, C at 112; D only when pb >= 5)
+    const int top = J.fmt == kQ5KP ? 5 : 4;
     std::uint32_t pa[8], pb[4], pc[4], pd[4];
     const long long r0s = (M == 3 || M == 5) ? rb0 / nB : 0;
-    const long long stride = (M == 3 || M == 5) ? static_cast<long long>(plane_prefix(g_q5_kp, 176ull * static_cast<unsigned long long>(nB), J.pb)) : J.rs;
+    const long long stride = (M == 3 || M == 5) ? plane_pf(J.fmt, nB, J.pb) : J.rs;
     const int4 hd = q5p_part<M>(J, cs, W + (r - r0s) * stride, B, half, nB, pa, pb, pc, pd);
-    const int kmiss = 5 - J.pb;  // code bits not read (their midpoint is added through the input sums)
+    const int kmiss = top - J.pb;  // code bits not read (their midpoint is added through the input sums)
     const std::uint32_t h0 = static_cast<std::uint32_t>(hd.x);
     const float d = __half2float(__ushort_as_half(static_cast<unsigned short>(h0 & 0xffffu)));
     const float dmin = __half2float(__ushort_as_half(static_cast<unsigned short>(h0 >> 16)));
@@ -469,15 +483,16 @@ __device__ __forceinline__ void lane_part_n(const DJob& J, int r, int part, cons
           const std::uint32_t u8[8] = {static_cast<std::uint32_t>(v0.x), static_cast<std::uint32_t>(v0.y), static_cast<std::uint32_t>(v0.z),
                                        static_cast<std::uint32_t>(v0.w), static_cast<std::uint32_t>(v1.x), static_cast<std::uint32_t>(v1.y),
                                        static_cast<std::uint32_t>(v1.z), static_cast<std::uint32_t>(v1.w)};
-          sq = (plane_dot32(pa[2 * jj], u8) << 4) + (plane_dot32(pa[2 * jj + 1], u8) << 3);
-          if (J.pb >= 3) sq += plane_dot32(pb[jj], u8) << 2;
-          if (J.pb >= 4) sq += plane_dot32(pc[jj], u8) << 1;
+          sq = (plane_dot32(pa[2 * jj], u8) << (top - 1)) + (plane_dot32(pa[2 * jj + 1], u8) << (top - 2));
+          if (J.pb >= 3) sq += plane_dot32(pb[jj], u8) << (top - 3);
+          if (J.pb >= 4) sq += plane_dot32(pc[jj], u8) << (top - 4);
           if (J.pb >= 5) sq += plane_dot32(pd[jj], u8);
         } else {  // the dp4a route (inputs without planes: the separate expert kernels)
           int xj[8];
           ld_x8<M>(xq[t], jg, xj);
+          const int dsh = 5 - top;  // Q4_K planes: the Q5 word's codes halved (bit 0 of every byte is the zero D plane)
 #pragma unroll
-          for (int g = 0; g < 8; ++g) sq = __dp4a(static_cast<int>(q5p_word(pa, pb, pc, pd, jj, g)), xj[g], sq);
+          for (int g = 0; g < 8; ++g) sq = __dp4a(static_cast<int>(q5p_word(pa, pb, pc, pd, jj, g) >> dsh), xj[g], sq);
         }
         const int xsi = ldxi<M>(xsum[t] + jg);
         const float sqf = kmiss > 0 ? 0.5f * static_cast<float>(2 * sq + ((1 << kmiss) - 1) * xsi) : static_cast<float>(sq);
@@ -820,6 +835,7 @@ __host__ __device__ inline int rx_fmt(std::uint32_t t) {
     case g_q4_tg2: return kQ4TG2;
     case g_q4_tg2p: return kQ4TG2P;
     case g_q5_kp: return kQ5KP;
+    case g_q4_kp: return kQ4KP;  // v60 F
     case g_q5_k: return kQ5K;
     case g_q4_k: return kQ4K;
     case g_q6_k: return kQ6KS;
@@ -913,11 +929,11 @@ __device__ __forceinline__ void rx_plan_body(const int* __restrict__ grp, const 
         const ExpertPtr& FL = gfill[u];
         J.fmt = rx_fmt(X.type[kind]);
         {  // v54b / v54c: the slider's bits, at most the matrix's own (4 for Q4_TG2, 5 for Q5_K)
-          const int top = J.fmt == kQ5KP ? 5 : 4;
+          const int top = J.fmt == kQ5KP ? 5 : 4;  // Q4_TG2 / Q4_K planes: 4
           J.pb = X.pbits >= 2 && static_cast<int>(X.pbits) < top ? static_cast<int>(X.pbits) : top;
         }
         J.rs = static_cast<long long>(X.rs[kind]);  // v60: the stride in memory (the RAM planes are packed at the prefix)
-        J.fw = J.fmt == kQ4TG2P || J.fmt == kQ5KP ? const_cast<std::uint8_t*>(FL.w[kind]) : nullptr;
+        J.fw = is_plane_fmt(J.fmt) ? const_cast<std::uint8_t*>(FL.w[kind]) : nullptr;
         J.frs = static_cast<long long>(FL.rs[kind]);
         if (J.fmt < 0) s_err = 2;  // every writer stores 2; read after the barrier
         J.n = kind < 2 ? F : H;
@@ -927,7 +943,7 @@ __device__ __forceinline__ void rx_plan_body(const int* __restrict__ grp, const 
         J.w = X.w[kind];
         J.fd = FL.w[kind] ? static_cast<long long>(FL.w[kind] - X.w[kind]) : 0;
         J.stg = load_mode == 2 || (load_mode == 1 && !X.vram);  // v46a-2: all experts, or those read from RAM
-        if (J.fmt == kQ4TG2P || J.fmt == kQ5KP) J.fd = 0;  // v54b: a plane matrix's miss fills its slot through fw / frs (packed rows), staged
+        if (is_plane_fmt(J.fmt)) J.fd = 0;  // v54b: a plane matrix's miss fills its slot through fw / frs (packed rows), staged
         if (kind < 2) {
           J.xq = xq;
           J.xs = xs;
@@ -1054,7 +1070,7 @@ __device__ __forceinline__ void rx_rows(const DJob& J, long long t) {
 }
 // v46a-2: bytes per 256-value block of the stage's formats (as read: Q8_0 in R3's repacked layout)
 __host__ __device__ inline int rx_blk(int fmt) {
-  return fmt == kQ5K || fmt == kQ5KP ? 176 : fmt == kQ6KS ? 210 : fmt == kQ8_0 ? 272 : 144;  // Q4_TG2(P), Q4_K: 144
+  return fmt == kQ5K || fmt == kQ5KP ? 176 : fmt == kQ6KS ? 210 : fmt == kQ8_0 ? 272 : 144;  // Q4_TG2(P), Q4_K(P): 144
 }
 // v57 (author 13:02 "fix the kernel. Properly."): the expert stage's copy pipeline. v55f3 / v56 MEASURED: the stage reads
 // ~0.46 GB per token in ~5.58 ms (~80 GB/s DERIVED) at 1 block of 8 warps per SM (188 registers): each warp loaded its task's
@@ -1129,10 +1145,9 @@ __device__ __forceinline__ void rx_rows_staged(const DJob& J, long long t, std::
   const long long rowb = static_cast<long long>(nB) * rx_blk(J.fmt);
   const std::uint8_t* src = J.w + static_cast<long long>(r0) * rowb;
   const std::uint8_t* wb;
-  if (J.fmt == kQ4TG2P || J.fmt == kQ5KP) {  // v54b / v54c: each row's first J.pb bits (the prefix) from w at stride J.rs,
+  if (is_plane_fmt(J.fmt)) {  // v54b / v54c: each row's first J.pb bits (the prefix) from w at stride J.rs,
                                             // packed in the buffer and, on a miss, in the slot (fw at frs)
-    const long long pf = static_cast<long long>(plane_prefix(J.fmt == kQ4TG2P ? g_q4_tg2p : g_q5_kp,
-                                                             static_cast<std::uint64_t>(nB) * (J.fmt == kQ4TG2P ? 144u : 176u), J.pb));
+    const long long pf = plane_pf(J.fmt, nB, J.pb);
     if (J.rs == pf && (!J.fw || J.frs == pf)) {  // v60 (Fix 2): packed rows: the task's rows are one contiguous run, one copy
       wb = rx_stage(J.w + static_cast<long long>(r0) * pf, nr * pf, sbuf, J.fw ? J.fw + static_cast<long long>(r0) * pf : nullptr, lane);
     } else {
@@ -1192,9 +1207,8 @@ __device__ __forceinline__ void rxp_issue(const DJob& J, long long t, std::uint8
   const int r0 = static_cast<int>((t - J.task0) * rpw);
   const int nr = J.n - r0 < rpw ? J.n - r0 : rpw;
   if (nr <= 0) return;
-  if (J.fmt == kQ4TG2P || J.fmt == kQ5KP) {
-    const long long pf = static_cast<long long>(plane_prefix(J.fmt == kQ4TG2P ? g_q4_tg2p : g_q5_kp,
-                                                             static_cast<std::uint64_t>(nB) * (J.fmt == kQ4TG2P ? 144u : 176u), J.pb));
+  if (is_plane_fmt(J.fmt)) {
+    const long long pf = plane_pf(J.fmt, nB, J.pb);
     if (J.rs == pf) rxp_issue_range(J.w + static_cast<long long>(r0) * pf, nr * pf, buf, lane);  // v60: packed rows, one range
     else
       for (int rr = 0; rr < nr; ++rr) rxp_issue_range(J.w + (r0 + rr) * J.rs, pf, buf + rr * pf, lane);
@@ -1207,7 +1221,7 @@ __device__ __forceinline__ void rxp_issue(const DJob& J, long long t, std::uint8
 // packed rows of one buffer); the others any phase
 __device__ __forceinline__ bool rxp_ok(const DJob& J) {
   if (J.fmt == kEpi) return false;
-  if (J.fmt == kQ4TG2P || J.fmt == kQ5KP)
+  if (is_plane_fmt(J.fmt))
     return ((reinterpret_cast<std::uintptr_t>(J.w) | static_cast<std::uintptr_t>(J.rs)) & 15u) == 0;
   return true;
 }
@@ -1219,9 +1233,8 @@ __device__ __forceinline__ void rxp_compute(const DJob& J, long long t, std::uin
   const int r = r0 + lane / J.lpr, part = lane % J.lpr;
   const int nr = J.n - r0 < rpw ? J.n - r0 : rpw;
   const std::uint8_t* wb;
-  if (J.fmt == kQ4TG2P || J.fmt == kQ5KP) {
-    const long long pf = static_cast<long long>(plane_prefix(J.fmt == kQ4TG2P ? g_q4_tg2p : g_q5_kp,
-                                                             static_cast<std::uint64_t>(nB) * (J.fmt == kQ4TG2P ? 144u : 176u), J.pb));
+  if (is_plane_fmt(J.fmt)) {
+    const long long pf = plane_pf(J.fmt, nB, J.pb);
     wb = buf;
     if (J.fw) {
       if (J.frs == pf) rxp_fill(J.fw + static_cast<long long>(r0) * pf, buf, nr * pf, lane);  // v60: the slot's rows are packed, one run
@@ -2492,6 +2505,7 @@ bool dn_half(const DnHalfArgs& A, Stream s) {
 int rx_stage_block_bytes(std::uint32_t type, int plane_bits) {
   if (type == g_q4_tg2p) return static_cast<int>(tg2p_prefix(1, plane_bits >= 2 ? plane_bits : 4));
   if (type == g_q5_kp) return static_cast<int>(plane_prefix(g_q5_kp, 176, plane_bits >= 2 ? plane_bits : 5));
+  if (type == g_q4_kp) return static_cast<int>(plane_prefix(g_q4_kp, 144, plane_bits >= 2 ? plane_bits : 4));  // v60 F
   const int f = rx_fmt(type);
   return f < 0 ? 272 : rx_blk(f);
 }
