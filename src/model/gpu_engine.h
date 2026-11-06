@@ -162,7 +162,8 @@ class GpuEngine {
   Status step(const std::int32_t* tokens, int n, float* logits, bool last_only, EngineStats* st = nullptr, float* hidden_out = nullptr);
   // MTP verify: as step (every row's logits and hidden) with the DeltaNet state of every prefix kept, n <= max_verify;
   // then keep(k) keeps the first k tokens of that batch (1 <= k <= n): position pos0 + k, the state and the conv tails as
-  // if only those k had run (bit for bit), the attention cache's later rows dropped.
+  // if only those k had run (bit for bit), the attention cache's later rows dropped. v60 G: keep() queues one launch on the
+  // stream (every DeltaNet layer at once) and returns without a sync; the next step or host read orders after it.
   Status verify(const std::int32_t* tokens, int n, float* logits, float* hidden_out, EngineStats* st = nullptr);
   Status keep(int k);
   // The MTP block (EngineOptions::mtp): tokens[0..n) at MTP positions mtp_pos() .., token t paired with the hidden row

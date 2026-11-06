@@ -216,6 +216,9 @@ struct GpuEngine::Impl {
   static constexpr int kHeadSketchTop = 64;
   void* hsk_mem = nullptr;
   std::uint8_t* hsk = nullptr;
+  // v60 G (item 4): the keep() stitch's table - one g::DnKeepLayer per DeltaNet layer with checkpoints (device, fixed at open)
+  g::DnKeepLayer* dnk_d = nullptr;
+  int dnk_n = 0;
   std::size_t hsk_bytes = 0;
   DevW head_top;
   void* htop_w = nullptr;
@@ -1482,6 +1485,7 @@ GpuEngine::~GpuEngine() {
   p_->graphs.clear();
   for (void* rb2 : p_->reg_bases) g::host_unregister(rb2);
   g::dfree(p_->rtab);
+  g::dfree(p_->dnk_d);  // v60 G
   g::dfree(p_->rgu);
   g::dfree(p_->ryd);
   g::dfree(p_->rgrp);
@@ -1844,6 +1848,26 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
       c += al(z(o.max_ctx) * z(I.kv_w) * 4);
     }
   }
+  // v60 G (item 4): the keep() stitch's table - every DeltaNet layer's state, checkpoints, saved inputs and tails, one upload
+  {
+    std::vector<g::DnKeepLayer> kt;
+    for (std::uint32_t il = 0; il < s.n_layer; ++il) {
+      const Layer& D = I.L[il];
+      if (!D.state || !D.ckpt || !D.mixed_save) continue;
+      g::DnKeepLayer ke;
+      ke.state = D.state;
+      ke.ckpt = D.ckpt;
+      ke.msave = D.mixed_save;
+      ke.tail[0] = D.tail[0];
+      ke.tail[1] = D.tail[1];
+      kt.push_back(ke);
+    }
+    if (!kt.empty()) {
+      I.dnk_d = static_cast<g::DnKeepLayer*>(g::dalloc(kt.size() * sizeof(g::DnKeepLayer)));
+      if (!I.dnk_d || !g::to_device(I.dnk_d, kt.data(), kt.size() * sizeof(g::DnKeepLayer))) return R::fail(gfail("engine: keep table"));
+      I.dnk_n = static_cast<int>(kt.size());
+    }
+  }
   // (v60 commit C: the batched MoE scratch (g::moe_scratch_alloc) is gone: nothing read it since the R3 stage became the only
   // expert path; its bytes were taken before the VRAM probe and never used)
   // the dense weights of every layer and the output layer, resident
@@ -2157,6 +2181,25 @@ Status GpuEngine::keep(int k) {
   if (k == n) return Status::good();
   const Qwen35MoeSpec& s = I.s;
   const int64_t ch = s.conv_channels(), taps = s.ssm_d_conv, ss = s.ssm_dt_rank * s.ssm_d_state * s.ssm_d_state;
+  // v60 G (item 4, the keep() stitch): one launch for every DeltaNet layer - the state from the checkpoint after token k - 1,
+  // the conv tail rebuilt from the tail before the batch and the saved inputs - queued on the stream behind the verify; the
+  // next step or host read orders after it (no conv output computed, no sync here). The per-layer form it replaces (a state
+  // copy + a conv over k rows whose output was discarded + a tail kernel per layer, then a sync: 90 launches) MEASURED 1.2-1.4
+  // ms per rejecting step (v60o: keep 0.011-0.041 s over 9-30 such steps). Every DeltaNet layer runs every step, so their
+  // ping-pong indices agree; if ever not (or no table), the per-layer form runs, synced as before.
+  int cur = -1;
+  bool same = I.dnk_d != nullptr && I.dnk_n > 0;
+  for (std::uint32_t il = 0; il < s.n_layer && same; ++il) {
+    const Layer& D = I.L[il];
+    if (!D.state) continue;
+    if (cur < 0) cur = D.cur;
+    else if (D.cur != cur) same = false;
+  }
+  if (same && cur >= 0) {
+    if (!g::deltanet_keep(I.dnk_d, I.dnk_n, k, cur, ss, ch, taps)) return gfail("engine: keep (stitch)");
+    I.pos = I.verify_pos0 + k;
+    return Status::good();
+  }
   for (std::uint32_t il = 0; il < s.n_layer; ++il) {
     Layer& D = I.L[il];
     if (!D.state) continue;

@@ -441,6 +441,22 @@ __global__ void k_dn_tail(const float* __restrict__ mixed, const float* __restri
   nt[id] = src >= 0 ? mixed[src * ch + c] : (tail ? tail[(taps - 1 + src) * ch + c] : 0.0f);
 }
 
+// v60 G: the keep() stitch (gpu_ops.h DnKeepLayer) - every DeltaNet layer's state and tail in one launch; blockIdx.y = the layer
+__global__ void k_dn_keep(const DnKeepLayer* __restrict__ tab, int k, int cur, std::int64_t ss4, std::int64_t ch, std::int64_t taps) {
+  const DnKeepLayer L = tab[blockIdx.y];
+  const std::int64_t id = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (id < ss4) {  // the state after token k - 1 of the batch, 16 bytes per thread
+    const float4* src = reinterpret_cast<const float4*>(L.ckpt) + static_cast<std::int64_t>(k - 1) * ss4;
+    reinterpret_cast<float4*>(L.state)[id] = src[id];
+  }
+  if (id < (taps - 1) * ch) {  // the tail after k kept rows: as k_dn_tail over (tail before the batch, the batch's k inputs)
+    const float* before = L.tail[1 - cur];
+    float* after = L.tail[cur];
+    const std::int64_t r = id / ch, c = id % ch, src = k - (taps - 1) + r;
+    after[id] = src >= 0 ? L.msave[src * ch + c] : before[(taps - 1 + src) * ch + c];
+  }
+}
+
 __global__ void k_dn_gates(float* beta, float* alpha, const float* __restrict__ dt, const float* __restrict__ a, std::int64_t n, std::int64_t nv) {
   const std::int64_t id = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (id >= n * nv) return;
@@ -1593,6 +1609,15 @@ bool attention(const float* q, std::int64_t q_stride, std::int64_t q_head, const
   const dim3 g3(static_cast<unsigned>(n_tok * n_head), blocks_for(head_dim, tpb));
   k_attn_out<<<g3, tpb, 0, st(s)>>>(scratch, V, kv_w, n_head, group, head_dim, p0, L, q, q_stride, q_head, gate ? 1 : 0, out, pos_d);
   return launched("attention output");
+}
+
+bool deltanet_keep(const DnKeepLayer* table, int layers, int k, int cur, std::int64_t ss, std::int64_t ch, std::int64_t taps, Stream s) {
+  if (!table || layers <= 0 || k < 1 || (cur != 0 && cur != 1) || ss <= 0 || (ss & 3) != 0 || ch <= 0 || taps <= 0)
+    return fail("deltanet_keep: bad shape (ss must be a multiple of 4 floats)");
+  const std::int64_t ss4 = ss / 4, n = std::max(ss4, (taps - 1) * ch);
+  const dim3 grid(blocks_for(n, 256), static_cast<unsigned>(layers));
+  k_dn_keep<<<grid, 256, 0, st(s)>>>(table, k, cur, ss4, ch, taps);
+  return launched("deltanet keep");
 }
 
 bool deltanet_conv(const float* mixed, const float* tail, const float* w, std::int64_t n, std::int64_t ch, std::int64_t taps, float* conv,

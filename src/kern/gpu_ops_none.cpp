@@ -101,6 +101,7 @@ bool attention(const float*, std::int64_t, std::int64_t, const float*, const flo
   return false;
 }
 bool deltanet_conv(const float*, const float*, const float*, std::int64_t, std::int64_t, std::int64_t, float*, float*, Stream) { return false; }
+bool deltanet_keep(const DnKeepLayer*, int, int, int, std::int64_t, std::int64_t, std::int64_t, Stream) { return false; }
 bool deltanet_gates(float*, float*, const float*, const float*, std::int64_t, std::int64_t, Stream) { return false; }
 bool argmax_rows(const float*, std::int64_t, std::int64_t, std::int64_t, std::int32_t*, Stream) { return false; }
 // v60 E: the head sketch

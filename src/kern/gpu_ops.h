@@ -127,6 +127,19 @@ bool stream_wait(Stream s, void* e);
 // + kk); tail null = zeros (a fresh sequence); new_tail (taps - 1 rows, may be null) receives the last taps - 1 inputs
 bool deltanet_conv(const float* mixed, const float* tail, const float* w, std::int64_t n, std::int64_t ch, std::int64_t taps,
                    float* conv, float* new_tail, Stream s = nullptr);
+// v60 commit G (item 4, the keep() stitch): after a verify batch of n tokens, keep its first k (k < n) in ONE launch over every
+// DeltaNet layer: the state <- the checkpoint after token k - 1 (row k - 1 of ckpt, ss floats, 16-byte aligned), and the conv tail
+// rebuilt as deltanet_conv's tail step would over k rows (from the tail before the batch and the batch's saved conv inputs) - no
+// conv output, no host sync (queued on the stream; the next step or host read orders after it). The table has one entry per
+// DeltaNet layer (device memory, fixed at open); cur is the ping-pong index the batch left (tail[cur] = after the batch, rewritten;
+// tail[1 - cur] = before the batch, read) and must be the same for every layer in the table.
+struct DnKeepLayer {
+  float* state = nullptr;
+  const float* ckpt = nullptr;   // nck rows of ss floats
+  const float* msave = nullptr;  // max_verify rows of ch floats
+  float* tail[2] = {nullptr, nullptr};
+};
+bool deltanet_keep(const DnKeepLayer* table, int layers, int k, int cur, std::int64_t ss, std::int64_t ch, std::int64_t taps, Stream s = nullptr);
 // v56: out[r] = the first index of row r's largest value (rows of n floats at stride ld), as a host scan with strict >
 bool argmax_rows(const float* x, std::int64_t n, std::int64_t rows, std::int64_t ld, std::int32_t* out, Stream s = nullptr);
 // v60 E: the head sketch for MTP drafts (kern/tg2_planes.h, g_q6_ksk): a Q6_K matrix's top two code planes + scales
