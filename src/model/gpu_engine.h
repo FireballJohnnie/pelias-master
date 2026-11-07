@@ -83,6 +83,13 @@ struct EngineOptions {
   // half: what the pipeline is worth today). Both are measurement knobs; the loser leaves (one engine path).
   int moe_blocks = 1;
   int rx_pipe = 1;
+  // v60 I (R3 rebuild stage 0): mtp_graph - the MTP draft chain (cat, norms, eh_proj, attention, MoE half, head / sketch) replayed
+  // as a CUDA graph per (hidden input, output slot, hidden output) after its first plain run, as the trunk's layers() are
+  // (v60q MEASURED the draft's ~15 eager launches at 0.63-0.90 ms with ~0.2 ms of bytes). rx_bit_route - 1 = the expert
+  // stage's 1-bit route (activation bit planes, AND + popcount) for the plane formats; 0 = the dp4a route of the same integers
+  // (sdecode MEASURED 19-30 % fewer decode cycles per task, flat in bits). Both measurement knobs for one gate; the loser leaves.
+  bool mtp_graph = true;
+  int rx_bit_route = 0;
   // v60 commit C2: the pinned-planes read probe at open (copy engine, GB/s, logged). pin_read_min_gbs > 0: below it the
   // planes are freed, pinned and packed again, up to pin_read_tries times (v60d: three of five arms read them 2-3x slower)
   double pin_read_min_gbs = 0.0;  // v60 C3: applies to the SM one-line-per-page read (GB/s of 128 B lines)

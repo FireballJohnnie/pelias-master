@@ -480,6 +480,19 @@ struct GpuEngine::Impl {
   std::string graph_note = "off";
   std::map<std::tuple<int, int, int, int>, void*> graphs;
   std::map<std::tuple<int, int, int, int>, int> graph_seen;
+  std::map<std::tuple<int, int, int, int>, std::size_t> graph_nodes;  // v60 I (0.3): launches per captured trunk step
+  // v60 I (0.4): the MTP draft chain's graphs, keyed by (hidden input, argmax output, hidden output): the ids are gathered and the
+  // position copied before the graph (they vary per call); the chain's stamps land in the slot it was captured with
+  struct MtpGraph {
+    void* exec = nullptr;
+    unsigned slot = 0;
+    int seen = 0;
+    std::size_t nodes = 0;
+  };
+  std::map<std::tuple<const void*, const void*, const void*>, MtpGraph> mtp_graphs;
+  bool mtp_graph_ok = false;
+  std::string mtp_graph_note = "off";
+  std::uint64_t mtp_graph_captures = 0, mtp_graph_replays = 0;
   std::uint64_t graph_replays = 0, graph_captures = 0;
   float* r3y = nullptr;
   std::size_t r3y_floats = 0;
@@ -781,8 +794,9 @@ struct GpuEngine::Impl {
     A.st = il < s.n_layer ? rst_d : rst_mtp_d;                    // v55e3 (v60 C: the MTP row has its own counters)
     // v55f / v55f2: the bit planes only feed planed experts' 1-bit route; with no planes (--plane-bits 0) nothing reads
     // them, so they are not built (v55f2 S0 +0.33 ms vs g55e3, MEASURED)
-    A.xb = o.plane_bits > 0 ? rxb : nullptr;
-    A.hb = o.plane_bits > 0 ? rhb : nullptr;
+    // v60 I (0.5): the plane formats' dp4a route by default (no activation bit planes built or read); rx_bit_route 1 = the 1-bit route
+    A.xb = o.plane_bits > 0 && o.rx_bit_route != 0 ? rxb : nullptr;
+    A.hb = o.plane_bits > 0 && o.rx_bit_route != 0 ? rhb : nullptr;
     if (!g::moe_half(A)) return Status::fail(Code::internal, std::string("engine: fused MoE half: ") + g::stream_last_error());
     return Status::good();
   }
@@ -1384,7 +1398,8 @@ struct GpuEngine::Impl {
           rx_ok = true;
           rx_note = std::string("on (gate / up, silu x up, down of every pick in one R3 launch per layer)") +
                     (o.moe_blocks == 2 ? "; one-token kernel at __launch_bounds__(256, 2), copy pipeline off (v60 H A/B)"
-                                       : o.rx_pipe == 0 ? "; copy pipeline off (v60 H A/B)" : "");
+                                       : o.rx_pipe == 0 ? "; copy pipeline off (v60 H A/B)" : "") +
+                    (o.plane_bits > 0 ? (o.rx_bit_route != 0 ? "; plane formats on the 1-bit route (v60 I A/B)" : "; plane formats on the dp4a route (v60 I)") : "");
           // v55b: the stage's one grid in shared memory: the slider's bits for every Q4_TG2 job (planes), else the stored grid
           {  // v55f: the staging buffer sized to the largest block of any matrix the stage stages (load mode 1: the experts
              // not in VRAM; 2: every expert and the shared one), at the slider's bits for the plane matrices
@@ -1490,6 +1505,8 @@ GpuEngine::~GpuEngine() {
   if (!p_) return;
   for (auto& kv : p_->graphs) g::graph_free(kv.second);
   p_->graphs.clear();
+  for (auto& kv : p_->mtp_graphs) g::graph_free(kv.second.exec);  // v60 I
+  p_->mtp_graphs.clear();
   for (void* rb2 : p_->reg_bases) g::host_unregister(rb2);
   g::dfree(p_->rtab);
   g::dfree(p_->dnk_d);  // v60 G
@@ -1665,12 +1682,26 @@ std::string GpuEngine::mtp_path_report() const {
     r += "; head sketch: " + std::to_string(I.sk_drafts) + " drafts through the two-plane sketch + top-" + std::to_string(Impl::kHeadSketchTop) + " re-score";
     if (I.o.mtp_head_sketch_check) r += ", recall " + std::to_string(I.sk_hit) + " / " + std::to_string(I.sk_total) + " (the full head's argmax among the sketch's top rows)";
   }
+  r += "; draft graphs (v60 I): " + I.mtp_graph_note;  // 0.4
+  if (I.mtp_graph_captures) {
+    r += ", " + std::to_string(I.mtp_graph_captures) + " captured, " + std::to_string(I.mtp_graph_replays) + " replays";
+    for (const auto& kv : I.mtp_graphs)
+      if (kv.second.exec) {
+        r += ", " + std::to_string(kv.second.nodes) + " nodes per draft";
+        break;
+      }
+  }
   return r;
 }
 
 std::string GpuEngine::graph_report() const {
-  return p_->graph_note + "; captures " + std::to_string(p_->graph_captures) + ", replays " + std::to_string(p_->graph_replays) +
-         "; DeltaNet dense halves in one launch (L3, v55g) " + std::to_string(p_->dn_half_runs);
+  std::string r = p_->graph_note + "; captures " + std::to_string(p_->graph_captures) + ", replays " + std::to_string(p_->graph_replays);
+  if (!p_->graph_nodes.empty()) {  // v60 I (0.3): launches per captured step, by (tokens, parity, verify checkpoints)
+    r += "; nodes per step:";
+    for (const auto& kv : p_->graph_nodes)
+      r += " " + std::to_string(std::get<0>(kv.first)) + "-token" + (std::get<2>(kv.first) ? " verify" : "") + " " + std::to_string(kv.second);
+  }
+  return r + "; DeltaNet dense halves in one launch (L3, v55g) " + std::to_string(p_->dn_half_runs);
 }
 bool GpuEngine::router_margins(std::vector<float>* m, std::vector<std::uint8_t>* have) const {
   if (!p_->rlg_h) return false;
@@ -1752,6 +1783,7 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
     return R::fail(Status::fail(Code::invalid_argument, "engine: mtp_plane_bits 0 (the slider) or 2-5 (v60 F2)"));
   if ((o.moe_blocks != 1 && o.moe_blocks != 2) || (o.rx_pipe != 0 && o.rx_pipe != 1))
     return R::fail(Status::fail(Code::invalid_argument, "engine: moe_blocks 1 or 2, rx_pipe 0 or 1 (v60 H)"));
+  if (o.rx_bit_route != 0 && o.rx_bit_route != 1) return R::fail(Status::fail(Code::invalid_argument, "engine: rx_bit_route 0 (dp4a) or 1 (1-bit) (v60 I)"));
   if (o.mtp && I.row_bits(s.n_layer) != o.plane_bits) {  // v60 F2: the Q4_TG2 decode grid (c_rx_bits) is one per launch, so a planed
     // Q4_TG2 matrix in the MTP row cannot read with other bits than the trunk's; this file's MTP experts are Q4_K (no grid)
     for (const WeightView* v : {&w.mtp.layer.gate_exps, &w.mtp.layer.up_exps, &w.mtp.layer.down_exps})
@@ -2136,6 +2168,12 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
       g::set_stream(I.stm);
       I.graph_ok = true;
       I.graph_note = "on (reader steps of 1-4 tokens)";
+      if (o.mtp && o.mtp_graph) {  // v60 I (0.4): the draft chain's graphs ride on the same capture machinery
+        I.mtp_graph_ok = true;
+        I.mtp_graph_note = "on (the chain from the input copies to the pick, per hidden input / output slot; the id gather and the position before it)";
+      } else if (o.mtp) {
+        I.mtp_graph_note = "off (--no-mtp-graph)";
+      }
     }
   }
   return R::good(std::unique_ptr<GpuEngine>(new GpuEngine(std::move(p))));
@@ -2313,9 +2351,11 @@ Status GpuEngine::Impl::run(const std::int32_t* tokens, int n, float* logits, bo
       for (std::uint32_t il = 0; il < s.n_layer; ++il) cur_before[il] = I.L[il].cur;
       const bool began = g::capture_begin(nullptr);
       const Status cs = began ? layers() : Status::fail(Code::internal, "capture did not begin");
-      const bool ended = began && g::capture_end(nullptr, &ex);
+      std::size_t nodes = 0;
+      const bool ended = began && g::capture_end(nullptr, &ex, &nodes);  // v60 I (0.3): the step's launch count
       if (cs.ok() && ended && ex) {
         I.graphs[key] = ex;
+        I.graph_nodes[key] = nodes;
         ++I.graph_captures;
         if (!g::graph_launch(ex, nullptr)) return gfail("engine: graph launch");
       } else {  // the attempt ran the host side only: restore the tails' parities, stop using graphs, run this step plainly
@@ -2460,12 +2500,23 @@ Status GpuEngine::Impl::mtp_run(const std::int32_t* tokens_h, const std::int32_t
   }
   I.ring_pos_h[slot] = static_cast<int>(I.mtp_pos);
   if (!g::h2d_async(I.pos_d, I.ring_pos_h + slot, sizeof(int))) return gfail("engine: MTP position");
-  unsigned long long* ts = I.mtp_ts_d ? I.mtp_ts_d + static_cast<std::ptrdiff_t>(slot) * Impl::kMtpStamps : nullptr;  // v60 D (E2: 6 per slot)
+  // v60 I (R3 rebuild 0.4): a one-token draft that wants only its device argmax runs its chain (from the input copies to the
+  // pick) as a CUDA graph after the first plain run of that (hidden input, argmax output, hidden output) shape - the trunk's
+  // policy (plain, then capture on the second sight, then replay). Outside the graph, as in run(): the id gather (it reads
+  // the ring slot), the position copy (pos_d is fixed), the host-side stamp clearing and the start stamp. The chain's own
+  // stamps land in the slot it was captured with, so a replay records that slot for the fold. v60q MEASURED the eager chain at
+  // 0.63-0.90 ms per draft for ~0.2 ms of bytes; the trunk's replays cost 0.7 us per kernel.
+  Impl::MtpGraph* G = nullptr;
+  if (I.mtp_graph_ok && n == 1 && top_d_out && !logits_h && !top_h && !I.o.mtp_head_sketch_check) G = &I.mtp_graphs[{h_prev_d, top_d_out, h_out_d}];
+  const bool replay = G && G->exec;
+  const bool capture = G && !G->exec && G->seen++ >= 1;
+  const unsigned sslot = replay ? G->slot : slot;
+  unsigned long long* ts = I.mtp_ts_d ? I.mtp_ts_d + static_cast<std::ptrdiff_t>(sslot) * Impl::kMtpStamps : nullptr;  // v60 D (E2: 6 per slot; H: 9)
   if (ts) {
-    I.mtp_slots.push_back(slot);
+    I.mtp_slots.push_back(sslot);
     // v60 E2: the chain stamps (3, 4) are written on the sketch path only; the slot is reused after kRing steps, so clear them
     // on the host first (mapped memory; the GPU's writes for this step come later in stream order)
-    unsigned long long* th = I.mtp_ts_h + static_cast<std::ptrdiff_t>(slot) * Impl::kMtpStamps;
+    unsigned long long* th = I.mtp_ts_h + static_cast<std::ptrdiff_t>(sslot) * Impl::kMtpStamps;
     th[3] = 0;
     th[4] = 0;
     if (!g::stamp(ts + 0)) return gfail("engine: MTP stamp");
@@ -2473,6 +2524,7 @@ Status GpuEngine::Impl::mtp_run(const std::int32_t* tokens_h, const std::int32_t
   // [enorm(embedding) | hnorm(h_prev)] -> eh_proj: the embedding rows gathered into xr, both halves copied at the 2 n_embd stride
   const WeightView& et = wt.mtp.embed_tokens;
   if (!g::gather_rows(et.type, I.mtp_emb_dev, et.row_bytes, e, ids, n, I.xr)) return gfail("engine: MTP embedding gather");
+  auto chain = [&]() -> Status {
   if (!g::dcopy2d(I.cat, z(2 * e) * sizeof(float), I.xr, z(e) * sizeof(float), z(e) * sizeof(float), z(n)) ||
       !g::dcopy2d(I.cat + e, z(2 * e) * sizeof(float), h_prev_d, z(e) * sizeof(float), z(e) * sizeof(float), z(n)))
     return gfail("engine: MTP input");
@@ -2530,6 +2582,34 @@ Status GpuEngine::Impl::mtp_run(const std::int32_t* tokens_h, const std::int32_t
     if (logits_h && !g::to_host(logits_h, I.lg, z(n) * z(nvoc) * sizeof(float))) return gfail("engine: MTP logits");
   }
   if (ts && !g::stamp(ts + 5)) return gfail("engine: MTP stamp");
+  return Status::good();
+  };
+  if (replay) {
+    if (!g::graph_launch(G->exec, nullptr)) return gfail("engine: MTP draft graph replay");
+    ++I.mtp_graph_replays;
+    ++I.mtp_fused_steps;  // the host-side counts the chain would have kept
+    if (I.hsk) ++I.sk_drafts;
+  } else if (capture) {
+    void* ex = nullptr;
+    const bool began = g::capture_begin(nullptr);
+    const Status cs = began ? chain() : Status::fail(Code::internal, "capture did not begin");
+    std::size_t nodes = 0;
+    const bool ended = began && g::capture_end(nullptr, &ex, &nodes);
+    if (cs.ok() && ended && ex) {
+      G->exec = ex;
+      G->slot = slot;
+      G->nodes = nodes;
+      ++I.mtp_graph_captures;
+      if (!g::graph_launch(ex, nullptr)) return gfail("engine: MTP draft graph launch");
+    } else {  // the attempt ran the host side only: no more draft graphs, run this chain plainly
+      g::graph_free(ex);
+      I.mtp_graph_ok = false;
+      I.mtp_graph_note = std::string("off after a failed capture (") + (cs.ok() ? g::last_error() : cs.text()) + ")";
+      if (Status r = chain(); !r) return r;
+    }
+  } else if (Status r = chain(); !r) {
+    return r;
+  }
   I.mtp_pos += n;
   // the ring guard, as run(): a step that read nothing on the host stays queued; the slots must not lap the GPU
   if (I.unsynced + 2 < static_cast<unsigned>(Impl::kRing)) {

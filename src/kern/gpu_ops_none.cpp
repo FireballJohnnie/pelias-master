@@ -51,8 +51,9 @@ Stream stream_new() { return nullptr; }
 void stream_free(Stream) {}
 bool h2d_async(void*, const void*, std::size_t, Stream) { return false; }
 bool capture_begin(Stream) { return false; }
-bool capture_end(Stream, void** exec) {
+bool capture_end(Stream, void** exec, std::size_t* nodes) {
   *exec = nullptr;
+  if (nodes) *nodes = 0;
   return false;
 }
 bool graph_launch(void*, Stream) { return false; }

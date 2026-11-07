@@ -2066,10 +2066,14 @@ bool h2d_async(void* dst, const void* src, std::size_t bytes, Stream s) {
   return ck(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, st(s)), "copy to the device (async)");
 }
 bool capture_begin(Stream s) { return ck(cudaStreamBeginCapture(st(s), cudaStreamCaptureModeRelaxed), "graph capture begin"); }
-bool capture_end(Stream s, void** exec) {
+bool capture_end(Stream s, void** exec, std::size_t* nodes) {
   cudaGraph_t gr = nullptr;
   *exec = nullptr;
   if (!ck(cudaStreamEndCapture(st(s), &gr), "graph capture end")) return false;
+  if (nodes) {  // v60 I (R3 rebuild 0.3): how many launches a captured step holds
+    std::size_t n = 0;
+    *nodes = cudaGraphGetNodes(gr, nullptr, &n) == cudaSuccess ? n : 0;
+  }
   cudaGraphExec_t ex = nullptr;
   const bool ok = ck(cudaGraphInstantiate(&ex, gr, 0ull), "graph instantiate");
   cudaGraphDestroy(gr);

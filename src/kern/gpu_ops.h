@@ -114,7 +114,7 @@ Stream stream_new();
 void stream_free(Stream s);
 bool h2d_async(void* dst, const void* src, std::size_t bytes, Stream s = nullptr);
 bool capture_begin(Stream s);
-bool capture_end(Stream s, void** exec);
+bool capture_end(Stream s, void** exec, std::size_t* nodes = nullptr);  // v60 I: nodes = the captured graph's node count (0.3)
 bool graph_launch(void* exec, Stream s);
 void graph_free(void* exec);
 void* event_new();
