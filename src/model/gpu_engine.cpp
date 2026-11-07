@@ -489,7 +489,11 @@ struct GpuEngine::Impl {
     int seen = 0;
     std::size_t nodes = 0;
   };
-  std::map<std::tuple<const void*, const void*, const void*>, MtpGraph> mtp_graphs;
+  // v60 I2: keyed by (hidden input, argmax output, hidden output, tokens) so the catch-up steps (1-4 tokens, no head) and the
+  // prompt catch-up chunks (16 hidden-row pointers x 4 tokens) replay too; kMtpGraphMax caps the table (a new shape past the cap
+  // runs plainly)
+  std::map<std::tuple<const void*, const void*, const void*, int>, MtpGraph> mtp_graphs;
+  static constexpr std::size_t kMtpGraphMax = 96;
   bool mtp_graph_ok = false;
   std::string mtp_graph_note = "off";
   std::uint64_t mtp_graph_captures = 0, mtp_graph_replays = 0;
@@ -1682,14 +1686,21 @@ std::string GpuEngine::mtp_path_report() const {
     r += "; head sketch: " + std::to_string(I.sk_drafts) + " drafts through the two-plane sketch + top-" + std::to_string(Impl::kHeadSketchTop) + " re-score";
     if (I.o.mtp_head_sketch_check) r += ", recall " + std::to_string(I.sk_hit) + " / " + std::to_string(I.sk_total) + " (the full head's argmax among the sketch's top rows)";
   }
-  r += "; draft graphs (v60 I): " + I.mtp_graph_note;  // 0.4
+  r += "; MTP step graphs (v60 I / I2): " + I.mtp_graph_note;  // 0.4 + I2
   if (I.mtp_graph_captures) {
-    r += ", " + std::to_string(I.mtp_graph_captures) + " captured, " + std::to_string(I.mtp_graph_replays) + " replays";
+    std::size_t nd = 0, nc = 0, draft_nodes = 0, catch_nodes = 0;
     for (const auto& kv : I.mtp_graphs)
       if (kv.second.exec) {
-        r += ", " + std::to_string(kv.second.nodes) + " nodes per draft";
-        break;
+        if (std::get<1>(kv.first)) {
+          ++nd;
+          draft_nodes = kv.second.nodes;
+        } else {
+          ++nc;
+          catch_nodes = kv.second.nodes;
+        }
       }
+    r += ", " + std::to_string(I.mtp_graph_captures) + " captured (" + std::to_string(nd) + " draft, " + std::to_string(nc) + " catch-up shapes), " +
+         std::to_string(I.mtp_graph_replays) + " replays, " + std::to_string(draft_nodes) + " nodes per draft, " + std::to_string(catch_nodes) + " per catch-up step";
   }
   return r;
 }
@@ -2170,7 +2181,7 @@ Result<std::unique_ptr<GpuEngine>> GpuEngine::open(const Qwen35MoeSpec& s, const
       I.graph_note = "on (reader steps of 1-4 tokens)";
       if (o.mtp && o.mtp_graph) {  // v60 I (0.4): the draft chain's graphs ride on the same capture machinery
         I.mtp_graph_ok = true;
-        I.mtp_graph_note = "on (the chain from the input copies to the pick, per hidden input / output slot; the id gather and the position before it)";
+        I.mtp_graph_note = "on (drafts and catch-up steps: the chain from the input copies on, per hidden input / output / tokens; the id gather and the position before it)";
       } else if (o.mtp) {
         I.mtp_graph_note = "off (--no-mtp-graph)";
       }
@@ -2506,8 +2517,15 @@ Status GpuEngine::Impl::mtp_run(const std::int32_t* tokens_h, const std::int32_t
   // the ring slot), the position copy (pos_d is fixed), the host-side stamp clearing and the start stamp. The chain's own
   // stamps land in the slot it was captured with, so a replay records that slot for the fold. v60q MEASURED the eager chain at
   // 0.63-0.90 ms per draft for ~0.2 ms of bytes; the trunk's replays cost 0.7 us per kernel.
+  // v60 I2: the catch-up steps (no head, 1-4 tokens) and the prompt catch-up chunks join: v60r MEASURED the eager catch-up
+  // steps that follow a graph replay at +11 ms over the run (0.043 -> 0.054 s) while the drafts saved 15 ms
   Impl::MtpGraph* G = nullptr;
-  if (I.mtp_graph_ok && n == 1 && top_d_out && !logits_h && !top_h && !I.o.mtp_head_sketch_check) G = &I.mtp_graphs[{h_prev_d, top_d_out, h_out_d}];
+  if (I.mtp_graph_ok && !logits_h && !top_h && !I.o.mtp_head_sketch_check && (!top_d_out || n == 1)) {
+    const std::tuple<const void*, const void*, const void*, int> key{h_prev_d, top_d_out, h_out_d, n};
+    auto it = I.mtp_graphs.find(key);
+    if (it != I.mtp_graphs.end()) G = &it->second;
+    else if (I.mtp_graphs.size() < Impl::kMtpGraphMax) G = &I.mtp_graphs[key];
+  }
   const bool replay = G && G->exec;
   const bool capture = G && !G->exec && G->seen++ >= 1;
   const unsigned sslot = replay ? G->slot : slot;
@@ -2588,7 +2606,7 @@ Status GpuEngine::Impl::mtp_run(const std::int32_t* tokens_h, const std::int32_t
     if (!g::graph_launch(G->exec, nullptr)) return gfail("engine: MTP draft graph replay");
     ++I.mtp_graph_replays;
     ++I.mtp_fused_steps;  // the host-side counts the chain would have kept
-    if (I.hsk) ++I.sk_drafts;
+    if (I.hsk && top_d_out) ++I.sk_drafts;  // (I2: a catch-up replay has no head)
   } else if (capture) {
     void* ex = nullptr;
     const bool began = g::capture_begin(nullptr);
